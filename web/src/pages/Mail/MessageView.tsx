@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams } from "react-router-dom";
 
 import { jmapClient } from "../../api/jmap";
 import type { Email, EmailBodyPart } from "../../types";
@@ -13,6 +13,7 @@ import type { Email, EmailBodyPart } from "../../types";
  * (docs/JMAP-CONTRACT.md §2.4) is deferred to Phase 3.
  */
 export default function MessageView() {
+  const navigate = useNavigate();
   const { mailboxId, emailId } = useParams<{
     mailboxId: string;
     emailId: string;
@@ -34,7 +35,16 @@ export default function MessageView() {
     jmapClient
       .getEmail(emailId)
       .then((e) => {
-        if (!cancelled) setEmail(e);
+        if (cancelled) return;
+        setEmail(e);
+        // Mark-on-open: only call if the message is currently unread.
+        // We intentionally fire-and-forget — a failure here shouldn't
+        // block rendering the message body the user is already reading.
+        if (!e.keywords.$seen) {
+          jmapClient.markRead(e.id, true).catch(() => {
+            // Swallow; surfacing this would be more noisy than useful.
+          });
+        }
       })
       .catch((err: unknown) => {
         if (!cancelled) {
@@ -50,6 +60,37 @@ export default function MessageView() {
   }, [emailId]);
 
   const bodyText = useMemo(() => resolveBody(email), [email]);
+  const attachments = useMemo(() => resolveAttachments(email), [email]);
+
+  const handleReply = (replyAll: boolean) => {
+    if (!email) return;
+    navigate("/mail/compose", {
+      state: {
+        mode: replyAll ? "replyAll" : "reply",
+        sourceEmailId: email.id,
+        to: email.from ?? [],
+        cc: replyAll ? [...(email.to ?? []), ...(email.cc ?? [])] : [],
+        subject: withPrefix(email.subject, "Re:"),
+        quotedBody: bodyText,
+        quotedFrom: email.from,
+        quotedDate: email.receivedAt,
+      },
+    });
+  };
+
+  const handleForward = () => {
+    if (!email) return;
+    navigate("/mail/compose", {
+      state: {
+        mode: "forward",
+        sourceEmailId: email.id,
+        subject: withPrefix(email.subject, "Fwd:"),
+        quotedBody: bodyText,
+        quotedFrom: email.from,
+        quotedDate: email.receivedAt,
+      },
+    });
+  };
 
   return (
     <section style={viewStyles.root}>
@@ -66,9 +107,34 @@ export default function MessageView() {
       {email && (
         <article style={viewStyles.article}>
           <header style={viewStyles.header}>
-            <h1 style={viewStyles.subject}>
-              {email.subject ?? "(no subject)"}
-            </h1>
+            <div style={viewStyles.subjectRow}>
+              <h1 style={viewStyles.subject}>
+                {email.subject ?? "(no subject)"}
+              </h1>
+              <div style={viewStyles.actions}>
+                <button
+                  type="button"
+                  onClick={() => handleReply(false)}
+                  style={viewStyles.actionButton}
+                >
+                  Reply
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleReply(true)}
+                  style={viewStyles.actionButton}
+                >
+                  Reply all
+                </button>
+                <button
+                  type="button"
+                  onClick={handleForward}
+                  style={viewStyles.actionButton}
+                >
+                  Forward
+                </button>
+              </div>
+            </div>
             <dl style={viewStyles.headerList}>
               <dt>From</dt>
               <dd>{formatAddresses(email.from)}</dd>
@@ -97,6 +163,28 @@ export default function MessageView() {
               <p style={viewStyles.muted}>(empty message body)</p>
             )}
           </div>
+          {attachments.length > 0 && (
+            <section style={viewStyles.attachmentsBox}>
+              <h2 style={viewStyles.attachmentsTitle}>
+                Attachments ({attachments.length})
+              </h2>
+              <ul style={viewStyles.attachmentsList}>
+                {attachments.map((a) => (
+                  <li key={a.partId ?? a.name ?? Math.random()}>
+                    <span style={viewStyles.attachmentName}>
+                      {a.name ?? "(unnamed)"}
+                    </span>
+                    <span style={viewStyles.attachmentMeta}>
+                      {formatType(a.type)}
+                      {typeof a.size === "number"
+                        ? ` · ${formatBytes(a.size)}`
+                        : ""}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
         </article>
       )}
     </section>
@@ -121,6 +209,46 @@ function resolveBody(email: Email | null): string {
     return stripHtml(email.bodyValues[htmlPart.partId].value);
   }
   return "";
+}
+
+/**
+ * Return the parts of an email that should be listed as
+ * attachments. `attachments` is the canonical JMAP field (RFC 8621
+ * §4.1.4); we fall back to body parts that set a `disposition` of
+ * `attachment` when the server does not populate it.
+ */
+function resolveAttachments(email: Email | null): EmailBodyPart[] {
+  if (!email) return [];
+  if (email.attachments && email.attachments.length > 0) {
+    return email.attachments;
+  }
+  const fromBody = (email.bodyStructure?.subParts ?? [])
+    .concat(email.bodyStructure ? [email.bodyStructure] : [])
+    .filter((p) => p.disposition === "attachment");
+  return fromBody;
+}
+
+function withPrefix(
+  subject: string | null | undefined,
+  prefix: string,
+): string {
+  const trimmed = (subject ?? "").trim();
+  if (!trimmed) return prefix;
+  if (trimmed.toLowerCase().startsWith(prefix.toLowerCase())) {
+    return trimmed;
+  }
+  return `${prefix} ${trimmed}`;
+}
+
+function formatType(type: string | null | undefined): string {
+  if (!type) return "application/octet-stream";
+  return type;
+}
+
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function isPart(part: EmailBodyPart): boolean {
@@ -177,9 +305,54 @@ const viewStyles: Record<string, React.CSSProperties> = {
     paddingBottom: "0.75rem",
     marginBottom: "1rem",
   },
+  subjectRow: {
+    display: "flex",
+    alignItems: "flex-start",
+    justifyContent: "space-between",
+    gap: "0.75rem",
+    marginBottom: "0.75rem",
+  },
   subject: {
-    margin: "0 0 0.75rem",
+    margin: 0,
     fontSize: "1.25rem",
+  },
+  actions: {
+    display: "flex",
+    gap: "0.25rem",
+    flexShrink: 0,
+  },
+  actionButton: {
+    padding: "0.3rem 0.6rem",
+    fontSize: "0.8rem",
+    background: "#fff",
+    border: "1px solid #d1d5db",
+    borderRadius: "0.25rem",
+    cursor: "pointer",
+    color: "#374151",
+  },
+  attachmentsBox: {
+    marginTop: "1rem",
+    padding: "0.75rem",
+    borderTop: "1px solid #e5e7eb",
+  },
+  attachmentsTitle: {
+    margin: "0 0 0.5rem",
+    fontSize: "0.95rem",
+  },
+  attachmentsList: {
+    listStyle: "none",
+    margin: 0,
+    padding: 0,
+    display: "flex",
+    flexDirection: "column",
+    gap: "0.25rem",
+    fontSize: "0.85rem",
+  },
+  attachmentName: {
+    marginRight: "0.5rem",
+  },
+  attachmentMeta: {
+    color: "#6b7280",
   },
   headerList: {
     display: "grid",
