@@ -93,7 +93,11 @@ services:
       - "587:587"
       - "143:143"
       - "993:993"
-      - "8080:8080"
+      # Host port 18080 avoids collision with the Go BFF (`kmail-api`),
+      # which is expected to bind host 8080 during local development
+      # (see web/vite.config.ts). The BFF proxies JMAP to Stalwart
+      # over the compose network.
+      - "18080:8080"
     environment:
       # Stalwart configuration will need to be customized;
       # these are placeholder env vars for local dev.
