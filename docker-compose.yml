@@ -12,11 +12,13 @@
 #                      stands in for the real gateway during local
 #                      development.
 #
-# Stalwart v0.16.0 is NOT wired in yet. Once the Stalwart binary /
-# container image is available locally, add a `stalwart` service
-# here that mounts the shared PostgreSQL, MinIO, and Valkey
-# instances. See docs/PROPOSAL.md §1 for the Stalwart version pin
-# and the staging upgrade plan.
+# Stalwart v0.16.0 is wired in as the `stalwart` service below,
+# pinned to `stalwartlabs/mail-server:v0.16.0` and depending on the
+# shared PostgreSQL, MinIO, and Valkey instances above. A proper
+# Stalwart config file mount (pointing it at those services) is a
+# follow-up task — see the inline NOTE on the service. See
+# docs/PROPOSAL.md §1 for the Stalwart version pin and the staging
+# upgrade plan.
 
 services:
   postgres:
