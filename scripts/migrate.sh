@@ -66,15 +66,20 @@ ensure_bookkeeping_table() {
 is_applied() {
     local filename="$1"
     local count
-    count=$(psql "${DATABASE_URL}" -v ON_ERROR_STOP=1 -Atqc \
-        "SELECT count(*) FROM schema_migrations WHERE filename = '${filename}'")
+    # Use psql's `-v` variable binding and `:'migfile'` interpolation
+    # so the filename is properly quoted by psql rather than spliced
+    # into the SQL string by the shell.
+    count=$(psql "${DATABASE_URL}" -v ON_ERROR_STOP=1 \
+        -v "migfile=${filename}" -Atqc \
+        "SELECT count(*) FROM schema_migrations WHERE filename = :'migfile'")
     [ "${count}" = "1" ]
 }
 
 record_applied() {
     local filename="$1"
-    psql "${DATABASE_URL}" -v ON_ERROR_STOP=1 -Atqc \
-        "INSERT INTO schema_migrations (filename) VALUES ('${filename}')
+    psql "${DATABASE_URL}" -v ON_ERROR_STOP=1 \
+        -v "migfile=${filename}" -Atqc \
+        "INSERT INTO schema_migrations (filename) VALUES (:'migfile')
          ON CONFLICT (filename) DO NOTHING" >/dev/null
 }
 

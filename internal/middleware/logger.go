@@ -44,3 +44,20 @@ func (s *statusRecorder) Write(b []byte) (int, error) {
 	}
 	return s.ResponseWriter.Write(b)
 }
+
+// Flush forwards to the underlying writer's http.Flusher when
+// available. httputil.ReverseProxy (and server-sent events) relies
+// on this to stream responses incrementally; without it the proxy
+// buffers the entire upstream body before forwarding.
+func (s *statusRecorder) Flush() {
+	if f, ok := s.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// Unwrap exposes the underlying ResponseWriter so Go 1.20+
+// http.ResponseController can discover optional interfaces
+// (Hijacker, Pusher, etc.) through this wrapper.
+func (s *statusRecorder) Unwrap() http.ResponseWriter {
+	return s.ResponseWriter
+}

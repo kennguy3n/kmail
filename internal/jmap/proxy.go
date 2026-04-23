@@ -138,7 +138,11 @@ func (p *Proxy) rewrite(r *httputil.ProxyRequest) {
 
 	// Strip the `/jmap` prefix from the outgoing path so the
 	// upstream sees the JMAP path it actually implements. Leave
-	// trailing `/` and deeper paths intact.
+	// trailing `/` and deeper paths intact. Clear RawPath so
+	// net/url regenerates it from the rewritten Path — otherwise a
+	// non-empty RawPath (set whenever the incoming URL contained
+	// percent-encoded bytes) would win inside RequestURI() and the
+	// upstream would still see `/jmap`.
 	outPath := r.Out.URL.Path
 	if strings.HasPrefix(outPath, p.stripPR) {
 		trimmed := strings.TrimPrefix(outPath, p.stripPR)
@@ -146,6 +150,7 @@ func (p *Proxy) rewrite(r *httputil.ProxyRequest) {
 			trimmed = "/"
 		}
 		r.Out.URL.Path = trimmed
+		r.Out.URL.RawPath = ""
 	}
 
 	r.Out.Header.Set("X-KMail-Tenant-Id", tenantID)
