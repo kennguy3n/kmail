@@ -1,0 +1,18 @@
+{
+  "@type": "PostgreSql",
+  "host": "postgres",
+  "port": 5432,
+  "database": "stalwart",
+  "authUsername": "stalwart",
+  "authSecret": {
+    "@type": "Value",
+    "secret": "stalwart-dev"
+  },
+  "useTls": false,
+  "allowInvalidCerts": false,
+  "poolRecyclingMethod": "fast",
+  "readReplicas": {},
+  "timeout": null,
+  "poolMaxConnections": null,
+  "options": null
+}
