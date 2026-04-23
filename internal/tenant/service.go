@@ -106,6 +106,26 @@ type CreateDomainInput struct {
 	Domain string `json:"domain"`
 }
 
+// UpdateTenantInput carries the fields accepted by
+// PUT /api/v1/tenants/:id. Fields are pointers so callers can
+// distinguish "unset" from "set to zero value" and only the provided
+// fields are updated.
+type UpdateTenantInput struct {
+	Name   *string `json:"name,omitempty"`
+	Plan   *string `json:"plan,omitempty"`
+	Status *string `json:"status,omitempty"`
+}
+
+// UpdateUserInput carries the fields accepted by
+// PUT /api/v1/tenants/:id/users/:userId. Fields are pointers so
+// callers can omit fields they do not want to change.
+type UpdateUserInput struct {
+	DisplayName *string `json:"display_name,omitempty"`
+	Role        *string `json:"role,omitempty"`
+	Status      *string `json:"status,omitempty"`
+	QuotaBytes  *int64  `json:"quota_bytes,omitempty"`
+}
+
 // CreateSharedInboxInput carries the fields accepted by
 // POST /api/v1/tenants/:id/shared-inboxes.
 type CreateSharedInboxInput struct {
@@ -142,6 +162,37 @@ func (s *Service) CreateTenant(ctx context.Context, in CreateTenantInput) (*Tena
 		return nil, fmt.Errorf("insert tenant: %w", err)
 	}
 	return &t, nil
+}
+
+// ListTenants returns every tenant in the control plane, ordered by
+// creation time. This is an admin-only operation that intentionally
+// bypasses RLS — callers are expected to gate it behind the
+// control-plane admin role in the BFF.
+func (s *Service) ListTenants(ctx context.Context) ([]Tenant, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT id::text, name, slug, plan, status, created_at, updated_at
+		FROM tenants
+		ORDER BY created_at ASC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list tenants: %w", err)
+	}
+	defer rows.Close()
+	var out []Tenant
+	for rows.Next() {
+		var t Tenant
+		if err := rows.Scan(
+			&t.ID, &t.Name, &t.Slug, &t.Plan, &t.Status,
+			&t.CreatedAt, &t.UpdatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan tenant: %w", err)
+		}
+		out = append(out, t)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate tenants: %w", err)
+	}
+	return out, nil
 }
 
 // GetTenant fetches a tenant by ID.
@@ -266,6 +317,274 @@ func (s *Service) ListDomains(ctx context.Context, tenantID string) ([]Domain, e
 		return nil, fmt.Errorf("list domains: %w", err)
 	}
 	return out, nil
+}
+
+// UpdateTenant updates mutable tenant fields (name, plan, status)
+// and returns the persisted row. Nil fields on the input are left
+// unchanged. Like CreateTenant and ListTenants this is an admin
+// operation that does not run through tenant-scoped RLS.
+func (s *Service) UpdateTenant(ctx context.Context, id string, in UpdateTenantInput) (*Tenant, error) {
+	if id == "" {
+		return nil, fmt.Errorf("%w: tenant id is required", ErrInvalidInput)
+	}
+	if in.Name == nil && in.Plan == nil && in.Status == nil {
+		return nil, fmt.Errorf("%w: no fields to update", ErrInvalidInput)
+	}
+	if in.Name != nil && *in.Name == "" {
+		return nil, fmt.Errorf("%w: name cannot be empty", ErrInvalidInput)
+	}
+	if in.Plan != nil {
+		switch *in.Plan {
+		case "core", "pro", "privacy":
+		default:
+			return nil, fmt.Errorf("%w: plan must be one of core, pro, privacy", ErrInvalidInput)
+		}
+	}
+	if in.Status != nil {
+		switch *in.Status {
+		case "active", "suspended", "deleted":
+		default:
+			return nil, fmt.Errorf("%w: status must be one of active, suspended, deleted", ErrInvalidInput)
+		}
+	}
+	var t Tenant
+	err := s.pool.QueryRow(ctx, `
+		UPDATE tenants
+		SET name   = COALESCE($2, name),
+		    plan   = COALESCE($3, plan),
+		    status = COALESCE($4, status)
+		WHERE id = $1::uuid
+		RETURNING id::text, name, slug, plan, status, created_at, updated_at
+	`, id, in.Name, in.Plan, in.Status).Scan(
+		&t.ID, &t.Name, &t.Slug, &t.Plan, &t.Status,
+		&t.CreatedAt, &t.UpdatedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("update tenant: %w", err)
+	}
+	return &t, nil
+}
+
+// DeleteTenant soft-deletes a tenant by flipping its status to
+// "deleted". We never purge the row — downstream RLS-scoped tables
+// still reference it and audit retention applies.
+func (s *Service) DeleteTenant(ctx context.Context, id string) error {
+	if id == "" {
+		return fmt.Errorf("%w: tenant id is required", ErrInvalidInput)
+	}
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE tenants
+		SET status = 'deleted'
+		WHERE id = $1::uuid
+	`, id)
+	if err != nil {
+		return fmt.Errorf("delete tenant: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ListUsers returns every user in a tenant, scoped by RLS.
+func (s *Service) ListUsers(ctx context.Context, tenantID string) ([]User, error) {
+	if tenantID == "" {
+		return nil, fmt.Errorf("%w: tenant id is required", ErrInvalidInput)
+	}
+	var out []User
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
+			return err
+		}
+		rows, err := tx.Query(ctx, `
+			SELECT id::text, tenant_id::text, kchat_user_id,
+			       stalwart_account_id, email, display_name, role,
+			       status, quota_bytes, created_at, updated_at
+			FROM users
+			WHERE tenant_id = $1::uuid
+			ORDER BY created_at ASC
+		`, tenantID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var u User
+			if err := rows.Scan(
+				&u.ID, &u.TenantID, &u.KChatUserID, &u.StalwartAccountID,
+				&u.Email, &u.DisplayName, &u.Role, &u.Status, &u.QuotaBytes,
+				&u.CreatedAt, &u.UpdatedAt,
+			); err != nil {
+				return err
+			}
+			out = append(out, u)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list users: %w", err)
+	}
+	return out, nil
+}
+
+// GetUser fetches a single user inside a tenant. RLS scopes the
+// lookup so cross-tenant probes return ErrNotFound.
+func (s *Service) GetUser(ctx context.Context, tenantID, userID string) (*User, error) {
+	if tenantID == "" || userID == "" {
+		return nil, fmt.Errorf("%w: tenant id and user id are required", ErrInvalidInput)
+	}
+	var u User
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `
+			SELECT id::text, tenant_id::text, kchat_user_id,
+			       stalwart_account_id, email, display_name, role,
+			       status, quota_bytes, created_at, updated_at
+			FROM users
+			WHERE id = $1::uuid AND tenant_id = $2::uuid
+		`, userID, tenantID).Scan(
+			&u.ID, &u.TenantID, &u.KChatUserID, &u.StalwartAccountID,
+			&u.Email, &u.DisplayName, &u.Role, &u.Status, &u.QuotaBytes,
+			&u.CreatedAt, &u.UpdatedAt,
+		)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("select user: %w", err)
+	}
+	return &u, nil
+}
+
+// UpdateUser updates mutable user fields (display_name, role,
+// status, quota_bytes). Nil fields on the input are left unchanged.
+// Runs inside the tenant-scoped GUC so RLS enforces tenant
+// boundaries on the update.
+func (s *Service) UpdateUser(ctx context.Context, tenantID, userID string, in UpdateUserInput) (*User, error) {
+	if tenantID == "" || userID == "" {
+		return nil, fmt.Errorf("%w: tenant id and user id are required", ErrInvalidInput)
+	}
+	if in.DisplayName == nil && in.Role == nil && in.Status == nil && in.QuotaBytes == nil {
+		return nil, fmt.Errorf("%w: no fields to update", ErrInvalidInput)
+	}
+	if in.DisplayName != nil && *in.DisplayName == "" {
+		return nil, fmt.Errorf("%w: display_name cannot be empty", ErrInvalidInput)
+	}
+	if in.Role != nil {
+		switch *in.Role {
+		case "owner", "admin", "member", "billing", "deliverability":
+		default:
+			return nil, fmt.Errorf("%w: role must be one of owner, admin, member, billing, deliverability", ErrInvalidInput)
+		}
+	}
+	if in.Status != nil {
+		switch *in.Status {
+		case "active", "suspended", "deleted":
+		default:
+			return nil, fmt.Errorf("%w: status must be one of active, suspended, deleted", ErrInvalidInput)
+		}
+	}
+	if in.QuotaBytes != nil && *in.QuotaBytes < 0 {
+		return nil, fmt.Errorf("%w: quota_bytes must be non-negative", ErrInvalidInput)
+	}
+	var u User
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `
+			UPDATE users
+			SET display_name = COALESCE($3, display_name),
+			    role         = COALESCE($4, role),
+			    status       = COALESCE($5, status),
+			    quota_bytes  = COALESCE($6, quota_bytes)
+			WHERE id = $1::uuid AND tenant_id = $2::uuid
+			RETURNING id::text, tenant_id::text, kchat_user_id,
+			          stalwart_account_id, email, display_name, role,
+			          status, quota_bytes, created_at, updated_at
+		`, userID, tenantID, in.DisplayName, in.Role, in.Status, in.QuotaBytes).Scan(
+			&u.ID, &u.TenantID, &u.KChatUserID, &u.StalwartAccountID,
+			&u.Email, &u.DisplayName, &u.Role, &u.Status, &u.QuotaBytes,
+			&u.CreatedAt, &u.UpdatedAt,
+		)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("update user: %w", err)
+	}
+	return &u, nil
+}
+
+// DeleteUser soft-deletes a user by flipping status to "deleted".
+// The row stays in place so audit trails and RLS references remain
+// valid.
+func (s *Service) DeleteUser(ctx context.Context, tenantID, userID string) error {
+	if tenantID == "" || userID == "" {
+		return fmt.Errorf("%w: tenant id and user id are required", ErrInvalidInput)
+	}
+	var affected int64
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
+			return err
+		}
+		tag, err := tx.Exec(ctx, `
+			UPDATE users
+			SET status = 'deleted'
+			WHERE id = $1::uuid AND tenant_id = $2::uuid
+		`, userID, tenantID)
+		if err != nil {
+			return err
+		}
+		affected = tag.RowsAffected()
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("delete user: %w", err)
+	}
+	if affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// GetDomain fetches a single domain inside a tenant. Used by the
+// DNS verification handler to look up records before running checks.
+func (s *Service) GetDomain(ctx context.Context, tenantID, domainID string) (*Domain, error) {
+	if tenantID == "" || domainID == "" {
+		return nil, fmt.Errorf("%w: tenant id and domain id are required", ErrInvalidInput)
+	}
+	var d Domain
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `
+			SELECT id::text, tenant_id::text, domain, verified,
+			       mx_verified, spf_verified, dkim_verified,
+			       dmarc_verified, created_at, updated_at
+			FROM domains
+			WHERE id = $1::uuid AND tenant_id = $2::uuid
+		`, domainID, tenantID).Scan(
+			&d.ID, &d.TenantID, &d.Domain, &d.Verified,
+			&d.MXVerified, &d.SPFVerified, &d.DKIMVerified,
+			&d.DMARCVerified, &d.CreatedAt, &d.UpdatedAt,
+		)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("select domain: %w", err)
+	}
+	return &d, nil
 }
 
 // CreateSharedInbox creates a shared inbox for a tenant. Membership

@@ -61,6 +61,13 @@ type Config struct {
 	// endpoints and credentials for tenant bucket provisioning,
 	// presigned-URL minting (attachments), and usage/quota lookups.
 	ZKFabric ZKFabricConfig
+
+	// DNS controls the DNS Onboarding Service. The BFF mounts a
+	// sub-handler for /api/v1/tenants/{id}/domains/{domainId}/...
+	// routes; the standalone `cmd/kmail-dns` binary exposes the
+	// same surface on its own port for operators that want to
+	// split the service out.
+	DNS DNSConfig
 }
 
 // ZKFabricConfig is the connection surface for the zk-object-fabric
@@ -82,6 +89,36 @@ type ZKFabricConfig struct {
 	// template.
 	AccessKey string
 	SecretKey string
+}
+
+// DNSConfig wires the DNS Onboarding Service. The defaults target
+// KMail's dev infrastructure (`kmail.local`) so `go run
+// ./cmd/kmail-api` and `go run ./cmd/kmail-dns` work out of the
+// box without additional configuration.
+type DNSConfig struct {
+	// Addr is the listen address for the standalone kmail-dns
+	// binary. The in-process BFF integration ignores this.
+	Addr string
+	// MailHost is the canonical KMail mail host; tenant MX records
+	// must point at this or a subdomain.
+	MailHost string
+	// SPFInclude is the SPF include tenants must add to their SPF
+	// record.
+	SPFInclude string
+	// DKIMSelector is the default DKIM selector KMail publishes for
+	// tenant domains.
+	DKIMSelector string
+	// DKIMPublicKey is the RSA DKIM public key (base64) KMail
+	// publishes. Surfaced through GenerateRecords so the tenant
+	// can configure the matching DNS record.
+	DKIMPublicKey string
+	// DMARCPolicy is the baseline DMARC policy
+	// (`none`/`quarantine`/`reject`) surfaced through
+	// GenerateRecords.
+	DMARCPolicy string
+	// ReportingMailbox receives DMARC aggregate and TLS-RPT
+	// reports.
+	ReportingMailbox string
 }
 
 // HTTPConfig holds the BFF HTTP listener configuration.
@@ -130,6 +167,15 @@ func Load() (*Config, error) {
 			ConsoleURL: getenv("ZK_FABRIC_CONSOLE_URL", "http://localhost:9081"),
 			AccessKey:  getenv("ZK_FABRIC_ACCESS_KEY", "kmail-access-key"),
 			SecretKey:  getenv("ZK_FABRIC_SECRET_KEY", "kmail-secret-key"),
+		},
+		DNS: DNSConfig{
+			Addr:             getenv("KMAIL_DNS_ADDR", ":8090"),
+			MailHost:         getenv("KMAIL_DNS_MAIL_HOST", "mx.kmail.local"),
+			SPFInclude:       getenv("KMAIL_DNS_SPF_INCLUDE", "_spf.kmail.local"),
+			DKIMSelector:     getenv("KMAIL_DNS_DKIM_SELECTOR", "kmail"),
+			DKIMPublicKey:    getenv("KMAIL_DNS_DKIM_PUBLIC_KEY", ""),
+			DMARCPolicy:      getenv("KMAIL_DNS_DMARC_POLICY", "none"),
+			ReportingMailbox: getenv("KMAIL_DNS_REPORTING_MAILBOX", "dmarc@kmail.local"),
 		},
 	}, nil
 }

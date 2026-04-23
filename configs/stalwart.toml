@@ -1,11 +1,30 @@
-# KMail — local development Stalwart v0.16.0 configuration.
+# -----------------------------------------------------------------
+# DEPRECATED — reference only.
+# -----------------------------------------------------------------
+# This TOML file is kept as a human-readable reference for the
+# Stalwart v0.16.0 settings layout, but it is no longer loaded by
+# the local dev stack. The compose service now bootstraps from
+# `configs/stalwart-bootstrap.json` (mounted at
+# `/etc/stalwart/config.json`) and applies the rest of the settings
+# through the Stalwart admin API via `scripts/stalwart-init.sh` —
+# see `docker-compose.yml` and docs/PROPOSAL.md §1.1. Editing this
+# file has no effect on the running dev stack; make changes in the
+# bootstrap JSON or the init script instead.
+# -----------------------------------------------------------------
 #
-# This file is mounted into the Stalwart container by
-# `docker-compose.yml` at `/opt/stalwart-mail/etc/config.toml`
-# (Stalwart's default `CONFIG_PATH`). It points Stalwart at the
-# other compose services — Postgres for metadata, zk-object-fabric
-# (service name `zk-fabric`) for blob storage via its S3-compatible
-# API, Valkey for lookups, Meilisearch for full-text search.
+# KMail — Stalwart v0.16.0 reference configuration (TOML form).
+#
+# Historically this file was mounted at
+# `/opt/stalwart-mail/etc/config.toml` and contained the complete
+# local dev config. With v0.16.0 we moved to a JSON bootstrap +
+# admin-API model (see the header above and docs/PROPOSAL.md §1.1):
+# `configs/stalwart/config.json` points Stalwart at its Postgres
+# data store, and `scripts/stalwart-init.sh` writes the rest of the
+# configuration through the admin API. This file is kept in-tree
+# as a readable cheat-sheet for the same key/value layout the init
+# script POSTs — Postgres for metadata, zk-object-fabric (service
+# name `zk-fabric`) for blob storage via its S3-compatible API,
+# Valkey for lookups, Meilisearch for full-text search.
 #
 # The blob store is the real zk-object-fabric S3 gateway — the same
 # API contract as the Wasabi / Ceph RGW backends used in later
