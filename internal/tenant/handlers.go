@@ -47,7 +47,7 @@ func (h *Handlers) createTenant(w http.ResponseWriter, r *http.Request) {
 	t, err := h.svc.CreateTenant(r.Context(), in)
 	if err != nil {
 		h.logger.Printf("createTenant: %v", err)
-		writeError(w, http.StatusBadRequest, err)
+		writeError(w, statusForServiceError(err), err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, t)
@@ -82,7 +82,7 @@ func (h *Handlers) createUser(w http.ResponseWriter, r *http.Request) {
 	u, err := h.svc.CreateUser(r.Context(), tenantID, in)
 	if err != nil {
 		h.logger.Printf("createUser: %v", err)
-		writeError(w, http.StatusBadRequest, err)
+		writeError(w, statusForServiceError(err), err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, u)
@@ -102,7 +102,7 @@ func (h *Handlers) createDomain(w http.ResponseWriter, r *http.Request) {
 	d, err := h.svc.CreateDomain(r.Context(), tenantID, in)
 	if err != nil {
 		h.logger.Printf("createDomain: %v", err)
-		writeError(w, http.StatusBadRequest, err)
+		writeError(w, statusForServiceError(err), err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, d)
@@ -140,7 +140,7 @@ func (h *Handlers) createSharedInbox(w http.ResponseWriter, r *http.Request) {
 	si, err := h.svc.CreateSharedInbox(r.Context(), tenantID, in)
 	if err != nil {
 		h.logger.Printf("createSharedInbox: %v", err)
-		writeError(w, http.StatusBadRequest, err)
+		writeError(w, statusForServiceError(err), err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, si)
@@ -179,4 +179,21 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 
 func writeError(w http.ResponseWriter, status int, err error) {
 	writeJSON(w, status, map[string]string{"error": err.Error()})
+}
+
+// statusForServiceError maps a Service error to the HTTP status the
+// mutation handlers should return. Validation failures surface as
+// 400 via the ErrInvalidInput sentinel; everything else (Postgres
+// outages, pool exhaustion, constraint violations, unexpected RLS
+// failures) surfaces as 500 so clients don't retry a transient
+// infra failure forever.
+func statusForServiceError(err error) int {
+	switch {
+	case errors.Is(err, ErrInvalidInput):
+		return http.StatusBadRequest
+	case errors.Is(err, ErrNotFound):
+		return http.StatusNotFound
+	default:
+		return http.StatusInternalServerError
+	}
 }

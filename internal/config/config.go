@@ -82,7 +82,12 @@ func Load() (*Config, error) {
 			ShutdownTimeout:   getenvDuration("KMAIL_API_SHUTDOWN_TIMEOUT", 30*time.Second),
 		},
 		DatabaseURL:     getenv("DATABASE_URL", "postgresql://kmail:kmail@localhost:5432/kmail?sslmode=disable"),
-		StalwartURL:     getenv("STALWART_URL", "http://stalwart:8080"),
+		// Stalwart's container port 8080 is published to host 18080
+		// in `docker-compose.yml` precisely so a host-run BFF
+		// (`go run ./cmd/kmail-api`) can reach it without colliding
+		// with the BFF's own :8080 listener. Inside compose, override
+		// this with `STALWART_URL=http://stalwart:8080`.
+		StalwartURL:     getenv("STALWART_URL", "http://localhost:18080"),
 		ValkeyURL:       getenv("VALKEY_URL", "valkey:6379"),
 		KChatOIDCIssuer: getenv("KCHAT_OIDC_ISSUER", ""),
 		DevBypassToken:  getenv("KMAIL_DEV_BYPASS_TOKEN", ""),

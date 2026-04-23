@@ -117,13 +117,18 @@ type CreateSharedInboxInput struct {
 // ErrNotFound is returned when a lookup resolves no rows.
 var ErrNotFound = errors.New("not found")
 
+// ErrInvalidInput wraps caller-visible validation failures (missing
+// or malformed fields on a Create* input). Handlers surface this as
+// HTTP 400; every other Service error is treated as 500.
+var ErrInvalidInput = errors.New("invalid input")
+
 // CreateTenant inserts a new tenant row and returns the persisted
 // representation. Tenants are the only entity not subject to RLS —
 // creating one is a control-plane-admin operation, not a
 // tenant-scoped one.
 func (s *Service) CreateTenant(ctx context.Context, in CreateTenantInput) (*Tenant, error) {
 	if in.Name == "" || in.Slug == "" || in.Plan == "" {
-		return nil, errors.New("name, slug, and plan are required")
+		return nil, fmt.Errorf("%w: name, slug, and plan are required", ErrInvalidInput)
 	}
 	var t Tenant
 	err := s.pool.QueryRow(ctx, `
@@ -161,7 +166,7 @@ func (s *Service) GetTenant(ctx context.Context, id string) (*Tenant, error) {
 // RLS policy on `users` validates the insert.
 func (s *Service) CreateUser(ctx context.Context, tenantID string, in CreateUserInput) (*User, error) {
 	if in.KChatUserID == "" || in.StalwartAccountID == "" || in.Email == "" || in.DisplayName == "" {
-		return nil, errors.New("kchat_user_id, stalwart_account_id, email, and display_name are required")
+		return nil, fmt.Errorf("%w: kchat_user_id, stalwart_account_id, email, and display_name are required", ErrInvalidInput)
 	}
 	role := in.Role
 	if role == "" {
@@ -200,7 +205,7 @@ func (s *Service) CreateUser(ctx context.Context, tenantID string, in CreateUser
 // record is observed — see `docs/ARCHITECTURE.md` §7.
 func (s *Service) CreateDomain(ctx context.Context, tenantID string, in CreateDomainInput) (*Domain, error) {
 	if in.Domain == "" {
-		return nil, errors.New("domain is required")
+		return nil, fmt.Errorf("%w: domain is required", ErrInvalidInput)
 	}
 	var d Domain
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
@@ -268,7 +273,7 @@ func (s *Service) ListDomains(ctx context.Context, tenantID string) ([]Domain, e
 // only mints the inbox row and the MLS group reference.
 func (s *Service) CreateSharedInbox(ctx context.Context, tenantID string, in CreateSharedInboxInput) (*SharedInbox, error) {
 	if in.Address == "" || in.DisplayName == "" || in.MLSGroupID == "" {
-		return nil, errors.New("address, display_name, and mls_group_id are required")
+		return nil, fmt.Errorf("%w: address, display_name, and mls_group_id are required", ErrInvalidInput)
 	}
 	var s2 SharedInbox
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
