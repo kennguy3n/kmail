@@ -169,8 +169,8 @@ export default function MessageView() {
                 Attachments ({attachments.length})
               </h2>
               <ul style={viewStyles.attachmentsList}>
-                {attachments.map((a) => (
-                  <li key={a.partId ?? a.name ?? Math.random()}>
+                {attachments.map((a, i) => (
+                  <li key={a.partId ?? a.blobId ?? a.name ?? `att-${i}`}>
                     <span style={viewStyles.attachmentName}>
                       {a.name ?? "(unnamed)"}
                     </span>
