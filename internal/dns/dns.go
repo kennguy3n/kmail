@@ -137,6 +137,12 @@ type DomainRecords struct {
 	Records []DomainRecord `json:"records"`
 }
 
+// ExpectedRecords aliases DomainRecords and is the shape returned
+// by GetExpectedRecords. The alias exists so callers can use the
+// name the DNS wizard UI speaks ("expected records") without
+// breaking the historical DomainRecords export.
+type ExpectedRecords = DomainRecords
+
 // CheckMX verifies that the authoritative MX records for `domain`
 // include a target under `s.MailHost`. Returns (false, nil) for a
 // domain that resolves cleanly but does not point at KMail; returns
@@ -346,6 +352,49 @@ func (s *Service) VerifyDomain(ctx context.Context, tenantID, domainID string) (
 	result.DomainID = domainID
 	result.Domain = domain
 	return &result, nil
+}
+
+// GetExpectedRecords returns the records the tenant should publish
+// for their domain, as a pointer so handlers can distinguish an
+// empty record set from a missing one. It is a thin wrapper over
+// GenerateRecords and shares the same logic; the separate name
+// matches the DNS wizard contract documented in
+// docs/PROPOSAL.md §9.3.
+func (s *Service) GetExpectedRecords(domain string) *ExpectedRecords {
+	out := s.GenerateRecords(domain)
+	return &out
+}
+
+// LookupDomainName resolves a domain row by (tenantID, domainID)
+// and returns its registered domain name. It runs under an
+// RLS-scoped tx so cross-tenant probes surface as ErrNotFound, and
+// is the handler-friendly companion to VerifyDomain for the
+// records endpoint (which only needs the name, not the full row).
+func (s *Service) LookupDomainName(ctx context.Context, tenantID, domainID string) (string, error) {
+	if tenantID == "" || domainID == "" {
+		return "", fmt.Errorf("%w: tenant id and domain id are required", ErrInvalidInput)
+	}
+	if s.pool == nil {
+		return "", errors.New("dns: service has no database pool")
+	}
+	var domain string
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `
+			SELECT domain
+			FROM domains
+			WHERE id = $1::uuid AND tenant_id = $2::uuid
+		`, domainID, tenantID).Scan(&domain)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	if err != nil {
+		return "", fmt.Errorf("lookup domain: %w", err)
+	}
+	return domain, nil
 }
 
 // GenerateRecords returns the DNS records the tenant must publish to

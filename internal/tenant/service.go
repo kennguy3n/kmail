@@ -134,6 +134,23 @@ type CreateSharedInboxInput struct {
 	MLSGroupID  string `json:"mls_group_id"`
 }
 
+// AddSharedInboxMemberInput carries the fields accepted by
+// POST /api/v1/tenants/:id/shared-inboxes/:inboxId/members.
+type AddSharedInboxMemberInput struct {
+	UserID string `json:"user_id"`
+	Role   string `json:"role"`
+}
+
+// SharedInboxMember is the API representation of a row in
+// `shared_inbox_members`.
+type SharedInboxMember struct {
+	TenantID      string    `json:"tenant_id"`
+	SharedInboxID string    `json:"shared_inbox_id"`
+	UserID        string    `json:"user_id"`
+	Role          string    `json:"role"`
+	AddedAt       time.Time `json:"added_at"`
+}
+
 // ErrNotFound is returned when a lookup resolves no rows.
 var ErrNotFound = errors.New("not found")
 
@@ -585,6 +602,118 @@ func (s *Service) GetDomain(ctx context.Context, tenantID, domainID string) (*Do
 		return nil, fmt.Errorf("select domain: %w", err)
 	}
 	return &d, nil
+}
+
+// ListSharedInboxes returns every shared inbox owned by the tenant,
+// RLS-scoped via the `app.tenant_id` GUC.
+func (s *Service) ListSharedInboxes(ctx context.Context, tenantID string) ([]SharedInbox, error) {
+	if tenantID == "" {
+		return nil, fmt.Errorf("%w: tenant id is required", ErrInvalidInput)
+	}
+	var out []SharedInbox
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
+			return err
+		}
+		rows, err := tx.Query(ctx, `
+			SELECT id::text, tenant_id::text, address, display_name,
+			       mls_group_id, created_at, updated_at
+			FROM shared_inboxes
+			WHERE tenant_id = $1::uuid
+			ORDER BY created_at ASC
+		`, tenantID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var si SharedInbox
+			if err := rows.Scan(
+				&si.ID, &si.TenantID, &si.Address, &si.DisplayName,
+				&si.MLSGroupID, &si.CreatedAt, &si.UpdatedAt,
+			); err != nil {
+				return err
+			}
+			out = append(out, si)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list shared inboxes: %w", err)
+	}
+	return out, nil
+}
+
+// AddSharedInboxMember adds a user to a shared inbox with the given
+// role. Both the inbox and the user must already exist inside the
+// tenant — RLS scopes the insert so cross-tenant references cannot
+// be created even if the IDs collide.
+func (s *Service) AddSharedInboxMember(ctx context.Context, tenantID, inboxID, userID, role string) (*SharedInboxMember, error) {
+	if tenantID == "" || inboxID == "" || userID == "" {
+		return nil, fmt.Errorf("%w: tenant id, inbox id, and user id are required", ErrInvalidInput)
+	}
+	if role == "" {
+		role = "member"
+	}
+	switch role {
+	case "owner", "member", "viewer":
+	default:
+		return nil, fmt.Errorf("%w: role must be one of owner, member, viewer", ErrInvalidInput)
+	}
+	m := SharedInboxMember{
+		TenantID:      tenantID,
+		SharedInboxID: inboxID,
+		UserID:        userID,
+		Role:          role,
+	}
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `
+			INSERT INTO shared_inbox_members (
+				tenant_id, shared_inbox_id, user_id, role
+			) VALUES ($1::uuid, $2::uuid, $3::uuid, $4)
+			RETURNING added_at
+		`, tenantID, inboxID, userID, role).Scan(&m.AddedAt)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("insert shared inbox member: %w", err)
+	}
+	return &m, nil
+}
+
+// RemoveSharedInboxMember removes a user from a shared inbox. It
+// returns ErrNotFound if the membership row does not exist or is
+// hidden by RLS.
+func (s *Service) RemoveSharedInboxMember(ctx context.Context, tenantID, inboxID, userID string) error {
+	if tenantID == "" || inboxID == "" || userID == "" {
+		return fmt.Errorf("%w: tenant id, inbox id, and user id are required", ErrInvalidInput)
+	}
+	var affected int64
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
+			return err
+		}
+		tag, err := tx.Exec(ctx, `
+			DELETE FROM shared_inbox_members
+			WHERE tenant_id = $1::uuid
+			  AND shared_inbox_id = $2::uuid
+			  AND user_id = $3::uuid
+		`, tenantID, inboxID, userID)
+		if err != nil {
+			return err
+		}
+		affected = tag.RowsAffected()
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("delete shared inbox member: %w", err)
+	}
+	if affected == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // CreateSharedInbox creates a shared inbox for a tenant. Membership

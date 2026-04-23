@@ -361,6 +361,72 @@ func TestGetDomain_EmptyIDs(t *testing.T) {
 }
 
 // ---------------------------------------------------------------
+// ListSharedInboxes / AddSharedInboxMember / RemoveSharedInboxMember
+// ---------------------------------------------------------------
+
+func TestListSharedInboxes_EmptyTenantID(t *testing.T) {
+	_, err := nilService().ListSharedInboxes(context.Background(), "")
+	if !errors.Is(err, ErrInvalidInput) {
+		t.Errorf("expected ErrInvalidInput, got %v", err)
+	}
+}
+
+func TestAddSharedInboxMember_MissingIDs(t *testing.T) {
+	cases := []struct {
+		name                        string
+		tenantID, inboxID, userID   string
+	}{
+		{"empty tenant", "", "iid", "uid"},
+		{"empty inbox", "tid", "", "uid"},
+		{"empty user", "tid", "iid", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := nilService().AddSharedInboxMember(context.Background(), tc.tenantID, tc.inboxID, tc.userID, "member")
+			if !errors.Is(err, ErrInvalidInput) {
+				t.Errorf("expected ErrInvalidInput, got %v", err)
+			}
+		})
+	}
+}
+
+func TestAddSharedInboxMember_InvalidRole(t *testing.T) {
+	_, err := nilService().AddSharedInboxMember(context.Background(), "tid", "iid", "uid", "superuser")
+	if !errors.Is(err, ErrInvalidInput) {
+		t.Errorf("expected ErrInvalidInput for bad role, got %v", err)
+	}
+}
+
+func TestAddSharedInboxMember_ValidRoles(t *testing.T) {
+	for _, role := range []string{"", "owner", "member", "viewer"} {
+		r := role
+		assertNotInvalidInput(t, role, func() error {
+			_, err := nilService().AddSharedInboxMember(context.Background(), "tid", "iid", "uid", r)
+			return err
+		})
+	}
+}
+
+func TestRemoveSharedInboxMember_MissingIDs(t *testing.T) {
+	cases := []struct {
+		name                        string
+		tenantID, inboxID, userID   string
+	}{
+		{"empty tenant", "", "iid", "uid"},
+		{"empty inbox", "tid", "", "uid"},
+		{"empty user", "tid", "iid", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := nilService().RemoveSharedInboxMember(context.Background(), tc.tenantID, tc.inboxID, tc.userID)
+			if !errors.Is(err, ErrInvalidInput) {
+				t.Errorf("expected ErrInvalidInput, got %v", err)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------
 

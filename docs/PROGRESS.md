@@ -4,8 +4,37 @@
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
 - **Status**: Phase 1 — Foundation (in progress); Phase 2 —
   Prototype (in progress)
-- **Last updated**: 2026-04-23 — Phase 2 engineering work has
-  begun. This update lands three pieces of the Phase 2 checklist:
+- **Last updated**: 2026-04-23 — Second Phase 2 batch landed. This
+  update finishes the Tenant Service CRUD surface with
+  shared-inbox membership (`ListSharedInboxes`,
+  `AddSharedInboxMember`, `RemoveSharedInboxMember` in
+  `internal/tenant/service.go` and matching `/shared-inboxes` and
+  `/shared-inboxes/{inboxId}/members` routes), adds `PATCH` verbs
+  alongside `PUT` for the tenant and user update endpoints, lifts
+  the DNS wizard HTTP surface into its own package
+  (`internal/dns/handlers.go`, `dns.NewHandlers(...)`,
+  `POST /api/v1/tenants/{id}/domains/{domainId}/verify` +
+  `GET .../dns-records`) so it can evolve independently of tenant
+  CRUD, introduces `dns.GetExpectedRecords` /
+  `dns.LookupDomainName` for the new records endpoint (RLS-scoped
+  domain lookup; no more routing through the tenant service for a
+  single field), deletes the duplicated DNS handler code that used
+  to live in `cmd/kmail-dns` and `internal/tenant/handlers.go`,
+  and adds input-validation unit tests for every new method. On
+  the frontend, `web/src/api/jmap.ts` now has a real `JMAPClient`
+  class (session fetch + caching, `request(methodCalls)` with
+  Mail + Submission capability, typed `getMailboxes` /
+  `getEmails` / `getEmail` / `sendEmail` / `moveEmail` /
+  `deleteEmail`), `web/src/types/index.ts` exports RFC 8621–
+  shaped `Mailbox` / `Email` / `EmailAddress` / `EmailBodyPart`
+  types, and the Inbox + MessageView pages in `web/src/pages/Mail/`
+  render a mailbox sidebar, an email list (sender / subject / date
+  with unread styling), and a single-message reading pane against
+  that client. The previous Phase 2 batch (below) remains
+  accurate for the three pieces it landed.
+- **Previously (2026-04-23 earlier)**: Phase 2 engineering work
+  kicked off. That update landed three pieces of the Phase 2
+  checklist:
   (1) the full Tenant Service CRUD surface in
   `internal/tenant/service.go` (`ListTenants`, `UpdateTenant`,
   `DeleteTenant`, `ListUsers`, `GetUser`, `UpdateUser`,
@@ -188,9 +217,15 @@ Checklist:
 - [x] Go DNS Onboarding Service (MX / SPF / DKIM / DMARC checks,
       domain verification).
 - [ ] React KChat Mail UI (inbox, compose, read, search).
+      _(Inbox list and single-message read pane are live against
+      the JMAP client; compose and full-text search remain.)_
 - [ ] React KChat Calendar UI (personal calendar, event create /
       edit, RSVP).
-- [ ] JMAP client integration (web app → Go BFF → Stalwart JMAP).
+- [x] JMAP client integration (web app → Go BFF → Stalwart JMAP).
+      _(`web/src/api/jmap.ts`: session fetch, typed
+      `Mailbox/get` / `Email/query` / `Email/get` / `Email/set` /
+      `EmailSubmission/set` helpers; RFC 8621 shapes in
+      `web/src/types/index.ts`.)_
 - [ ] IMAP / SMTP compatibility testing (Thunderbird, Apple Mail).
 - [ ] CalDAV compatibility testing.
 - [ ] Basic spam / phishing filtering via Stalwart.
