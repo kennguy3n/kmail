@@ -184,6 +184,28 @@ export interface EmailDraft {
   textBody?: string;
   htmlBody?: string;
   privacyMode?: PrivacyMode;
+  /**
+   * Explicit Identity id to send under. When omitted, the client
+   * resolves the account's default identity via `Identity/get`
+   * (see RFC 8621 §6) and uses that — callers that need a
+   * non-default identity must set this field.
+   */
+  identityId?: string;
+}
+
+/**
+ * RFC 8621 §6.1 Identity object. Narrowed to the fields the client
+ * actually consults; unknown fields pass through the wire.
+ */
+export interface Identity {
+  id: string;
+  name: string;
+  email: string;
+  replyTo: EmailAddress[] | null;
+  bcc: EmailAddress[] | null;
+  textSignature: string | null;
+  htmlSignature: string | null;
+  mayDelete: boolean;
 }
 
 /** Options accepted by JMAPClient.getEmails() for list-view queries. */

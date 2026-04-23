@@ -4,6 +4,7 @@ import {
   type Email,
   type EmailDraft,
   type GetEmailsOptions,
+  type Identity,
   type JmapInvocation,
   type JmapResponse,
   type JmapResponseInvocation,
@@ -76,6 +77,7 @@ export class JmapMethodError extends Error {
  */
 export class JMAPClient {
   private session: JmapSession | null = null;
+  private defaultIdentityId: string | null = null;
 
   /**
    * Return a cached session or fetch and cache it. Callers rarely
@@ -92,10 +94,12 @@ export class JMAPClient {
 
   /**
    * Clear the cached session. Called by the login/logout flow so a
-   * new user does not inherit the previous tenant's accountId.
+   * new user does not inherit the previous tenant's accountId or
+   * default identity.
    */
   resetSession(): void {
     this.session = null;
+    this.defaultIdentityId = null;
   }
 
   /**
@@ -274,12 +278,58 @@ export class JMAPClient {
   }
 
   /**
+   * Fetch every Identity the authenticated user may send under.
+   * Matches RFC 8621 §6.3 (`Identity/get` with `ids: null`).
+   */
+  async getIdentities(): Promise<Identity[]> {
+    const accountId = await this.getAccountId();
+    const response = await this.request([
+      ["Identity/get", { accountId, ids: null }, "0"],
+    ]);
+    const result = expectResult(response, "Identity/get", "0");
+    const list = result.list;
+    if (!Array.isArray(list)) {
+      throw new Error("kmail-web: Identity/get returned no list");
+    }
+    return list as Identity[];
+  }
+
+  /**
+   * Resolve an Identity id to send `draft` under. Prefers
+   * `draft.identityId` when the caller supplied one; otherwise
+   * returns the cached default, fetching and caching it if needed.
+   * The default identity is the first entry returned by
+   * `Identity/get` — Stalwart orders the list so the account's
+   * primary address comes first. Throws if no identities are
+   * available for the account.
+   */
+  private async resolveIdentityId(draft: EmailDraft): Promise<string> {
+    if (draft.identityId) return draft.identityId;
+    if (this.defaultIdentityId !== null) return this.defaultIdentityId;
+    const identities = await this.getIdentities();
+    if (identities.length === 0) {
+      throw new Error(
+        "kmail-web: account has no send-capable identity; set draft.identityId explicitly",
+      );
+    }
+    this.defaultIdentityId = identities[0].id;
+    return this.defaultIdentityId;
+  }
+
+  /**
    * Create a draft and submit it. Uses a create-ref (`#emailId`)
    * so the Submission happens in the same round-trip as the create,
    * matching the RFC 8621 §7 example for "send in one request".
+   *
+   * The EmailSubmission result is checked explicitly — RFC 8621
+   * §7.5 lets `create` fail per-object (`notCreated`) even when the
+   * batch itself succeeds, so a silent `notCreated` entry would
+   * otherwise leave the draft sitting in the mailbox forever while
+   * the caller believed the email had been sent.
    */
   async sendEmail(draft: EmailDraft): Promise<string> {
     const accountId = await this.getAccountId();
+    const identityId = await this.resolveIdentityId(draft);
     const bodyStructure: Record<string, unknown> = {};
     const bodyValues: Record<string, { value: string }> = {};
     if (draft.htmlBody) {
@@ -317,7 +367,7 @@ export class JMAPClient {
           create: {
             submission: {
               emailId: "#draft",
-              identityId: null,
+              identityId,
             },
           },
           onSuccessDestroyEmail: ["#submission"],
@@ -325,10 +375,43 @@ export class JMAPClient {
         "1",
       ],
     ]);
-    const result = expectResult(response, "Email/set", "0");
-    const created = result.created as Record<string, { id: string }> | null;
+    const emailResult = expectResult(response, "Email/set", "0");
+    const created = emailResult.created as
+      | Record<string, { id: string }>
+      | null;
+    const notCreated = emailResult.notCreated as
+      | Record<string, { type: string; description?: string }>
+      | undefined;
+    if (notCreated && notCreated.draft) {
+      const entry = notCreated.draft;
+      throw new Error(
+        `kmail-web: failed to create draft: ${entry.type}${entry.description ? `: ${entry.description}` : ""}`,
+      );
+    }
     if (!created || !created.draft) {
       throw new Error("kmail-web: sendEmail did not create a draft");
+    }
+    const submissionResult = expectResult(
+      response,
+      "EmailSubmission/set",
+      "1",
+    );
+    const submissionNotCreated = submissionResult.notCreated as
+      | Record<string, { type: string; description?: string }>
+      | undefined;
+    if (submissionNotCreated && submissionNotCreated.submission) {
+      const entry = submissionNotCreated.submission;
+      throw new Error(
+        `kmail-web: failed to submit email: ${entry.type}${entry.description ? `: ${entry.description}` : ""}`,
+      );
+    }
+    const submissionCreated = submissionResult.created as
+      | Record<string, { id: string }>
+      | null;
+    if (!submissionCreated || !submissionCreated.submission) {
+      throw new Error(
+        "kmail-web: sendEmail did not create an EmailSubmission",
+      );
     }
     return created.draft.id;
   }
