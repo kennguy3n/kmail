@@ -19,12 +19,22 @@
 # `stalwartlabs/stalwart:v0.16.0` (the upstream image was renamed
 # from `stalwartlabs/mail-server` in this release) and depending
 # on the shared Postgres / zk-fabric / Valkey / Meilisearch
-# instances above. v0.16.0 uses a JSON bootstrap config plus
-# database-backed settings managed via the admin API, so the
-# legacy `configs/stalwart.toml` is kept as a reference (see the
-# inline note on the `stalwart` service) and will be migrated in
-# a follow-up PR. See docs/PROPOSAL.md §1 for the Stalwart
-# version pin and the staging upgrade plan.
+# instances above. v0.16.0 stores all runtime settings (listeners,
+# blob store, directories, domains, DKIM keys, …) in a data store;
+# `configs/stalwart/config.json` is a minimal JSON bootstrap that
+# points Stalwart at the dedicated `stalwart` Postgres database
+# created by `scripts/postgres-init-stalwart.sql`. On first boot
+# Stalwart connects to Postgres, sees no `Bootstrap` object, and
+# opens its setup wizard on host port 18080 with the pinned admin
+# credentials below. `docs/DEVELOPMENT.md` documents the ~5 setup
+# screens (domain, admin, blob store, listeners) that wire
+# Stalwart to the zk-fabric S3 gateway; the resulting state is
+# persisted in the `postgres_data` volume, so subsequent `docker
+# compose up` runs boot straight into a configured server. See
+# docs/PROPOSAL.md §1 for the Stalwart version pin and the
+# staging upgrade plan; the legacy `configs/stalwart.toml` is kept
+# around as a reference for what a future automated seed should
+# write into Postgres.
 #
 # zk-fabric is published on host ports 9080 (S3 API) and 9081
 # (console API) to avoid collision with the Go BFF (`kmail-api`) on
@@ -42,6 +52,9 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      # Creates the dedicated `stalwart` database + role used by
+      # Stalwart's v0.16.0 data store. Runs once on a fresh volume.
+      - ./scripts/postgres-init-stalwart.sql:/docker-entrypoint-initdb.d/10-stalwart.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U kmail -d kmail"]
       interval: 5s
@@ -115,26 +128,37 @@ services:
     restart: "no"
 
   stalwart:
-    # NOTE: v0.16.0 renamed the Docker image from
+    # v0.16.0 renamed the upstream image from
     # `stalwartlabs/mail-server` to `stalwartlabs/stalwart` and
-    # switched to a JSON bootstrap config at
-    # `/etc/stalwart/config.json` that only points at the data
-    # store — the rest of Stalwart's settings (listeners, blob
-    # store, directories, …) now live inside the Postgres data
-    # store and are managed via the admin API/UI. The
-    # `configs/stalwart.toml` in this repo is the pre-v0.16.0
-    # schema and is retained as a reference only; wiring it as
-    # the JSON bootstrap file fails at startup.
+    # split the configuration in two:
     #
-    # For local dev we let Stalwart come up in bootstrap mode
-    # and complete initial setup via the web UI on host port
-    # 18080 (the setup wizard writes the zk-fabric S3 blob
-    # store details into Postgres). A follow-up PR will migrate
-    # this file + `configs/stalwart.toml` to the v0.16.0 JSON
-    # bootstrap + seeded admin-API config model so the compose
-    # stack is fully hands-off.
+    #   1. `/etc/stalwart/config.json` is a tiny JSON file that only
+    #      tells Stalwart which data store to use. `configs/stalwart/
+    #      config.json` is mounted there and points at the dedicated
+    #      `stalwart` Postgres database provisioned by
+    #      `scripts/postgres-init-stalwart.sql`.
+    #   2. Every other setting (listeners, blob store, directories,
+    #      domains, DKIM keys, …) lives inside the data store and
+    #      is written by Stalwart's first-boot setup wizard, served
+    #      from the `http-recovery` listener on container port 8080
+    #      (host port 18080).
+    #
+    # `STALWART_RECOVERY_ADMIN` pins the bootstrap administrator to
+    # a deterministic value so the setup wizard is reproducible
+    # across rebuilds; without it the container prints a random
+    # password on every start. See `docs/DEVELOPMENT.md` for the
+    # one-time walkthrough that wires the zk-fabric S3 blob store
+    # and the mail listeners into the data store.
     image: stalwartlabs/stalwart:v0.16.0
     container_name: kmail-stalwart
+    # Force the container's internal hostname to `localhost` so the
+    # URL Stalwart generates for its own OIDC/OAuth issuer + the
+    # authorization endpoint (see `HttpContext::resolve_response_url`
+    # in v0.16.0) is browser-reachable from the host. Without this,
+    # `/.well-known/openid-configuration` advertises
+    # `http://<container-id>:8080` as the issuer and the admin SPA
+    # redirects browsers to an unresolvable URL.
+    hostname: localhost
     depends_on:
       postgres:
         condition: service_healthy
@@ -152,15 +176,31 @@ services:
       - "587:587"
       - "143:143"
       - "993:993"
-      # Host port 18080 avoids collision with the Go BFF (`kmail-api`),
-      # which is expected to bind host 8080 during local development
-      # (see web/vite.config.ts). The BFF proxies JMAP to Stalwart
-      # over the compose network.
-      - "18080:8080"
+      # Host port 8080 matches the container port so Stalwart's
+      # self-advertised OIDC issuer URL (`http://localhost:8080`,
+      # built from the `hostname: localhost` + container-side
+      # listener port by `HttpContext::resolve_response_url` in
+      # v0.16.0) is directly reachable from a host browser. The Go
+      # BFF (`kmail-api`) historically binds host 8080 during local
+      # development — when running both concurrently, start the BFF
+      # with `--addr=127.0.0.1:8088` and update `web/vite.config.ts`
+      # to proxy `/jmap` there instead.
+      - "8080:8080"
     environment:
-      STALWART_ADMIN_PASSWORD: kmail-dev
+      # Deterministic recovery admin — lets you log into the setup
+      # wizard after `docker compose up` with `admin / kmail-dev`.
+      # Not a real credential; rotate before exposing this stack
+      # anywhere off localhost. Once the wizard has provisioned a
+      # permanent administrator Stalwart ignores this variable.
+      STALWART_RECOVERY_ADMIN: "admin:kmail-dev"
     volumes:
-      - stalwart_data:/etc/stalwart
+      # JSON bootstrap → points Stalwart at its `stalwart`
+      # Postgres database. The rest of its settings live in that
+      # database after the setup wizard runs.
+      - ./configs/stalwart/config.json:/etc/stalwart/config.json:ro
+      # Persistent store for the downloaded web UI bundle, ACME
+      # state, any DKIM keys Stalwart generates locally, etc.
+      - stalwart_data:/opt/stalwart
 
 volumes:
   postgres_data:
