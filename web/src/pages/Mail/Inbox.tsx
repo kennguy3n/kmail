@@ -36,12 +36,20 @@ export default function Inbox() {
       .then((list) => {
         if (cancelled) return;
         setMailboxes(list);
-        // Prefer the route-supplied mailbox if it's still valid;
-        // otherwise fall back to the inbox role, then the first
-        // mailbox in the list.
+        // Prefer the route-supplied mailbox when present; otherwise
+        // keep the user's current sidebar selection if it still
+        // exists, then fall back to the inbox role, then the first
+        // mailbox in the list. Preserving the current selection
+        // matters when `reloadNonce` triggers a refetch — without
+        // it, the view would snap back to the Inbox after any
+        // write action in a sidebar-selected mailbox.
         const fromRoute = list.find((m) => m.id === selectedFromRoute);
         const inbox = list.find((m) => m.role === "inbox") ?? list[0];
-        setSelectedMailbox((fromRoute ?? inbox)?.id ?? null);
+        setSelectedMailbox((current) => {
+          if (fromRoute) return fromRoute.id;
+          if (current && list.some((m) => m.id === current)) return current;
+          return inbox?.id ?? null;
+        });
       })
       .catch((err: unknown) => {
         if (cancelled) return;
