@@ -322,6 +322,61 @@ func TestGenerateRecords_DKIMUsesConfiguredPublicKey(t *testing.T) {
 }
 
 // ---------------------------------------------------------------
+// GetExpectedRecords
+// ---------------------------------------------------------------
+
+func TestGetExpectedRecords_DelegatesToGenerateRecords(t *testing.T) {
+	svc := newService(&fakeResolver{})
+	got := svc.GetExpectedRecords("acme.example")
+	if got == nil {
+		t.Fatal("expected non-nil ExpectedRecords")
+	}
+	if got.Domain != "acme.example" {
+		t.Errorf("domain mismatch: %q", got.Domain)
+	}
+	if len(got.Records) == 0 {
+		t.Error("expected at least one record from GetExpectedRecords")
+	}
+	direct := svc.GenerateRecords("acme.example")
+	if len(got.Records) != len(direct.Records) {
+		t.Errorf("GetExpectedRecords and GenerateRecords disagree: %d vs %d",
+			len(got.Records), len(direct.Records))
+	}
+}
+
+func TestGetExpectedRecords_EmptyDomain(t *testing.T) {
+	svc := newService(&fakeResolver{})
+	got := svc.GetExpectedRecords("")
+	if got == nil {
+		t.Fatal("expected non-nil ExpectedRecords even for empty input")
+	}
+	if got.Domain != "" || len(got.Records) != 0 {
+		t.Errorf("expected empty result, got %+v", got)
+	}
+}
+
+// ---------------------------------------------------------------
+// LookupDomainName — input handling
+// ---------------------------------------------------------------
+
+func TestLookupDomainName_EmptyIDs(t *testing.T) {
+	svc := newService(&fakeResolver{})
+	if _, err := svc.LookupDomainName(context.Background(), "", "did"); !errors.Is(err, ErrInvalidInput) {
+		t.Errorf("expected ErrInvalidInput for empty tenantID, got %v", err)
+	}
+	if _, err := svc.LookupDomainName(context.Background(), "tid", ""); !errors.Is(err, ErrInvalidInput) {
+		t.Errorf("expected ErrInvalidInput for empty domainID, got %v", err)
+	}
+}
+
+func TestLookupDomainName_NilPool(t *testing.T) {
+	svc := newService(&fakeResolver{})
+	if _, err := svc.LookupDomainName(context.Background(), "tid", "did"); err == nil {
+		t.Error("expected error from nil pool")
+	}
+}
+
+// ---------------------------------------------------------------
 // VerifyDomain — validates input handling
 // ---------------------------------------------------------------
 

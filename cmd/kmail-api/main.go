@@ -81,8 +81,10 @@ func main() {
 		DMARCPolicy:         cfg.DNS.DMARCPolicy,
 		ReportingMailbox:    cfg.DNS.ReportingMailbox,
 	})
-	tenantHandlers := tenant.NewHandlers(tenantSvc, dnsSvc, logger)
+	tenantHandlers := tenant.NewHandlers(tenantSvc, logger)
 	tenantHandlers.Register(mux, authMW)
+	dnsHandlers := dns.NewHandlers(dnsSvc, logger)
+	dnsHandlers.Register(mux, authMW)
 
 	srv := &http.Server{
 		Addr:              cfg.HTTP.Addr,
