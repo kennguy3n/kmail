@@ -15,7 +15,7 @@
 # Stalwart v0.16.0 is wired in as the `stalwart` service below,
 # pinned to `stalwartlabs/mail-server:v0.16.0` and depending on the
 # shared PostgreSQL, MinIO, and Valkey instances above. The config
-# at `stalwart/etc/config.toml` is mounted into the container so
+# at `configs/stalwart.toml` is mounted into the container so
 # Stalwart picks up the local dev backends (Postgres / MinIO /
 # Valkey / Meilisearch). See docs/PROPOSAL.md §1 for the Stalwart
 # version pin and the staging upgrade plan, and
@@ -103,7 +103,7 @@ services:
       STALWART_ADMIN_PASSWORD: kmail-dev
     volumes:
       - stalwart_data:/opt/stalwart-mail
-      - ./stalwart/etc/config.toml:/opt/stalwart-mail/etc/config.toml:ro
+      - ./configs/stalwart.toml:/opt/stalwart-mail/etc/config.toml:ro
 
 volumes:
   postgres_data:

@@ -68,6 +68,9 @@ directory = "data"
 [server]
 hostname = "kmail.local"
 
+# Stalwart v0.16.0 supports `%{env:VAR}%` macro interpolation so
+# credentials can come from the environment rather than this file.
+
 [server.tls]
 enable = false
 
@@ -119,4 +122,4 @@ directory = "data"
 
 [authentication.fallback-admin]
 user = "admin"
-secret = "kmail-dev"
+secret = "%{env:STALWART_ADMIN_PASSWORD}%"
