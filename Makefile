@@ -1,4 +1,4 @@
-.PHONY: build test lint fmt vet tidy docker-build clean help
+.PHONY: build test lint fmt vet tidy docker-build clean help migrate
 
 # ---------------------------------------------------------------
 # KMail Go control plane — developer Makefile.
@@ -22,6 +22,7 @@ help:
 	@echo "  fmt            Run gofmt -s -w on all Go files"
 	@echo "  vet            Run go vet"
 	@echo "  tidy           Run go mod tidy"
+	@echo "  migrate        Apply migrations/*.sql to \$$DATABASE_URL (idempotent)"
 	@echo "  docker-build   Build the multi-stage Docker image"
 	@echo "  clean          Remove built binaries"
 
@@ -43,6 +44,9 @@ vet:
 
 tidy:
 	$(GO) mod tidy
+
+migrate:
+	./scripts/migrate.sh
 
 docker-build:
 	$(DOCKER) build -t $(IMAGE):$(TAG) .
