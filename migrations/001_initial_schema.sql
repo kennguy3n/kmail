@@ -59,10 +59,15 @@ CREATE TABLE users (
     status        TEXT NOT NULL DEFAULT 'active'
                   CHECK (status IN ('active', 'suspended', 'deleted')),
     quota_bytes   BIGINT NOT NULL DEFAULT 0 CHECK (quota_bytes >= 0),
-    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE INDEX users_tenant_id_idx ON users (tenant_id);
+
+CREATE TRIGGER users_set_updated_at
+    BEFORE UPDATE ON users
+    FOR EACH ROW EXECUTE FUNCTION kmail_set_updated_at();
 
 ALTER TABLE users ENABLE ROW LEVEL SECURITY;
 CREATE POLICY users_tenant_isolation ON users
@@ -82,11 +87,16 @@ CREATE TABLE domains (
     spf_verified   BOOLEAN NOT NULL DEFAULT false,
     dkim_verified  BOOLEAN NOT NULL DEFAULT false,
     dmarc_verified BOOLEAN NOT NULL DEFAULT false,
-    created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE INDEX domains_tenant_id_idx ON domains (tenant_id);
 CREATE INDEX domains_verified_idx ON domains (tenant_id) WHERE verified = true;
+
+CREATE TRIGGER domains_set_updated_at
+    BEFORE UPDATE ON domains
+    FOR EACH ROW EXECUTE FUNCTION kmail_set_updated_at();
 
 ALTER TABLE domains ENABLE ROW LEVEL SECURITY;
 CREATE POLICY domains_tenant_isolation ON domains
@@ -124,10 +134,15 @@ CREATE TABLE shared_inboxes (
     display_name  TEXT NOT NULL,
     mls_group_id  TEXT NOT NULL,
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (tenant_id, address)
 );
 
 CREATE INDEX shared_inboxes_tenant_id_idx ON shared_inboxes (tenant_id);
+
+CREATE TRIGGER shared_inboxes_set_updated_at
+    BEFORE UPDATE ON shared_inboxes
+    FOR EACH ROW EXECUTE FUNCTION kmail_set_updated_at();
 
 ALTER TABLE shared_inboxes ENABLE ROW LEVEL SECURITY;
 CREATE POLICY shared_inboxes_tenant_isolation ON shared_inboxes
@@ -139,6 +154,7 @@ CREATE POLICY shared_inboxes_tenant_isolation ON shared_inboxes
 -- ---------------------------------------------------------------
 
 CREATE TABLE shared_inbox_members (
+    tenant_id        UUID NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
     shared_inbox_id  UUID NOT NULL REFERENCES shared_inboxes(id) ON DELETE RESTRICT,
     user_id          UUID NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
     role             TEXT NOT NULL DEFAULT 'member'
@@ -147,7 +163,13 @@ CREATE TABLE shared_inbox_members (
     PRIMARY KEY (shared_inbox_id, user_id)
 );
 
+CREATE INDEX shared_inbox_members_tenant_id_idx ON shared_inbox_members (tenant_id);
 CREATE INDEX shared_inbox_members_user_id_idx ON shared_inbox_members (user_id);
+
+ALTER TABLE shared_inbox_members ENABLE ROW LEVEL SECURITY;
+CREATE POLICY shared_inbox_members_tenant_isolation ON shared_inbox_members
+    USING (tenant_id = current_setting('app.tenant_id', true)::uuid)
+    WITH CHECK (tenant_id = current_setting('app.tenant_id', true)::uuid);
 
 -- ---------------------------------------------------------------
 -- quotas
@@ -158,8 +180,14 @@ CREATE TABLE quotas (
     storage_used_bytes    BIGINT NOT NULL DEFAULT 0 CHECK (storage_used_bytes >= 0),
     storage_limit_bytes   BIGINT NOT NULL DEFAULT 0 CHECK (storage_limit_bytes >= 0),
     seat_count            INT NOT NULL DEFAULT 0 CHECK (seat_count >= 0),
-    seat_limit            INT NOT NULL DEFAULT 0 CHECK (seat_limit >= 0)
+    seat_limit            INT NOT NULL DEFAULT 0 CHECK (seat_limit >= 0),
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at            TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+CREATE TRIGGER quotas_set_updated_at
+    BEFORE UPDATE ON quotas
+    FOR EACH ROW EXECUTE FUNCTION kmail_set_updated_at();
 
 ALTER TABLE quotas ENABLE ROW LEVEL SECURITY;
 CREATE POLICY quotas_tenant_isolation ON quotas
@@ -203,11 +231,16 @@ CREATE TABLE calendar_metadata (
                    CHECK (calendar_type IN ('personal', 'team', 'resource')),
     name           TEXT NOT NULL,
     acl            JSONB NOT NULL DEFAULT '{}'::jsonb,
-    created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE INDEX calendar_metadata_tenant_id_idx ON calendar_metadata (tenant_id);
 CREATE INDEX calendar_metadata_owner_id_idx ON calendar_metadata (owner_id);
+
+CREATE TRIGGER calendar_metadata_set_updated_at
+    BEFORE UPDATE ON calendar_metadata
+    FOR EACH ROW EXECUTE FUNCTION kmail_set_updated_at();
 
 ALTER TABLE calendar_metadata ENABLE ROW LEVEL SECURITY;
 CREATE POLICY calendar_metadata_tenant_isolation ON calendar_metadata

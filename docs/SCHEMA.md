@@ -37,9 +37,16 @@ migrations, not ours.
    `tenants(id)` and an index on `tenant_id`. Go services set
    `app.tenant_id` as a session GUC on every connection and
    Postgres row-level-security (RLS) policies enforce the scope.
-2. **UUIDv7 primary keys.** Monotonic, sortable, safe for external
-   exposure. Generated client-side in Go services; no
-   server-generated sequences for primary keys.
+2. **UUID primary keys.** Go services generate UUIDv7
+   (monotonic, sortable, safe for external exposure) client-side
+   for all inserts they perform — that is the preferred path. The
+   DDL also declares `DEFAULT gen_random_uuid()` on `id` columns
+   as a fallback for ad-hoc SQL inserts (seed data, manual
+   operator actions) so the schema is usable without the
+   application layer. `gen_random_uuid()` returns UUIDv4, which
+   loses the monotonic-ordering property but preserves uniqueness
+   and foreign-key integrity. No server-generated sequences are
+   used for primary keys.
 3. **No hard deletes for tenant-affecting records.** Rows carry a
    `status` column (`active`, `suspended`, `deleted`) rather than
    being removed, so audit trails remain consistent. Housekeeping
@@ -171,11 +178,21 @@ route to two mailboxes).
 
 ### 5.6 `shared_inbox_members`
 
+- `tenant_id` UUID FK → `tenants(id)`. Denormalized from
+  `shared_inboxes.tenant_id` so RLS can be enforced directly on
+  this join table; PostgreSQL RLS on the referenced
+  `shared_inboxes` row does not propagate to rows in the
+  referencing table.
 - `shared_inbox_id` UUID FK → `shared_inboxes(id)`.
 - `user_id` UUID FK → `users(id)`.
 - `role` TEXT — `owner`, `member`, `viewer`.
 - `added_at` TIMESTAMPTZ.
 - Composite primary key `(shared_inbox_id, user_id)`.
+
+The Tenant Service must ensure `tenant_id` matches
+`shared_inboxes.tenant_id` and `users.tenant_id` on insert; a
+future migration may add a trigger or composite FK to enforce
+this at the database level.
 
 A change to this table triggers an MLS epoch change on the shared
 inbox group (out-of-band, by the Tenant Service).
@@ -232,8 +249,9 @@ Stalwart's CalDAV store.
 - `audit_log(tenant_id, created_at DESC)` for dashboard queries.
 - `audit_log(tenant_id, resource_type, resource_id)` for
   per-resource history lookups.
+- `shared_inbox_members(tenant_id)` for RLS-scoped scans.
 - `shared_inbox_members(user_id)` for "what shared inboxes does
-  this user belong to" reverse lookups.
+   this user belong to" reverse lookups.
 - Partial index on `domains(tenant_id) WHERE verified = true` for
   the common "list active domains" query.
 
