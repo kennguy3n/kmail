@@ -110,12 +110,22 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	accountID, err := p.resolveAccount(r.Context(), tenantID, kchatUserID)
 	if err != nil {
-		// An unresolved account is expected while the Tenant Service
-		// has not yet provisioned the user; surface it as 404 with a
-		// JMAP-compatible error shape.
 		w.Header().Set("Content-Type", "application/problem+json")
-		w.WriteHeader(http.StatusNotFound)
-		_, _ = w.Write([]byte(`{"type":"urn:ietf:params:jmap:error:accountNotFound","title":"stalwart account not provisioned"}` + "\n"))
+		switch {
+		case errors.Is(err, pgx.ErrNoRows):
+			// An unresolved account is expected while the Tenant Service
+			// has not yet provisioned the user; surface it as 404 with a
+			// JMAP-compatible error shape.
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"type":"urn:ietf:params:jmap:error:accountNotFound","title":"stalwart account not provisioned"}` + "\n"))
+		default:
+			// Infrastructure failures (Postgres outage, pool exhaustion,
+			// GUC errors, context cancellation, etc.) surface as 502 so
+			// on-call doesn't chase a spurious "not provisioned" signal.
+			p.logger.Printf("jmap proxy resolveAccount err tenant=%s kchat_user=%s err=%v", tenantID, kchatUserID, err)
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte(`{"type":"urn:ietf:params:jmap:error:serverUnavailable","title":"account lookup failed"}` + "\n"))
+		}
 		return
 	}
 
@@ -224,10 +234,21 @@ func (c *accountCache) key(tenantID, kchatUserID string) string {
 }
 
 func (c *accountCache) get(tenantID, kchatUserID string) (string, bool) {
+	k := c.key(tenantID, kchatUserID)
 	c.mu.RLock()
-	entry, ok := c.m[c.key(tenantID, kchatUserID)]
+	entry, ok := c.m[k]
 	c.mu.RUnlock()
-	if !ok || time.Now().After(entry.expiresAt) {
+	if !ok {
+		return "", false
+	}
+	if time.Now().After(entry.expiresAt) {
+		// Drop the expired entry eagerly so callers that only hit
+		// stale keys don't accumulate map entries forever.
+		c.mu.Lock()
+		if cur, still := c.m[k]; still && !time.Now().Before(cur.expiresAt) {
+			delete(c.m, k)
+		}
+		c.mu.Unlock()
 		return "", false
 	}
 	return entry.accountID, true
