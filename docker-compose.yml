@@ -16,13 +16,15 @@
 #                       repo (see its `Dockerfile` and `demo/`).
 #
 # Stalwart is wired as the `stalwart` service below, pinned to
-# `stalwartlabs/mail-server:v0.16.0` and depending on the shared
-# Postgres / zk-fabric / Valkey / Meilisearch instances above. The
-# config at `configs/stalwart.toml` is mounted into the container so
-# Stalwart picks up the local dev backends (Postgres / zk-fabric /
-# Valkey / Meilisearch). See docs/PROPOSAL.md §1 for the Stalwart
-# version pin and the staging upgrade plan, and
-# `configs/stalwart.example.toml` for the production-shaped template.
+# `stalwartlabs/stalwart:v0.16.0` (the upstream image was renamed
+# from `stalwartlabs/mail-server` in this release) and depending
+# on the shared Postgres / zk-fabric / Valkey / Meilisearch
+# instances above. v0.16.0 uses a JSON bootstrap config plus
+# database-backed settings managed via the admin API, so the
+# legacy `configs/stalwart.toml` is kept as a reference (see the
+# inline note on the `stalwart` service) and will be migrated in
+# a follow-up PR. See docs/PROPOSAL.md §1 for the Stalwart
+# version pin and the staging upgrade plan.
 #
 # zk-fabric is published on host ports 9080 (S3 API) and 9081
 # (console API) to avoid collision with the Go BFF (`kmail-api`) on
@@ -113,7 +115,25 @@ services:
     restart: "no"
 
   stalwart:
-    image: stalwartlabs/mail-server:v0.16.0
+    # NOTE: v0.16.0 renamed the Docker image from
+    # `stalwartlabs/mail-server` to `stalwartlabs/stalwart` and
+    # switched to a JSON bootstrap config at
+    # `/etc/stalwart/config.json` that only points at the data
+    # store — the rest of Stalwart's settings (listeners, blob
+    # store, directories, …) now live inside the Postgres data
+    # store and are managed via the admin API/UI. The
+    # `configs/stalwart.toml` in this repo is the pre-v0.16.0
+    # schema and is retained as a reference only; wiring it as
+    # the JSON bootstrap file fails at startup.
+    #
+    # For local dev we let Stalwart come up in bootstrap mode
+    # and complete initial setup via the web UI on host port
+    # 18080 (the setup wizard writes the zk-fabric S3 blob
+    # store details into Postgres). A follow-up PR will migrate
+    # this file + `configs/stalwart.toml` to the v0.16.0 JSON
+    # bootstrap + seeded admin-API config model so the compose
+    # stack is fully hands-off.
+    image: stalwartlabs/stalwart:v0.16.0
     container_name: kmail-stalwart
     depends_on:
       postgres:
@@ -140,8 +160,7 @@ services:
     environment:
       STALWART_ADMIN_PASSWORD: kmail-dev
     volumes:
-      - stalwart_data:/opt/stalwart-mail
-      - ./configs/stalwart.toml:/opt/stalwart-mail/etc/config.toml:ro
+      - stalwart_data:/etc/stalwart
 
 volumes:
   postgres_data:
