@@ -17,6 +17,10 @@ func TestLoadReturnsDefaults(t *testing.T) {
 		"VALKEY_URL",
 		"KCHAT_OIDC_ISSUER",
 		"KMAIL_DEV_BYPASS_TOKEN",
+		"ZK_FABRIC_S3_URL",
+		"ZK_FABRIC_CONSOLE_URL",
+		"ZK_FABRIC_ACCESS_KEY",
+		"ZK_FABRIC_SECRET_KEY",
 	} {
 		t.Setenv(k, "")
 	}
@@ -50,6 +54,18 @@ func TestLoadReturnsDefaults(t *testing.T) {
 	if cfg.DevBypassToken != "" {
 		t.Errorf("DevBypassToken default should be empty, got %q", cfg.DevBypassToken)
 	}
+	if cfg.ZKFabric.S3URL != "http://localhost:9080" {
+		t.Errorf("ZKFabric.S3URL = %q, want http://localhost:9080", cfg.ZKFabric.S3URL)
+	}
+	if cfg.ZKFabric.ConsoleURL != "http://localhost:9081" {
+		t.Errorf("ZKFabric.ConsoleURL = %q, want http://localhost:9081", cfg.ZKFabric.ConsoleURL)
+	}
+	if cfg.ZKFabric.AccessKey == "" {
+		t.Error("ZKFabric.AccessKey should have a default")
+	}
+	if cfg.ZKFabric.SecretKey == "" {
+		t.Error("ZKFabric.SecretKey should have a default")
+	}
 }
 
 func TestLoadHonoursEnv(t *testing.T) {
@@ -57,6 +73,10 @@ func TestLoadHonoursEnv(t *testing.T) {
 	t.Setenv("DATABASE_URL", "postgresql://u:p@db/kmail")
 	t.Setenv("STALWART_URL", "http://stalwart:8080")
 	t.Setenv("KMAIL_DEV_BYPASS_TOKEN", "dev-token")
+	t.Setenv("ZK_FABRIC_S3_URL", "http://zk-fabric:8080")
+	t.Setenv("ZK_FABRIC_CONSOLE_URL", "http://zk-fabric:8081")
+	t.Setenv("ZK_FABRIC_ACCESS_KEY", "override-access")
+	t.Setenv("ZK_FABRIC_SECRET_KEY", "override-secret")
 
 	cfg, err := Load()
 	if err != nil {
@@ -73,6 +93,18 @@ func TestLoadHonoursEnv(t *testing.T) {
 	}
 	if cfg.DevBypassToken != "dev-token" {
 		t.Errorf("DevBypassToken = %q", cfg.DevBypassToken)
+	}
+	if cfg.ZKFabric.S3URL != "http://zk-fabric:8080" {
+		t.Errorf("ZKFabric.S3URL = %q", cfg.ZKFabric.S3URL)
+	}
+	if cfg.ZKFabric.ConsoleURL != "http://zk-fabric:8081" {
+		t.Errorf("ZKFabric.ConsoleURL = %q", cfg.ZKFabric.ConsoleURL)
+	}
+	if cfg.ZKFabric.AccessKey != "override-access" {
+		t.Errorf("ZKFabric.AccessKey = %q", cfg.ZKFabric.AccessKey)
+	}
+	if cfg.ZKFabric.SecretKey != "override-secret" {
+		t.Errorf("ZKFabric.SecretKey = %q", cfg.ZKFabric.SecretKey)
 	}
 }
 
