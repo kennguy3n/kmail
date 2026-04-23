@@ -1,0 +1,135 @@
+# KMail — example Stalwart configuration.
+#
+# This file is NOT a production configuration. It is a template
+# that illustrates the storage-backend topology KMail targets
+# (see docs/ARCHITECTURE.md §4). Before deploying:
+#
+# - Replace all $PLACEHOLDERS with real, environment-specific
+#   values (ideally from a secret manager, never from this file).
+# - Tighten rate limits, auth configuration, and TLS to match the
+#   target environment.
+# - Mount the TOML at Stalwart's expected config path; see the
+#   Stalwart v0.16.0 documentation at
+#   https://github.com/stalwartlabs/mail-server/releases/tag/v0.16.0
+#   for authoritative schema and defaults.
+#
+# Stalwart is pinned to v0.16.0 per docs/PROPOSAL.md §1.1 and
+# docs/LICENSE-EVALUATION.md §1.
+
+# ---------------------------------------------------------------
+# Storage backends
+# ---------------------------------------------------------------
+# One backend per concern, aligned with docs/ARCHITECTURE.md §4:
+#   blob   -> zk-object-fabric S3 gateway (per-tenant ZK).
+#   data   -> PostgreSQL (tenant metadata, mailbox state).
+#   fts    -> Meilisearch (scale-out to OpenSearch in Phase 3+).
+#   lookup -> Valkey / Redis (in-memory, sessions, rate limits).
+
+[store."blob"]
+type = "s3"
+# zk-object-fabric's S3-compatible gateway endpoint. Per-tenant
+# bucket layout and EncryptionMode selection are owned by
+# zk-object-fabric; see docs/PROPOSAL.md §3.3.
+endpoint = "https://$ZKOF_S3_ENDPOINT"
+region = "$ZKOF_REGION"
+bucket = "$ZKOF_BLOB_BUCKET"
+access-key = "$ZKOF_ACCESS_KEY"
+secret-key = "$ZKOF_SECRET_KEY"
+# BLAKE3 content addressing aligns with zk-object-fabric piece
+# IDs so we avoid a redundant content-addressing step at the
+# KMail layer (docs/PROPOSAL.md §7).
+path-style = true
+
+[store."data"]
+type = "postgresql"
+host = "$POSTGRES_HOST"
+port = 5432
+database = "$POSTGRES_DATABASE"
+username = "$POSTGRES_USERNAME"
+password = "$POSTGRES_PASSWORD"
+# KMail's own control-plane tables live alongside Stalwart's
+# tables in the same database; Stalwart's migrations never touch
+# the control-plane schema in docs/SCHEMA.md.
+
+[store."fts"]
+type = "meilisearch"
+url = "http://$MEILISEARCH_HOST:7700"
+api-key = "$MEILISEARCH_API_KEY"
+# Tenant-isolated indexes — see docs/ARCHITECTURE.md §10.
+
+[store."lookup"]
+type = "redis"
+urls = ["redis://$VALKEY_HOST:6379"]
+# Sessions, rate limits, auth tokens, queue hints.
+
+# ---------------------------------------------------------------
+# Storage routing
+# ---------------------------------------------------------------
+# Direct each Stalwart storage concern at the appropriate backend.
+
+[storage]
+data = "data"
+blob = "blob"
+fts = "fts"
+lookup = "lookup"
+directory = "data"
+
+# ---------------------------------------------------------------
+# Server identity and TLS
+# ---------------------------------------------------------------
+
+[server]
+hostname = "$KMAIL_HOSTNAME"
+
+[server.tls]
+enable = true
+# TLS material is provisioned out-of-band; never commit certs.
+certificate = "$KMAIL_TLS_CERT_PATH"
+private-key = "$KMAIL_TLS_KEY_PATH"
+
+# ---------------------------------------------------------------
+# Protocol listeners
+# ---------------------------------------------------------------
+# See the protocol matrix in docs/ARCHITECTURE.md §8.
+# JMAP is the primary client path; IMAP / SMTP / CalDAV / CardDAV
+# remain for third-party clients (Thunderbird, Apple Mail).
+
+[server.listener."smtp"]
+protocol = "smtp"
+bind = "[::]:25"
+
+[server.listener."submission"]
+protocol = "smtp"
+bind = "[::]:587"
+tls.implicit = false
+
+[server.listener."imaps"]
+protocol = "imap"
+bind = "[::]:993"
+tls.implicit = true
+
+[server.listener."jmap"]
+protocol = "jmap"
+bind = "[::]:443"
+tls.implicit = true
+
+[server.listener."dav"]
+protocol = "http"
+bind = "[::]:8443"
+tls.implicit = true
+
+# ---------------------------------------------------------------
+# Authentication
+# ---------------------------------------------------------------
+# The Go BFF mints internal short-lived tokens that Stalwart
+# trusts via JWKS discovery. See docs/JMAP-CONTRACT.md §3.2 for
+# the auth injection model.
+
+[auth]
+directory = "data"
+
+[auth.oidc]
+enable = true
+issuer = "$KMAIL_BFF_OIDC_ISSUER"
+jwks-url = "$KMAIL_BFF_OIDC_ISSUER/.well-known/jwks.json"
+audience = "stalwart"

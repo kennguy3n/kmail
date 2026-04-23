@@ -3,11 +3,11 @@
 - **Project**: KMail — Privacy Email & Calendar for KChat B2B
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
 - **Status**: Phase 1 — Foundation (in progress)
-- **Last updated**: 2026-04-23 (initial docs scaffold: README, PROPOSAL,
-  ARCHITECTURE, PROGRESS landed. Architecture locked on Stalwart mail
-  core + Go control plane + React frontend + zk-object-fabric blob
-  storage; MLS-to-KMail encryption key derivation model and privacy
-  mode mapping documented.)
+- **Last updated**: 2026-04-23 — All Phase 1 items complete. JMAP
+  contract, PostgreSQL schema, license evaluation, Go scaffold, and
+  React scaffold delivered. Phase 1 remains `IN PROGRESS` because the
+  decision gate still requires external confirmations — see the
+  decision gate section below.
 
 This document is a phase-gated tracker. Each phase has an explicit
 checklist and a decision gate. Do not skip to the next phase until
@@ -29,36 +29,39 @@ engineers can implement without re-debating core decisions.
 
 Checklist:
 
-- [ ] Ratify architecture: Stalwart mail core + Go control plane +
+- [x] Ratify architecture: Stalwart mail core + Go control plane +
       React frontend + zk-object-fabric blob storage.
-- [ ] Evaluate Stalwart v0.16.0 — pin version, document breaking
+- [x] Evaluate Stalwart v0.16.0 — pin version, document breaking
       changes from earlier minor releases, plan the staging upgrade
       path to v1.0.0 (expected H1 2026).
-- [ ] Define zk-object-fabric integration: configure Stalwart's blob
+- [x] Define zk-object-fabric integration: configure Stalwart's blob
       store backend to use zk-object-fabric's S3 endpoint, define
       per-tenant bucket layout, pick `EncryptionMode` defaults per
       privacy tier, and wire content-addressing (BLAKE3) alignment.
-- [ ] Define MLS ↔ KMail encryption key derivation model
+- [x] Define MLS ↔ KMail encryption key derivation model
       (confidential-send envelope keys, protected-folder master keys,
       shared-inbox group keys) and document in
       [ARCHITECTURE.md §5](ARCHITECTURE.md).
-- [ ] Define privacy mode mapping: Standard Private Mail →
+- [x] Define privacy mode mapping: Standard Private Mail →
       `ManagedEncrypted`, Confidential Send → `StrictZK`, Zero-Access
       Vault → `StrictZK`; per-mode server-search scope.
-- [ ] Define Go service boundaries (tenant, DNS onboarding, admin
+- [x] Define Go service boundaries (tenant, DNS onboarding, admin
       BFF, migration, chat bridge, calendar bridge, billing,
       deliverability, audit).
-- [ ] Define JMAP-first client API contract (BFF → Stalwart JMAP
-      shape, capability negotiation, push semantics).
-- [ ] Define PostgreSQL schema for tenant metadata, users, domains,
-      mailbox state, and calendar metadata.
-- [ ] Define search tiering model (Core / Pro / Archive / Vault).
-- [ ] Stalwart commercial license evaluation (AGPL-3.0 base vs
+- [x] Define JMAP-first client API contract (BFF → Stalwart JMAP
+      shape, capability negotiation, push semantics). See
+      [JMAP-CONTRACT.md](JMAP-CONTRACT.md).
+- [x] Define PostgreSQL schema for tenant metadata, users, domains,
+      mailbox state, and calendar metadata. See
+      [SCHEMA.md](SCHEMA.md) and
+      [migrations/001_initial_schema.sql](../migrations/001_initial_schema.sql).
+- [x] Define search tiering model (Core / Pro / Archive / Vault).
+- [x] Stalwart commercial license evaluation (AGPL-3.0 base vs
       enterprise dual license) and KMail licensing compatibility
-      decision.
-- [ ] Create Go project scaffold (`cmd/`, `internal/`, `api/`,
+      decision. See [LICENSE-EVALUATION.md](LICENSE-EVALUATION.md).
+- [x] Create Go project scaffold (`cmd/`, `internal/`, `api/`,
       `docs/`).
-- [ ] Create React project scaffold for KChat Mail + Calendar UI.
+- [x] Create React project scaffold for KChat Mail + Calendar UI.
 
 ### Phase 1 decision gate
 
@@ -73,6 +76,21 @@ The Phase 1 gate is met when:
   zk-object-fabric maintainers.
 - MLS key derivation model is reviewed by the KChat MLS owners.
 - Go and React scaffolds exist in the repo.
+
+**Gate status (2026-04-23)**:
+
+| Criterion                                              | Status                      |
+| ------------------------------------------------------ | --------------------------- |
+| Architecture decisions ratified and documented         | Met — see ARCHITECTURE.md   |
+| Stalwart pinned to v0.16.0 with upgrade plan           | Met — see PROPOSAL.md §1    |
+| zk-object-fabric integration shape agreed              | **Pending** — awaiting zk-object-fabric maintainer sign-off on bucket layout, CMK policy, and `EncryptionMode` selection per privacy tier |
+| MLS key derivation model reviewed                      | **Pending** — awaiting KChat MLS owner review of the confidential-send / protected-folder / shared-inbox derivation shape documented in ARCHITECTURE.md §5 |
+| Go and React scaffolds exist in the repo               | Met — this PR               |
+
+Phase 1 remains `IN PROGRESS` until both pending external reviews
+are closed out. The scaffolds, contract documents, and schema are
+unblocking for Phase 2 engineering work that does not depend on the
+pending sign-offs.
 
 ---
 
