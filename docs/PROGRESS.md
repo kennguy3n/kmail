@@ -8,18 +8,33 @@
   earlier scaffolding work (Go module layout, Stalwart
   docker-compose wiring, schema migrations, JMAP contract doc),
   this update lands the runnable Phase 1 skeleton: the Stalwart
-  v0.16.0 config file at `stalwart/etc/config.toml` mounted into
-  the compose service, a `scripts/migrate.sh` / `make migrate`
-  runner that applies `migrations/*.sql` idempotently, the
-  `cmd/kmail-api` BFF binary (health / readiness / graceful
-  shutdown, `/jmap` reverse proxy, `/api/v1/tenants` CRUD), the
-  `internal/config` loader, the `internal/middleware` OIDC stub
-  (with dev-bypass token and the `app.tenant_id` GUC helper), and
-  the `internal/tenant` service+handlers backed by RLS. Phase 1
-  remains `IN PROGRESS` because the decision gate still requires
-  external confirmations — see the decision gate section below.
-  Those are process gates, not code gates; no additional KMail
-  code changes are required to close them out.
+  v0.16.0 config file at `configs/stalwart.toml` (admin password
+  sourced from `STALWART_ADMIN_PASSWORD`) mounted into the
+  compose service, a `scripts/migrate.sh` / `make migrate` runner
+  that applies `migrations/*.sql` idempotently, the
+  `cmd/kmail-api` BFF binary (a working entrypoint with health /
+  readiness / graceful shutdown, `/jmap` reverse proxy, and
+  `/api/v1/tenants` CRUD — the earlier duplicate `Service` stub
+  in `internal/tenant/tenant.go` that caused a compile error has
+  been removed so only `internal/tenant/service.go` defines the
+  type, and `go build ./...` is green), the `internal/config`
+  loader, the `internal/middleware` OIDC stub (with dev-bypass
+  token and the `app.tenant_id` GUC helper), and the
+  `internal/tenant` service+handlers backed by RLS. Unit tests
+  now cover `internal/tenant` service validation, the
+  `internal/jmap` proxy (account cache set/get/expiry/eviction,
+  `/jmap` prefix rewrite + RawPath clearing, `ServeHTTP` missing
+  context → 500, upstream failures → 502) and `internal/config`
+  (defaults, `getenv` / `getenvDuration` / `GetenvInt`, DSN
+  redaction). The GitHub Actions CI workflow at
+  `.github/workflows/ci.yml` runs Go 1.25 `make vet / build /
+  test` (with `-race`) on push and pull-request, so the skeleton
+  is CI-verified. Phase 1 remains `IN PROGRESS` because the
+  decision gate still requires external confirmations — see the
+  decision gate section below. Those are process gates, not code
+  gates; no additional KMail code changes are required to close
+  them out. Phase 2 engineering work is now unblocked for items
+  that do not depend on the pending external sign-offs.
 
 This document is a phase-gated tracker. Each phase has an explicit
 checklist and a decision gate. Do not skip to the next phase until
