@@ -53,6 +53,35 @@ type Config struct {
 	// production; the value is a convenience for local development
 	// only. Empty disables the bypass.
 	DevBypassToken string
+
+	// ZKFabric holds the zk-object-fabric S3 gateway wiring Stalwart
+	// talks to for blob storage (see docs/ARCHITECTURE.md §4). The
+	// BFF does NOT proxy blob reads/writes — Stalwart talks S3
+	// directly over its own configuration — but the BFF needs the
+	// endpoints and credentials for tenant bucket provisioning,
+	// presigned-URL minting (attachments), and usage/quota lookups.
+	ZKFabric ZKFabricConfig
+}
+
+// ZKFabricConfig is the connection surface for the zk-object-fabric
+// S3 gateway. In local compose the gateway is reachable at the
+// `zk-fabric` service name; host ports `9080` (S3) and `9081`
+// (console) avoid colliding with the BFF on `:8080`.
+type ZKFabricConfig struct {
+	// S3URL is the zk-object-fabric S3 endpoint for direct blob
+	// operations (presigned URLs, attachment links).
+	S3URL string
+
+	// ConsoleURL is the zk-object-fabric console API for tenant
+	// bucket provisioning and usage/quota reads.
+	ConsoleURL string
+
+	// AccessKey and SecretKey are the HMAC credentials for the
+	// kmail service tenant in zk-object-fabric. They match the
+	// `kmail-dev` binding in zk-object-fabric's demo/tenants.json
+	// template.
+	AccessKey string
+	SecretKey string
 }
 
 // HTTPConfig holds the BFF HTTP listener configuration.
@@ -91,6 +120,17 @@ func Load() (*Config, error) {
 		ValkeyURL:       getenv("VALKEY_URL", "valkey:6379"),
 		KChatOIDCIssuer: getenv("KCHAT_OIDC_ISSUER", ""),
 		DevBypassToken:  getenv("KMAIL_DEV_BYPASS_TOKEN", ""),
+		ZKFabric: ZKFabricConfig{
+			// Host-mapped defaults match docker-compose.yml, which
+			// publishes zk-fabric on host `:9080` (S3) and `:9081`
+			// (console) to avoid collision with the BFF on :8080.
+			// Inside compose, override with
+			// `ZK_FABRIC_S3_URL=http://zk-fabric:8080`.
+			S3URL:      getenv("ZK_FABRIC_S3_URL", "http://localhost:9080"),
+			ConsoleURL: getenv("ZK_FABRIC_CONSOLE_URL", "http://localhost:9081"),
+			AccessKey:  getenv("ZK_FABRIC_ACCESS_KEY", "kmail-access-key"),
+			SecretKey:  getenv("ZK_FABRIC_SECRET_KEY", "kmail-secret-key"),
+		},
 	}, nil
 }
 
@@ -138,13 +178,16 @@ func GetenvInt(key string, fallback int) int {
 // config for startup logging.
 func (c *Config) String() string {
 	return fmt.Sprintf(
-		"Config{HTTP.Addr=%s DatabaseURL=%s StalwartURL=%s ValkeyURL=%s KChatOIDCIssuer=%s DevBypass=%t}",
+		"Config{HTTP.Addr=%s DatabaseURL=%s StalwartURL=%s ValkeyURL=%s KChatOIDCIssuer=%s DevBypass=%t ZKFabric.S3URL=%s ZKFabric.ConsoleURL=%s ZKFabric.Keys=%t}",
 		c.HTTP.Addr,
 		redactDSN(c.DatabaseURL),
 		c.StalwartURL,
 		c.ValkeyURL,
 		c.KChatOIDCIssuer,
 		c.DevBypassToken != "",
+		c.ZKFabric.S3URL,
+		c.ZKFabric.ConsoleURL,
+		c.ZKFabric.AccessKey != "" && c.ZKFabric.SecretKey != "",
 	)
 }
 

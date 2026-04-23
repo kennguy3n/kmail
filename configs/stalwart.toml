@@ -3,9 +3,14 @@
 # This file is mounted into the Stalwart container by
 # `docker-compose.yml` at `/opt/stalwart-mail/etc/config.toml`
 # (Stalwart's default `CONFIG_PATH`). It points Stalwart at the
-# other compose services — Postgres for metadata, MinIO for blob
-# storage (standing in for zk-object-fabric locally), Valkey for
-# lookups, Meilisearch for full-text search.
+# other compose services — Postgres for metadata, zk-object-fabric
+# (service name `zk-fabric`) for blob storage via its S3-compatible
+# API, Valkey for lookups, Meilisearch for full-text search.
+#
+# The blob store is the real zk-object-fabric S3 gateway — the same
+# API contract as the Wasabi / Ceph RGW backends used in later
+# phases. The MinIO stand-in that earlier versions used has been
+# removed.
 #
 # This is NOT a production configuration. See
 # `configs/stalwart.example.toml` for the production-shaped template
@@ -17,18 +22,24 @@
 # Storage backends
 # ---------------------------------------------------------------
 # Matches docs/ARCHITECTURE.md §4:
-#   blob   -> MinIO (S3-compatible, stands in for zk-object-fabric)
+#   blob   -> zk-object-fabric (S3-compatible, service `zk-fabric`)
 #   data   -> PostgreSQL (tenant metadata, mailbox state)
 #   fts    -> Meilisearch
 #   lookup -> Valkey
 
+# The access-key / secret-key pair here matches the `kmail-dev`
+# tenant pre-loaded in zk-object-fabric's demo/tenants.json.tmpl.
+# Bucket creation happens once in the `zk-fabric-init` one-shot
+# service in `docker-compose.yml`; the gateway treats CreateBucket
+# on an existing bucket as idempotent.
+
 [store."blob"]
 type = "s3"
-endpoint = "http://minio:9000"
+endpoint = "http://zk-fabric:8080"
 region = "us-east-1"
 bucket = "kmail-blobs"
-access-key = "kmail"
-secret-key = "kmail-dev"
+access-key = "kmail-access-key"
+secret-key = "kmail-secret-key"
 path-style = true
 
 [store."data"]

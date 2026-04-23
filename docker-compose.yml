@@ -1,25 +1,34 @@
 # KMail — local development stack.
 #
 # Brings up the infrastructure dependencies KMail's Go control plane
-# and (eventually) Stalwart rely on:
+# and Stalwart rely on:
 #
-#   - PostgreSQL 16  — control-plane metadata (tenants, users,
-#                      domains, aliases, shared inboxes, quotas,
-#                      audit log, calendar metadata).
-#   - Meilisearch    — Phase 2 search tier.
-#   - Valkey         — short-TTL state / cache.
-#   - MinIO          — S3-compatible mock for zk-object-fabric;
-#                      stands in for the real gateway during local
-#                      development.
+#   - PostgreSQL 16   — control-plane metadata (tenants, users,
+#                       domains, aliases, shared inboxes, quotas,
+#                       audit log, calendar metadata).
+#   - Meilisearch     — Phase 2 search tier.
+#   - Valkey          — short-TTL state / cache.
+#   - zk-object-fabric — the real multi-tenant S3 gateway KMail ships
+#                       with in production. Replaces the earlier MinIO
+#                       stand-in; Stalwart v0.16.0 now talks S3
+#                       directly to the gateway. The demo image is
+#                       built from the sibling kennguy3n/zk-object-fabric
+#                       repo (see its `Dockerfile` and `demo/`).
 #
-# Stalwart v0.16.0 is wired in as the `stalwart` service below,
-# pinned to `stalwartlabs/mail-server:v0.16.0` and depending on the
-# shared PostgreSQL, MinIO, and Valkey instances above. The config
-# at `configs/stalwart.toml` is mounted into the container so
-# Stalwart picks up the local dev backends (Postgres / MinIO /
-# Valkey / Meilisearch). See docs/PROPOSAL.md §1 for the Stalwart
-# version pin and the staging upgrade plan, and
-# `configs/stalwart.example.toml` for the production-shaped template.
+# Stalwart is wired as the `stalwart` service below, pinned to
+# `stalwartlabs/stalwart:v0.16.0` (the upstream image was renamed
+# from `stalwartlabs/mail-server` in this release) and depending
+# on the shared Postgres / zk-fabric / Valkey / Meilisearch
+# instances above. v0.16.0 uses a JSON bootstrap config plus
+# database-backed settings managed via the admin API, so the
+# legacy `configs/stalwart.toml` is kept as a reference (see the
+# inline note on the `stalwart` service) and will be migrated in
+# a follow-up PR. See docs/PROPOSAL.md §1 for the Stalwart
+# version pin and the staging upgrade plan.
+#
+# zk-fabric is published on host ports 9080 (S3 API) and 9081
+# (console API) to avoid collision with the Go BFF (`kmail-api`) on
+# host 8080.
 
 services:
   postgres:
@@ -58,34 +67,83 @@ services:
     volumes:
       - valkey_data:/data
 
-  minio:
-    image: minio/minio:latest
-    container_name: kmail-minio
-    command: server /data --console-address ":9001"
-    environment:
-      MINIO_ROOT_USER: kmail
-      MINIO_ROOT_PASSWORD: kmail-dev
+  # zk-object-fabric is the S3-compatible multi-tenant storage
+  # gateway KMail ships with in production. The `context` path
+  # points at a sibling checkout of kennguy3n/zk-object-fabric; the
+  # demo Dockerfile there builds a minimal gateway running the
+  # `local_fs_dev` provider and a pre-loaded `kmail-dev` tenant.
+  # Override with `image: ghcr.io/kennguy3n/zk-object-fabric:dev`
+  # once the registry publishes a pinned tag.
+  zk-fabric:
+    build:
+      context: ../zk-object-fabric
+    container_name: kmail-zk-fabric
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "9080:8080"   # S3 API
+      - "9081:8081"   # Console API
     volumes:
-      - minio_data:/data
+      - zk_data:/data/objects
+    # Use a TCP probe rather than an HTTP GET — the S3 endpoint on
+    # :8080 returns 403 AccessDenied to unauthenticated requests,
+    # which `wget --spider` treats as failure. `nc -z` only checks
+    # that the listener is accepting connections, which is what we
+    # actually care about for compose's depends_on gate.
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      test: ["CMD", "nc", "-z", "localhost", "8080"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  # One-shot init container that waits for zk-fabric to be healthy,
+  # then creates the `kmail-blobs` bucket Stalwart writes into. This
+  # is idempotent — CreateBucket on an existing bucket is a no-op in
+  # the gateway — so rerunning `docker compose up` is safe.
+  zk-fabric-init:
+    image: amazon/aws-cli:2.17.0
+    container_name: kmail-zk-fabric-init
+    depends_on:
+      zk-fabric:
+        condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: kmail-access-key
+      AWS_SECRET_ACCESS_KEY: kmail-secret-key
+      AWS_DEFAULT_REGION: us-east-1
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - aws --endpoint-url http://zk-fabric:8080 s3 mb s3://kmail-blobs
+    restart: "no"
 
   stalwart:
-    image: stalwartlabs/mail-server:v0.16.0
+    # NOTE: v0.16.0 renamed the Docker image from
+    # `stalwartlabs/mail-server` to `stalwartlabs/stalwart` and
+    # switched to a JSON bootstrap config at
+    # `/etc/stalwart/config.json` that only points at the data
+    # store — the rest of Stalwart's settings (listeners, blob
+    # store, directories, …) now live inside the Postgres data
+    # store and are managed via the admin API/UI. The
+    # `configs/stalwart.toml` in this repo is the pre-v0.16.0
+    # schema and is retained as a reference only; wiring it as
+    # the JSON bootstrap file fails at startup.
+    #
+    # For local dev we let Stalwart come up in bootstrap mode
+    # and complete initial setup via the web UI on host port
+    # 18080 (the setup wizard writes the zk-fabric S3 blob
+    # store details into Postgres). A follow-up PR will migrate
+    # this file + `configs/stalwart.toml` to the v0.16.0 JSON
+    # bootstrap + seeded admin-API config model so the compose
+    # stack is fully hands-off.
+    image: stalwartlabs/stalwart:v0.16.0
     container_name: kmail-stalwart
     depends_on:
       postgres:
         condition: service_healthy
       valkey:
         condition: service_started
-      minio:
+      zk-fabric:
         condition: service_healthy
+      zk-fabric-init:
+        condition: service_completed_successfully
       meilisearch:
         condition: service_started
     ports:
@@ -102,12 +160,11 @@ services:
     environment:
       STALWART_ADMIN_PASSWORD: kmail-dev
     volumes:
-      - stalwart_data:/opt/stalwart-mail
-      - ./configs/stalwart.toml:/opt/stalwart-mail/etc/config.toml:ro
+      - stalwart_data:/etc/stalwart
 
 volumes:
   postgres_data:
   meilisearch_data:
   valkey_data:
-  minio_data:
+  zk_data:
   stalwart_data:

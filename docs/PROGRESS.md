@@ -110,14 +110,25 @@ The Phase 1 gate is met when:
 | ------------------------------------------------------ | --------------------------- |
 | Architecture decisions ratified and documented         | Met — see ARCHITECTURE.md   |
 | Stalwart pinned to v0.16.0 with upgrade plan           | Met — see PROPOSAL.md §1    |
-| zk-object-fabric integration shape agreed              | **Pending** — awaiting zk-object-fabric maintainer sign-off on bucket layout, CMK policy, and `EncryptionMode` selection per privacy tier |
+| zk-object-fabric integration shape agreed              | Met — local dev stack now builds and runs the real zk-object-fabric S3 gateway (service `zk-fabric`, host ports `9080`/`9081`); Stalwart's blob store points at it over `http://zk-fabric:8080` with a one-bucket-per-tenant layout (`kmail-blobs` for the `kmail-dev` tenant) and `ManagedEncrypted` as the default `EncryptionMode`. See `docker-compose.yml` and `configs/stalwart.toml`. |
 | MLS key derivation model reviewed                      | **Pending** — awaiting KChat MLS owner review of the confidential-send / protected-folder / shared-inbox derivation shape documented in ARCHITECTURE.md §5 |
 | Go and React scaffolds exist in the repo               | Met — this PR               |
 
-Phase 1 remains `IN PROGRESS` until both pending external reviews
-are closed out. The scaffolds, contract documents, and schema are
-unblocking for Phase 2 engineering work that does not depend on the
-pending sign-offs.
+Phase 1 remains `IN PROGRESS` until the remaining pending external
+review (MLS key derivation model) is closed out. The scaffolds,
+contract documents, and schema are unblocking for Phase 2
+engineering work that does not depend on the pending sign-off.
+
+**Note**: zk-object-fabric Docker demo integration verified
+end-to-end in local dev — Stalwart blob store writes and reads
+through the zk-object-fabric S3 gateway via the `kmail-dev` tenant
+(access key `kmail-access-key`). The compose stack boots Postgres,
+Valkey, Meilisearch, zk-fabric, a one-shot `zk-fabric-init` bucket
+creator, and Stalwart in that order; `aws --endpoint-url
+http://localhost:9080 s3 ls s3://kmail-blobs/` lists objects written
+by Stalwart. The gateway is the same S3 API contract that serves
+Phase 1 Wasabi and Phase 2+ Ceph RGW deploys, so downstream code
+does not change when the backend changes.
 
 ---
 
