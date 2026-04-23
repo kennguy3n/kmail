@@ -20,6 +20,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/kennguy3n/kmail/internal/config"
+	"github.com/kennguy3n/kmail/internal/dns"
 	"github.com/kennguy3n/kmail/internal/jmap"
 	"github.com/kennguy3n/kmail/internal/middleware"
 	"github.com/kennguy3n/kmail/internal/tenant"
@@ -71,7 +72,16 @@ func main() {
 	mux.Handle("/jmap/", authMW.Wrap(proxy))
 
 	tenantSvc := tenant.NewService(pool)
-	tenantHandlers := tenant.NewHandlers(tenantSvc, logger)
+	dnsSvc := dns.NewService(dns.Config{
+		Pool:                pool,
+		MailHost:            cfg.DNS.MailHost,
+		SPFInclude:          cfg.DNS.SPFInclude,
+		DefaultDKIMSelector: cfg.DNS.DKIMSelector,
+		DKIMPublicKey:       cfg.DNS.DKIMPublicKey,
+		DMARCPolicy:         cfg.DNS.DMARCPolicy,
+		ReportingMailbox:    cfg.DNS.ReportingMailbox,
+	})
+	tenantHandlers := tenant.NewHandlers(tenantSvc, dnsSvc, logger)
 	tenantHandlers.Register(mux, authMW)
 
 	srv := &http.Server{

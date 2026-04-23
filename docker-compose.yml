@@ -23,18 +23,19 @@
 # blob store, directories, domains, DKIM keys, …) in a data store;
 # `configs/stalwart/config.json` is a minimal JSON bootstrap that
 # points Stalwart at the dedicated `stalwart` Postgres database
-# created by `scripts/postgres-init-stalwart.sql`. On first boot
-# Stalwart connects to Postgres, sees no `Bootstrap` object, and
-# opens its setup wizard on host port 18080 with the pinned admin
-# credentials below. `docs/DEVELOPMENT.md` documents the ~5 setup
-# screens (domain, admin, blob store, listeners) that wire
-# Stalwart to the zk-fabric S3 gateway; the resulting state is
-# persisted in the `postgres_data` volume, so subsequent `docker
-# compose up` runs boot straight into a configured server. See
-# docs/PROPOSAL.md §1 for the Stalwart version pin and the
+# created by `scripts/postgres-init-stalwart.sql`. The remaining
+# configuration that used to require a trip through Stalwart's
+# first-boot setup wizard (blob store → zk-fabric S3, search
+# store → Meilisearch, in-memory store → Valkey, SMTP / IMAP /
+# JMAP listeners, the `kmail-dev` domain) is applied automatically
+# by the `stalwart-init` one-shot service below, which POSTs the
+# equivalent `/api/settings` payloads against Stalwart's admin
+# API. `docker compose up` is therefore hands-off — `docs/
+# DEVELOPMENT.md` no longer needs the manual wizard walkthrough.
+# See docs/PROPOSAL.md §1 for the Stalwart version pin and the
 # staging upgrade plan; the legacy `configs/stalwart.toml` is kept
-# around as a reference for what a future automated seed should
-# write into Postgres.
+# around as a read-only reference for the same key/value layout
+# the init script writes over the admin API.
 #
 # zk-fabric is published on host ports 9080 (S3 API) and 9081
 # (console API) to avoid collision with the Go BFF (`kmail-api`) on
@@ -195,12 +196,60 @@ services:
       STALWART_RECOVERY_ADMIN: "admin:kmail-dev"
     volumes:
       # JSON bootstrap → points Stalwart at its `stalwart`
-      # Postgres database. The rest of its settings live in that
-      # database after the setup wizard runs.
+      # Postgres database. The rest of its settings are written
+      # into that database by the `stalwart-init` one-shot below
+      # (via the admin API), so no manual setup wizard is needed.
       - ./configs/stalwart/config.json:/etc/stalwart/config.json:ro
       # Persistent store for the downloaded web UI bundle, ACME
       # state, any DKIM keys Stalwart generates locally, etc.
       - stalwart_data:/opt/stalwart
+
+  # One-shot initializer that replaces Stalwart's interactive
+  # first-boot setup wizard. Waits for Stalwart's admin API to be
+  # reachable, then POSTs the blob / search / lookup store
+  # configuration, the SMTP / IMAP / JMAP listener configuration,
+  # and the `kmail-dev` tenant domain through `/api/settings` and
+  # `/api/domain`. Idempotent — re-applying the same settings is a
+  # no-op — so subsequent `docker compose up` runs re-enter with
+  # zero changes. See `scripts/stalwart-init.sh` for the exact
+  # admin-API payloads.
+  stalwart-init:
+    image: curlimages/curl:8.10.1
+    container_name: kmail-stalwart-init
+    depends_on:
+      stalwart:
+        condition: service_started
+      zk-fabric:
+        condition: service_healthy
+      zk-fabric-init:
+        condition: service_completed_successfully
+      meilisearch:
+        condition: service_started
+      valkey:
+        condition: service_started
+    environment:
+      # Stalwart's admin API is the same listener the setup wizard
+      # binds to; we reach it over the compose network rather than
+      # via host port 8080.
+      STALWART_ADMIN_URL: http://stalwart:8080
+      # Matches `STALWART_RECOVERY_ADMIN=admin:kmail-dev` above.
+      STALWART_ADMIN_PASSWORD: kmail-dev
+      # zk-object-fabric S3 gateway wiring — matches `configs/
+      # stalwart.toml`'s reference layout. Reached over the compose
+      # network at the `zk-fabric` service name on container port
+      # 8080 (not the host-published 9080).
+      ZK_FABRIC_URL: http://zk-fabric:8080
+      ZK_FABRIC_BUCKET: kmail-blobs
+      ZK_FABRIC_ACCESS_KEY: kmail-access-key
+      ZK_FABRIC_SECRET_KEY: kmail-secret-key
+      MEILISEARCH_URL: http://meilisearch:7700
+      MEILISEARCH_API_KEY: kmail-dev
+      VALKEY_URL: redis://valkey:6379
+      KMAIL_DEV_TENANT_DOMAIN: kmail.local
+    volumes:
+      - ./scripts/stalwart-init.sh:/stalwart-init.sh:ro
+    entrypoint: ["sh", "/stalwart-init.sh"]
+    restart: "no"
 
 volumes:
   postgres_data:

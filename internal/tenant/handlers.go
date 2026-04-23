@@ -6,23 +6,32 @@ import (
 	"log"
 	"net/http"
 
+	kmaildns "github.com/kennguy3n/kmail/internal/dns"
 	"github.com/kennguy3n/kmail/internal/middleware"
 )
 
 // Handlers exposes the Tenant Service over REST under
 // `/api/v1/tenants`. The handlers are thin: they decode JSON,
 // delegate to Service, and marshal the result.
+//
+// `dnsSvc` is optional. When unset the domain verify / records
+// endpoints return 501 Not Implemented so callers get a clear
+// signal the DNS Onboarding Service is not wired into this
+// deployment.
 type Handlers struct {
 	svc    *Service
+	dnsSvc *kmaildns.Service
 	logger *log.Logger
 }
 
-// NewHandlers returns a Handlers bound to the provided Service.
-func NewHandlers(svc *Service, logger *log.Logger) *Handlers {
+// NewHandlers returns a Handlers bound to the provided Service. Pass
+// a non-nil `dnsSvc` to enable the DNS verification and records
+// endpoints.
+func NewHandlers(svc *Service, dnsSvc *kmaildns.Service, logger *log.Logger) *Handlers {
 	if logger == nil {
 		logger = log.Default()
 	}
-	return &Handlers{svc: svc, logger: logger}
+	return &Handlers{svc: svc, dnsSvc: dnsSvc, logger: logger}
 }
 
 // Register installs every tenant route onto the provided mux. Each
@@ -31,10 +40,19 @@ func NewHandlers(svc *Service, logger *log.Logger) *Handlers {
 // `http.ServeMux`, which supports method+path patterns natively.
 func (h *Handlers) Register(mux *http.ServeMux, authMW *middleware.OIDC) {
 	mux.Handle("POST /api/v1/tenants", authMW.Wrap(http.HandlerFunc(h.createTenant)))
+	mux.Handle("GET /api/v1/tenants", authMW.Wrap(http.HandlerFunc(h.listTenants)))
 	mux.Handle("GET /api/v1/tenants/{id}", authMW.Wrap(http.HandlerFunc(h.getTenant)))
+	mux.Handle("PUT /api/v1/tenants/{id}", authMW.Wrap(http.HandlerFunc(h.updateTenant)))
+	mux.Handle("DELETE /api/v1/tenants/{id}", authMW.Wrap(http.HandlerFunc(h.deleteTenant)))
 	mux.Handle("POST /api/v1/tenants/{id}/users", authMW.Wrap(http.HandlerFunc(h.createUser)))
+	mux.Handle("GET /api/v1/tenants/{id}/users", authMW.Wrap(http.HandlerFunc(h.listUsers)))
+	mux.Handle("GET /api/v1/tenants/{id}/users/{userId}", authMW.Wrap(http.HandlerFunc(h.getUser)))
+	mux.Handle("PUT /api/v1/tenants/{id}/users/{userId}", authMW.Wrap(http.HandlerFunc(h.updateUser)))
+	mux.Handle("DELETE /api/v1/tenants/{id}/users/{userId}", authMW.Wrap(http.HandlerFunc(h.deleteUser)))
 	mux.Handle("POST /api/v1/tenants/{id}/domains", authMW.Wrap(http.HandlerFunc(h.createDomain)))
 	mux.Handle("GET /api/v1/tenants/{id}/domains", authMW.Wrap(http.HandlerFunc(h.listDomains)))
+	mux.Handle("POST /api/v1/tenants/{id}/domains/{domainId}/verify", authMW.Wrap(http.HandlerFunc(h.verifyDomain)))
+	mux.Handle("GET /api/v1/tenants/{id}/domains/{domainId}/records", authMW.Wrap(http.HandlerFunc(h.getDomainRecords)))
 	mux.Handle("POST /api/v1/tenants/{id}/shared-inboxes", authMW.Wrap(http.HandlerFunc(h.createSharedInbox)))
 }
 
@@ -53,6 +71,19 @@ func (h *Handlers) createTenant(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, t)
 }
 
+func (h *Handlers) listTenants(w http.ResponseWriter, r *http.Request) {
+	tenants, err := h.svc.ListTenants(r.Context())
+	if err != nil {
+		h.logger.Printf("listTenants: %v", err)
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if tenants == nil {
+		tenants = []Tenant{}
+	}
+	writeJSON(w, http.StatusOK, tenants)
+}
+
 func (h *Handlers) getTenant(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	t, err := h.svc.GetTenant(r.Context(), id)
@@ -66,6 +97,32 @@ func (h *Handlers) getTenant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, t)
+}
+
+func (h *Handlers) updateTenant(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var in UpdateTenantInput
+	if err := decodeJSON(r, &in); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	t, err := h.svc.UpdateTenant(r.Context(), id, in)
+	if err != nil {
+		h.logger.Printf("updateTenant: %v", err)
+		writeError(w, statusForServiceError(err), err)
+		return
+	}
+	writeJSON(w, http.StatusOK, t)
+}
+
+func (h *Handlers) deleteTenant(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if err := h.svc.DeleteTenant(r.Context(), id); err != nil {
+		h.logger.Printf("deleteTenant: %v", err)
+		writeError(w, statusForServiceError(err), err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *Handlers) createUser(w http.ResponseWriter, r *http.Request) {
@@ -86,6 +143,76 @@ func (h *Handlers) createUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, u)
+}
+
+func (h *Handlers) listUsers(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.PathValue("id")
+	if err := checkTenantScope(r, tenantID); err != nil {
+		writeError(w, http.StatusForbidden, err)
+		return
+	}
+	users, err := h.svc.ListUsers(r.Context(), tenantID)
+	if err != nil {
+		h.logger.Printf("listUsers: %v", err)
+		writeError(w, statusForServiceError(err), err)
+		return
+	}
+	if users == nil {
+		users = []User{}
+	}
+	writeJSON(w, http.StatusOK, users)
+}
+
+func (h *Handlers) getUser(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.PathValue("id")
+	userID := r.PathValue("userId")
+	if err := checkTenantScope(r, tenantID); err != nil {
+		writeError(w, http.StatusForbidden, err)
+		return
+	}
+	u, err := h.svc.GetUser(r.Context(), tenantID, userID)
+	if err != nil {
+		h.logger.Printf("getUser: %v", err)
+		writeError(w, statusForServiceError(err), err)
+		return
+	}
+	writeJSON(w, http.StatusOK, u)
+}
+
+func (h *Handlers) updateUser(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.PathValue("id")
+	userID := r.PathValue("userId")
+	if err := checkTenantScope(r, tenantID); err != nil {
+		writeError(w, http.StatusForbidden, err)
+		return
+	}
+	var in UpdateUserInput
+	if err := decodeJSON(r, &in); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	u, err := h.svc.UpdateUser(r.Context(), tenantID, userID, in)
+	if err != nil {
+		h.logger.Printf("updateUser: %v", err)
+		writeError(w, statusForServiceError(err), err)
+		return
+	}
+	writeJSON(w, http.StatusOK, u)
+}
+
+func (h *Handlers) deleteUser(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.PathValue("id")
+	userID := r.PathValue("userId")
+	if err := checkTenantScope(r, tenantID); err != nil {
+		writeError(w, http.StatusForbidden, err)
+		return
+	}
+	if err := h.svc.DeleteUser(r.Context(), tenantID, userID); err != nil {
+		h.logger.Printf("deleteUser: %v", err)
+		writeError(w, statusForServiceError(err), err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *Handlers) createDomain(w http.ResponseWriter, r *http.Request) {
@@ -124,6 +251,47 @@ func (h *Handlers) listDomains(w http.ResponseWriter, r *http.Request) {
 		domains = []Domain{}
 	}
 	writeJSON(w, http.StatusOK, domains)
+}
+
+func (h *Handlers) verifyDomain(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.PathValue("id")
+	domainID := r.PathValue("domainId")
+	if err := checkTenantScope(r, tenantID); err != nil {
+		writeError(w, http.StatusForbidden, err)
+		return
+	}
+	if h.dnsSvc == nil {
+		writeError(w, http.StatusNotImplemented, errors.New("dns service not configured"))
+		return
+	}
+	result, err := h.dnsSvc.VerifyDomain(r.Context(), tenantID, domainID)
+	if err != nil {
+		h.logger.Printf("verifyDomain: %v", err)
+		writeError(w, statusForDNSError(err), err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (h *Handlers) getDomainRecords(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.PathValue("id")
+	domainID := r.PathValue("domainId")
+	if err := checkTenantScope(r, tenantID); err != nil {
+		writeError(w, http.StatusForbidden, err)
+		return
+	}
+	if h.dnsSvc == nil {
+		writeError(w, http.StatusNotImplemented, errors.New("dns service not configured"))
+		return
+	}
+	d, err := h.svc.GetDomain(r.Context(), tenantID, domainID)
+	if err != nil {
+		h.logger.Printf("getDomainRecords: %v", err)
+		writeError(w, statusForServiceError(err), err)
+		return
+	}
+	records := h.dnsSvc.GenerateRecords(d.Domain)
+	writeJSON(w, http.StatusOK, records)
 }
 
 func (h *Handlers) createSharedInbox(w http.ResponseWriter, r *http.Request) {
@@ -192,6 +360,20 @@ func statusForServiceError(err error) int {
 	case errors.Is(err, ErrInvalidInput):
 		return http.StatusBadRequest
 	case errors.Is(err, ErrNotFound):
+		return http.StatusNotFound
+	default:
+		return http.StatusInternalServerError
+	}
+}
+
+// statusForDNSError mirrors statusForServiceError but over the
+// `internal/dns` sentinel errors. Kept separate so the two packages
+// can evolve their error taxonomies independently.
+func statusForDNSError(err error) int {
+	switch {
+	case errors.Is(err, kmaildns.ErrInvalidInput):
+		return http.StatusBadRequest
+	case errors.Is(err, kmaildns.ErrNotFound):
 		return http.StatusNotFound
 	default:
 		return http.StatusInternalServerError

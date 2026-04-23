@@ -2,39 +2,58 @@
 
 - **Project**: KMail — Privacy Email & Calendar for KChat B2B
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
-- **Status**: Phase 1 — Foundation (in progress)
-- **Last updated**: 2026-04-23 — All eleven Phase 1 checklist
-  items below are delivered in code and docs. In addition to the
-  earlier scaffolding work (Go module layout, Stalwart
-  docker-compose wiring, schema migrations, JMAP contract doc),
-  this update lands the runnable Phase 1 skeleton: the Stalwart
-  v0.16.0 config file at `configs/stalwart.toml` (admin password
-  sourced from `STALWART_ADMIN_PASSWORD`) mounted into the
-  compose service, a `scripts/migrate.sh` / `make migrate` runner
-  that applies `migrations/*.sql` idempotently, the
-  `cmd/kmail-api` BFF binary (a working entrypoint with health /
-  readiness / graceful shutdown, `/jmap` reverse proxy, and
-  `/api/v1/tenants` CRUD — the earlier duplicate `Service` stub
-  in `internal/tenant/tenant.go` that caused a compile error has
-  been removed so only `internal/tenant/service.go` defines the
-  type, and `go build ./...` is green), the `internal/config`
-  loader, the `internal/middleware` OIDC stub (with dev-bypass
-  token and the `app.tenant_id` GUC helper), and the
-  `internal/tenant` service+handlers backed by RLS. Unit tests
-  now cover `internal/tenant` service validation, the
-  `internal/jmap` proxy (account cache set/get/expiry/eviction,
-  `/jmap` prefix rewrite + RawPath clearing, `ServeHTTP` missing
-  context → 500, upstream failures → 502) and `internal/config`
-  (defaults, `getenv` / `getenvDuration` / `GetenvInt`, DSN
-  redaction). The GitHub Actions CI workflow at
-  `.github/workflows/ci.yml` runs Go 1.25 `make vet / build /
-  test` (with `-race`) on push and pull-request, so the skeleton
-  is CI-verified. Phase 1 remains `IN PROGRESS` because the
-  decision gate still requires external confirmations — see the
-  decision gate section below. Those are process gates, not code
-  gates; no additional KMail code changes are required to close
-  them out. Phase 2 engineering work is now unblocked for items
-  that do not depend on the pending external sign-offs.
+- **Status**: Phase 1 — Foundation (in progress); Phase 2 —
+  Prototype (in progress)
+- **Last updated**: 2026-04-23 — Phase 2 engineering work has
+  begun. This update lands three pieces of the Phase 2 checklist:
+  (1) the full Tenant Service CRUD surface in
+  `internal/tenant/service.go` (`ListTenants`, `UpdateTenant`,
+  `DeleteTenant`, `ListUsers`, `GetUser`, `UpdateUser`,
+  `DeleteUser`, `GetDomain`) backed by the `app.tenant_id` GUC
+  for RLS-scoped calls, with the matching `GET` / `PUT` /
+  `DELETE` routes registered under `/api/v1/tenants/...` in
+  `internal/tenant/handlers.go` and validation unit tests in
+  `service_test.go`; (2) the DNS Onboarding Service in
+  `internal/dns/dns.go` — a `Resolver` interface makes MX / SPF /
+  DKIM / DMARC lookups mockable, `VerifyDomain` runs all four
+  checks inside an RLS-scoped pgx transaction and writes the
+  resulting flags to `domains`, and `GenerateRecords` returns the
+  MX / SPF / DKIM / DMARC / MTA-STS / TLS-RPT / autoconfig /
+  autodiscover records a tenant must publish; the service is
+  mounted in-process by `cmd/kmail-api` under
+  `POST /api/v1/tenants/{id}/domains/{domainId}/verify` and
+  `GET .../records`, and `cmd/kmail-dns` now has a working
+  standalone HTTP entrypoint for deployments that want to scale
+  the DNS service independently; unit tests cover the DNS logic
+  with an in-memory fake resolver; (3) the Stalwart v0.16.0
+  automated bootstrap — `configs/stalwart-bootstrap.json` is the
+  minimal JSON config that points Stalwart at Postgres and sets
+  the admin password from `STALWART_ADMIN_PASSWORD`,
+  `scripts/stalwart-init.sh` configures blob store →
+  zk-object-fabric (MinIO locally), search → Meilisearch,
+  in-memory → Valkey, SMTP / IMAP / JMAP listeners, and the
+  `kmail-dev` tenant through the admin API, and
+  `docker-compose.yml` mounts the JSON bootstrap as
+  `/etc/stalwart/config.json` and adds a `stalwart-init` one-shot
+  service so `docker compose up` is now hands-off. The earlier
+  `configs/stalwart.toml` is retained as a reference cheat-sheet
+  with a clear deprecation header. Phase 1 remains `IN PROGRESS`
+  because the decision gate still requires external
+  confirmations — see the decision gate section below. Those are
+  process gates, not code gates; no additional KMail code changes
+  are required to close them out.
+- **Previously (2026-04-23 earlier)**: All eleven Phase 1
+  checklist items below were delivered in code and docs: the Go
+  module layout, Stalwart docker-compose wiring, schema
+  migrations, JMAP contract doc, `cmd/kmail-api` BFF binary with
+  health / readiness / graceful shutdown / `/jmap` reverse
+  proxy / `/api/v1/tenants` CRUD, the `internal/config` loader,
+  the `internal/middleware` OIDC stub with dev-bypass token and
+  the `app.tenant_id` GUC helper, and the initial
+  `internal/tenant` service+handlers backed by RLS. The GitHub
+  Actions CI workflow at `.github/workflows/ci.yml` runs
+  Go 1.25 `make vet / build / test` (with `-race`) on push and
+  pull-request.
 
 This document is a phase-gated tracker. Each phase has an explicit
 checklist and a decision gate. Do not skip to the next phase until
@@ -134,21 +153,39 @@ does not change when the backend changes.
 
 ## Phase 2 — Prototype (Weeks 5–10)
 
-**Status**: `NOT STARTED`
+**Status**: `IN PROGRESS`
 
 **Goal**: a single-tenant prototype with custom-domain email, basic
 calendar, JMAP webmail, IMAP/SMTP compatibility, and zk-object-fabric
 blob storage wired end-to-end.
 
+Delivered in this batch:
+
+- Full **Tenant CRUD** — list / update / delete for tenants and
+  users, all RLS-scoped where applicable; matching HTTP routes
+  under `/api/v1/tenants/...`.
+- **DNS Onboarding Service** — MX / SPF / DKIM / DMARC
+  verification, `GenerateRecords` helper for the DNS wizard,
+  mockable resolver interface for unit testing; mounted
+  in-process by `cmd/kmail-api` and available as a standalone
+  binary at `cmd/kmail-dns`.
+- **Stalwart v0.16.0 automated bootstrap** — JSON bootstrap at
+  `configs/stalwart-bootstrap.json` + admin-API init script at
+  `scripts/stalwart-init.sh`, wired into `docker-compose.yml` as
+  a `stalwart-init` one-shot so `docker compose up` is now
+  hands-off (no manual setup wizard).
+
 Checklist:
 
-- [ ] Stalwart deployment with PostgreSQL metadata backend +
+- [x] Stalwart deployment with PostgreSQL metadata backend +
       zk-object-fabric blob store backend + Meilisearch search +
-      Valkey state.
+      Valkey state. _(compose wiring + automated bootstrap;
+      production wiring swaps the MinIO blob mock for the real
+      zk-object-fabric gateway.)_
 - [ ] Go API Gateway / BFF with KChat auth integration.
-- [ ] Go Tenant Service (organizations, domains, users, aliases,
-      shared inboxes, quotas).
-- [ ] Go DNS Onboarding Service (MX / SPF / DKIM / DMARC checks,
+- [x] Go Tenant Service (organizations, domains, users, aliases,
+      shared inboxes, quotas). _(full CRUD, RLS-scoped.)_
+- [x] Go DNS Onboarding Service (MX / SPF / DKIM / DMARC checks,
       domain verification).
 - [ ] React KChat Mail UI (inbox, compose, read, search).
 - [ ] React KChat Calendar UI (personal calendar, event create /
