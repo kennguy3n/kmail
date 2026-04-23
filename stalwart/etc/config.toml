@@ -1,0 +1,122 @@
+# KMail — local development Stalwart v0.16.0 configuration.
+#
+# This file is mounted into the Stalwart container by
+# `docker-compose.yml` at `/opt/stalwart-mail/etc/config.toml`
+# (Stalwart's default `CONFIG_PATH`). It points Stalwart at the
+# other compose services — Postgres for metadata, MinIO for blob
+# storage (standing in for zk-object-fabric locally), Valkey for
+# lookups, Meilisearch for full-text search.
+#
+# This is NOT a production configuration. See
+# `configs/stalwart.example.toml` for the production-shaped template
+# and `docs/ARCHITECTURE.md` §4 for the storage-backend topology.
+#
+# Stalwart version is pinned to v0.16.0 per `docs/PROPOSAL.md` §1.1.
+
+# ---------------------------------------------------------------
+# Storage backends
+# ---------------------------------------------------------------
+# Matches docs/ARCHITECTURE.md §4:
+#   blob   -> MinIO (S3-compatible, stands in for zk-object-fabric)
+#   data   -> PostgreSQL (tenant metadata, mailbox state)
+#   fts    -> Meilisearch
+#   lookup -> Valkey
+
+[store."blob"]
+type = "s3"
+endpoint = "http://minio:9000"
+region = "us-east-1"
+bucket = "kmail-blobs"
+access-key = "kmail"
+secret-key = "kmail-dev"
+path-style = true
+
+[store."data"]
+type = "postgresql"
+host = "postgres"
+port = 5432
+database = "kmail"
+username = "kmail"
+password = "kmail"
+
+[store."fts"]
+type = "meilisearch"
+url = "http://meilisearch:7700"
+api-key = "kmail-dev"
+
+[store."lookup"]
+type = "redis"
+urls = ["redis://valkey:6379"]
+
+# ---------------------------------------------------------------
+# Storage routing
+# ---------------------------------------------------------------
+
+[storage]
+data = "data"
+blob = "blob"
+fts = "fts"
+lookup = "lookup"
+directory = "data"
+
+# ---------------------------------------------------------------
+# Server identity
+# ---------------------------------------------------------------
+# TLS is disabled in local dev; production configs terminate TLS at
+# Stalwart per `configs/stalwart.example.toml`.
+
+[server]
+hostname = "kmail.local"
+
+[server.tls]
+enable = false
+
+# ---------------------------------------------------------------
+# Protocol listeners
+# ---------------------------------------------------------------
+# Container-internal ports. The compose file publishes 25/465/587
+# (SMTP), 143/993 (IMAP) to the host and maps Stalwart's internal
+# JMAP 8080 to host 18080 to avoid colliding with the Go BFF.
+
+[server.listener."smtp"]
+protocol = "smtp"
+bind = "[::]:25"
+
+[server.listener."smtps"]
+protocol = "smtp"
+bind = "[::]:465"
+tls.implicit = false
+
+[server.listener."submission"]
+protocol = "smtp"
+bind = "[::]:587"
+tls.implicit = false
+
+[server.listener."imap"]
+protocol = "imap"
+bind = "[::]:143"
+tls.implicit = false
+
+[server.listener."imaps"]
+protocol = "imap"
+bind = "[::]:993"
+tls.implicit = false
+
+[server.listener."jmap"]
+protocol = "jmap"
+bind = "[::]:8080"
+tls.implicit = false
+
+# ---------------------------------------------------------------
+# Authentication
+# ---------------------------------------------------------------
+# Local dev uses Stalwart's built-in admin account; the Go BFF
+# connects to Stalwart over the compose network. Production swaps
+# this for OIDC-based auth per `docs/JMAP-CONTRACT.md` §3.2.
+
+[auth]
+directory = "data"
+
+[authentication.fallback-admin]
+user = "admin"
+secret = "kmail-dev"

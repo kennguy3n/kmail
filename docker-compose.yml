@@ -14,11 +14,12 @@
 #
 # Stalwart v0.16.0 is wired in as the `stalwart` service below,
 # pinned to `stalwartlabs/mail-server:v0.16.0` and depending on the
-# shared PostgreSQL, MinIO, and Valkey instances above. A proper
-# Stalwart config file mount (pointing it at those services) is a
-# follow-up task — see the inline NOTE on the service. See
-# docs/PROPOSAL.md §1 for the Stalwart version pin and the staging
-# upgrade plan.
+# shared PostgreSQL, MinIO, and Valkey instances above. The config
+# at `stalwart/etc/config.toml` is mounted into the container so
+# Stalwart picks up the local dev backends (Postgres / MinIO /
+# Valkey / Meilisearch). See docs/PROPOSAL.md §1 for the Stalwart
+# version pin and the staging upgrade plan, and
+# `configs/stalwart.example.toml` for the production-shaped template.
 
 services:
   postgres:
@@ -75,10 +76,6 @@ services:
       timeout: 5s
       retries: 5
 
-  # NOTE: a config file mount (pointing Stalwart at the local
-  # postgres, minio, and valkey services above) is still required
-  # for this service to actually run end-to-end. Wiring that
-  # config is tracked as a follow-up task.
   stalwart:
     image: stalwartlabs/mail-server:v0.16.0
     container_name: kmail-stalwart
@@ -89,6 +86,8 @@ services:
         condition: service_started
       minio:
         condition: service_healthy
+      meilisearch:
+        condition: service_started
     ports:
       - "25:25"
       - "465:465"
@@ -101,11 +100,10 @@ services:
       # over the compose network.
       - "18080:8080"
     environment:
-      # Stalwart configuration will need to be customized;
-      # these are placeholder env vars for local dev.
       STALWART_ADMIN_PASSWORD: kmail-dev
     volumes:
       - stalwart_data:/opt/stalwart-mail
+      - ./stalwart/etc/config.toml:/opt/stalwart-mail/etc/config.toml:ro
 
 volumes:
   postgres_data:

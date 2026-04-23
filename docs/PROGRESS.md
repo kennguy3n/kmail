@@ -3,17 +3,23 @@
 - **Project**: KMail — Privacy Email & Calendar for KChat B2B
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
 - **Status**: Phase 1 — Foundation (in progress)
-- **Last updated**: 2026-04-23 — Aligned Go scaffold with the
-  documented service topology (`cmd/kmail-api` as the BFF
-  entrypoint, split `internal/bridge` into `internal/chatbridge`
-  and `internal/calendarbridge`, added `internal/config` and
-  `internal/middleware`), bumped the module to Go 1.25 to match
-  CI, wired Stalwart v0.16.0 into `docker-compose.yml`, generated
-  `web/package-lock.json`, and corrected `docs/SCHEMA.md` to list
-  `updated_at` on `domains`, `shared_inboxes`, and
-  `calendar_metadata`. Phase 1 remains `IN PROGRESS` because the
-  decision gate still requires external confirmations — see the
-  decision gate section below.
+- **Last updated**: 2026-04-23 — All eleven Phase 1 checklist
+  items below are delivered in code and docs. In addition to the
+  earlier scaffolding work (Go module layout, Stalwart
+  docker-compose wiring, schema migrations, JMAP contract doc),
+  this update lands the runnable Phase 1 skeleton: the Stalwart
+  v0.16.0 config file at `stalwart/etc/config.toml` mounted into
+  the compose service, a `scripts/migrate.sh` / `make migrate`
+  runner that applies `migrations/*.sql` idempotently, the
+  `cmd/kmail-api` BFF binary (health / readiness / graceful
+  shutdown, `/jmap` reverse proxy, `/api/v1/tenants` CRUD), the
+  `internal/config` loader, the `internal/middleware` OIDC stub
+  (with dev-bypass token and the `app.tenant_id` GUC helper), and
+  the `internal/tenant` service+handlers backed by RLS. Phase 1
+  remains `IN PROGRESS` because the decision gate still requires
+  external confirmations — see the decision gate section below.
+  Those are process gates, not code gates; no additional KMail
+  code changes are required to close them out.
 
 This document is a phase-gated tracker. Each phase has an explicit
 checklist and a decision gate. Do not skip to the next phase until
