@@ -116,11 +116,16 @@ CREATE TABLE aliases (
     tenant_id    UUID NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
     user_id      UUID NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
     alias_email  TEXT NOT NULL UNIQUE,
-    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE INDEX aliases_tenant_id_idx ON aliases (tenant_id);
 CREATE INDEX aliases_user_id_idx ON aliases (user_id);
+
+CREATE TRIGGER aliases_set_updated_at
+    BEFORE UPDATE ON aliases
+    FOR EACH ROW EXECUTE FUNCTION kmail_set_updated_at();
 
 ALTER TABLE aliases ENABLE ROW LEVEL SECURITY;
 CREATE POLICY aliases_tenant_isolation ON aliases

@@ -159,7 +159,7 @@ domain simultaneously.
 - `tenant_id` UUID FK.
 - `user_id` UUID FK → `users(id)`.
 - `alias_email` TEXT UNIQUE.
-- `created_at` TIMESTAMPTZ.
+- `created_at`, `updated_at` TIMESTAMPTZ.
 
 Aliases route to a user's primary address. Deleting a user cascades
 to deleting aliases via the Tenant Service's soft-delete flow (not
