@@ -1,4 +1,4 @@
-// Command kmail-bff is the API Gateway / BFF entrypoint.
+// Command kmail-api is the API Gateway / BFF entrypoint.
 //
 // Responsibilities (per docs/ARCHITECTURE.md §7 and
 // docs/JMAP-CONTRACT.md): translate KChat OIDC auth into Stalwart
@@ -13,6 +13,6 @@ import (
 )
 
 func main() {
-	fmt.Fprintln(os.Stderr, "kmail-bff: not yet implemented")
+	fmt.Fprintln(os.Stderr, "kmail-api: not yet implemented")
 	os.Exit(1)
 }
