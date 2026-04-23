@@ -251,7 +251,17 @@ func (s *Service) CheckDMARC(ctx context.Context, domain string) (bool, error) {
 // VerifyDomain runs MX / SPF / DKIM / DMARC checks against the
 // authoritative DNS for a tenant-owned domain, updates the
 // `domains` verification flags, and returns the aggregated result.
-// Runs under the tenant GUC so RLS scopes the update.
+//
+// Structured as three phases so the pgx pool connection is never
+// held across DNS lookups (which can block for 5–30 s each on
+// resolver timeouts):
+//
+//  1. Short-lived RLS-scoped tx → SELECT the domain name.
+//  2. DNS lookups (MX / SPF / DKIM / DMARC) with no DB connection held.
+//  3. Short-lived RLS-scoped tx → UPDATE the verification flags.
+//
+// If the row is deleted between phase 1 and phase 3 the UPDATE
+// affects 0 rows, which is surfaced as ErrNotFound.
 func (s *Service) VerifyDomain(ctx context.Context, tenantID, domainID string) (*VerificationResult, error) {
 	if tenantID == "" || domainID == "" {
 		return nil, fmt.Errorf("%w: tenant id and domain id are required", ErrInvalidInput)
@@ -260,36 +270,53 @@ func (s *Service) VerifyDomain(ctx context.Context, tenantID, domainID string) (
 		return nil, errors.New("dns: service has no database pool")
 	}
 
+	// Phase 1 — SELECT the domain name under an RLS-scoped tx.
 	var domain string
-	var result VerificationResult
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
 			return err
 		}
-		if err := tx.QueryRow(ctx, `
+		return tx.QueryRow(ctx, `
 			SELECT domain
 			FROM domains
 			WHERE id = $1::uuid AND tenant_id = $2::uuid
-		`, domainID, tenantID).Scan(&domain); err != nil {
-			return err
-		}
+		`, domainID, tenantID).Scan(&domain)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("verify domain: %w", err)
+	}
 
-		var err error
-		if result.MXVerified, err = s.CheckMX(ctx, domain); err != nil {
-			return err
-		}
-		if result.SPFVerified, err = s.CheckSPF(ctx, domain); err != nil {
-			return err
-		}
-		if result.DKIMVerified, err = s.CheckDKIM(ctx, domain, ""); err != nil {
-			return err
-		}
-		if result.DMARCVerified, err = s.CheckDMARC(ctx, domain); err != nil {
-			return err
-		}
-		result.Verified = result.MXVerified && result.SPFVerified && result.DKIMVerified && result.DMARCVerified
+	// Phase 2 — DNS lookups outside any transaction. Each check can
+	// block for the resolver's timeout; holding a pooled DB
+	// connection across these would starve the pool under
+	// concurrent verification load.
+	result := VerificationResult{}
+	if result.MXVerified, err = s.CheckMX(ctx, domain); err != nil {
+		return nil, fmt.Errorf("verify domain: %w", err)
+	}
+	if result.SPFVerified, err = s.CheckSPF(ctx, domain); err != nil {
+		return nil, fmt.Errorf("verify domain: %w", err)
+	}
+	if result.DKIMVerified, err = s.CheckDKIM(ctx, domain, ""); err != nil {
+		return nil, fmt.Errorf("verify domain: %w", err)
+	}
+	if result.DMARCVerified, err = s.CheckDMARC(ctx, domain); err != nil {
+		return nil, fmt.Errorf("verify domain: %w", err)
+	}
+	result.Verified = result.MXVerified && result.SPFVerified && result.DKIMVerified && result.DMARCVerified
 
-		_, err = tx.Exec(ctx, `
+	// Phase 3 — UPDATE the flags under a second RLS-scoped tx.
+	// RowsAffected == 0 means the row was deleted between phase 1
+	// and phase 3 or RLS now hides it; return ErrNotFound.
+	var rows int64
+	err = pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
+			return err
+		}
+		tag, err := tx.Exec(ctx, `
 			UPDATE domains
 			SET mx_verified    = $3,
 			    spf_verified   = $4,
@@ -303,14 +330,19 @@ func (s *Service) VerifyDomain(ctx context.Context, tenantID, domainID string) (
 			result.DKIMVerified, result.DMARCVerified,
 			result.Verified,
 		)
-		return err
+		if err != nil {
+			return err
+		}
+		rows = tag.RowsAffected()
+		return nil
 	})
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, ErrNotFound
-	}
 	if err != nil {
 		return nil, fmt.Errorf("verify domain: %w", err)
 	}
+	if rows == 0 {
+		return nil, ErrNotFound
+	}
+
 	result.DomainID = domainID
 	result.Domain = domain
 	return &result, nil
