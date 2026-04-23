@@ -49,18 +49,22 @@ CREATE TRIGGER tenants_set_updated_at
 -- ---------------------------------------------------------------
 
 CREATE TABLE users (
-    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    tenant_id     UUID NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
-    email         TEXT NOT NULL UNIQUE,
-    display_name  TEXT NOT NULL,
-    role          TEXT NOT NULL DEFAULT 'member'
-                  CHECK (role IN ('owner', 'admin', 'member',
-                                  'billing', 'deliverability')),
-    status        TEXT NOT NULL DEFAULT 'active'
-                  CHECK (status IN ('active', 'suspended', 'deleted')),
-    quota_bytes   BIGINT NOT NULL DEFAULT 0 CHECK (quota_bytes >= 0),
-    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+    id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id            UUID NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    kchat_user_id        TEXT NOT NULL,
+    stalwart_account_id  TEXT NOT NULL,
+    email                TEXT NOT NULL UNIQUE,
+    display_name         TEXT NOT NULL,
+    role                 TEXT NOT NULL DEFAULT 'member'
+                         CHECK (role IN ('owner', 'admin', 'member',
+                                         'billing', 'deliverability')),
+    status               TEXT NOT NULL DEFAULT 'active'
+                         CHECK (status IN ('active', 'suspended', 'deleted')),
+    quota_bytes          BIGINT NOT NULL DEFAULT 0 CHECK (quota_bytes >= 0),
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (tenant_id, kchat_user_id),
+    UNIQUE (stalwart_account_id)
 );
 
 CREATE INDEX users_tenant_id_idx ON users (tenant_id);

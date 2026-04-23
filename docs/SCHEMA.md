@@ -122,13 +122,17 @@ other tenant-scoped table.
 
 - `id` UUID primary key.
 - `tenant_id` UUID FK → `tenants(id)`.
+- `kchat_user_id` TEXT — KChat identity of this user. Unique
+  within a tenant (`UNIQUE (tenant_id, kchat_user_id)`).
+- `stalwart_account_id` TEXT — Stalwart account ID this user's
+  mailbox is bound to. Globally unique.
 - `email` TEXT UNIQUE — global primary address.
 - `display_name` TEXT.
 - `role` TEXT — `owner`, `admin`, `member`, `billing`,
   `deliverability`.
 - `status` TEXT — `active`, `suspended`, `deleted`.
 - `quota_bytes` BIGINT — per-user mailbox quota.
-- `created_at` TIMESTAMPTZ.
+- `created_at`, `updated_at` TIMESTAMPTZ.
 
 KMail user records map 1:1 to KChat user identities. The BFF
 resolves `(tenant_id, kchat_user_id) → stalwart_account_id` via
