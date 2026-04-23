@@ -3,9 +3,15 @@
 - **Project**: KMail — Privacy Email & Calendar for KChat B2B
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
 - **Status**: Phase 1 — Foundation (in progress)
-- **Last updated**: 2026-04-23 — All Phase 1 items complete. JMAP
-  contract, PostgreSQL schema, license evaluation, Go scaffold, and
-  React scaffold delivered. Phase 1 remains `IN PROGRESS` because the
+- **Last updated**: 2026-04-23 — Aligned Go scaffold with the
+  documented service topology (`cmd/kmail-api` as the BFF
+  entrypoint, split `internal/bridge` into `internal/chatbridge`
+  and `internal/calendarbridge`, added `internal/config` and
+  `internal/middleware`), bumped the module to Go 1.25 to match
+  CI, wired Stalwart v0.16.0 into `docker-compose.yml`, generated
+  `web/package-lock.json`, and corrected `docs/SCHEMA.md` to list
+  `updated_at` on `domains`, `shared_inboxes`, and
+  `calendar_metadata`. Phase 1 remains `IN PROGRESS` because the
   decision gate still requires external confirmations — see the
   decision gate section below.
 

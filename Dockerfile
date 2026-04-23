@@ -2,12 +2,12 @@
 #
 # Builds every cmd/* binary and copies them into a minimal runtime
 # image. The concrete service to run is selected by the container
-# command (e.g., `kmail-bff`, `kmail-tenant`).
+# command (e.g., `kmail-api`, `kmail-tenant`).
 
 # ---------------------------------------------------------------
 # Stage 1: build
 # ---------------------------------------------------------------
-FROM golang:1.22-alpine AS build
+FROM golang:1.25-alpine AS build
 
 WORKDIR /src
 
@@ -34,4 +34,4 @@ COPY --from=build /out/ /usr/local/bin/
 USER kmail
 
 # Default command; override with e.g. `kmail-tenant`, `kmail-dns`.
-ENTRYPOINT ["/usr/local/bin/kmail-bff"]
+ENTRYPOINT ["/usr/local/bin/kmail-api"]

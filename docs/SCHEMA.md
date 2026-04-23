@@ -146,7 +146,7 @@ this table (see [JMAP-CONTRACT.md §3.3](JMAP-CONTRACT.md)).
 - `verified` BOOLEAN — overall verification state.
 - `mx_verified`, `spf_verified`, `dkim_verified`, `dmarc_verified`
   BOOLEAN — per-record verification flags.
-- `created_at` TIMESTAMPTZ.
+- `created_at`, `updated_at` TIMESTAMPTZ.
 
 The DNS Onboarding service writes verification flags as it walks
 the DNS wizard (see [PROPOSAL.md §9.3](PROPOSAL.md)). The `domain`
@@ -173,7 +173,7 @@ via DB cascade).
 - `display_name` TEXT.
 - `mls_group_id` TEXT — identifier of the KChat MLS group that
   gates access.
-- `created_at` TIMESTAMPTZ.
+- `created_at`, `updated_at` TIMESTAMPTZ.
 
 The `(tenant_id, address)` pair is unique within a tenant. The
 global uniqueness of `address` is enforced by Stalwart's SMTP
@@ -237,7 +237,7 @@ day's rows with a hash chain so tampering is detectable.
 - `name` TEXT.
 - `acl` JSONB — `{ "readers": [user_id], "writers": [user_id],
   "admins": [user_id] }`.
-- `created_at` TIMESTAMPTZ.
+- `created_at`, `updated_at` TIMESTAMPTZ.
 
 Mirrors the subset of CalDAV calendar state needed for RBAC
 decisions in the BFF and Admin API. Events themselves remain in
