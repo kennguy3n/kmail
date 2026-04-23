@@ -81,11 +81,17 @@ services:
       - "9081:8081"   # Console API
     volumes:
       - zk_data:/data/objects
+    # Use a TCP probe rather than an HTTP GET — the S3 endpoint on
+    # :8080 returns 403 AccessDenied to unauthenticated requests,
+    # which `wget --spider` treats as failure. `nc -z` only checks
+    # that the listener is accepting connections, which is what we
+    # actually care about for compose's depends_on gate.
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      test: ["CMD", "nc", "-z", "localhost", "8080"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
 
   # One-shot init container that waits for zk-fabric to be healthy,
   # then creates the `kmail-blobs` bucket Stalwart writes into. This
