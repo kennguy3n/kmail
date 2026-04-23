@@ -27,6 +27,7 @@ import (
 	"github.com/kennguy3n/kmail/internal/config"
 	"github.com/kennguy3n/kmail/internal/dns"
 	"github.com/kennguy3n/kmail/internal/middleware"
+	"github.com/kennguy3n/kmail/internal/tenant"
 )
 
 func main() {
@@ -46,7 +47,7 @@ func main() {
 	}
 	defer pool.Close()
 
-	svc := dns.NewService(dns.Config{
+	dnsSvc := dns.NewService(dns.Config{
 		Pool:                pool,
 		MailHost:            cfg.DNS.MailHost,
 		SPFInclude:          cfg.DNS.SPFInclude,
@@ -55,6 +56,11 @@ func main() {
 		DMARCPolicy:         cfg.DNS.DMARCPolicy,
 		ReportingMailbox:    cfg.DNS.ReportingMailbox,
 	})
+	// tenantSvc is used for the one RLS-scoped domain lookup the
+	// records handler needs; it reuses the same RLS-wrapped query
+	// the in-process kmail-api path uses, so the standalone binary
+	// has identical tenant-isolation guarantees.
+	tenantSvc := tenant.NewService(pool)
 
 	authMW := middleware.NewOIDC(middleware.OIDCConfig{
 		Issuer:         cfg.KChatOIDCIssuer,
@@ -69,9 +75,9 @@ func main() {
 		_, _ = w.Write([]byte("ok\n"))
 	})
 	mux.Handle("POST /api/v1/tenants/{id}/domains/{domainId}/verify",
-		authMW.Wrap(http.HandlerFunc(verifyDomainHandler(svc, logger))))
+		authMW.Wrap(http.HandlerFunc(verifyDomainHandler(dnsSvc, logger))))
 	mux.Handle("GET /api/v1/tenants/{id}/domains/{domainId}/records",
-		authMW.Wrap(http.HandlerFunc(getDomainRecordsHandler(svc, pool, logger))))
+		authMW.Wrap(http.HandlerFunc(getDomainRecordsHandler(dnsSvc, tenantSvc, logger))))
 
 	srv := &http.Server{
 		Addr:              cfg.DNS.Addr,
@@ -113,6 +119,10 @@ func verifyDomainHandler(svc *dns.Service, logger *log.Logger) http.HandlerFunc 
 	return func(w http.ResponseWriter, r *http.Request) {
 		tenantID := r.PathValue("id")
 		domainID := r.PathValue("domainId")
+		if err := checkTenantScope(r, tenantID); err != nil {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+			return
+		}
 		result, err := svc.VerifyDomain(r.Context(), tenantID, domainID)
 		if err != nil {
 			logger.Printf("verifyDomain: %v", err)
@@ -123,22 +133,42 @@ func verifyDomainHandler(svc *dns.Service, logger *log.Logger) http.HandlerFunc 
 	}
 }
 
-func getDomainRecordsHandler(svc *dns.Service, pool *pgxpool.Pool, logger *log.Logger) http.HandlerFunc {
+func getDomainRecordsHandler(svc *dns.Service, tenantSvc *tenant.Service, logger *log.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		tenantID := r.PathValue("id")
 		domainID := r.PathValue("domainId")
-		var domain string
-		err := pool.QueryRow(r.Context(), `
-			SELECT domain FROM domains
-			WHERE id = $1::uuid AND tenant_id = $2::uuid
-		`, domainID, tenantID).Scan(&domain)
-		if err != nil {
-			logger.Printf("getDomainRecords: %v", err)
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		if err := checkTenantScope(r, tenantID); err != nil {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
 			return
 		}
-		writeJSON(w, http.StatusOK, svc.GenerateRecords(domain))
+		d, err := tenantSvc.GetDomain(r.Context(), tenantID, domainID)
+		if err != nil {
+			logger.Printf("getDomainRecords: %v", err)
+			writeJSON(w, statusForTenantError(err), map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, svc.GenerateRecords(d.Domain))
 	}
+}
+
+// checkTenantScope enforces that the authenticated tenant (read
+// from the request context by the OIDC middleware) matches the
+// tenant ID in the URL path. Mirrors the application-level check
+// the in-process handlers in `internal/tenant/handlers.go` do
+// before every tenant-scoped mutation — the RLS policy would
+// already block a cross-tenant read, but failing at the handler
+// gives a friendlier 403 than a Postgres error and prevents an
+// authenticated caller in tenant A from even touching tenant B's
+// verification state.
+func checkTenantScope(r *http.Request, pathTenantID string) error {
+	ctxTenantID := middleware.TenantIDFrom(r.Context())
+	if ctxTenantID == "" {
+		return errors.New("missing tenant context")
+	}
+	if ctxTenantID != pathTenantID {
+		return errors.New("cross-tenant access forbidden")
+	}
+	return nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
@@ -152,6 +182,17 @@ func statusForDNSError(err error) int {
 	case errors.Is(err, dns.ErrInvalidInput):
 		return http.StatusBadRequest
 	case errors.Is(err, dns.ErrNotFound):
+		return http.StatusNotFound
+	default:
+		return http.StatusInternalServerError
+	}
+}
+
+func statusForTenantError(err error) int {
+	switch {
+	case errors.Is(err, tenant.ErrInvalidInput):
+		return http.StatusBadRequest
+	case errors.Is(err, tenant.ErrNotFound):
 		return http.StatusNotFound
 	default:
 		return http.StatusInternalServerError
