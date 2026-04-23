@@ -1,0 +1,85 @@
+# KMail — local development stack.
+#
+# Brings up the infrastructure dependencies KMail's Go control plane
+# and (eventually) Stalwart rely on:
+#
+#   - PostgreSQL 16  — control-plane metadata (tenants, users,
+#                      domains, aliases, shared inboxes, quotas,
+#                      audit log, calendar metadata).
+#   - Meilisearch    — Phase 2 search tier.
+#   - Valkey         — short-TTL state / cache.
+#   - MinIO          — S3-compatible mock for zk-object-fabric;
+#                      stands in for the real gateway during local
+#                      development.
+#
+# Stalwart v0.16.0 is NOT wired in yet. Once the Stalwart binary /
+# container image is available locally, add a `stalwart` service
+# here that mounts the shared PostgreSQL, MinIO, and Valkey
+# instances. See docs/PROPOSAL.md §1 for the Stalwart version pin
+# and the staging upgrade plan.
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: kmail-postgres
+    environment:
+      POSTGRES_USER: kmail
+      POSTGRES_PASSWORD: kmail
+      POSTGRES_DB: kmail
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kmail -d kmail"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  meilisearch:
+    image: getmeili/meilisearch:v1.10
+    container_name: kmail-meilisearch
+    environment:
+      MEILI_ENV: development
+      MEILI_MASTER_KEY: kmail-dev
+    ports:
+      - "7700:7700"
+    volumes:
+      - meilisearch_data:/meili_data
+
+  valkey:
+    image: valkey/valkey:8
+    container_name: kmail-valkey
+    ports:
+      - "6379:6379"
+    volumes:
+      - valkey_data:/data
+
+  minio:
+    image: minio/minio:latest
+    container_name: kmail-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: kmail
+      MINIO_ROOT_PASSWORD: kmail-dev
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # TODO: add a `stalwart` service here once Stalwart v0.16.0 is
+  # available locally. It should depend on postgres, valkey, and
+  # minio and expose SMTP (25/465/587), IMAP (143/993), and JMAP
+  # (8080) on the host.
+
+volumes:
+  postgres_data:
+  meilisearch_data:
+  valkey_data:
+  minio_data:
