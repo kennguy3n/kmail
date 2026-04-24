@@ -2,6 +2,7 @@ import {
   FormEvent,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
@@ -52,6 +53,24 @@ export default function Compose() {
   const [isSavingDraft, setSavingDraft] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
+  // The id of the draft we saved most recently in this compose
+  // session. Used to replace rather than duplicate the draft on
+  // subsequent Save clicks.
+  const [savedDraftId, setSavedDraftId] = useState<string | null>(null);
+  // Handle for the deferred post-send navigation. We hold it in a
+  // ref so the unmount cleanup can cancel it — otherwise a user
+  // who navigates away in the 600 ms success window gets yanked
+  // back to /mail.
+  const navTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (navTimerRef.current) {
+        clearTimeout(navTimerRef.current);
+        navTimerRef.current = null;
+      }
+    };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -138,8 +157,13 @@ export default function Compose() {
       // before we navigate them back to the inbox. We deliberately
       // leave `isSending` true so the Send button stays disabled
       // through the navigation delay — resetting it here would let
-      // a rapid second click dispatch a duplicate submission.
-      setTimeout(() => navigate("/mail"), 600);
+      // a rapid second click dispatch a duplicate submission. The
+      // timer id is tracked on a ref so the unmount cleanup can
+      // cancel it if the user navigates away themselves.
+      navTimerRef.current = setTimeout(() => {
+        navTimerRef.current = null;
+        navigate("/mail");
+      }, 600);
     } catch (err: unknown) {
       setError(errorMessage(err));
       setSending(false);
@@ -156,7 +180,11 @@ export default function Compose() {
     }
     setSavingDraft(true);
     try {
-      await jmapClient.createDraft(draft);
+      // Pass the previously-saved draft id so the client can batch
+      // destroy+create in a single Email/set call — otherwise the
+      // Drafts mailbox would accumulate one copy per Save click.
+      const newId = await jmapClient.saveDraft(draft, savedDraftId);
+      setSavedDraftId(newId);
       setSuccessMessage("Draft saved.");
     } catch (err: unknown) {
       setError(errorMessage(err));

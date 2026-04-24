@@ -457,10 +457,34 @@ export class JMAPClient {
    * round-trip). Returns the server-assigned draft id.
    */
   async createDraft(draft: EmailDraft): Promise<string> {
+    return this.saveDraft(draft, null);
+  }
+
+  /**
+   * Save a draft, optionally replacing one previously saved in the
+   * same compose session. When `existingId` is non-null we batch a
+   * `destroy` of the old draft with the `create` of the new one in
+   * a single `Email/set` call so the Drafts mailbox never contains
+   * two copies of the same in-progress message. The BFF sees this
+   * as one atomic change — if the destroy fails (e.g. the user
+   * already deleted the old draft from another tab) we still
+   * surface the new draft's id.
+   */
+  async saveDraft(
+    draft: EmailDraft,
+    existingId: string | null,
+  ): Promise<string> {
     const accountId = await this.getAccountId();
     const create = buildEmailCreate(draft);
+    const setArgs: Record<string, unknown> = {
+      accountId,
+      create: { draft: create },
+    };
+    if (existingId) {
+      setArgs.destroy = [existingId];
+    }
     const response = await this.request([
-      ["Email/set", { accountId, create: { draft: create } }, "0"],
+      ["Email/set", setArgs, "0"],
     ]);
     const result = expectResult(response, "Email/set", "0");
     const created = result.created as
