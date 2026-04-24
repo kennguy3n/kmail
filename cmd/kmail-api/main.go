@@ -23,6 +23,7 @@ import (
 	"github.com/kennguy3n/kmail/internal/dns"
 	"github.com/kennguy3n/kmail/internal/jmap"
 	"github.com/kennguy3n/kmail/internal/middleware"
+	"github.com/kennguy3n/kmail/internal/migration"
 	"github.com/kennguy3n/kmail/internal/tenant"
 )
 
@@ -85,6 +86,15 @@ func main() {
 	tenantHandlers.Register(mux, authMW)
 	dnsHandlers := dns.NewHandlers(dnsSvc, logger)
 	dnsHandlers.Register(mux, authMW)
+
+	migrationSvc := migration.NewService(migration.Config{
+		Pool:             pool,
+		StalwartAdminURL: cfg.StalwartURL,
+		ImapsyncBin:      os.Getenv("KMAIL_IMAPSYNC_BIN"),
+		MaxConcurrent:    config.GetenvInt("KMAIL_MIGRATION_MAX_CONCURRENT", 4),
+	})
+	migrationHandlers := migration.NewHandlers(migrationSvc, logger)
+	migrationHandlers.Register(mux, authMW)
 
 	srv := &http.Server{
 		Addr:              cfg.HTTP.Addr,

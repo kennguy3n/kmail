@@ -669,6 +669,64 @@ export class JMAPClient {
   }
 
   /**
+   * Mark an email as spam (move into the Junk mailbox and set the
+   * JMAP `$junk` keyword) or mark it as not spam (move back to
+   * Inbox and clear `$junk` / set `$notjunk`). Follows the same
+   * JMAP patch-path pattern as `moveEmail` so the BFF sees one
+   * atomic `Email/set` update.
+   *
+   * The `$junk` / `$notjunk` keyword flip drives Stalwart's
+   * Bayesian spam classifier (see `scripts/stalwart-init.sh` for
+   * the `spam-filter.bayes.auto-learn.*` settings that train
+   * against these keywords); the mailbox move is what the user
+   * actually sees in the UI.
+   *
+   * Callers pass the source and destination mailbox ids so the
+   * method works in both directions (Inbox → Junk and Junk →
+   * Inbox) without having to inspect the email's current mailbox
+   * set first.
+   */
+  async markAsSpam(
+    emailId: string,
+    fromMailbox: string,
+    junkMailbox: string,
+    isSpam: boolean,
+  ): Promise<void> {
+    const accountId = await this.getAccountId();
+    const keywords: Record<string, boolean | null> = isSpam
+      ? { "keywords/$junk": true, "keywords/$notjunk": null }
+      : { "keywords/$junk": null, "keywords/$notjunk": true };
+    const [src, dst] = isSpam
+      ? [fromMailbox, junkMailbox]
+      : [junkMailbox, fromMailbox];
+    const response = await this.request([
+      [
+        "Email/set",
+        {
+          accountId,
+          update: {
+            [emailId]: {
+              [`mailboxIds/${src}`]: null,
+              [`mailboxIds/${dst}`]: true,
+              ...keywords,
+            },
+          },
+        },
+        "0",
+      ],
+    ]);
+    const result = expectResult(response, "Email/set", "0");
+    const notUpdated = result.notUpdated as
+      | Record<string, unknown>
+      | undefined;
+    if (notUpdated && notUpdated[emailId]) {
+      throw new Error(
+        `kmail-web: failed to mark email ${emailId} as ${isSpam ? "spam" : "not spam"}: ${JSON.stringify(notUpdated[emailId])}`,
+      );
+    }
+  }
+
+  /**
    * Permanently destroy an email. Callers that want "move to
    * trash" semantics should use `moveEmail(emailId, mailboxId,
    * trashMailboxId)` instead; this method is reserved for emptying
