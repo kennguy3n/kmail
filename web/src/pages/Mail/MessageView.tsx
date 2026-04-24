@@ -230,18 +230,13 @@ function resolveBody(email: Email | null): string {
 /**
  * Return the parts of an email that should be listed as
  * attachments. `attachments` is the canonical JMAP field (RFC 8621
- * §4.1.4); we fall back to body parts that set a `disposition` of
- * `attachment` when the server does not populate it.
+ * §4.1.4) and is the only property we request from the server — if
+ * a future backend stops populating it, extend `getEmail` to also
+ * request `bodyStructure` rather than carrying a dead fallback.
  */
 function resolveAttachments(email: Email | null): EmailBodyPart[] {
   if (!email) return [];
-  if (email.attachments && email.attachments.length > 0) {
-    return email.attachments;
-  }
-  const fromBody = (email.bodyStructure?.subParts ?? [])
-    .concat(email.bodyStructure ? [email.bodyStructure] : [])
-    .filter((p) => p.disposition === "attachment");
-  return fromBody;
+  return email.attachments ?? [];
 }
 
 function withPrefix(
