@@ -339,16 +339,30 @@ export default function Inbox() {
           if (list.length === 0) return null;
           return (
             <ul style={layoutStyles.emailList}>
-              {list.map((email) => (
-                <EmailRow
-                  key={email.id}
-                  email={email}
-                  inTrashView={inTrashView}
-                  onOpen={() => handleOpenEmail(email.id)}
-                  onToggleRead={() => handleToggleRead(email)}
-                  onMoveToTrash={() => handleMoveToTrash(email)}
-                />
-              ))}
+              {list.map((email) => {
+                // In search mode the sidebar mailbox is not
+                // authoritative, so compute per-email whether the
+                // hit already lives in trash (which is what
+                // handleMoveToTrash keys off). Outside search mode
+                // the sidebar flag is correct and cheaper.
+                const rowInTrash = inSearchMode
+                  ? trashMailboxId !== null &&
+                    Object.prototype.hasOwnProperty.call(
+                      email.mailboxIds,
+                      trashMailboxId,
+                    )
+                  : inTrashView;
+                return (
+                  <EmailRow
+                    key={email.id}
+                    email={email}
+                    inTrashView={rowInTrash}
+                    onOpen={() => handleOpenEmail(email.id)}
+                    onToggleRead={() => handleToggleRead(email)}
+                    onMoveToTrash={() => handleMoveToTrash(email)}
+                  />
+                );
+              })}
             </ul>
           );
         })()}
