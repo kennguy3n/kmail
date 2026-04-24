@@ -193,7 +193,11 @@ func (s *RedisStore) IncrWithTTL(ctx context.Context, key string, ttl time.Durat
 	}
 	pipe := s.Client.TxPipeline()
 	incr := pipe.Incr(ctx, key)
-	pipe.Expire(ctx, key, ttl)
+	// ExpireNX (not Expire) to match the documented "INCR + EXPIRE
+	// NX" contract — the TTL is set once on the first increment and
+	// left alone thereafter, so old-bucket keys age out on schedule
+	// rather than being kept alive by every subsequent hit.
+	pipe.ExpireNX(ctx, key, ttl)
 	if _, err := pipe.Exec(ctx); err != nil {
 		return 0, err
 	}

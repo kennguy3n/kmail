@@ -11,6 +11,7 @@ package audit
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -242,12 +243,28 @@ func (s *Service) Export(ctx context.Context, tenantID, format string, since, un
 	case "json", "":
 		return json.MarshalIndent(entries, "", "  ")
 	case "csv":
+		// encoding/csv handles RFC 4180 quoting (commas, quotes,
+		// newlines in field values) that a bare fmt.Fprintf loop
+		// would produce malformed output for.
 		var b strings.Builder
-		b.WriteString("id,created_at,actor_id,actor_type,action,resource_type,resource_id,entry_hash\n")
+		cw := csv.NewWriter(&b)
+		if err := cw.Write([]string{
+			"id", "created_at", "actor_id", "actor_type", "action",
+			"resource_type", "resource_id", "entry_hash",
+		}); err != nil {
+			return nil, err
+		}
 		for _, e := range entries {
-			fmt.Fprintf(&b, "%s,%s,%s,%s,%s,%s,%s,%s\n",
-				e.ID, e.CreatedAt.Format(time.RFC3339), e.ActorID, e.ActorType,
-				e.Action, e.ResourceType, e.ResourceID, e.EntryHash)
+			if err := cw.Write([]string{
+				e.ID, e.CreatedAt.Format(time.RFC3339), e.ActorID, string(e.ActorType),
+				e.Action, e.ResourceType, e.ResourceID, e.EntryHash,
+			}); err != nil {
+				return nil, err
+			}
+		}
+		cw.Flush()
+		if err := cw.Error(); err != nil {
+			return nil, err
 		}
 		return []byte(b.String()), nil
 	default:

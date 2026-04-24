@@ -41,9 +41,12 @@ func (h *Handlers) query(w http.ResponseWriter, r *http.Request) {
 	tenantID := h.tenantID(r)
 	q := r.URL.Query()
 	f := QueryFilters{
-		Action:       q.Get("action"),
-		ActorID:      q.Get("actor"),
-		ResourceType: q.Get("resource"),
+		Action:  q.Get("action"),
+		ActorID: q.Get("actor"),
+		// Client-side key is `resource_type` (see
+		// web/src/api/admin.ts#AuditLogQuery). Accept `resource`
+		// as a legacy alias for CLI callers.
+		ResourceType: firstNonEmpty(q.Get("resource_type"), q.Get("resource")),
 	}
 	if v := q.Get("limit"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
@@ -127,6 +130,15 @@ func (h *Handlers) respondError(w http.ResponseWriter, err error) {
 		h.logger.Printf("audit: %v", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
 	}
+}
+
+func firstNonEmpty(vs ...string) string {
+	for _, v := range vs {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
