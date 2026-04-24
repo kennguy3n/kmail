@@ -205,17 +205,28 @@ services:
       - stalwart_data:/opt/stalwart
 
   # One-shot initializer that replaces Stalwart's interactive
-  # first-boot setup wizard. Waits for Stalwart's admin API to be
-  # reachable, then POSTs the blob / search / lookup store
-  # configuration, the SMTP / IMAP / JMAP listener configuration,
-  # and the `kmail-dev` tenant domain through `/api/settings` and
-  # `/api/domain`. Idempotent — re-applying the same settings is a
-  # no-op — so subsequent `docker compose up` runs re-enter with
-  # zero changes. See `scripts/stalwart-init.sh` for the exact
-  # admin-API payloads.
+  # first-boot setup wizard. Waits for Stalwart's JMAP endpoint to
+  # answer Basic auth, then drives the admin registry via JMAP
+  # (`x:BlobStore/set` → zk-fabric S3, `x:InMemoryStore/set` →
+  # Valkey, `x:SearchStore/set` → Meilisearch, `x:Domain/set` →
+  # `kmail.dev`). Idempotent — singletons are checked via /get and
+  # the domain is checked via /query before create — so subsequent
+  # `docker compose up` runs re-enter with zero changes. See
+  # `scripts/stalwart-init.sh` for the exact JMAP payloads.
+  # Stalwart v0.16.0 dropped the legacy `/api/settings` REST
+  # surface the previous revision of this init container used, so
+  # the script now talks JMAP instead of REST.
   stalwart-init:
     image: curlimages/curl:8.10.1
     container_name: kmail-stalwart-init
+    # The `curlimages/curl` image defaults to `curl_user` (uid
+    # 100), which lacks access to the bind-mounted
+    # `/var/run/docker.sock` (owned by root:docker on the host). We
+    # need the socket to trigger the one-time Stalwart restart
+    # that activates the zk-fabric blob store, so the container is
+    # pinned to root for this dev compose stack. Not a production
+    # pattern.
+    user: "0:0"
     depends_on:
       stalwart:
         condition: service_started
@@ -228,9 +239,9 @@ services:
       valkey:
         condition: service_started
     environment:
-      # Stalwart's admin API is the same listener the setup wizard
-      # binds to; we reach it over the compose network rather than
-      # via host port 8080.
+      # Stalwart's JMAP endpoint doubles as the admin-registry
+      # transport in v0.16.0; we reach it over the compose network
+      # rather than via host port 8080.
       STALWART_ADMIN_URL: http://stalwart:8080
       # Matches `STALWART_RECOVERY_ADMIN=admin:kmail-dev` above.
       STALWART_ADMIN_PASSWORD: kmail-dev
@@ -245,9 +256,23 @@ services:
       MEILISEARCH_URL: http://meilisearch:7700
       MEILISEARCH_API_KEY: kmail-dev
       VALKEY_URL: redis://valkey:6379
-      KMAIL_DEV_TENANT_DOMAIN: kmail.local
+      # Stalwart v0.16.0's domain validator rejects RFC 2606 / mDNS
+      # suffixes (`.local`, `.test`), so the dev tenant lives under
+      # `kmail.dev` instead. Matches `docs/DEVELOPMENT.md`.
+      KMAIL_DEV_TENANT_DOMAIN: kmail.dev
     volumes:
       - ./scripts/stalwart-init.sh:/stalwart-init.sh:ro
+      # Stalwart v0.16.0 reads the BlobStore / InMemoryStore /
+      # SearchStore singletons only at startup — the init script
+      # writes them into Postgres *after* Stalwart has already
+      # booted with the Default (Postgres-backed) blob store. On a
+      # fresh volume the script POSTs to
+      # `POST /containers/kmail-stalwart/restart` against the
+      # Docker Engine API over this socket to trigger a one-time
+      # restart so the zk-fabric blob store becomes live. On
+      # subsequent boots the script's /set calls are no-ops — the
+      # restart fires regardless but is cheap.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
     entrypoint: ["sh", "/stalwart-init.sh"]
     restart: "no"
 
