@@ -28,6 +28,30 @@ export default function Inbox() {
   // racing an optimistic update against the next query.
   const [reloadNonce, setReloadNonce] = useState(0);
 
+  // Search state. `query` is the input value; `submittedQuery` is
+  // the last value actually sent to the server and is what drives
+  // whether the main pane shows search results or a mailbox
+  // listing. `searchScope` toggles between scoping the search to
+  // the sidebar-selected mailbox and searching every mailbox the
+  // user can see. A non-empty `submittedQuery` puts the page into
+  // search mode; clearing it returns to the normal mailbox view
+  // without re-querying the server.
+  const [query, setQuery] = useState("");
+  const [submittedQuery, setSubmittedQuery] = useState("");
+  const [searchScope, setSearchScope] = useState<"mailbox" | "global">(
+    "mailbox",
+  );
+  // Scope captured at the moment the last search was submitted;
+  // `searchScope` above is the live checkbox state and can diverge
+  // from what the currently-displayed results were actually
+  // searched under.
+  const [submittedScope, setSubmittedScope] = useState<"mailbox" | "global">(
+    "mailbox",
+  );
+  const [searchResults, setSearchResults] = useState<Email[] | null>(null);
+  const [isSearching, setIsSearching] = useState(false);
+  const inSearchMode = submittedQuery.trim().length > 0;
+
   useEffect(() => {
     let cancelled = false;
     setLoadingMailboxes(true);
@@ -89,15 +113,87 @@ export default function Inbox() {
 
   const handleOpenEmail = useCallback(
     (emailId: string) => {
-      if (!selectedMailbox) return;
-      navigate(`/mail/${selectedMailbox}/${emailId}`);
+      // In search mode the result may belong to a different
+      // mailbox than the sidebar selection; pick the first mailbox
+      // id on the email so the MessageView URL is always valid.
+      let mailboxId: string | null = selectedMailbox;
+      if (inSearchMode) {
+        const hit = (searchResults ?? []).find((e) => e.id === emailId);
+        const firstOnEmail = hit ? Object.keys(hit.mailboxIds)[0] : undefined;
+        mailboxId = firstOnEmail ?? selectedMailbox;
+      }
+      if (!mailboxId) return;
+      navigate(`/mail/${mailboxId}/${emailId}`);
     },
-    [navigate, selectedMailbox],
+    [inSearchMode, navigate, searchResults, selectedMailbox],
   );
+
+  const runSearch = useCallback(
+    async (raw: string) => {
+      const trimmed = raw.trim();
+      setSubmittedQuery(trimmed);
+      setSubmittedScope(searchScope);
+      if (trimmed.length === 0) {
+        setSearchResults(null);
+        return;
+      }
+      setIsSearching(true);
+      try {
+        const results = await jmapClient.searchEmails(trimmed, {
+          mailboxId:
+            searchScope === "mailbox" ? (selectedMailbox ?? undefined) : null,
+          limit: 50,
+        });
+        setSearchResults(results);
+      } catch (err: unknown) {
+        setError(errorMessage(err));
+        setSearchResults([]);
+      } finally {
+        setIsSearching(false);
+      }
+    },
+    [searchScope, selectedMailbox],
+  );
+
+  const handleSubmitSearch = useCallback(
+    (e: React.FormEvent) => {
+      e.preventDefault();
+      void runSearch(query);
+    },
+    [query, runSearch],
+  );
+
+  const handleClearSearch = useCallback(() => {
+    setQuery("");
+    setSubmittedQuery("");
+    setSearchResults(null);
+  }, []);
 
   const trashMailboxId = useMemo(
     () => (mailboxes ?? []).find((m) => m.role === "trash")?.id ?? null,
     [mailboxes],
+  );
+
+  // Single source of truth for "this row behaves as if it lives in
+  // trash". Used both for the row label (Trash vs Delete) and the
+  // handler's delete-vs-move branch so they can't drift. In search
+  // mode, results can come from any mailbox so the decision is
+  // per-email; outside search mode, the user is viewing a specific
+  // mailbox and the old sidebar-based rule applies (so a message
+  // cross-labelled Inbox+Trash still moves when the user clicks
+  // Trash from Inbox, matching the pre-search-feature behaviour).
+  const isEmailInTrash = useCallback(
+    (email: Email): boolean => {
+      if (trashMailboxId === null) return false;
+      if (inSearchMode) {
+        return Object.prototype.hasOwnProperty.call(
+          email.mailboxIds,
+          trashMailboxId,
+        );
+      }
+      return selectedMailbox === trashMailboxId;
+    },
+    [inSearchMode, selectedMailbox, trashMailboxId],
   );
 
   const handleToggleRead = useCallback(async (email: Email) => {
@@ -112,12 +208,11 @@ export default function Inbox() {
 
   const handleMoveToTrash = useCallback(
     async (email: Email) => {
-      if (!selectedMailbox || !trashMailboxId) {
+      if (!trashMailboxId) {
         setError("Trash mailbox is not available on this account");
         return;
       }
-      if (selectedMailbox === trashMailboxId) {
-        // Already in trash: destroy permanently.
+      if (isEmailInTrash(email)) {
         try {
           await jmapClient.deleteEmail(email.id);
           setReloadNonce((n) => n + 1);
@@ -126,14 +221,25 @@ export default function Inbox() {
         }
         return;
       }
+      // Resolve the source mailbox from the email itself in search
+      // mode so the JMAP patch removes it from its actual location
+      // rather than a no-op key on the sidebar selection.
+      const emailMailboxIds = Object.keys(email.mailboxIds);
+      const sourceMailbox = inSearchMode
+        ? (emailMailboxIds[0] ?? selectedMailbox)
+        : selectedMailbox;
+      if (!sourceMailbox) {
+        setError("Could not determine source mailbox for this email");
+        return;
+      }
       try {
-        await jmapClient.moveEmail(email.id, selectedMailbox, trashMailboxId);
+        await jmapClient.moveEmail(email.id, sourceMailbox, trashMailboxId);
         setReloadNonce((n) => n + 1);
       } catch (err: unknown) {
         setError(errorMessage(err));
       }
     },
-    [selectedMailbox, trashMailboxId],
+    [inSearchMode, isEmailInTrash, selectedMailbox, trashMailboxId],
   );
 
   const sortedMailboxes = useMemo(
@@ -186,6 +292,38 @@ export default function Inbox() {
         )}
       </aside>
       <main style={layoutStyles.main}>
+        <form style={layoutStyles.searchBar} onSubmit={handleSubmitSearch}>
+          <input
+            type="search"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Search mail…"
+            aria-label="Search mail"
+            style={layoutStyles.searchInput}
+          />
+          <label style={layoutStyles.searchScopeLabel}>
+            <input
+              type="checkbox"
+              checked={searchScope === "global"}
+              onChange={(e) =>
+                setSearchScope(e.target.checked ? "global" : "mailbox")
+              }
+            />
+            All mailboxes
+          </label>
+          <button type="submit" style={layoutStyles.searchButton}>
+            Search
+          </button>
+          {inSearchMode && (
+            <button
+              type="button"
+              onClick={handleClearSearch}
+              style={layoutStyles.searchClear}
+            >
+              Clear
+            </button>
+          )}
+        </form>
         {error && (
           <div style={layoutStyles.error}>
             <span>{error}</span>
@@ -199,24 +337,66 @@ export default function Inbox() {
             </button>
           </div>
         )}
-        {isLoadingEmails && <p style={layoutStyles.muted}>Loading emails…</p>}
-        {!isLoadingEmails && emails && emails.length === 0 && (
-          <p style={layoutStyles.muted}>No messages.</p>
+        {inSearchMode && (
+          <p style={layoutStyles.searchStatus}>
+            {isSearching
+              ? `Searching for “${submittedQuery}”…`
+              : `Results for “${submittedQuery}” (${
+                  searchResults?.length ?? 0
+                })${
+                  submittedScope === "mailbox"
+                    ? " in this mailbox"
+                    : " across all mail"
+                }`}
+          </p>
         )}
-        {emails && emails.length > 0 && (
-          <ul style={layoutStyles.emailList}>
-            {emails.map((email) => (
-              <EmailRow
-                key={email.id}
-                email={email}
-                inTrashView={inTrashView}
-                onOpen={() => handleOpenEmail(email.id)}
-                onToggleRead={() => handleToggleRead(email)}
-                onMoveToTrash={() => handleMoveToTrash(email)}
-              />
-            ))}
-          </ul>
+        {!inSearchMode && isLoadingEmails && (
+          <p style={layoutStyles.muted}>Loading emails…</p>
         )}
+        {!inSearchMode &&
+          !isLoadingEmails &&
+          emails &&
+          emails.length === 0 && (
+            <p style={layoutStyles.muted}>No messages.</p>
+          )}
+        {inSearchMode &&
+          !isSearching &&
+          searchResults &&
+          searchResults.length === 0 && (
+            <p style={layoutStyles.muted}>No matching messages.</p>
+          )}
+        {(() => {
+          const list = inSearchMode ? (searchResults ?? []) : (emails ?? []);
+          if (list.length === 0) return null;
+          return (
+            <ul style={layoutStyles.emailList}>
+              {list.map((email) => {
+                // In search mode the sidebar mailbox is not
+                // authoritative, so compute per-email whether the
+                // hit already lives in trash (which is what
+                // handleMoveToTrash keys off). Outside search mode
+                // the sidebar flag is correct and cheaper.
+                const rowInTrash = inSearchMode
+                  ? trashMailboxId !== null &&
+                    Object.prototype.hasOwnProperty.call(
+                      email.mailboxIds,
+                      trashMailboxId,
+                    )
+                  : inTrashView;
+                return (
+                  <EmailRow
+                    key={email.id}
+                    email={email}
+                    inTrashView={rowInTrash}
+                    onOpen={() => handleOpenEmail(email.id)}
+                    onToggleRead={() => handleToggleRead(email)}
+                    onMoveToTrash={() => handleMoveToTrash(email)}
+                  />
+                );
+              })}
+            </ul>
+          );
+        })()}
       </main>
     </section>
   );
@@ -371,6 +551,49 @@ const layoutStyles: Record<string, React.CSSProperties> = {
   },
   main: {
     padding: "1rem",
+  },
+  searchBar: {
+    display: "flex",
+    alignItems: "center",
+    gap: "0.5rem",
+    marginBottom: "0.75rem",
+  },
+  searchInput: {
+    flex: 1,
+    padding: "0.4rem 0.6rem",
+    fontSize: "0.9rem",
+    border: "1px solid #d1d5db",
+    borderRadius: "0.25rem",
+  },
+  searchScopeLabel: {
+    display: "flex",
+    alignItems: "center",
+    gap: "0.25rem",
+    fontSize: "0.8rem",
+    color: "#374151",
+  },
+  searchButton: {
+    padding: "0.4rem 0.75rem",
+    fontSize: "0.85rem",
+    background: "#2563eb",
+    color: "#fff",
+    border: "none",
+    borderRadius: "0.25rem",
+    cursor: "pointer",
+  },
+  searchClear: {
+    padding: "0.4rem 0.75rem",
+    fontSize: "0.85rem",
+    background: "#fff",
+    color: "#374151",
+    border: "1px solid #d1d5db",
+    borderRadius: "0.25rem",
+    cursor: "pointer",
+  },
+  searchStatus: {
+    fontSize: "0.85rem",
+    color: "#374151",
+    margin: "0 0 0.5rem 0",
   },
   error: {
     padding: "0.5rem 0.75rem",

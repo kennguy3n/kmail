@@ -4,8 +4,50 @@
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
 - **Status**: Phase 1 — Foundation (in progress); Phase 2 —
   Prototype (in progress)
-- **Last updated**: 2026-04-24 — zk-object-fabric blob store is
-  now verified end-to-end through Stalwart, and the
+- **Last updated**: 2026-04-24 — Phase 2 Mail + Calendar UI batch
+  landed. The React Mail UI now has full-text search: a new
+  `searchEmails(query, opts)` method on `web/src/api/jmap.ts`
+  builds a JMAP `Email/query` with an RFC 8621 §4.4.1 `text`
+  FilterCondition (wrapped in an `AND` against `inMailbox` when a
+  mailbox is selected), hydrates results through a back-referenced
+  `Email/get`, and powers a new search bar in
+  `web/src/pages/Mail/Inbox.tsx` that submits on Enter, toggles
+  between per-mailbox and "All mailboxes" scope via a checkbox,
+  shows hit count + scope in the status line, and exposes a Clear
+  button that reverts to the normal mailbox view. The React
+  Calendar UI also ships: `web/src/types/index.ts` now exports
+  `Calendar`, `CalendarEvent`, `CalendarEventDraft`,
+  `EventParticipant`, `EventParticipantResponse`, `RecurrenceRule`,
+  `EventDateRange`, and `SearchEmailsOptions`, plus a
+  `JMAP_CALENDARS_CAPABILITY =
+  "urn:ietf:params:jmap:calendars"` constant (Stalwart v0.16.0
+  ships CalDAV but does not yet advertise the draft JMAP calendars
+  capability, so the Go BFF surfaces JMAP on top of the CalDAV
+  store — the React client only talks JMAP). `web/src/api/jmap.ts`
+  gains `getCalendarAccountId()` (falls back to the Mail account
+  when no separate Calendar account exists), a `calendarRequest()`
+  private helper that scopes method calls with the Calendars
+  capability, and typed `getCalendars()` / `getEvents()` /
+  `getEvent()` / `createEvent()` / `updateEvent()` /
+  `deleteEvent()` / `respondToEvent()` methods.
+  `web/src/pages/Calendar/CalendarView.tsx` renders a Day / Week /
+  Month toggle, a 24-hour time grid for day+week views, a 6x7
+  month grid, a sidebar with per-calendar visibility checkboxes,
+  an event detail panel with RSVP (Accept / Tentative / Decline)
+  and Edit / Delete actions, and opens `/calendar/new` with
+  `?start=&end=` pre-filled when an empty slot is clicked.
+  `web/src/pages/Calendar/EventCreate.tsx` is a full create/edit
+  form (Calendar picker, title, start/end `datetime-local`,
+  location, participant list, RSVP-required toggle, status,
+  description) driving `createEvent()` in create mode and
+  `updateEvent()` in edit mode. `web/src/App.tsx` now routes
+  `/calendar/:eventId` through `CalendarView` (deep link to the
+  event detail panel via `useParams` + `getEvent`) and
+  `/calendar/:eventId/edit` through `EventCreate`. No backend
+  changes — everything in this batch is frontend-only and speaks
+  the existing JMAP contract.
+- **Previously (2026-04-24)**: zk-object-fabric blob store is
+  verified end-to-end through Stalwart, and the
   `docker compose up` path is fully hands-off again.
   `scripts/stalwart-init.sh` has been rewritten from the
   legacy REST `/api/settings*` surface (which Stalwart v0.16.0
@@ -260,7 +302,7 @@ does not change when the backend changes.
 calendar, JMAP webmail, IMAP/SMTP compatibility, and zk-object-fabric
 blob storage wired end-to-end.
 
-Delivered in this batch:
+Delivered so far:
 
 - Full **Tenant CRUD** — list / update / delete for tenants and
   users, all RLS-scoped where applicable; matching HTTP routes
@@ -271,10 +313,25 @@ Delivered in this batch:
   in-process by `cmd/kmail-api` and available as a standalone
   binary at `cmd/kmail-dns`.
 - **Stalwart v0.16.0 automated bootstrap** — JSON bootstrap at
-  `configs/stalwart-bootstrap.json` + admin-API init script at
-  `scripts/stalwart-init.sh`, wired into `docker-compose.yml` as
-  a `stalwart-init` one-shot so `docker compose up` is now
-  hands-off (no manual setup wizard).
+  `configs/stalwart-bootstrap.json` + JMAP admin-registry init
+  script at `scripts/stalwart-init.sh`, wired into
+  `docker-compose.yml` as a `stalwart-init` one-shot so
+  `docker compose up` is now hands-off (no manual setup wizard).
+- **Mail UI** — mailbox sidebar, email list, single-message
+  reading pane, composer (To / Cc / Bcc / Subject / Body,
+  From-identity selector, privacy-mode selector, Reply / Reply-All
+  / Forward pre-fill, Save draft), per-row Mark read/unread and
+  Move-to-trash / Delete, and now **full-text search** through a
+  JMAP `Email/query` `text` FilterCondition with a per-mailbox /
+  all-mailboxes scope toggle.
+- **Calendar UI** — Day / Week / Month views with a 24-hour time
+  grid (week/day) and 6×7 month grid, calendar-visibility
+  sidebar, event detail panel with RSVP + Edit + Delete,
+  slot-click that seeds `/calendar/new?start=&end=`,
+  create / edit form backed by `CalendarEvent/set`, and deep-link
+  route `/calendar/:eventId`. Speaks the draft JMAP calendars
+  capability (`urn:ietf:params:jmap:calendars`) exposed by the Go
+  BFF on top of Stalwart's CalDAV store.
 
 Checklist:
 
@@ -288,15 +345,22 @@ Checklist:
       shared inboxes, quotas). _(full CRUD, RLS-scoped.)_
 - [x] Go DNS Onboarding Service (MX / SPF / DKIM / DMARC checks,
       domain verification).
-- [ ] React KChat Mail UI (inbox, compose, read, search).
-      _(Inbox, compose, and single-message read are live against
-      the JMAP client — Inbox supports per-row Mark read/unread
-      and Move to trash / Delete, Compose drives `Email/set` +
-      `EmailSubmission/set` with Reply / Reply-All / Forward
-      pre-fill, MessageView marks-on-open and lists attachments.
-      Full-text search remains.)_
-- [ ] React KChat Calendar UI (personal calendar, event create /
-      edit, RSVP).
+- [x] React KChat Mail UI (inbox, compose, read, search).
+      _(Inbox, compose, single-message read, and full-text search
+      are live against the JMAP client — Inbox supports per-row
+      Mark read/unread and Move to trash / Delete plus a search
+      bar with per-mailbox / all-mailboxes scope via JMAP
+      `Email/query` `text` FilterCondition, Compose drives
+      `Email/set` + `EmailSubmission/set` with Reply / Reply-All /
+      Forward pre-fill, MessageView marks-on-open and lists
+      attachments.)_
+- [x] React KChat Calendar UI (personal calendar, event create /
+      edit, RSVP). _(Day / Week / Month views, calendar-visibility
+      sidebar, event detail panel with RSVP + Edit + Delete,
+      slot-click that seeds `/calendar/new`, create / edit form,
+      deep-link `/calendar/:eventId`. Talks the draft JMAP
+      calendars capability through the Go BFF; backend CalDAV
+      wiring is in progress.)_
 - [x] JMAP client integration (web app → Go BFF → Stalwart JMAP).
       _(`web/src/api/jmap.ts`: session fetch, typed
       `Mailbox/get` / `Email/query` / `Email/get` / `Email/set` /
