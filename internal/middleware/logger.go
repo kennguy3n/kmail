@@ -1,22 +1,47 @@
 package middleware
 
 import (
+	"encoding/json"
 	"log"
 	"net/http"
 	"time"
 )
 
-// RequestLogger returns middleware that emits a single structured
-// log line per request with method, path, status, and latency. It is
-// deliberately stdlib-only; richer structured logging (OpenTelemetry
-// + Loki) lands in Phase 3 per `docs/ARCHITECTURE.md` §12.
-func RequestLogger(logger *log.Logger) func(http.Handler) http.Handler {
+// RequestLogger returns middleware that emits a single log line per
+// request. Format is controlled by `format`: "json" emits one JSON
+// object per line with `method`, `path`, `status`, `duration_ms`,
+// `tenant_id`, `user_id`, and `trace_id` fields; anything else (or
+// empty) falls back to the previous text format.
+func RequestLogger(logger *log.Logger, format string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			start := time.Now()
 			sr := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 			next.ServeHTTP(sr, r)
-			logger.Printf("%s %s %d %s", r.Method, r.URL.Path, sr.status, time.Since(start))
+			elapsed := time.Since(start)
+			if format == "json" {
+				rec := map[string]any{
+					"ts":          start.UTC().Format(time.RFC3339Nano),
+					"method":      r.Method,
+					"path":        r.URL.Path,
+					"status":      sr.status,
+					"duration_ms": elapsed.Milliseconds(),
+				}
+				if tid := TenantIDFrom(r.Context()); tid != "" {
+					rec["tenant_id"] = tid
+				}
+				if uid := KChatUserIDFrom(r.Context()); uid != "" {
+					rec["user_id"] = uid
+				}
+				if trid := TraceIDFrom(r.Context()); trid != "" {
+					rec["trace_id"] = trid
+				}
+				if b, err := json.Marshal(rec); err == nil {
+					logger.Println(string(b))
+					return
+				}
+			}
+			logger.Printf("%s %s %d %s", r.Method, r.URL.Path, sr.status, elapsed)
 		})
 	}
 }

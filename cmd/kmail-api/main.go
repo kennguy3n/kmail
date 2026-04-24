@@ -18,12 +18,15 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
 
+	"github.com/kennguy3n/kmail/internal/audit"
+	"github.com/kennguy3n/kmail/internal/billing"
 	"github.com/kennguy3n/kmail/internal/calendarbridge"
 	"github.com/kennguy3n/kmail/internal/chatbridge"
 	"github.com/kennguy3n/kmail/internal/config"
+	"github.com/kennguy3n/kmail/internal/deliverability"
 	"github.com/kennguy3n/kmail/internal/dns"
-	"github.com/kennguy3n/kmail/internal/audit"
 	"github.com/kennguy3n/kmail/internal/jmap"
 	"github.com/kennguy3n/kmail/internal/middleware"
 	"github.com/kennguy3n/kmail/internal/migration"
@@ -107,7 +110,21 @@ func main() {
 	mux.Handle("/jmap", wrapAuthRL(proxy))
 	mux.Handle("/jmap/", wrapAuthRL(proxy))
 
-	tenantSvc := tenant.NewService(pool)
+	// Billing / Quota Service — constructed early so the Tenant
+	// Service can consume it as a SeatAccounter for CreateUser /
+	// DeleteUser seat counter updates.
+	billingSvc := billing.NewService(billing.Config{
+		Pool:                pool,
+		CoreSeatCents:       cfg.Billing.CoreSeatCents,
+		ProSeatCents:        cfg.Billing.ProSeatCents,
+		PrivacySeatCents:    cfg.Billing.PrivacySeatCents,
+		CorePerSeatBytes:    cfg.Billing.CorePerSeatBytes,
+		ProPerSeatBytes:     cfg.Billing.ProPerSeatBytes,
+		PrivacyPerSeatBytes: cfg.Billing.PrivacyPerSeatBytes,
+	})
+	billing.NewHandlers(billingSvc, logger).Register(mux, authMW)
+
+	tenantSvc := tenant.NewService(pool).WithSeatAccounter(billingSvc)
 	dnsSvc := dns.NewService(dns.Config{
 		Pool:                pool,
 		MailHost:            cfg.DNS.MailHost,
@@ -148,9 +165,84 @@ func main() {
 	auditSvc := audit.NewService(pool)
 	audit.NewHandlers(auditSvc, logger).Register(mux, authMW)
 
+	// Deliverability Control Plane (suppression, bounces, IP
+	// pools, send limits, warmup, DMARC).
+	var valkeyClient *redis.Client
+	if cfg.ValkeyURL != "" {
+		valkeyClient = redis.NewClient(&redis.Options{Addr: cfg.ValkeyURL})
+	}
+	deliverabilitySvc := deliverability.NewService(deliverability.Config{
+		Pool:                      pool,
+		Valkey:                    valkeyClient,
+		Logger:                    logger,
+		CoreDailyLimit:            cfg.Deliverability.CoreDailyLimit,
+		ProDailyLimit:             cfg.Deliverability.ProDailyLimit,
+		PrivacyDailyLimit:         cfg.Deliverability.PrivacyDailyLimit,
+		WarmupDays:                cfg.Deliverability.WarmupDays,
+		BounceSoftEscalationCount: cfg.Deliverability.BounceSoftEscalationCount,
+		BounceSoftWindow:          cfg.Deliverability.BounceSoftWindow,
+	})
+	deliverability.NewHandlers(deliverabilitySvc, logger).Register(mux, authMW)
+
+	// Attachment-to-link conversion.
+	attachmentSvc := jmap.NewAttachmentService(jmap.AttachmentConfig{
+		Pool:      pool,
+		S3URL:     cfg.ZKFabric.S3URL,
+		AccessKey: cfg.ZKFabric.AccessKey,
+		SecretKey: cfg.ZKFabric.SecretKey,
+		Bucket:    cfg.Attachments.BucketName,
+		Threshold: cfg.Attachments.ThresholdBytes,
+		Expiry:    cfg.Attachments.DefaultExpiry,
+		Logger:    logger,
+	})
+	jmap.NewAttachmentHandlers(attachmentSvc, logger).Register(mux, authMW)
+
+	// Observability: Prometheus /metrics + OpenTelemetry tracing.
+	metrics := middleware.NewMetrics()
+	if cfg.Observability.MetricsEnabled {
+		mux.Handle("GET /metrics", metrics.Handler())
+	}
+	tracingShutdown := func(context.Context) error { return nil }
+	if cfg.Observability.TracingEnabled {
+		sh, err := middleware.InitTracing(ctx, "kmail-api", cfg.Observability.OTLPEndpoint)
+		if err != nil {
+			logger.Printf("tracing init: %v", err)
+		} else {
+			tracingShutdown = sh
+		}
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = tracingShutdown(shutdownCtx)
+	}()
+
+	// Background quota worker polls zk-object-fabric every
+	// `QuotaWorkerInterval` and reconciles actual tenant storage
+	// usage with the `quotas.storage_used_bytes` snapshot.
+	if cfg.Billing.QuotaWorkerEnabled {
+		worker := billing.NewQuotaWorker(billing.QuotaWorkerConfig{
+			Pool:     pool,
+			Billing:  billingSvc,
+			Scanner:  billing.StaticScanner{Bytes: -1},
+			Interval: cfg.Billing.QuotaWorkerInterval,
+			Logger:   logger,
+		})
+		go worker.Run(ctx)
+	}
+
+	// Wire metrics and tracing into the outer handler chain.
+	handler := http.Handler(mux)
+	if cfg.Observability.TracingEnabled {
+		handler = middleware.TracingMiddleware(handler)
+	}
+	if cfg.Observability.MetricsEnabled {
+		handler = metrics.Middleware(handler)
+	}
+
 	srv := &http.Server{
 		Addr:              cfg.HTTP.Addr,
-		Handler:           middleware.RequestLogger(logger)(mux),
+		Handler:           middleware.RequestLogger(logger, cfg.Observability.LogFormat)(handler),
 		ReadHeaderTimeout: cfg.HTTP.ReadHeaderTimeout,
 	}
 

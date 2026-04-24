@@ -276,9 +276,29 @@ services:
     entrypoint: ["sh", "/stalwart-init.sh"]
     restart: "no"
 
+  # Prometheus scrapes the BFF's `/metrics` endpoint on an
+  # unauthenticated port. Observability lives outside the tenant
+  # data path so the scrape target is the control-plane API
+  # rather than JMAP traffic.
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=15d"
+    restart: unless-stopped
+
 volumes:
   postgres_data:
   meilisearch_data:
   valkey_data:
   zk_data:
   stalwart_data:
+  prometheus_data:

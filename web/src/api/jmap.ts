@@ -1142,3 +1142,70 @@ function buildEventCreate(
   }
   return create;
 }
+
+// ---------------------------------------------------------------
+// Attachment-to-link (Phase 3, attachments > 10 MB)
+// ---------------------------------------------------------------
+
+export interface AttachmentLinkResponse {
+  id: string;
+  url: string;
+  expiry: string;
+  filename: string;
+  size_bytes: number;
+}
+
+/**
+ * Uploads an attachment larger than the JMAP blob-size threshold
+ * (default 10 MB) to the BFF, which forwards it to zk-object-fabric
+ * and returns a presigned GET URL valid for 7 days.
+ *
+ * Unlike the JMAP `Upload` endpoint, this path stores metadata in
+ * `attachment_links` so the URL can be revoked via
+ * `DELETE /api/v1/attachments/{id}`.
+ */
+export async function uploadLargeAttachment(file: File): Promise<AttachmentLinkResponse> {
+  const body = new FormData();
+  body.set("file", file, file.name);
+  const res = await fetch(`/api/v1/attachments/upload`, {
+    method: "POST",
+    credentials: "include",
+    headers: { Authorization: `Bearer ${DEV_BEARER_TOKEN}` },
+    body,
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => res.statusText);
+    throw new Error(`attachment upload failed: ${res.status} ${text}`);
+  }
+  return (await res.json()) as AttachmentLinkResponse;
+}
+
+/** Fetches a fresh presigned URL for a previously-uploaded attachment. */
+export async function getAttachmentLink(id: string): Promise<AttachmentLinkResponse> {
+  const res = await fetch(`/api/v1/attachments/${encodeURIComponent(id)}/link`, {
+    method: "GET",
+    credentials: "include",
+    headers: { Authorization: `Bearer ${DEV_BEARER_TOKEN}` },
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => res.statusText);
+    throw new Error(`attachment link failed: ${res.status} ${text}`);
+  }
+  return (await res.json()) as AttachmentLinkResponse;
+}
+
+/** Revokes an attachment so the presigned link stops resolving. */
+export async function revokeAttachment(id: string): Promise<void> {
+  const res = await fetch(`/api/v1/attachments/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+    credentials: "include",
+    headers: { Authorization: `Bearer ${DEV_BEARER_TOKEN}` },
+  });
+  if (!res.ok && res.status !== 204) {
+    const text = await res.text().catch(() => res.statusText);
+    throw new Error(`attachment revoke failed: ${res.status} ${text}`);
+  }
+}
+
+/** Threshold in bytes above which attachments are converted to links. */
+export const ATTACHMENT_LINK_THRESHOLD_BYTES = 10 * 1024 * 1024;

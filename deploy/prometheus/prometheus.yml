@@ -1,0 +1,22 @@
+# Prometheus scrape config for the local KMail dev stack.
+#
+# The BFF (`cmd/kmail-api`) registers the Prometheus collectors in
+# `internal/middleware/metrics.go` and exposes `/metrics` on the
+# same HTTP port as the REST/JMAP surface. Keep the scrape interval
+# aggressive in dev so we see tenant lifecycle events land on the
+# `kmail_active_tenants` / `kmail_seats_total` gauges within a few
+# seconds of the change.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: "kmail-api"
+    metrics_path: /metrics
+    # The BFF runs on the host during `make dev`; from inside the
+    # compose network Prometheus reaches it via the Docker host
+    # gateway. In production the static_config becomes a proper
+    # service-discovery entry.
+    static_configs:
+      - targets:
+          - "host.docker.internal:8080"

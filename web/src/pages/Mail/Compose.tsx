@@ -7,7 +7,12 @@ import {
 } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 
-import { jmapClient } from "../../api/jmap";
+import {
+  ATTACHMENT_LINK_THRESHOLD_BYTES,
+  jmapClient,
+  uploadLargeAttachment,
+  type AttachmentLinkResponse,
+} from "../../api/jmap";
 import type {
   EmailAddress,
   EmailDraft,
@@ -57,6 +62,14 @@ export default function Compose() {
   // session. Used to replace rather than duplicate the draft on
   // subsequent Save clicks.
   const [savedDraftId, setSavedDraftId] = useState<string | null>(null);
+  // Attachments > 10 MB are uploaded to zk-object-fabric out of
+  // band and replaced in the body with a presigned download link
+  // (docs/PROPOSAL.md §9 attachment-to-link). Smaller files still
+  // go through the normal JMAP Upload path — the UI surface below
+  // only exposes the link-conversion flow for large files.
+  const [attachmentLinks, setAttachmentLinks] = useState<AttachmentLinkResponse[]>([]);
+  const [attachmentUploading, setAttachmentUploading] = useState(false);
+  const [attachmentError, setAttachmentError] = useState<string | null>(null);
   // Handle for the deferred post-send navigation. We hold it in a
   // ref so the unmount cleanup can cancel it — otherwise a user
   // who navigates away in the 600 ms success window gets yanked
@@ -315,6 +328,58 @@ export default function Compose() {
             <option value="confidential-send">Confidential Send</option>
             <option value="zero-access-vault">Zero-Access Vault</option>
           </select>
+        </div>
+        <div style={styles.row}>
+          <label style={styles.label}>Attachments</label>
+          <div>
+            <input
+              type="file"
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                if (!file) return;
+                if (file.size < ATTACHMENT_LINK_THRESHOLD_BYTES) {
+                  setAttachmentError(
+                    "Files under 10 MB are not yet supported by this form; use a larger file or paste inline.",
+                  );
+                  e.target.value = "";
+                  return;
+                }
+                setAttachmentError(null);
+                setAttachmentUploading(true);
+                uploadLargeAttachment(file)
+                  .then((link) => {
+                    setAttachmentLinks((cur) => [...cur, link]);
+                    setBody(
+                      (b) =>
+                        `${b}${b && !b.endsWith("\n") ? "\n" : ""}\nAttachment: ${link.filename} — ${link.url}\n`,
+                    );
+                  })
+                  .catch((err: unknown) =>
+                    setAttachmentError(err instanceof Error ? err.message : String(err)),
+                  )
+                  .finally(() => {
+                    setAttachmentUploading(false);
+                    e.target.value = "";
+                  });
+              }}
+              disabled={attachmentUploading}
+            />
+            {attachmentUploading && <span>&nbsp;Uploading…</span>}
+            {attachmentError && (
+              <p role="alert" style={{ color: "#991b1b", margin: "0.25rem 0 0" }}>
+                {attachmentError}
+              </p>
+            )}
+            {attachmentLinks.length > 0 && (
+              <ul style={{ margin: "0.25rem 0 0", paddingLeft: "1.2rem" }}>
+                {attachmentLinks.map((a) => (
+                  <li key={a.id || a.url}>
+                    {a.filename} ({Math.round(a.size_bytes / 1024 / 1024)} MB)
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
         </div>
         <div style={styles.bodyRow}>
           <textarea

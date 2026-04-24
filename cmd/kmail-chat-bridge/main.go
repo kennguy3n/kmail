@@ -67,7 +67,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:              cfg.ChatBridge.Addr,
-		Handler:           middleware.RequestLogger(logger)(mux),
+		Handler:           middleware.RequestLogger(logger, "")(mux),
 		ReadHeaderTimeout: cfg.HTTP.ReadHeaderTimeout,
 	}
 

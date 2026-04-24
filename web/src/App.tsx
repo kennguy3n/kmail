@@ -9,6 +9,9 @@ import EventCreate from "./pages/Calendar/EventCreate";
 import TenantAdmin from "./pages/Admin/TenantAdmin";
 import DomainAdmin from "./pages/Admin/DomainAdmin";
 import UserAdmin from "./pages/Admin/UserAdmin";
+import QuotaAdmin from "./pages/Admin/QuotaAdmin";
+import AuditAdmin from "./pages/Admin/AuditAdmin";
+import DmarcAdmin from "./pages/Admin/DmarcAdmin";
 
 /**
  * App is the KMail React entrypoint.
@@ -36,6 +39,9 @@ export default function App() {
         <Route path="admin/tenant" element={<TenantAdmin />} />
         <Route path="admin/domains" element={<DomainAdmin />} />
         <Route path="admin/users" element={<UserAdmin />} />
+        <Route path="admin/billing" element={<QuotaAdmin />} />
+        <Route path="admin/audit" element={<AuditAdmin />} />
+        <Route path="admin/dmarc" element={<DmarcAdmin />} />
 
         <Route path="*" element={<Navigate to="/mail" replace />} />
       </Route>

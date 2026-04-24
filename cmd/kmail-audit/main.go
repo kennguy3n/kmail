@@ -103,7 +103,7 @@ func runServe(ctx context.Context, logger *log.Logger, cfg *config.Config, pool 
 
 	srv := &http.Server{
 		Addr:              cfg.Audit.Addr,
-		Handler:           middleware.RequestLogger(logger)(mux),
+		Handler:           middleware.RequestLogger(logger, "")(mux),
 		ReadHeaderTimeout: cfg.HTTP.ReadHeaderTimeout,
 	}
 
