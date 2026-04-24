@@ -4,7 +4,33 @@
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
 - **Status**: Phase 1 — Foundation (in progress); Phase 2 —
   Prototype (in progress)
-- **Last updated**: 2026-04-23 — Third Phase 2 batch landed. Mail
+- **Last updated**: 2026-04-24 — zk-object-fabric blob store
+  smoke test partially verified against the local compose stack.
+  Brought the full stack up (`docker compose up`); `zk-fabric`,
+  `postgres`, `valkey`, `meilisearch`, and `stalwart` all come up
+  healthy and the one-shot `zk-fabric-init` creates the
+  `kmail-blobs` bucket as expected. Verified from the host with
+  the dev `kmail-access-key` credentials that the gateway accepts
+  S3 `PutObject` / `ListObjectsV2` / `HeadObject` / `DeleteObject`
+  against `s3://kmail-blobs/` — i.e. the blob path Stalwart is
+  pointed at is a working S3 endpoint. The `kmail-blobs`
+  integration verified end-to-end checklist item (below) is still
+  left unchecked because this run did *not* exercise a round-trip
+  through Stalwart itself: `scripts/stalwart-init.sh` targets
+  `${ADMIN_URL}/api/settings/list` and `/api/settings` /
+  `/api/domain`, but Stalwart v0.16.0 serves the management API
+  under `/admin/api/...` (the `/api/...` paths 404 on the running
+  `stalwart:v0.16.0` image), so the one-shot config run aborts
+  with `timed out waiting for stalwart admin API`. The manual
+  admin-API probe (`curl -u admin:kmail-dev
+  http://localhost:8080/admin/api/settings/list`) also comes back
+  as the admin SPA's index HTML rather than a JSON payload, so
+  wiring this fully hands-off in compose needs a follow-up pass
+  against the exact v0.16.0 admin-API shape — tracked as the
+  first item of the Phase 2 follow-up list below. No KMail
+  application code depends on that fix; the BFF, JMAP proxy, and
+  web client are already written against the JMAP surface.
+- **Previously (2026-04-23)**: Third Phase 2 batch landed. Mail
   UI is now end-to-end functional against the JMAP client:
   `web/src/pages/Mail/Compose.tsx` is a fully working composer
   (To / Cc / Bcc / Subject / Body, From-identity selector, privacy
