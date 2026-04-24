@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 
 import { jmapClient } from "../../api/jmap";
@@ -162,19 +162,39 @@ export default function Inbox() {
 
   // After a successful write in search mode, re-run the last
   // submitted search against the captured `submittedScope` so
-  // `searchResults` converges with server state. Using
-  // `submittedScope` (not the live `searchScope`) matches what the
-  // currently-displayed results were actually queried under.
+  // `searchResults` converges with server state. The effect is
+  // gated on `searchReloadNonce` actually changing — other deps
+  // (submittedQuery/submittedScope/selectedMailbox/inSearchMode)
+  // are read through refs so changing the sidebar mailbox or
+  // submitting a new search does not trigger this refetch (the
+  // mailbox effect above and `runSearch` respectively own those
+  // code paths).
+  const lastProcessedNonceRef = useRef(0);
+  const searchRefreshArgsRef = useRef({
+    inSearchMode,
+    submittedQuery,
+    submittedScope,
+    selectedMailbox,
+  });
+  searchRefreshArgsRef.current = {
+    inSearchMode,
+    submittedQuery,
+    submittedScope,
+    selectedMailbox,
+  };
   useEffect(() => {
     if (searchReloadNonce === 0) return;
-    if (!inSearchMode) return;
+    if (lastProcessedNonceRef.current === searchReloadNonce) return;
+    lastProcessedNonceRef.current = searchReloadNonce;
+    const args = searchRefreshArgsRef.current;
+    if (!args.inSearchMode) return;
     let cancelled = false;
     setIsSearching(true);
     jmapClient
-      .searchEmails(submittedQuery, {
+      .searchEmails(args.submittedQuery, {
         mailboxId:
-          submittedScope === "mailbox"
-            ? (selectedMailbox ?? undefined)
+          args.submittedScope === "mailbox"
+            ? (args.selectedMailbox ?? undefined)
             : null,
         limit: 50,
       })
@@ -193,13 +213,7 @@ export default function Inbox() {
     return () => {
       cancelled = true;
     };
-  }, [
-    searchReloadNonce,
-    inSearchMode,
-    submittedQuery,
-    submittedScope,
-    selectedMailbox,
-  ]);
+  }, [searchReloadNonce]);
 
   const handleSubmitSearch = useCallback(
     (e: React.FormEvent) => {
