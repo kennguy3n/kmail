@@ -104,9 +104,28 @@ export default function DomainAdmin() {
             message: summarizeResult(result),
           },
         }));
-        // Refresh the list so the persisted per-check flags catch
-        // up with what `verifyDomain` just wrote.
-        loadDomains(selectedTenantId);
+        // Patch the single row from the VerificationResult instead
+        // of refetching the full list. The result already carries
+        // the updated per-check flags, and skipping the refetch
+        // sidesteps a race where a tenant switch between click and
+        // response would otherwise overwrite the new tenant's
+        // domain list with the old tenant's rows.
+        setDomains((current) =>
+          current
+            ? current.map((row) =>
+                row.id === domain.id
+                  ? {
+                      ...row,
+                      mx_verified: result.mx_verified,
+                      spf_verified: result.spf_verified,
+                      dkim_verified: result.dkim_verified,
+                      dmarc_verified: result.dmarc_verified,
+                      verified: result.verified,
+                    }
+                  : row,
+              )
+            : current,
+        );
       })
       .catch((e: unknown) => {
         setVerifyState((prev) => ({
