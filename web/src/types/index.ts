@@ -386,3 +386,125 @@ export interface EventDateRange {
   start: string;
   end: string;
 }
+
+// ----------------------------------------------------------------
+// Admin console (Phase 3)
+// ----------------------------------------------------------------
+
+/**
+ * Tenant record as returned by the Go tenant service
+ * (internal/tenant/service.go). The plan field drives per-seat
+ * pricing: core ($3), pro ($6), privacy ($9).
+ */
+export interface Tenant {
+  id: string;
+  name: string;
+  slug: string;
+  plan: TenantPlan;
+  status: "active" | "suspended" | "deleted";
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** Fields the tenant admin form can patch. */
+export interface TenantPatch {
+  name?: string;
+  plan?: TenantPlan;
+  status?: "active" | "suspended" | "deleted";
+}
+
+/**
+ * User record scoped to a tenant. `mailboxQuotaBytes` is the
+ * soft quota the BFF enforces before Stalwart's own limits.
+ */
+export interface User {
+  id: string;
+  tenantId: string;
+  email: string;
+  displayName: string;
+  role: "member" | "admin" | "owner";
+  status: "active" | "suspended";
+  mailboxQuotaBytes: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** Fields the user admin form can patch. */
+export interface UserPatch {
+  displayName?: string;
+  role?: "member" | "admin" | "owner";
+  status?: "active" | "suspended";
+  mailboxQuotaBytes?: number;
+}
+
+/** Domain record as returned by the DNS onboarding service. */
+export interface Domain {
+  id: string;
+  tenantId: string;
+  domain: string;
+  mxVerified: boolean;
+  spfVerified: boolean;
+  dkimVerified: boolean;
+  dmarcVerified: boolean;
+  verifiedAt?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** One record in the DNS-record instructions table. */
+export interface DnsRecord {
+  type: "MX" | "TXT" | "CNAME";
+  host: string;
+  value: string;
+  priority?: number | null;
+  purpose: "mx" | "spf" | "dkim" | "dmarc";
+}
+
+/**
+ * Verification result from a POST to
+ * `/api/v1/tenants/{id}/domains/{domainId}/verify`.
+ */
+export interface VerifyDomainResult {
+  mx: boolean;
+  spf: boolean;
+  dkim: boolean;
+  dmarc: boolean;
+  messages?: Record<string, string>;
+}
+
+/** Shared-inbox record (team mailboxes). */
+export interface SharedInbox {
+  id: string;
+  tenantId: string;
+  address: string;
+  displayName: string;
+  createdAt: string;
+}
+
+/** One row in the audit log. */
+export interface AuditLogEntry {
+  id: string;
+  tenantId: string;
+  actorId: string;
+  actorType: "user" | "admin" | "system";
+  action: string;
+  resourceType: string;
+  resourceId?: string;
+  metadata?: Record<string, unknown>;
+  ipAddress?: string;
+  userAgent?: string;
+  prevHash?: string;
+  entryHash?: string;
+  createdAt: string;
+}
+
+/** Optional filters for the audit-log query endpoint. */
+export interface AuditLogQuery {
+  action?: string;
+  actor?: string;
+  resource?: string;
+  since?: string;
+  until?: string;
+  limit?: number;
+  offset?: number;
+}

@@ -176,6 +176,76 @@ password compose pins via `STALWART_RECOVERY_ADMIN`. The dashboard
 drops you straight onto the configured server — no wizard.
 
 
+## 5a. Third-party client configuration
+
+Stalwart's IMAP, SMTP submission, and CalDAV surfaces are enabled
+by `scripts/stalwart-init.sh` and mapped to the following host
+ports by `docker-compose.yml`:
+
+| Protocol           | Port(s)       | Notes                                  |
+| ------------------ | ------------- | -------------------------------------- |
+| SMTP (MX)          | 25            | Inbound only; MTA-to-MTA traffic.      |
+| SMTP submission    | 587 (STARTTLS), 465 (implicit TLS) | Client send path. |
+| IMAP               | 143 (STARTTLS), 993 (implicit TLS) | Folder sync.      |
+| CalDAV / CardDAV   | 8080 over HTTPS in prod; plain HTTP on dev | Served under `/dav/`. |
+
+### Thunderbird
+
+1. Account setup → "Email account" → enter any `@kmail.dev`
+   dev-tenant mailbox + password.
+2. Manual config:
+   - **Incoming**: IMAP, server `localhost`, port `143`, STARTTLS,
+     normal password auth.
+   - **Outgoing**: SMTP, server `localhost`, port `587`, STARTTLS,
+     normal password auth.
+3. Thunderbird's Lightning / TB Calendar add-on — "New calendar" →
+   "On the network" → CalDAV → `http://localhost:8080/dav/` →
+   pick the default calendar.
+4. Autoconfig / autodiscover is not wired in dev; production
+   deployments can point `autoconfig.<domain>` and
+   `autodiscover.<domain>` at the BFF if they want Thunderbird's
+   "just the email address" flow.
+
+### Apple Mail / Calendar
+
+1. System Settings → Internet Accounts → "Add Other Account…" →
+   Mail account.
+2. IMAP server `localhost`, port `143`, STARTTLS. SMTP server
+   `localhost`, port `587`, STARTTLS. Username = full address.
+3. Calendar account → CalDAV → "Manual" → username + password,
+   server address `localhost:8080`. Enter the CalDAV path when
+   prompted (`/dav/calendars/<principal>/`).
+
+### Known limitations (Stalwart v0.16.0)
+
+- No XOAUTH2 yet; clients must use plain password auth over TLS.
+- SMTP submission supports SIZE, 8BITMIME, PIPELINING,
+  STARTTLS, AUTH PLAIN/LOGIN, but not BURL or DSN.
+- IMAP exposes IDLE, CONDSTORE, MOVE, LIST-EXTENDED, but SORT is
+  unoptimised — prefer `THREAD` on large mailboxes.
+
+## 5b. Spam / phishing filter
+
+`scripts/stalwart-init.sh` enables Stalwart's built-in spam
+classifier on first boot. The declarative snapshot of what the
+init script pushes lives at
+[`configs/stalwart/spam-config.json`](../configs/stalwart/spam-config.json).
+
+- **Scoring**: `spam ≥ 5.0` moves to Junk, `≥ 10.0` silently
+  discards, `≥ 15.0` rejects at MAIL FROM.
+- **Bayesian** classifier trains on the JMAP `$junk` / `$notjunk`
+  keywords the React UI sets from the per-row Spam / Not spam
+  button.
+- **DNSBL**: Spamhaus Zen, SpamCop, Spamhaus DBL, SURBL.
+- **Phishing**: URL reputation + sender authentication checks.
+- **Sieve**: the trusted script auto-files anything tagged
+  `X-Spam-Status: Yes` into the per-principal Junk mailbox.
+
+To smoke-test: paste the
+[GTUBE](https://spamassassin.apache.org/gtube/) string into a
+message body, send it through SMTP :587 from an allow-listed
+sender, and confirm the message lands in Junk (not Inbox).
+
 ## 6. What's deliberately still manual
 
 The init script configures the infrastructure (blob / in-memory /

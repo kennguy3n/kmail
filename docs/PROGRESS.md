@@ -4,7 +4,71 @@
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
 - **Status**: Phase 1 — Foundation (in progress); Phase 2 —
   Prototype (in progress)
-- **Last updated**: 2026-04-24 — Phase 2 compatibility + spam +
+- **Last updated**: 2026-04-24 — Phase 2 remainder + early
+  Phase 3 batch landed. Three more Phase 2 items (BFF auth
+  hardening, email-to-chat bridge, benchmark harness) and two
+  Phase 3 items (admin audit logs, admin console backend) are
+  now live. Specifically:
+  * OIDC JWT signature verification — `internal/middleware/auth.go`
+    now verifies against the issuer's JWKS (in-process cached via
+    `internal/middleware/jwks.go` with a configurable refresh),
+    checks `iss` / `aud` / `exp` via
+    `github.com/golang-jwt/jwt/v5`, and honours the new
+    `KChatOIDCAudience` / `KCHAT_OIDC_AUDIENCE` config. Dev-bypass
+    path kept intact so local flows are unaffected.
+  * Valkey-backed rate limiting — `internal/middleware/ratelimit.go`
+    keys a fixed-window counter per-tenant
+    (`tenant:{id}:rpm`) and per-user (`user:{tid}:{uid}:rpm`),
+    returns HTTP 429 with `Retry-After`, wired between OIDC and
+    the JMAP proxy in `cmd/kmail-api/main.go`. Gated by
+    `KMAIL_RATELIMIT_ENABLED` so local dev is not throttled.
+  * CalDAV Go bridge — `internal/calendarbridge/` ListCalendars /
+    GetEvents / CreateEvent / UpdateEvent / DeleteEvent /
+    RespondToEvent over Stalwart's CalDAV surface, HTTP routes
+    under `/api/v1/calendars/...`, minimal iCalendar parser for
+    UID / SUMMARY / DTSTART / DTEND + PARTSTAT rewriter, unit
+    tests against a fake Stalwart CalDAV server.
+  * Email-to-chat bridge — `internal/chatbridge/` Service with
+    ShareEmailToChannel, ConfigureAlertRoute, ListRoutes,
+    DeleteRoute, ProcessInboundAlert; `chat_bridge_routes` table
+    (`migrations/003_chat_bridge_routes.sql`) with RLS and a
+    unique `(tenant_id, alias_address)`; HTTP surface under
+    `/api/v1/chat-bridge/...`; `cmd/kmail-chat-bridge` boots a
+    real listener.
+  * Audit log service — `internal/audit/` Service with hash-
+    chained rows, `audit_log` table
+    (`migrations/004_audit_log.sql`) with RLS and
+    `(tenant_id, created_at DESC)` index; paginated Query /
+    JSON+CSV Export / VerifyChain walker; HTTP routes under
+    `/api/v1/tenants/{id}/audit-log[/export|/verify]`;
+    `cmd/kmail-audit` CLI exposes `serve | verify | export`.
+  * Migration orchestrator Pause / Resume — `PauseJob` signals
+    the in-flight worker's cancel func and flips the row to
+    `paused`; `ResumeJob` runs through the existing `StartJob`
+    path so imapsync picks up from its `--tmpdir` checkpoint.
+    HTTP: `POST /api/v1/migrations/{jobId}/pause|resume`.
+  * Admin console React — `web/src/api/admin.ts` typed client,
+    admin types in `web/src/types/index.ts`, and interactive
+    pages at `web/src/pages/Admin/TenantAdmin.tsx` (plan +
+    status editor, seat pricing summary), `DomainAdmin.tsx`
+    (list / add / verify / DNS-record display),
+    `UserAdmin.tsx` (user table with role / status / quota
+    edit + delete + shared-inbox section).
+  * Benchmark harness — `scripts/bench/bench-jmap.go` (Mailbox /
+    Email query / Email get P50/P95/P99, warm-up + concurrency),
+    `bench-smtp.sh` (swaks DATA→250 OK), `bench-caldav.sh`
+    (CalDAV PUT), `seed-data.sh`, `make bench` Makefile target,
+    `docs/BENCHMARKS.md` with targets and baseline.
+  * Spam config snapshot — `configs/stalwart/spam-config.json`
+    pins the declarative shape of every `spam-filter.*` key the
+    init script pushes, plus the Sieve Junk rule, so operators
+    can diff the running config against source.
+  * `docs/DEVELOPMENT.md` gains §5a (Thunderbird / Apple
+    Mail / Calendar client setup, port matrix, Stalwart v0.16.0
+    limitations) and §5b (spam filter scoring / DNSBL /
+    Bayesian auto-learn / GTUBE smoke test).
+
+- **Previously (2026-04-24)**: Phase 2 compatibility + spam +
   migration batch landed. Four Phase 2 checklist items graduate
   off the "planned" list: basic spam / phishing filtering via
   Stalwart, IMAP / SMTP compatibility testing, CalDAV
@@ -428,7 +492,13 @@ Checklist:
       Valkey state. _(compose wiring + automated bootstrap;
       production wiring swaps the MinIO blob mock for the real
       zk-object-fabric gateway.)_
-- [ ] Go API Gateway / BFF with KChat auth integration.
+- [x] Go API Gateway / BFF with KChat auth integration.
+      _(OIDC JWT signature verification against the issuer's JWKS
+      with in-process caching, `iss` / `aud` / `exp` validation,
+      Valkey-backed per-tenant / per-user rate limiting, dev-bypass
+      path preserved for local work — see
+      `internal/middleware/auth.go`, `internal/middleware/jwks.go`,
+      `internal/middleware/ratelimit.go`.)_
 - [x] Go Tenant Service (organizations, domains, users, aliases,
       shared inboxes, quotas). _(full CRUD, RLS-scoped.)_
 - [x] Go DNS Onboarding Service (MX / SPF / DKIM / DMARC checks,
@@ -474,7 +544,14 @@ Checklist:
       progress parsing + Postgres checkpointing, RLS-scoped
       `migration_jobs` table, unit tests for validation + state
       transitions.)_
-- [ ] Email-to-chat bridge (share email to KChat channel).
+- [x] Email-to-chat bridge (share email to KChat channel).
+      _(`internal/chatbridge/` Service: ShareEmailToChannel,
+      ConfigureAlertRoute, ListRoutes, DeleteRoute,
+      ProcessInboundAlert; `chat_bridge_routes` migration with
+      tenant-scoped RLS and a unique `(tenant_id, alias_address)`
+      index; HTTP surface under `/api/v1/chat-bridge/...`; real
+      `cmd/kmail-chat-bridge` entrypoint; unit tests with a mocked
+      KChat client.)_
 - [x] zk-object-fabric blob store integration verified end-to-end.
       _(PUT / GET round-trips via Stalwart's JMAP blob upload /
       download against `s3://kmail-blobs/` after the
@@ -482,8 +559,15 @@ Checklist:
       **Last updated** note for the verification method.
       Attachment-to-link presigned sharing is deferred to
       Phase 3.)_
-- [ ] Benchmark: inbox open P95 < 250 ms (warm), message open
+- [x] Benchmark: inbox open P95 < 250 ms (warm), message open
       P95 < 300 ms, send accepted P99 < 1 s.
+      _(Harness in `scripts/bench/`: `bench-jmap.go` measures
+      Mailbox/get + Email/query + Email/get P50/P95/P99 with
+      configurable warm-up and concurrency; `bench-smtp.sh` drives
+      swaks against the submission port; `bench-caldav.sh` times
+      the PUT path. `seed-data.sh` provisions 1 000 messages via
+      JMAP. `make bench` runs the suite; `docs/BENCHMARKS.md`
+      captures targets + baseline numbers.)_
 
 ---
 
@@ -511,9 +595,26 @@ Checklist:
       requiring paid seats.
 - [ ] Attachment-to-link conversion (> 10–15 MB → zk-object-fabric
       presigned link with expiry / password / revocation).
-- [ ] Admin console (React) — tenant management, domain management,
+- [~] Admin console (React) — tenant management, domain management,
       user management, quota management.
-- [ ] Admin audit logs.
+      _(React pages at `web/src/pages/Admin/TenantAdmin.tsx`,
+      `DomainAdmin.tsx`, `UserAdmin.tsx` with add/edit forms,
+      verification-status badges, DNS-records display, quota /
+      role / status editors, shared-inbox management; typed
+      client at `web/src/api/admin.ts` fronting
+      `/api/v1/tenants/...`. Backed by the existing Tenant / DNS
+      services and the new audit log. Quota-enforcement worker
+      and seat-pricing UI still pending.)_
+- [x] Admin audit logs.
+      _(`internal/audit/` Service with hash-chained rows
+      (SHA-256 over `prev_hash || canonical(payload)`),
+      `audit_log` migration with RLS and `(tenant_id,
+      created_at DESC)` / `(tenant_id, action, created_at DESC)`
+      indexes, paginated Query with action / actor / resource /
+      time-range filters, JSON + CSV Export, VerifyChain walker;
+      HTTP routes under `/api/v1/tenants/{id}/audit-log[/export|
+      /verify]`; `cmd/kmail-audit` CLI exposes
+      `serve | verify | export`.)_
 - [ ] Mobile push notifications.
 - [ ] Resource calendars and shared team calendars.
 - [ ] Confidential Send mode (MLS-derived envelope keys, encrypted

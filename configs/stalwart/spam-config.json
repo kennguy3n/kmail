@@ -1,0 +1,36 @@
+{
+  "_note": "Declarative snapshot of the Stalwart v0.16.0 spam-filter registry keys that scripts/stalwart-init.sh sets. Keep this file in sync with the init script so operators can diff what the script pushes vs. what a live deployment reports via the admin JMAP `Config/get` call.",
+  "spam-filter.enable": true,
+  "spam-filter.score.spam": 5.0,
+  "spam-filter.score.discard": 10.0,
+  "spam-filter.score.reject": 15.0,
+
+  "spam-filter.bayes.enable": true,
+  "spam-filter.bayes.auto-learn.enable": true,
+  "spam-filter.bayes.auto-learn.trusted": true,
+  "spam-filter.bayes.score.spam": 0.7,
+  "spam-filter.bayes.score.ham": 0.3,
+
+  "spam-filter.dnsbl.enable": true,
+  "spam-filter.dnsbl.servers": [
+    "zen.spamhaus.org",
+    "bl.spamcop.net",
+    "dbl.spamhaus.org",
+    "multi.surbl.org"
+  ],
+
+  "spam-filter.phishing.enable": true,
+  "spam-filter.phishing.url-check": true,
+  "spam-filter.phishing.sender-auth": true,
+
+  "spam-filter.headers.analyse": true,
+  "spam-filter.headers.add-x-spam-status": true,
+
+  "sieve.trusted.scripts.junk-file": [
+    "require [\"fileinto\", \"envelope\", \"variables\"];",
+    "if header :matches \"X-Spam-Status\" \"Yes*\" {",
+    "  fileinto :specialuse \"\\\\Junk\" \"Junk\";",
+    "  stop;",
+    "}"
+  ]
+}

@@ -1,4 +1,4 @@
-.PHONY: build test lint fmt vet tidy docker-build clean help migrate
+.PHONY: build test lint fmt vet tidy docker-build clean help migrate bench
 
 # ---------------------------------------------------------------
 # KMail Go control plane — developer Makefile.
@@ -53,3 +53,13 @@ docker-build:
 
 clean:
 	rm -rf ./bin
+
+# bench runs the benchmark harness against the local compose stack.
+# Override BENCH_ITER to control the JMAP iteration count.
+BENCH_ITER ?= 200
+BENCH_SMTP_N ?= 50
+BENCH_CALDAV_N ?= 50
+bench:
+	$(GO) run ./scripts/bench/bench-jmap.go --iterations $(BENCH_ITER)
+	./scripts/bench/bench-smtp.sh $(BENCH_SMTP_N)
+	./scripts/bench/bench-caldav.sh $(BENCH_CALDAV_N)
