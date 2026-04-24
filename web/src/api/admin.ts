@@ -1,241 +1,376 @@
 /**
- * Typed client for the BFF admin REST surface under
- * `/api/v1/tenants/...`.
+ * Typed REST client for the KMail admin surface.
  *
- * The admin console (Phase 3) calls these methods to manage
- * tenants, users, domains, shared inboxes, and the audit log.
- * The shapes mirror the Go types in `internal/tenant/service.go`,
- * `internal/dns/dns.go`, and `internal/audit/audit.go`.
+ * The JMAP client in `jmap.ts` talks to the mail / calendar data
+ * plane; this module talks to the Tenant Service and DNS
+ * Onboarding Service control-plane REST endpoints under
+ * `/api/v1/tenants/...`. Keeping them in separate files keeps the
+ * JMAP batch machinery from leaking into the (much simpler)
+ * admin CRUD path.
+ *
+ * Authentication mirrors `jmap.ts`: every request carries the
+ * dev-bypass bearer token (`Authorization: Bearer kmail-dev`). The
+ * Go OIDC middleware accepts that token only when
+ * `KMAIL_DEV_BYPASS_TOKEN=kmail-dev` is set on the BFF — in
+ * staging / production the middleware rejects it and real KChat
+ * OIDC tokens are used instead. See docs/JMAP-CONTRACT.md §3.1.
+ *
+ * In dev-bypass mode the middleware also reads
+ * `X-KMail-Dev-Tenant-Id` off the request so a single bearer token
+ * can drive every tenant in the local compose stack
+ * (`internal/middleware/auth.go` — `devClaimsFromHeaders`). The
+ * admin UI picks a tenant from `GET /api/v1/tenants`, stores the
+ * selected ID, and sends it on every tenant-scoped request so the
+ * handler-side `checkTenantScope` check accepts the URL tenant ID.
  */
-
-import type {
-  AuditLogEntry,
-  AuditLogQuery,
-  DnsRecord,
-  Domain,
-  SharedInbox,
-  Tenant,
-  TenantPatch,
-  User,
-  UserPatch,
-  VerifyDomainResult,
-} from "../types";
 import { DEV_BEARER_TOKEN } from "./jmap";
 
-/** Base URL for every admin REST endpoint the BFF exposes. */
+/** Base path for every control-plane REST route. */
 export const ADMIN_API_BASE = "/api/v1";
 
 /**
- * Build the auth headers admin requests need. Mirrors the pattern
- * used by the JMAP client so both surfaces stay in sync when the
- * dev-bypass path gets retired.
+ * Build the headers for an admin REST request. Mirrors
+ * `jmap.ts#authHeaders` so the auth wiring only lives in one
+ * conceptual place — the only difference is the optional
+ * `X-KMail-Dev-Tenant-Id` header used by the dev-bypass path.
  */
-function authHeaders(extra: HeadersInit = {}): Headers {
+export function adminAuthHeaders(
+  tenantId?: string,
+  extra: HeadersInit = {},
+): Headers {
   const h = new Headers(extra);
   h.set("Authorization", `Bearer ${DEV_BEARER_TOKEN}`);
+  if (tenantId) {
+    h.set("X-KMail-Dev-Tenant-Id", tenantId);
+  }
   return h;
 }
 
 /**
- * Thin typed wrapper around `fetch` that encodes JSON bodies,
- * decodes JSON responses, and raises on non-2xx status with the
- * server's error message when available.
+ * Thrown for any non-2xx REST response. Carries both the status
+ * code and the server-supplied error message (when the BFF returns
+ * a JSON body of the shape `{ "error": "<message>" }`).
  */
-async function call<T>(
-  method: string,
-  path: string,
-  body?: unknown,
+export class AdminApiError extends Error {
+  readonly status: number;
+  readonly url: string;
+  constructor(url: string, status: number, message: string) {
+    super(`${status} ${message}`);
+    this.name = "AdminApiError";
+    this.status = status;
+    this.url = url;
+  }
+}
+
+async function parseErrorBody(res: Response): Promise<string> {
+  const text = await res.text();
+  if (!text) return res.statusText;
+  try {
+    const parsed = JSON.parse(text) as { error?: string };
+    if (parsed && typeof parsed.error === "string") return parsed.error;
+  } catch {
+    // fall through
+  }
+  return text;
+}
+
+async function requestJSON<T>(
+  url: string,
+  init: RequestInit,
+  { expectJson = true }: { expectJson?: boolean } = {},
 ): Promise<T> {
-  const headers = authHeaders({ Accept: "application/json" });
-  const init: RequestInit = { method, headers };
-  if (body !== undefined) {
-    headers.set("Content-Type", "application/json");
-    init.body = JSON.stringify(body);
-  }
-  const res = await fetch(`${ADMIN_API_BASE}${path}`, init);
+  const res = await fetch(url, { credentials: "include", ...init });
   if (!res.ok) {
-    let msg = `${method} ${path}: HTTP ${res.status}`;
-    try {
-      const payload = (await res.json()) as { error?: string };
-      if (payload?.error) msg = payload.error;
-    } catch {
-      // Body was not JSON; fall through with the default message.
-    }
-    throw new Error(msg);
+    throw new AdminApiError(url, res.status, await parseErrorBody(res));
   }
-  if (res.status === 204) {
-    return undefined as T;
+  if (!expectJson || res.status === 204) {
+    // Matches DELETE endpoints that return 204 No Content.
+    return undefined as unknown as T;
   }
   return (await res.json()) as T;
 }
 
-// ----------------------------------------------------------------
-// Tenants
-// ----------------------------------------------------------------
-
-export function getTenant(tenantId: string): Promise<Tenant> {
-  return call<Tenant>("GET", `/tenants/${encodeURIComponent(tenantId)}`);
+/** Mirrors `internal/tenant/service.go#Tenant`. */
+export interface Tenant {
+  id: string;
+  name: string;
+  slug: string;
+  plan: string;
+  status: string;
+  created_at: string;
+  updated_at: string;
 }
 
-export function updateTenant(
-  tenantId: string,
-  patch: TenantPatch,
-): Promise<Tenant> {
-  return call<Tenant>(
-    "PATCH",
-    `/tenants/${encodeURIComponent(tenantId)}`,
-    patch,
-  );
-}
-
-// ----------------------------------------------------------------
-// Users
-// ----------------------------------------------------------------
-
-export function listUsers(tenantId: string): Promise<User[]> {
-  return call<User[]>(
-    "GET",
-    `/tenants/${encodeURIComponent(tenantId)}/users`,
-  );
-}
-
-export function getUser(tenantId: string, userId: string): Promise<User> {
-  return call<User>(
-    "GET",
-    `/tenants/${encodeURIComponent(tenantId)}/users/${encodeURIComponent(userId)}`,
-  );
-}
-
-export interface CreateUserInput {
+/** Mirrors `internal/tenant/service.go#User`. */
+export interface TenantUser {
+  id: string;
+  tenant_id: string;
+  kchat_user_id: string;
+  stalwart_account_id: string;
   email: string;
-  displayName: string;
+  display_name: string;
+  role: string;
+  status: string;
+  quota_bytes: number;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Mirrors `internal/tenant/service.go#Domain`. */
+export interface TenantDomain {
+  id: string;
+  tenant_id: string;
+  domain: string;
+  verified: boolean;
+  mx_verified: boolean;
+  spf_verified: boolean;
+  dkim_verified: boolean;
+  dmarc_verified: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Mirrors `internal/dns/dns.go#VerificationResult`. */
+export interface DomainVerificationResult {
+  domain_id: string;
+  domain: string;
+  mx_verified: boolean;
+  spf_verified: boolean;
+  dkim_verified: boolean;
+  dmarc_verified: boolean;
+  verified: boolean;
+}
+
+/** One DNS record the tenant must publish. */
+export interface DomainRecord {
+  type: string;
+  name: string;
+  value: string;
+  ttl?: number;
+  priority?: number;
+  notes?: string;
+}
+
+/** Mirrors `internal/dns/dns.go#DomainRecords`. */
+export interface DomainRecords {
+  domain: string;
+  records: DomainRecord[];
+}
+
+/** Mirrors `internal/tenant/service.go#UpdateUserInput` (all fields optional). */
+export interface UpdateUserInput {
+  display_name?: string;
   role?: string;
   status?: string;
-  mailboxQuotaBytes?: number;
+  quota_bytes?: number;
 }
 
-export function createUser(
-  tenantId: string,
-  input: CreateUserInput,
-): Promise<User> {
-  return call<User>(
-    "POST",
-    `/tenants/${encodeURIComponent(tenantId)}/users`,
-    input,
+/** List every tenant in the control plane (admin-only, bypasses RLS). */
+export async function listTenants(): Promise<Tenant[]> {
+  return requestJSON<Tenant[]>(`${ADMIN_API_BASE}/tenants`, {
+    method: "GET",
+    headers: adminAuthHeaders(undefined, { Accept: "application/json" }),
+  });
+}
+
+/** List domains owned by a tenant. */
+export async function listDomains(tenantId: string): Promise<TenantDomain[]> {
+  return requestJSON<TenantDomain[]>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/domains`,
+    {
+      method: "GET",
+      headers: adminAuthHeaders(tenantId, { Accept: "application/json" }),
+    },
   );
 }
 
-export function updateUser(
+/**
+ * Run the DNS checks for a single domain and persist the new per-
+ * record verification flags. Returns the aggregate result.
+ */
+export async function verifyDomain(
+  tenantId: string,
+  domainId: string,
+): Promise<DomainVerificationResult> {
+  const url = `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/domains/${encodeURIComponent(domainId)}/verify`;
+  return requestJSON<DomainVerificationResult>(url, {
+    method: "POST",
+    headers: adminAuthHeaders(tenantId, { Accept: "application/json" }),
+  });
+}
+
+/**
+ * Return the set of DNS records the tenant must publish for the
+ * domain (MX / SPF / DKIM / DMARC / MTA-STS / TLS-RPT / autoconfig).
+ */
+export async function getDomainRecords(
+  tenantId: string,
+  domainId: string,
+): Promise<DomainRecords> {
+  const url = `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/domains/${encodeURIComponent(domainId)}/dns-records`;
+  return requestJSON<DomainRecords>(url, {
+    method: "GET",
+    headers: adminAuthHeaders(tenantId, { Accept: "application/json" }),
+  });
+}
+
+/** List every user in a tenant. */
+export async function listUsers(tenantId: string): Promise<TenantUser[]> {
+  return requestJSON<TenantUser[]>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/users`,
+    {
+      method: "GET",
+      headers: adminAuthHeaders(tenantId, { Accept: "application/json" }),
+    },
+  );
+}
+
+/**
+ * Patch one or more mutable user fields. The Go handler accepts
+ * both PUT and PATCH because the input type carries pointer fields
+ * — omitted fields are left unchanged on both verbs. We use PATCH
+ * here to match the HTTP convention callers expect from a partial
+ * update.
+ */
+export async function updateUser(
   tenantId: string,
   userId: string,
-  patch: UserPatch,
-): Promise<User> {
-  return call<User>(
-    "PATCH",
-    `/tenants/${encodeURIComponent(tenantId)}/users/${encodeURIComponent(userId)}`,
-    patch,
-  );
+  input: UpdateUserInput,
+): Promise<TenantUser> {
+  const url = `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/users/${encodeURIComponent(userId)}`;
+  return requestJSON<TenantUser>(url, {
+    method: "PATCH",
+    headers: adminAuthHeaders(tenantId, {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    }),
+    body: JSON.stringify(input),
+  });
 }
 
-export function deleteUser(tenantId: string, userId: string): Promise<void> {
-  return call<void>(
-    "DELETE",
-    `/tenants/${encodeURIComponent(tenantId)}/users/${encodeURIComponent(userId)}`,
-  );
-}
-
-// ----------------------------------------------------------------
-// Domains
-// ----------------------------------------------------------------
-
-export function listDomains(tenantId: string): Promise<Domain[]> {
-  return call<Domain[]>(
-    "GET",
-    `/tenants/${encodeURIComponent(tenantId)}/domains`,
-  );
-}
-
-export interface CreateDomainInput {
-  domain: string;
-}
-
-export function createDomain(
+/** Delete a user. Returns on 204 No Content. */
+export async function deleteUser(
   tenantId: string,
-  input: CreateDomainInput,
-): Promise<Domain> {
-  return call<Domain>(
-    "POST",
-    `/tenants/${encodeURIComponent(tenantId)}/domains`,
-    input,
+  userId: string,
+): Promise<void> {
+  const url = `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/users/${encodeURIComponent(userId)}`;
+  await requestJSON<void>(
+    url,
+    {
+      method: "DELETE",
+      headers: adminAuthHeaders(tenantId),
+    },
+    { expectJson: false },
   );
 }
 
-export function verifyDomain(
-  tenantId: string,
-  domainId: string,
-): Promise<VerifyDomainResult> {
-  return call<VerifyDomainResult>(
-    "POST",
-    `/tenants/${encodeURIComponent(tenantId)}/domains/${encodeURIComponent(domainId)}/verify`,
-  );
+/**
+ * Mirrors `internal/audit/audit.go#Entry`. Each row carries a
+ * hash-chain link (`prev_hash`, `entry_hash`) so `VerifyChain`
+ * can detect tampering.
+ */
+export interface AuditLogEntry {
+  id: string;
+  tenant_id: string;
+  actor_id: string;
+  actor_type: "user" | "admin" | "system";
+  action: string;
+  resource_type: string;
+  resource_id: string;
+  metadata: Record<string, unknown> | null;
+  ip_address: string;
+  user_agent: string;
+  prev_hash: string;
+  entry_hash: string;
+  created_at: string;
 }
 
-export function getDnsRecords(
-  tenantId: string,
-  domainId: string,
-): Promise<DnsRecord[]> {
-  return call<DnsRecord[]>(
-    "GET",
-    `/tenants/${encodeURIComponent(tenantId)}/domains/${encodeURIComponent(domainId)}/dns-records`,
-  );
+/** Filters accepted by the audit-log paginated query. */
+export interface AuditLogQuery {
+  action?: string;
+  actor?: string;
+  resource_type?: string;
+  resource_id?: string;
+  since?: string;
+  until?: string;
+  limit?: number;
+  offset?: number;
 }
 
-// ----------------------------------------------------------------
-// Shared inboxes
-// ----------------------------------------------------------------
-
-export function listSharedInboxes(tenantId: string): Promise<SharedInbox[]> {
-  return call<SharedInbox[]>(
-    "GET",
-    `/tenants/${encodeURIComponent(tenantId)}/shared-inboxes`,
-  );
+function auditQueryString(q?: AuditLogQuery): string {
+  if (!q) return "";
+  const params = new URLSearchParams();
+  for (const [k, v] of Object.entries(q)) {
+    if (v === undefined || v === null || v === "") continue;
+    params.set(k, String(v));
+  }
+  const s = params.toString();
+  return s ? `?${s}` : "";
 }
 
-export interface CreateSharedInboxInput {
-  address: string;
-  displayName: string;
-}
-
-export function createSharedInbox(
-  tenantId: string,
-  input: CreateSharedInboxInput,
-): Promise<SharedInbox> {
-  return call<SharedInbox>(
-    "POST",
-    `/tenants/${encodeURIComponent(tenantId)}/shared-inboxes`,
-    input,
-  );
-}
-
-// ----------------------------------------------------------------
-// Audit log
-// ----------------------------------------------------------------
-
+/**
+ * Paginated query of the audit log. Backend route:
+ * `GET /api/v1/tenants/{id}/audit-log`.
+ */
 export async function getAuditLog(
   tenantId: string,
-  filters: AuditLogQuery = {},
-): Promise<{ entries: AuditLogEntry[] }> {
-  const params = new URLSearchParams();
-  if (filters.action) params.set("action", filters.action);
-  if (filters.actor) params.set("actor", filters.actor);
-  if (filters.resource) params.set("resource", filters.resource);
-  if (filters.since) params.set("since", filters.since);
-  if (filters.until) params.set("until", filters.until);
-  if (filters.limit) params.set("limit", String(filters.limit));
-  if (filters.offset) params.set("offset", String(filters.offset));
-  const qs = params.toString();
-  const path =
-    `/tenants/${encodeURIComponent(tenantId)}/audit-log` +
-    (qs ? `?${qs}` : "");
-  return call<{ entries: AuditLogEntry[] }>("GET", path);
+  filters?: AuditLogQuery,
+): Promise<AuditLogEntry[]> {
+  const url =
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/audit-log` +
+    auditQueryString(filters);
+  return requestJSON<AuditLogEntry[]>(url, {
+    method: "GET",
+    headers: adminAuthHeaders(tenantId, { Accept: "application/json" }),
+  });
+}
+
+/**
+ * Export the audit log as JSON or CSV. Returns the raw response
+ * body as a string so the caller can trigger a file download.
+ */
+export async function exportAuditLog(
+  tenantId: string,
+  format: "json" | "csv" = "json",
+  range?: { since?: string; until?: string },
+): Promise<string> {
+  const params = new URLSearchParams({ format });
+  if (range?.since) params.set("since", range.since);
+  if (range?.until) params.set("until", range.until);
+  const url =
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/audit-log/export?` +
+    params.toString();
+  const res = await fetch(url, {
+    method: "GET",
+    credentials: "include",
+    headers: adminAuthHeaders(tenantId),
+  });
+  if (!res.ok) {
+    throw new AdminApiError(url, res.status, await parseErrorBody(res));
+  }
+  return res.text();
+}
+
+/**
+ * Verify the hash chain. Returns `ok: true` when the full chain
+ * validates; the backend returns HTTP 409 with `ok: false` and a
+ * `broken_at` row id when a tamper is detected.
+ */
+export async function verifyAuditChain(
+  tenantId: string,
+): Promise<{ ok: boolean; rows: number; broken_at?: string }> {
+  const url = `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/audit-log/verify`;
+  const res = await fetch(url, {
+    method: "POST",
+    credentials: "include",
+    headers: adminAuthHeaders(tenantId, { Accept: "application/json" }),
+  });
+  if (!res.ok && res.status !== 409) {
+    throw new AdminApiError(url, res.status, await parseErrorBody(res));
+  }
+  return (await res.json()) as {
+    ok: boolean;
+    rows: number;
+    broken_at?: string;
+  };
 }

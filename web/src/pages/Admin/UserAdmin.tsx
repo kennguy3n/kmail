@@ -1,252 +1,382 @@
-import { useEffect, useState } from "react";
-import type { FormEvent } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+
 import {
-  createSharedInbox,
-  createUser,
+  AdminApiError,
   deleteUser,
-  listSharedInboxes,
   listUsers,
   updateUser,
+  type TenantUser,
+  type UpdateUserInput,
 } from "../../api/admin";
-import type { SharedInbox, User, UserPatch } from "../../types";
 
-const DEV_TENANT_ID = "00000000-0000-0000-0000-000000000000";
+import { useTenantSelection } from "./useTenantSelection";
 
-function resolveTenantId(): string {
-  const params = new URLSearchParams(window.location.search);
-  return params.get("tenantId") ?? DEV_TENANT_ID;
-}
-
-function formatBytes(n: number): string {
-  if (!n) return "—";
-  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
-  let v = n;
-  let u = 0;
-  while (v >= 1024 && u < units.length - 1) {
-    v /= 1024;
-    u++;
-  }
-  return `${v.toFixed(1)} ${units[u]}`;
-}
-
+/**
+ * UserAdmin is the user management console.
+ *
+ * Lists users for the currently-selected tenant, surfaces the
+ * fields that matter to an admin (email, display name, role,
+ * status, quota), and exposes per-row **Edit** (inline form) and
+ * **Delete** (with a confirm step) actions that drive the REST
+ * endpoints exported by `internal/tenant/handlers.go`:
+ *
+ *   PATCH  /api/v1/tenants/:id/users/:userId
+ *   DELETE /api/v1/tenants/:id/users/:userId
+ *
+ * Shared-inbox membership, alias management, and MLS-epoch
+ * plumbing for shared-group membership changes are out of scope
+ * for this iteration — they land alongside the KChat-group side
+ * of that workflow (docs/SCHEMA.md §5.6).
+ */
 export default function UserAdmin() {
-  const [tenantId] = useState(resolveTenantId);
-  const [users, setUsers] = useState<User[]>([]);
-  const [inboxes, setInboxes] = useState<SharedInbox[]>([]);
-  const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
+  const {
+    tenants,
+    selectedTenantId,
+    selectedTenant,
+    selectTenant,
+    isLoading: tenantsLoading,
+    error: tenantsError,
+  } = useTenantSelection();
 
-  const [newUser, setNewUser] = useState({
-    email: "",
-    displayName: "",
-    role: "member",
-  });
-  const [newInbox, setNewInbox] = useState({ address: "", displayName: "" });
+  const [users, setUsers] = useState<TenantUser[] | null>(null);
+  const [usersLoading, setUsersLoading] = useState(false);
+  const [usersError, setUsersError] = useState<string | null>(null);
 
-  async function reload() {
-    try {
-      setError(null);
-      const [u, s] = await Promise.all([
-        listUsers(tenantId),
-        listSharedInboxes(tenantId),
-      ]);
-      setUsers(u);
-      setInboxes(s);
-    } catch (err) {
-      setError((err as Error).message);
-    }
-  }
+  // `editingUserId` toggles the inline edit row. `editDraft` holds
+  // the in-flight form values; it is seeded from the user record
+  // when editing starts and flushed through `updateUser` on save.
+  // `editingUserIdRef` mirrors `editingUserId` so promise handlers
+  // can observe the live value instead of a stale closure — matters
+  // when an admin clicks Save on one row and then Edit on another
+  // before the PATCH resolves.
+  const [editingUserId, setEditingUserId] = useState<string | null>(null);
+  const editingUserIdRef = useRef<string | null>(null);
   useEffect(() => {
-    reload();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tenantId]);
+    editingUserIdRef.current = editingUserId;
+  }, [editingUserId]);
+  const [editDraft, setEditDraft] = useState<UpdateUserInput>({});
+  const [saving, setSaving] = useState(false);
+  const [rowError, setRowError] = useState<Record<string, string>>({});
+  // Pending-delete state gates the destructive action behind a
+  // per-row confirm. The user clicks Delete once to arm, then
+  // Confirm delete to actually fire the DELETE.
+  const [pendingDelete, setPendingDelete] = useState<string | null>(null);
 
-  async function onCreateUser(e: FormEvent) {
-    e.preventDefault();
-    setBusy(true);
-    try {
-      await createUser(tenantId, newUser);
-      setNewUser({ email: "", displayName: "", role: "member" });
-      await reload();
-    } catch (err) {
-      setError((err as Error).message);
-    } finally {
-      setBusy(false);
-    }
-  }
+  const loadUsers = useCallback((tenantId: string) => {
+    let cancelled = false;
+    setUsersLoading(true);
+    setUsersError(null);
+    listUsers(tenantId)
+      .then((list) => {
+        if (cancelled) return;
+        setUsers(list);
+      })
+      .catch((e: unknown) => {
+        if (cancelled) return;
+        setUsersError(errorMessage(e));
+      })
+      .finally(() => {
+        if (cancelled) return;
+        setUsersLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
-  async function onPatch(userId: string, patch: UserPatch) {
-    setBusy(true);
-    try {
-      await updateUser(tenantId, userId, patch);
-      await reload();
-    } catch (err) {
-      setError((err as Error).message);
-    } finally {
-      setBusy(false);
-    }
-  }
+  useEffect(() => {
+    if (!selectedTenantId) return;
+    return loadUsers(selectedTenantId);
+  }, [selectedTenantId, loadUsers]);
 
-  async function onDelete(userId: string) {
-    if (!confirm("Delete this user?")) return;
-    setBusy(true);
-    try {
-      await deleteUser(tenantId, userId);
-      await reload();
-    } catch (err) {
-      setError((err as Error).message);
-    } finally {
-      setBusy(false);
-    }
-  }
+  const startEdit = (u: TenantUser): void => {
+    setEditingUserId(u.id);
+    setEditDraft({
+      display_name: u.display_name,
+      role: u.role,
+      status: u.status,
+      quota_bytes: u.quota_bytes,
+    });
+    setRowError((prev) => {
+      const { [u.id]: _dropped, ...rest } = prev;
+      return rest;
+    });
+  };
 
-  async function onCreateInbox(e: FormEvent) {
-    e.preventDefault();
-    setBusy(true);
-    try {
-      await createSharedInbox(tenantId, newInbox);
-      setNewInbox({ address: "", displayName: "" });
-      await reload();
-    } catch (err) {
-      setError((err as Error).message);
-    } finally {
-      setBusy(false);
+  const cancelEdit = (): void => {
+    setEditingUserId(null);
+    setEditDraft({});
+  };
+
+  const saveEdit = (u: TenantUser): void => {
+    if (!selectedTenantId) return;
+    setSaving(true);
+    setRowError((prev) => {
+      const { [u.id]: _dropped, ...rest } = prev;
+      return rest;
+    });
+    // Only send fields the draft actually changed so the server
+    // does not stomp on concurrent edits.
+    const patch: UpdateUserInput = {};
+    if (editDraft.display_name !== undefined && editDraft.display_name !== u.display_name) {
+      patch.display_name = editDraft.display_name;
     }
-  }
+    if (editDraft.role !== undefined && editDraft.role !== u.role) {
+      patch.role = editDraft.role;
+    }
+    if (editDraft.status !== undefined && editDraft.status !== u.status) {
+      patch.status = editDraft.status;
+    }
+    if (editDraft.quota_bytes !== undefined && editDraft.quota_bytes !== u.quota_bytes) {
+      patch.quota_bytes = editDraft.quota_bytes;
+    }
+    if (Object.keys(patch).length === 0) {
+      cancelEdit();
+      setSaving(false);
+      return;
+    }
+    updateUser(selectedTenantId, u.id, patch)
+      .then((updated) => {
+        setUsers((current) =>
+          current
+            ? current.map((row) => (row.id === updated.id ? updated : row))
+            : current,
+        );
+        // Scope the cancel to the row whose save just completed so
+        // an admin who started editing a different row while this
+        // PATCH was in flight does not lose their in-progress edit.
+        if (editingUserIdRef.current === updated.id) {
+          setEditingUserId(null);
+          setEditDraft({});
+        }
+      })
+      .catch((e: unknown) => {
+        setRowError((prev) => ({ ...prev, [u.id]: errorMessage(e) }));
+      })
+      .finally(() => {
+        setSaving(false);
+      });
+  };
+
+  const onDelete = (u: TenantUser): void => {
+    if (!selectedTenantId) return;
+    if (pendingDelete !== u.id) {
+      setPendingDelete(u.id);
+      return;
+    }
+    setRowError((prev) => {
+      const { [u.id]: _dropped, ...rest } = prev;
+      return rest;
+    });
+    deleteUser(selectedTenantId, u.id)
+      .then(() => {
+        setPendingDelete(null);
+        setUsers((current) =>
+          current ? current.filter((row) => row.id !== u.id) : current,
+        );
+      })
+      .catch((e: unknown) => {
+        setRowError((prev) => ({ ...prev, [u.id]: errorMessage(e) }));
+      });
+  };
 
   return (
-    <section>
+    <section className="kmail-admin">
       <h2>User admin</h2>
-      <p style={{ fontSize: "0.9em", color: "#666" }}>Tenant ID: {tenantId}</p>
-      {error && <div style={{ color: "crimson" }}>Error: {error}</div>}
 
-      <h3>Add user</h3>
-      <form onSubmit={onCreateUser} style={{ marginBottom: 16 }}>
-        <input
-          placeholder="email"
-          type="email"
-          value={newUser.email}
-          onChange={(e) => setNewUser({ ...newUser, email: e.target.value })}
-          required
-        />{" "}
-        <input
-          placeholder="display name"
-          value={newUser.displayName}
-          onChange={(e) =>
-            setNewUser({ ...newUser, displayName: e.target.value })
-          }
-          required
-        />{" "}
+      <div className="kmail-admin-tenant-picker">
+        <label htmlFor="kmail-admin-tenant">Tenant:</label>{" "}
         <select
-          value={newUser.role}
-          onChange={(e) => setNewUser({ ...newUser, role: e.target.value })}
+          id="kmail-admin-tenant"
+          disabled={tenantsLoading || !tenants || tenants.length === 0}
+          value={selectedTenantId ?? ""}
+          onChange={(e) => selectTenant(e.target.value)}
         >
-          <option value="member">Member</option>
-          <option value="admin">Admin</option>
-          <option value="owner">Owner</option>
-        </select>{" "}
-        <button type="submit" disabled={busy}>
-          Create
-        </button>
-      </form>
-
-      <table style={{ width: "100%", borderCollapse: "collapse" }}>
-        <thead>
-          <tr style={{ textAlign: "left", borderBottom: "1px solid #ddd" }}>
-            <th>Email</th>
-            <th>Name</th>
-            <th>Role</th>
-            <th>Status</th>
-            <th>Quota</th>
-            <th></th>
-          </tr>
-        </thead>
-        <tbody>
-          {users.map((u) => (
-            <tr
-              key={u.id}
-              style={{ borderBottom: "1px solid #eee" }}
-            >
-              <td>{u.email}</td>
-              <td>{u.displayName}</td>
-              <td>
-                <select
-                  value={u.role}
-                  onChange={(e) =>
-                    onPatch(u.id, { role: e.target.value as User["role"] })
-                  }
-                  disabled={busy}
-                >
-                  <option value="member">Member</option>
-                  <option value="admin">Admin</option>
-                  <option value="owner">Owner</option>
-                </select>
-              </td>
-              <td>
-                <select
-                  value={u.status}
-                  onChange={(e) =>
-                    onPatch(u.id, {
-                      status: e.target.value as User["status"],
-                    })
-                  }
-                  disabled={busy}
-                >
-                  <option value="active">Active</option>
-                  <option value="suspended">Suspended</option>
-                </select>
-              </td>
-              <td>{formatBytes(u.mailboxQuotaBytes)}</td>
-              <td>
-                <button onClick={() => onDelete(u.id)} disabled={busy}>
-                  Delete
-                </button>
-              </td>
-            </tr>
-          ))}
-          {users.length === 0 && (
-            <tr>
-              <td colSpan={6} style={{ color: "#777", padding: 12 }}>
-                No users yet.
-              </td>
-            </tr>
+          {tenantsLoading && <option value="">Loading…</option>}
+          {!tenantsLoading && tenants && tenants.length === 0 && (
+            <option value="">No tenants</option>
           )}
-        </tbody>
-      </table>
-
-      <h3 style={{ marginTop: 24 }}>Shared inboxes</h3>
-      <form onSubmit={onCreateInbox} style={{ marginBottom: 16 }}>
-        <input
-          placeholder="address (e.g. alerts@example.com)"
-          type="email"
-          value={newInbox.address}
-          onChange={(e) =>
-            setNewInbox({ ...newInbox, address: e.target.value })
-          }
-          required
-        />{" "}
-        <input
-          placeholder="display name"
-          value={newInbox.displayName}
-          onChange={(e) =>
-            setNewInbox({ ...newInbox, displayName: e.target.value })
-          }
-          required
-        />{" "}
-        <button type="submit" disabled={busy}>
-          Add shared inbox
-        </button>
-      </form>
-      <ul>
-        {inboxes.map((i) => (
-          <li key={i.id}>
-            <strong>{i.displayName}</strong> — {i.address}
-          </li>
-        ))}
-        {inboxes.length === 0 && (
-          <li style={{ color: "#777" }}>No shared inboxes yet.</li>
+          {tenants &&
+            tenants.map((t) => (
+              <option key={t.id} value={t.id}>
+                {t.name} ({t.slug})
+              </option>
+            ))}
+        </select>
+        {tenantsError && (
+          <span className="kmail-admin-error">
+            {" "}Failed to load tenants: {tenantsError}
+          </span>
         )}
-      </ul>
+      </div>
+
+      {!selectedTenant ? (
+        <p className="kmail-admin-hint">
+          {tenantsLoading
+            ? "Loading tenants…"
+            : "Select a tenant to manage its users."}
+        </p>
+      ) : (
+        <>
+          <p className="kmail-admin-hint">
+            Users for <strong>{selectedTenant.name}</strong> ({selectedTenant.slug}).
+          </p>
+
+          {usersLoading && <p>Loading users…</p>}
+          {usersError && (
+            <p className="kmail-admin-error">Failed to load users: {usersError}</p>
+          )}
+
+          {users && users.length === 0 && !usersLoading && (
+            <p>No users in this tenant.</p>
+          )}
+
+          {users && users.length > 0 && (
+            <table className="kmail-admin-table">
+              <thead>
+                <tr>
+                  <th>Email</th>
+                  <th>Display name</th>
+                  <th>Role</th>
+                  <th>Status</th>
+                  <th>Quota (bytes)</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {users.map((u) =>
+                  editingUserId === u.id ? (
+                    <tr key={u.id}>
+                      <td>{u.email}</td>
+                      <td>
+                        <input
+                          type="text"
+                          value={editDraft.display_name ?? ""}
+                          onChange={(e) =>
+                            setEditDraft((prev) => ({
+                              ...prev,
+                              display_name: e.target.value,
+                            }))
+                          }
+                        />
+                      </td>
+                      <td>
+                        <select
+                          value={editDraft.role ?? u.role}
+                          onChange={(e) =>
+                            setEditDraft((prev) => ({
+                              ...prev,
+                              role: e.target.value,
+                            }))
+                          }
+                        >
+                          <option value="member">member</option>
+                          <option value="admin">admin</option>
+                          <option value="owner">owner</option>
+                        </select>
+                      </td>
+                      <td>
+                        <select
+                          value={editDraft.status ?? u.status}
+                          onChange={(e) =>
+                            setEditDraft((prev) => ({
+                              ...prev,
+                              status: e.target.value,
+                            }))
+                          }
+                        >
+                          <option value="active">active</option>
+                          <option value="suspended">suspended</option>
+                          <option value="deleted">deleted</option>
+                        </select>
+                      </td>
+                      <td>
+                        <input
+                          type="number"
+                          min={0}
+                          value={
+                            editDraft.quota_bytes !== undefined
+                              ? editDraft.quota_bytes
+                              : u.quota_bytes
+                          }
+                          onChange={(e) =>
+                            setEditDraft((prev) => ({
+                              ...prev,
+                              quota_bytes: Number(e.target.value),
+                            }))
+                          }
+                        />
+                      </td>
+                      <td>
+                        <button
+                          type="button"
+                          onClick={() => saveEdit(u)}
+                          disabled={saving}
+                        >
+                          {saving ? "Saving…" : "Save"}
+                        </button>{" "}
+                        <button type="button" onClick={cancelEdit} disabled={saving}>
+                          Cancel
+                        </button>
+                        {rowError[u.id] && (
+                          <div className="kmail-admin-error">{rowError[u.id]}</div>
+                        )}
+                      </td>
+                    </tr>
+                  ) : (
+                    <tr key={u.id}>
+                      <td>{u.email}</td>
+                      <td>{u.display_name}</td>
+                      <td>{u.role}</td>
+                      <td>{u.status}</td>
+                      <td>{u.quota_bytes.toLocaleString()}</td>
+                      <td>
+                        <button type="button" onClick={() => startEdit(u)}>
+                          Edit
+                        </button>{" "}
+                        {pendingDelete === u.id ? (
+                          <>
+                            <button
+                              type="button"
+                              onClick={() => onDelete(u)}
+                              className="kmail-admin-danger"
+                            >
+                              Confirm delete
+                            </button>{" "}
+                            <button
+                              type="button"
+                              onClick={() => setPendingDelete(null)}
+                            >
+                              Cancel
+                            </button>
+                          </>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() => onDelete(u)}
+                            className="kmail-admin-danger"
+                          >
+                            Delete
+                          </button>
+                        )}
+                        {rowError[u.id] && (
+                          <div className="kmail-admin-error">{rowError[u.id]}</div>
+                        )}
+                      </td>
+                    </tr>
+                  ),
+                )}
+              </tbody>
+            </table>
+          )}
+        </>
+      )}
     </section>
   );
+}
+
+function errorMessage(e: unknown): string {
+  if (e instanceof AdminApiError) return e.message;
+  if (e instanceof Error) return e.message;
+  return String(e);
 }
