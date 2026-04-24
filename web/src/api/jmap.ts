@@ -28,6 +28,29 @@ export const JMAP_BASE_URL = "/jmap";
 export const JMAP_SESSION_URL = "/jmap/session";
 
 /**
+ * Dev-bypass bearer token. The Go BFF's OIDC middleware accepts a
+ * static token when `KMAIL_DEV_BYPASS_TOKEN` matches — in local dev
+ * we run the stack with `KMAIL_DEV_BYPASS_TOKEN=kmail-dev`, so the
+ * React client sends `Authorization: Bearer kmail-dev` on every
+ * JMAP request. In staging / production the middleware rejects
+ * this value and clients must obtain a real KChat OIDC token; see
+ * docs/JMAP-CONTRACT.md §3.1.
+ */
+export const DEV_BEARER_TOKEN = "kmail-dev";
+
+/**
+ * Build the base headers every JMAP request needs. Centralised so
+ * the auth wiring only lives in one place — switching from
+ * dev-bypass to real OIDC is a single-point edit when that work
+ * lands in Phase 3.
+ */
+function authHeaders(extra: HeadersInit = {}): Headers {
+  const h = new Headers(extra);
+  h.set("Authorization", `Bearer ${DEV_BEARER_TOKEN}`);
+  return h;
+}
+
+/**
  * Fetch the JMAP session object. Kept as a standalone helper so
  * tests and the React `useSession` hook can call it without first
  * instantiating a `JMAPClient`.
@@ -35,7 +58,7 @@ export const JMAP_SESSION_URL = "/jmap/session";
 export async function fetchSession(): Promise<JmapSession> {
   const res = await fetch(JMAP_SESSION_URL, {
     credentials: "include",
-    headers: { Accept: "application/json" },
+    headers: authHeaders({ Accept: "application/json" }),
   });
   if (!res.ok) {
     throw new Error(
@@ -130,10 +153,10 @@ export class JMAPClient {
     const res = await fetch(session.apiUrl, {
       method: "POST",
       credentials: "include",
-      headers: {
+      headers: authHeaders({
         "Content-Type": "application/json",
         Accept: "application/json",
-      },
+      }),
       body: JSON.stringify({
         using: [JMAP_MAIL_CAPABILITY, JMAP_SUBMISSION_CAPABILITY],
         methodCalls,
@@ -260,6 +283,7 @@ export class JMAPClient {
             "preview",
             "textBody",
             "htmlBody",
+            "attachments",
             "bodyValues",
             "privacyMode",
           ],
@@ -327,39 +351,29 @@ export class JMAPClient {
    * otherwise leave the draft sitting in the mailbox forever while
    * the caller believed the email had been sent.
    */
-  async sendEmail(draft: EmailDraft): Promise<string> {
+  async sendEmail(
+    draft: EmailDraft,
+    existingDraftId: string | null = null,
+  ): Promise<string> {
     const accountId = await this.getAccountId();
     const identityId = await this.resolveIdentityId(draft);
-    const bodyStructure: Record<string, unknown> = {};
-    const bodyValues: Record<string, { value: string }> = {};
-    if (draft.htmlBody) {
-      bodyStructure.htmlBody = [{ partId: "html", type: "text/html" }];
-      bodyValues.html = { value: draft.htmlBody };
-    }
-    if (draft.textBody || !draft.htmlBody) {
-      bodyStructure.textBody = [{ partId: "text", type: "text/plain" }];
-      bodyValues.text = { value: draft.textBody ?? "" };
-    }
-    const create: Record<string, unknown> = {
-      mailboxIds: draft.mailboxIds,
-      keywords: { $draft: true },
-      from: draft.from,
-      to: draft.to,
-      cc: draft.cc,
-      bcc: draft.bcc,
-      subject: draft.subject,
-      bodyValues,
-      ...bodyStructure,
+    const create = buildEmailCreate(draft);
+    const emailSetArgs: Record<string, unknown> = {
+      accountId,
+      create: { draft: create },
     };
-    if (draft.privacyMode) {
-      create.privacyMode = draft.privacyMode;
+    // If the user has already clicked Save draft in this compose
+    // session, destroy that stale draft in the same Email/set call
+    // so it doesn't linger in the Drafts mailbox after a successful
+    // Send. The server-side draft we submit and auto-destroy via
+    // `onSuccessDestroyEmail` below is a *different* email (the one
+    // this call creates) — without this destroy the prior saved
+    // draft would be orphaned.
+    if (existingDraftId) {
+      emailSetArgs.destroy = [existingDraftId];
     }
     const response = await this.request([
-      [
-        "Email/set",
-        { accountId, create: { draft: create } },
-        "0",
-      ],
+      ["Email/set", emailSetArgs, "0"],
       [
         "EmailSubmission/set",
         {
@@ -412,6 +426,94 @@ export class JMAPClient {
       throw new Error(
         "kmail-web: sendEmail did not create an EmailSubmission",
       );
+    }
+    return created.draft.id;
+  }
+
+  /**
+   * Mark an email as read (`$seen` set) or unread (`$seen` cleared).
+   * Uses a JMAP patch path on `keywords/$seen` so we don't need to
+   * fetch the current keyword set first. RFC 8621 §4.1.1 defines
+   * `$seen` as the canonical read flag.
+   */
+  async markRead(emailId: string, read: boolean): Promise<void> {
+    const accountId = await this.getAccountId();
+    const response = await this.request([
+      [
+        "Email/set",
+        {
+          accountId,
+          update: {
+            [emailId]: {
+              "keywords/$seen": read ? true : null,
+            },
+          },
+        },
+        "0",
+      ],
+    ]);
+    const result = expectResult(response, "Email/set", "0");
+    const notUpdated = result.notUpdated as
+      | Record<string, unknown>
+      | undefined;
+    if (notUpdated && notUpdated[emailId]) {
+      throw new Error(
+        `kmail-web: failed to mark email ${emailId}: ${JSON.stringify(notUpdated[emailId])}`,
+      );
+    }
+  }
+
+  /**
+   * Create a draft without submitting it. Used by the compose page
+   * for "Save as draft" flows and as the building block for
+   * `sendEmail` (which creates a draft and submits it in the same
+   * round-trip). Returns the server-assigned draft id.
+   */
+  async createDraft(draft: EmailDraft): Promise<string> {
+    return this.saveDraft(draft, null);
+  }
+
+  /**
+   * Save a draft, optionally replacing one previously saved in the
+   * same compose session. When `existingId` is non-null we batch a
+   * `destroy` of the old draft with the `create` of the new one in
+   * a single `Email/set` call so the Drafts mailbox never contains
+   * two copies of the same in-progress message. The BFF sees this
+   * as one atomic change — if the destroy fails (e.g. the user
+   * already deleted the old draft from another tab) we still
+   * surface the new draft's id.
+   */
+  async saveDraft(
+    draft: EmailDraft,
+    existingId: string | null,
+  ): Promise<string> {
+    const accountId = await this.getAccountId();
+    const create = buildEmailCreate(draft);
+    const setArgs: Record<string, unknown> = {
+      accountId,
+      create: { draft: create },
+    };
+    if (existingId) {
+      setArgs.destroy = [existingId];
+    }
+    const response = await this.request([
+      ["Email/set", setArgs, "0"],
+    ]);
+    const result = expectResult(response, "Email/set", "0");
+    const created = result.created as
+      | Record<string, { id: string }>
+      | null;
+    const notCreated = result.notCreated as
+      | Record<string, { type: string; description?: string }>
+      | undefined;
+    if (notCreated && notCreated.draft) {
+      const entry = notCreated.draft;
+      throw new Error(
+        `kmail-web: failed to create draft: ${entry.type}${entry.description ? `: ${entry.description}` : ""}`,
+      );
+    }
+    if (!created || !created.draft) {
+      throw new Error("kmail-web: createDraft did not return an id");
     }
     return created.draft.id;
   }
@@ -517,4 +619,40 @@ export async function invoke(
   invocations: JmapInvocation[],
 ): Promise<JmapResponse> {
   return jmapClient.request(invocations);
+}
+
+/**
+ * Build the `create` object for an `Email/set` call from an
+ * `EmailDraft`. Shared between `sendEmail` (create draft + submit)
+ * and `createDraft` (create only). Honours both text and HTML
+ * bodies; when neither is set a zero-length text part is emitted
+ * so RFC 8621 §4.1.4 clients don't see a completely bodiless
+ * email.
+ */
+function buildEmailCreate(draft: EmailDraft): Record<string, unknown> {
+  const bodyStructure: Record<string, unknown> = {};
+  const bodyValues: Record<string, { value: string }> = {};
+  if (draft.htmlBody) {
+    bodyStructure.htmlBody = [{ partId: "html", type: "text/html" }];
+    bodyValues.html = { value: draft.htmlBody };
+  }
+  if (draft.textBody || !draft.htmlBody) {
+    bodyStructure.textBody = [{ partId: "text", type: "text/plain" }];
+    bodyValues.text = { value: draft.textBody ?? "" };
+  }
+  const create: Record<string, unknown> = {
+    mailboxIds: draft.mailboxIds,
+    keywords: { $draft: true },
+    from: draft.from,
+    to: draft.to,
+    cc: draft.cc,
+    bcc: draft.bcc,
+    subject: draft.subject,
+    bodyValues,
+    ...bodyStructure,
+  };
+  if (draft.privacyMode) {
+    create.privacyMode = draft.privacyMode;
+  }
+  return create;
 }

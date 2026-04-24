@@ -23,6 +23,10 @@ export default function Inbox() {
   const [error, setError] = useState<string | null>(null);
   const [isLoadingMailboxes, setLoadingMailboxes] = useState(true);
   const [isLoadingEmails, setLoadingEmails] = useState(false);
+  // Reload nonce bumped after a write (mark-read, move-to-trash) so
+  // the list refetches with the latest server state instead of
+  // racing an optimistic update against the next query.
+  const [reloadNonce, setReloadNonce] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -32,12 +36,20 @@ export default function Inbox() {
       .then((list) => {
         if (cancelled) return;
         setMailboxes(list);
-        // Prefer the route-supplied mailbox if it's still valid;
-        // otherwise fall back to the inbox role, then the first
-        // mailbox in the list.
+        // Prefer the route-supplied mailbox when present; otherwise
+        // keep the user's current sidebar selection if it still
+        // exists, then fall back to the inbox role, then the first
+        // mailbox in the list. Preserving the current selection
+        // matters when `reloadNonce` triggers a refetch — without
+        // it, the view would snap back to the Inbox after any
+        // write action in a sidebar-selected mailbox.
         const fromRoute = list.find((m) => m.id === selectedFromRoute);
         const inbox = list.find((m) => m.role === "inbox") ?? list[0];
-        setSelectedMailbox((fromRoute ?? inbox)?.id ?? null);
+        setSelectedMailbox((current) => {
+          if (fromRoute) return fromRoute.id;
+          if (current && list.some((m) => m.id === current)) return current;
+          return inbox?.id ?? null;
+        });
       })
       .catch((err: unknown) => {
         if (cancelled) return;
@@ -49,7 +61,7 @@ export default function Inbox() {
     return () => {
       cancelled = true;
     };
-  }, [selectedFromRoute]);
+  }, [selectedFromRoute, reloadNonce]);
 
   useEffect(() => {
     if (!selectedMailbox) {
@@ -73,7 +85,7 @@ export default function Inbox() {
     return () => {
       cancelled = true;
     };
-  }, [selectedMailbox]);
+  }, [selectedMailbox, reloadNonce]);
 
   const handleOpenEmail = useCallback(
     (emailId: string) => {
@@ -83,6 +95,47 @@ export default function Inbox() {
     [navigate, selectedMailbox],
   );
 
+  const trashMailboxId = useMemo(
+    () => (mailboxes ?? []).find((m) => m.role === "trash")?.id ?? null,
+    [mailboxes],
+  );
+
+  const handleToggleRead = useCallback(async (email: Email) => {
+    const nextRead = !email.keywords.$seen;
+    try {
+      await jmapClient.markRead(email.id, nextRead);
+      setReloadNonce((n) => n + 1);
+    } catch (err: unknown) {
+      setError(errorMessage(err));
+    }
+  }, []);
+
+  const handleMoveToTrash = useCallback(
+    async (email: Email) => {
+      if (!selectedMailbox || !trashMailboxId) {
+        setError("Trash mailbox is not available on this account");
+        return;
+      }
+      if (selectedMailbox === trashMailboxId) {
+        // Already in trash: destroy permanently.
+        try {
+          await jmapClient.deleteEmail(email.id);
+          setReloadNonce((n) => n + 1);
+        } catch (err: unknown) {
+          setError(errorMessage(err));
+        }
+        return;
+      }
+      try {
+        await jmapClient.moveEmail(email.id, selectedMailbox, trashMailboxId);
+        setReloadNonce((n) => n + 1);
+      } catch (err: unknown) {
+        setError(errorMessage(err));
+      }
+    },
+    [selectedMailbox, trashMailboxId],
+  );
+
   const sortedMailboxes = useMemo(
     () =>
       (mailboxes ?? [])
@@ -90,6 +143,9 @@ export default function Inbox() {
         .sort((a, b) => a.sortOrder - b.sortOrder || a.name.localeCompare(b.name)),
     [mailboxes],
   );
+
+  const inTrashView =
+    selectedMailbox !== null && selectedMailbox === trashMailboxId;
 
   return (
     <section style={layoutStyles.root}>
@@ -130,7 +186,19 @@ export default function Inbox() {
         )}
       </aside>
       <main style={layoutStyles.main}>
-        {error && <div style={layoutStyles.error}>{error}</div>}
+        {error && (
+          <div style={layoutStyles.error}>
+            <span>{error}</span>
+            <button
+              type="button"
+              onClick={() => setError(null)}
+              style={layoutStyles.errorDismiss}
+              aria-label="Dismiss error"
+            >
+              ×
+            </button>
+          </div>
+        )}
         {isLoadingEmails && <p style={layoutStyles.muted}>Loading emails…</p>}
         {!isLoadingEmails && emails && emails.length === 0 && (
           <p style={layoutStyles.muted}>No messages.</p>
@@ -141,7 +209,10 @@ export default function Inbox() {
               <EmailRow
                 key={email.id}
                 email={email}
+                inTrashView={inTrashView}
                 onOpen={() => handleOpenEmail(email.id)}
+                onToggleRead={() => handleToggleRead(email)}
+                onMoveToTrash={() => handleMoveToTrash(email)}
               />
             ))}
           </ul>
@@ -153,10 +224,19 @@ export default function Inbox() {
 
 interface EmailRowProps {
   email: Email;
+  inTrashView: boolean;
   onOpen: () => void;
+  onToggleRead: () => void;
+  onMoveToTrash: () => void;
 }
 
-function EmailRow({ email, onOpen }: EmailRowProps) {
+function EmailRow({
+  email,
+  inTrashView,
+  onOpen,
+  onToggleRead,
+  onMoveToTrash,
+}: EmailRowProps) {
   const isUnread = !email.keywords.$seen;
   const from = email.from?.[0];
   const sender = from?.name ?? from?.email ?? "(unknown sender)";
@@ -164,18 +244,46 @@ function EmailRow({ email, onOpen }: EmailRowProps) {
   const dateLabel = formatDate(email.receivedAt);
   return (
     <li>
-      <button
-        type="button"
-        onClick={onOpen}
+      <div
         style={{
           ...layoutStyles.emailRow,
           ...(isUnread ? layoutStyles.emailRowUnread : {}),
         }}
       >
-        <span style={layoutStyles.emailSender}>{sender}</span>
-        <span style={layoutStyles.emailSubject}>{subject}</span>
-        <span style={layoutStyles.emailDate}>{dateLabel}</span>
-      </button>
+        <button
+          type="button"
+          onClick={onOpen}
+          style={layoutStyles.emailRowMain}
+        >
+          <span style={layoutStyles.emailSender}>{sender}</span>
+          <span style={layoutStyles.emailSubject}>{subject}</span>
+          <span style={layoutStyles.emailDate}>{dateLabel}</span>
+        </button>
+        <div style={layoutStyles.emailActions}>
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              onToggleRead();
+            }}
+            style={layoutStyles.actionButton}
+            title={isUnread ? "Mark as read" : "Mark as unread"}
+          >
+            {isUnread ? "Mark read" : "Mark unread"}
+          </button>
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              onMoveToTrash();
+            }}
+            style={layoutStyles.actionButton}
+            title={inTrashView ? "Delete permanently" : "Move to trash"}
+          >
+            {inTrashView ? "Delete" : "Trash"}
+          </button>
+        </div>
+      </div>
     </li>
   );
 }
@@ -270,6 +378,19 @@ const layoutStyles: Record<string, React.CSSProperties> = {
     color: "#991b1b",
     borderRadius: "0.25rem",
     marginBottom: "0.75rem",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: "0.5rem",
+  },
+  errorDismiss: {
+    background: "transparent",
+    border: "none",
+    color: "#991b1b",
+    fontSize: "1.1rem",
+    cursor: "pointer",
+    lineHeight: 1,
+    padding: "0 0.25rem",
   },
   muted: {
     color: "#6b7280",
@@ -282,18 +403,41 @@ const layoutStyles: Record<string, React.CSSProperties> = {
     borderTop: "1px solid #e5e7eb",
   },
   emailRow: {
+    display: "flex",
+    alignItems: "center",
+    gap: "0.5rem",
+    width: "100%",
+    padding: "0.6rem 0.5rem",
+    borderBottom: "1px solid #e5e7eb",
+    fontSize: "0.9rem",
+  },
+  emailRowMain: {
     display: "grid",
     gridTemplateColumns: "180px 1fr 120px",
     alignItems: "center",
     gap: "0.75rem",
-    width: "100%",
-    padding: "0.6rem 0.5rem",
+    flex: 1,
+    padding: 0,
     background: "transparent",
     border: "none",
-    borderBottom: "1px solid #e5e7eb",
     textAlign: "left",
     cursor: "pointer",
-    fontSize: "0.9rem",
+    font: "inherit",
+    color: "inherit",
+  },
+  emailActions: {
+    display: "flex",
+    gap: "0.25rem",
+    flexShrink: 0,
+  },
+  actionButton: {
+    padding: "0.25rem 0.5rem",
+    fontSize: "0.75rem",
+    background: "#fff",
+    border: "1px solid #d1d5db",
+    borderRadius: "0.25rem",
+    cursor: "pointer",
+    color: "#374151",
   },
   emailRowUnread: {
     fontWeight: 600,

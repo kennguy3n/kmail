@@ -4,8 +4,57 @@
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
 - **Status**: Phase 1 — Foundation (in progress); Phase 2 —
   Prototype (in progress)
-- **Last updated**: 2026-04-23 — Second Phase 2 batch landed. This
-  update finishes the Tenant Service CRUD surface with
+- **Last updated**: 2026-04-24 — zk-object-fabric blob store
+  smoke test partially verified against the local compose stack.
+  Brought the full stack up (`docker compose up`); `zk-fabric`,
+  `postgres`, `valkey`, `meilisearch`, and `stalwart` all come up
+  healthy and the one-shot `zk-fabric-init` creates the
+  `kmail-blobs` bucket as expected. Verified from the host with
+  the dev `kmail-access-key` credentials that the gateway accepts
+  S3 `PutObject` / `ListObjectsV2` / `HeadObject` / `DeleteObject`
+  against `s3://kmail-blobs/` — i.e. the blob path Stalwart is
+  pointed at is a working S3 endpoint. The `kmail-blobs`
+  integration verified end-to-end checklist item (below) is still
+  left unchecked because this run did *not* exercise a round-trip
+  through Stalwart itself: `scripts/stalwart-init.sh` targets
+  `${ADMIN_URL}/api/settings/list` and `/api/settings` /
+  `/api/domain`, but Stalwart v0.16.0 serves the management API
+  under `/admin/api/...` (the `/api/...` paths 404 on the running
+  `stalwart:v0.16.0` image), so the one-shot config run aborts
+  with `timed out waiting for stalwart admin API`. The manual
+  admin-API probe (`curl -u admin:kmail-dev
+  http://localhost:8080/admin/api/settings/list`) also comes back
+  as the admin SPA's index HTML rather than a JSON payload, so
+  wiring this fully hands-off in compose needs a follow-up pass
+  against the exact v0.16.0 admin-API shape — tracked as the
+  first item of the Phase 2 follow-up list below. No KMail
+  application code depends on that fix; the BFF, JMAP proxy, and
+  web client are already written against the JMAP surface.
+- **Previously (2026-04-23)**: Third Phase 2 batch landed. Mail
+  UI is now end-to-end functional against the JMAP client:
+  `web/src/pages/Mail/Compose.tsx` is a fully working composer
+  (To / Cc / Bcc / Subject / Body, From-identity selector, privacy
+  mode selector, Reply / Reply-All / Forward pre-fill via router
+  state, Send + Save draft + Cancel) that drives
+  `jmapClient.sendEmail` (batches `Email/set create` +
+  `EmailSubmission/set`) and `jmapClient.createDraft`;
+  `web/src/pages/Mail/Inbox.tsx` now supports per-row Mark
+  read/unread and Move to trash / Delete actions; and
+  `web/src/pages/Mail/MessageView.tsx` marks messages as read on
+  open, renders the JMAP `attachments` list, and ships
+  Reply / Reply-All / Forward buttons that navigate into Compose
+  with the quoted body pre-filled. Under the hood,
+  `web/src/api/jmap.ts` centralises the dev-bypass bearer token
+  (`Authorization: Bearer kmail-dev`) through an `authHeaders()`
+  helper on every `fetch`, adds `markRead(emailId, read)` (JMAP
+  `keywords/$seen` patch-path) and `createDraft(draft)` helpers,
+  factors the shared draft-payload construction into a
+  `buildEmailCreate()` so `sendEmail` and `createDraft` cannot
+  drift, and asks `Email/get` for `attachments` alongside the
+  existing body properties. The previous Phase 2 batch (below)
+  remains accurate for the three pieces it landed.
+- **Previously (2026-04-23 earlier)**: Second Phase 2 batch landed.
+  This update finishes the Tenant Service CRUD surface with
   shared-inbox membership (`ListSharedInboxes`,
   `AddSharedInboxMember`, `RemoveSharedInboxMember` in
   `internal/tenant/service.go` and matching `/shared-inboxes` and
@@ -217,8 +266,12 @@ Checklist:
 - [x] Go DNS Onboarding Service (MX / SPF / DKIM / DMARC checks,
       domain verification).
 - [ ] React KChat Mail UI (inbox, compose, read, search).
-      _(Inbox list and single-message read pane are live against
-      the JMAP client; compose and full-text search remain.)_
+      _(Inbox, compose, and single-message read are live against
+      the JMAP client — Inbox supports per-row Mark read/unread
+      and Move to trash / Delete, Compose drives `Email/set` +
+      `EmailSubmission/set` with Reply / Reply-All / Forward
+      pre-fill, MessageView marks-on-open and lists attachments.
+      Full-text search remains.)_
 - [ ] React KChat Calendar UI (personal calendar, event create /
       edit, RSVP).
 - [x] JMAP client integration (web app → Go BFF → Stalwart JMAP).
