@@ -178,12 +178,23 @@ export default function Inbox() {
 
   const handleMoveToTrash = useCallback(
     async (email: Email) => {
-      if (!selectedMailbox || !trashMailboxId) {
+      if (!trashMailboxId) {
         setError("Trash mailbox is not available on this account");
         return;
       }
-      if (selectedMailbox === trashMailboxId) {
-        // Already in trash: destroy permanently.
+      // In search mode the email may live in a different mailbox
+      // than the sidebar selection; resolve the source mailbox from
+      // the email itself so the JMAP patch removes it from its
+      // actual location rather than a no-op key on selectedMailbox.
+      const emailMailboxIds = Object.keys(email.mailboxIds);
+      const sourceMailbox = inSearchMode
+        ? (emailMailboxIds[0] ?? selectedMailbox)
+        : selectedMailbox;
+      if (!sourceMailbox) {
+        setError("Could not determine source mailbox for this email");
+        return;
+      }
+      if (emailMailboxIds.includes(trashMailboxId)) {
         try {
           await jmapClient.deleteEmail(email.id);
           setReloadNonce((n) => n + 1);
@@ -193,13 +204,13 @@ export default function Inbox() {
         return;
       }
       try {
-        await jmapClient.moveEmail(email.id, selectedMailbox, trashMailboxId);
+        await jmapClient.moveEmail(email.id, sourceMailbox, trashMailboxId);
         setReloadNonce((n) => n + 1);
       } catch (err: unknown) {
         setError(errorMessage(err));
       }
     },
-    [selectedMailbox, trashMailboxId],
+    [inSearchMode, selectedMailbox, trashMailboxId],
   );
 
   const sortedMailboxes = useMemo(
