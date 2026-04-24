@@ -100,14 +100,20 @@ export default function Compose() {
    */
   const buildDraft = (requireTo = true): EmailDraft | null => {
     if (!draftsMailbox || !identity) return null;
-    const toList = parseAddresses(to);
+    // Strip the sender's own identity from every recipient bucket
+    // so Reply-All (and plain typed-in self-addresses) don't end up
+    // mailing the sender a copy.
+    const self = identity.email.trim().toLowerCase();
+    const strip = (list: EmailAddress[]): EmailAddress[] =>
+      list.filter((a) => a.email.trim().toLowerCase() !== self);
+    const toList = strip(parseAddresses(to));
     if (requireTo && toList.length === 0) return null;
     return {
       mailboxIds: { [draftsMailbox.id]: true },
       from: [{ name: identity.name || null, email: identity.email }],
       to: toList,
-      cc: parseAddresses(cc),
-      bcc: parseAddresses(bcc),
+      cc: strip(parseAddresses(cc)),
+      bcc: strip(parseAddresses(bcc)),
       subject: subject.trim(),
       textBody: body,
       privacyMode,

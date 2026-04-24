@@ -70,12 +70,22 @@ export default function MessageView() {
       email.replyTo && email.replyTo.length > 0
         ? email.replyTo
         : (email.from ?? []);
+    // For Reply-All, dedupe the CC list against the reply target so
+    // the same address doesn't end up in both To and Cc. Compose
+    // does a second pass to strip the sender's own identity, which
+    // is not available here.
+    const replyAllCc = replyAll
+      ? dedupeAddresses(
+          [...(email.to ?? []), ...(email.cc ?? [])],
+          replyTarget,
+        )
+      : [];
     navigate("/mail/compose", {
       state: {
         mode: replyAll ? "replyAll" : "reply",
         sourceEmailId: email.id,
         to: replyTarget,
-        cc: replyAll ? [...(email.to ?? []), ...(email.cc ?? [])] : [],
+        cc: replyAllCc,
         subject: withPrefix(email.subject, "Re:"),
         quotedBody: bodyText,
         quotedFrom: email.from,
@@ -269,6 +279,27 @@ function stripHtml(input: string): string {
     .replace(/&nbsp;/g, " ")
     .replace(/\s+\n/g, "\n")
     .trim();
+}
+
+/**
+ * Remove from `list` any address whose email (case-insensitively)
+ * matches one in `exclude`. Used to prevent duplicate recipients
+ * between the To and Cc fields on Reply-All.
+ */
+function dedupeAddresses(
+  list: { name: string | null; email: string }[],
+  exclude: { name: string | null; email: string }[],
+): { name: string | null; email: string }[] {
+  const seen = new Set<string>();
+  for (const a of exclude) seen.add(a.email.trim().toLowerCase());
+  const out: { name: string | null; email: string }[] = [];
+  for (const a of list) {
+    const key = a.email.trim().toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(a);
+  }
+  return out;
 }
 
 function formatAddresses(
