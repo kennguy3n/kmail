@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
   AdminApiError,
@@ -45,7 +45,15 @@ export default function UserAdmin() {
   // `editingUserId` toggles the inline edit row. `editDraft` holds
   // the in-flight form values; it is seeded from the user record
   // when editing starts and flushed through `updateUser` on save.
+  // `editingUserIdRef` mirrors `editingUserId` so promise handlers
+  // can observe the live value instead of a stale closure — matters
+  // when an admin clicks Save on one row and then Edit on another
+  // before the PATCH resolves.
   const [editingUserId, setEditingUserId] = useState<string | null>(null);
+  const editingUserIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    editingUserIdRef.current = editingUserId;
+  }, [editingUserId]);
   const [editDraft, setEditDraft] = useState<UpdateUserInput>({});
   const [saving, setSaving] = useState(false);
   const [rowError, setRowError] = useState<Record<string, string>>({});
@@ -134,7 +142,13 @@ export default function UserAdmin() {
             ? current.map((row) => (row.id === updated.id ? updated : row))
             : current,
         );
-        cancelEdit();
+        // Scope the cancel to the row whose save just completed so
+        // an admin who started editing a different row while this
+        // PATCH was in flight does not lose their in-progress edit.
+        if (editingUserIdRef.current === updated.id) {
+          setEditingUserId(null);
+          setEditDraft({});
+        }
       })
       .catch((e: unknown) => {
         setRowError((prev) => ({ ...prev, [u.id]: errorMessage(e) }));

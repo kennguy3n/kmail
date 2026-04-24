@@ -137,7 +137,13 @@ export default function DomainAdmin() {
 
   const onToggleRecords = (domain: TenantDomain): void => {
     if (!selectedTenantId) return;
+    const wasExpanded = !!expanded[domain.id];
     setExpanded((prev) => ({ ...prev, [domain.id]: !prev[domain.id] }));
+    // Collapsing: nothing to fetch. Expanding: only fetch if we
+    // don't already have the records cached — this keeps a failed
+    // prior fetch from refiring a request just because the user
+    // hid the panel.
+    if (wasExpanded) return;
     if (records[domain.id]) return;
     setRecordsLoading((prev) => ({ ...prev, [domain.id]: true }));
     setRecordsError((prev) => {
