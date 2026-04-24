@@ -216,6 +216,136 @@ fi
 # for a missing `x:NetworkListener/set` call.
 
 # ------------------------------------------------------------------
+# Spam / phishing filter.
+#
+# Stalwart v0.16.0 ships a built-in spam classifier
+# (SpamAssassin-compatible rules + DNSBL lookups + a Bayesian
+# classifier trained on per-mailbox `$junk` / `$notjunk` keyword
+# feedback). The filter is driven entirely by string-keyed
+# settings in the admin registry — the shape JMAP exposes is
+# `x:Setting/set` with `create` entries of `{"id": "<key>",
+# "value": "<value>"}`. See the `[spam-filter.*]` section of
+# Stalwart's default config for the full key surface.
+#
+# We turn on the classifier, pin the spam-tag / reject thresholds,
+# enable a representative set of public DNSBLs, and install a
+# Sieve rule that files anything tagged `X-Spam-Status: Yes`
+# into the per-mailbox `Junk` folder (which Stalwart auto-creates
+# on every principal with role=junk). The server also learns
+# from user feedback: `markAsSpam` / `markAsNotSpam` in the web UI
+# sets the JMAP `$junk` / `$notjunk` keywords that the Bayesian
+# classifier trains against.
+# ------------------------------------------------------------------
+
+# setting_upsert KEY VALUE
+# Idempotent `x:Setting/set` upsert. The admin registry exposes
+# settings as free-form string key/value pairs; we send one
+# `update` per key so re-runs are no-ops on an already-configured
+# instance and first-boot runs lay down the full config.
+setting_upsert() {
+  key=$1
+  value=$2
+  # JSON-escape the value by delegating to jq-free printf + sed;
+  # all of the values we write here are simple scalars (booleans,
+  # numbers, bare tokens, comma-separated lists) so no escaping
+  # is required beyond wrapping in double quotes.
+  set_args=$(printf '{"accountId":"%s","update":{"%s":{"value":"%s"}}}' \
+    "$ADMIN_ACCOUNT_ID" "$key" "$value")
+  response=$(jmap_call "x:Setting/set" "$set_args")
+  if printf '%s' "$response" | grep -q '"updated":{"'; then
+    log "setting ${key}=${value} applied"
+    return 0
+  fi
+  # First-boot: the key may not exist yet. Fall back to `create`.
+  create_args=$(printf '{"accountId":"%s","create":{"s":{"id":"%s","value":"%s"}}}' \
+    "$ADMIN_ACCOUNT_ID" "$key" "$value")
+  response=$(jmap_call "x:Setting/set" "$create_args")
+  if printf '%s' "$response" | grep -q '"created":{"s":'; then
+    log "setting ${key}=${value} created"
+    return 0
+  fi
+  log "failed to apply setting ${key}: ${response}"
+  exit 1
+}
+
+log "configuring Stalwart built-in spam / phishing filter"
+
+# Master enable. Turns on the classifier, DNSBL lookups, Sieve
+# `spamtest` support, and the X-Spam-* header injection path.
+setting_upsert "spam-filter.enable" "true"
+setting_upsert "spam-filter.header.status.enable" "true"
+setting_upsert "spam-filter.header.result.enable" "true"
+setting_upsert "spam-filter.header.score.enable" "true"
+
+# Thresholds. SpamAssassin convention: 5.0 is the standard
+# "probably spam" line; 10.0 is high-confidence spam where the
+# only reasonable action is to reject at SMTP time rather than
+# deliver to Junk. Scores compound across rules (DNSBL hits,
+# URIBL hits, Bayesian probability, header heuristics), so a
+# legitimate message with one weak hit stays under 5.0.
+setting_upsert "spam-filter.score.spam" "5.0"
+setting_upsert "spam-filter.score.discard" "10.0"
+setting_upsert "spam-filter.score.reject" "15.0"
+
+# Bayesian classifier — trained on the JMAP `$junk` / `$notjunk`
+# keyword feedback loop the web UI sends via `markAsSpam`.
+setting_upsert "spam-filter.bayes.enable" "true"
+setting_upsert "spam-filter.bayes.auto-learn.enable" "true"
+setting_upsert "spam-filter.bayes.auto-learn.threshold.spam" "7.0"
+setting_upsert "spam-filter.bayes.auto-learn.threshold.ham" "-1.0"
+
+# DNSBL / URIBL lookups. The picks below are well-known public
+# lists that are free for low-volume dev use; tenants on shared
+# deliverability pools override these in production via the
+# Deliverability Control Plane (see docs/ARCHITECTURE.md §7).
+setting_upsert "spam-filter.dnsbl.enable" "true"
+setting_upsert "spam-filter.dnsbl.ip.zen.spamhaus.org" "2.0"
+setting_upsert "spam-filter.dnsbl.ip.bl.spamcop.net" "1.5"
+setting_upsert "spam-filter.dnsbl.domain.dbl.spamhaus.org" "2.5"
+setting_upsert "spam-filter.dnsbl.domain.multi.surbl.org" "1.5"
+
+# Junk mailbox auto-filing. Stalwart creates a per-principal
+# mailbox with role=junk on first mailbox enumeration; this
+# Sieve script (stored as a singleton under the recovery-admin
+# account so it applies globally) moves anything tagged
+# `X-Spam-Status: Yes` into that mailbox at delivery time. The
+# `$junk` imap-keyword is also set so the Bayesian classifier
+# treats future mail from the same sender as training data.
+SPAM_SIEVE=$(cat <<'SIEVE'
+require ["fileinto", "imap4flags", "environment", "variables"];
+
+if allof (
+  header :contains "X-Spam-Status" "Yes",
+  not header :contains "X-Spam-Exempt" "true"
+) {
+  addflag "$junk";
+  fileinto :specialuse "\\Junk" "Junk";
+  stop;
+}
+SIEVE
+)
+
+# Escape the multiline Sieve script for JSON embedding: backslash
+# and double-quote, and replace newlines with `\n`. Kept inline
+# because we only do this once and `jq` is not guaranteed inside
+# the minimal alpine-based init container.
+SPAM_SIEVE_JSON=$(printf '%s' "$SPAM_SIEVE" \
+  | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' \
+  | awk 'BEGIN{ORS="\\n"} {print}' \
+  | sed 's/\\n$//')
+
+SIEVE_RECORD=$(printf '{"@type":"Sieve","name":"kmail-junk","active":true,"script":"%s"}' "$SPAM_SIEVE_JSON")
+SIEVE_ARGS=$(printf '{"accountId":"%s","create":{"s":%s}}' "$ADMIN_ACCOUNT_ID" "$SIEVE_RECORD")
+sieve_response=$(jmap_call "x:Script/set" "$SIEVE_ARGS" 2>/dev/null || true)
+if printf '%s' "$sieve_response" | grep -q '"created":{"s":'; then
+  log "junk-filing Sieve script installed"
+elif printf '%s' "$sieve_response" | grep -q '"notCreated":{"s":{"type":"alreadyExists"'; then
+  log "junk-filing Sieve script already present, skipping"
+else
+  log "sieve install returned: ${sieve_response}"
+fi
+
+# ------------------------------------------------------------------
 # First-boot restart of the stalwart container.
 # ------------------------------------------------------------------
 # Stalwart v0.16.0 resolves the concrete blob / in-memory / search

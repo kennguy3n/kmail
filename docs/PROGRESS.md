@@ -4,7 +4,70 @@
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
 - **Status**: Phase 1 — Foundation (in progress); Phase 2 —
   Prototype (in progress)
-- **Last updated**: 2026-04-24 — Phase 2 Mail + Calendar UI batch
+- **Last updated**: 2026-04-24 — Phase 2 compatibility + spam +
+  migration batch landed. Four Phase 2 checklist items graduate
+  off the "planned" list: basic spam / phishing filtering via
+  Stalwart, IMAP / SMTP compatibility testing, CalDAV
+  compatibility testing, and the Gmail / IMAP migration
+  orchestrator. Specifically:
+  * `scripts/stalwart-init.sh` now drives Stalwart v0.16.0's
+    built-in spam filter through the JMAP admin registry —
+    toggles `spam-filter.enable`, pins spam / discard / reject
+    score thresholds (5.0 / 10.0 / 15.0), wires the Bayesian
+    classifier with JMAP `$junk` / `$notjunk` auto-learning,
+    enables a representative DNSBL set (Spamhaus Zen / SpamCop /
+    Spamhaus DBL / SURBL), and installs a Sieve script that
+    files anything tagged `X-Spam-Status: Yes` into the
+    per-principal Junk mailbox.
+  * `web/src/api/jmap.ts` gains `markAsSpam(emailId, fromMailbox,
+    junkMailbox, isSpam)` — an atomic JMAP `Email/set` patch that
+    moves the message between Inbox and Junk and flips the
+    `$junk` / `$notjunk` keywords in the same round-trip so the
+    server-side classifier learns from user feedback.
+  * `web/src/pages/Mail/Inbox.tsx` resolves the Junk mailbox by
+    role, shows a ⚠ icon + amber styling next to it in the
+    sidebar, adds a row-level `Spam` / `Not spam` button whose
+    label flips depending on whether the message already lives
+    in Junk, and paints a `SPAM` badge + amber background on
+    rows currently filed as junk.
+  * `scripts/test-imap-smtp.sh` asserts that SMTP :587 announces
+    STARTTLS + AUTH, SMTP :465 completes an implicit TLS
+    handshake, IMAP :143 accepts STARTTLS + `LOGIN` + `LIST`, and
+    a `curl`-submitted RFC 5322 message round-trips through the
+    recipient's INBOX within 10 s.
+  * `scripts/test-caldav.sh` asserts that `OPTIONS
+    /dav/calendars/` announces the `calendar-access` compliance
+    class, `PROPFIND Depth:0/1` returns multistatus + at least
+    one calendar collection, and a minimal VEVENT survives a
+    PUT → GET → DELETE round-trip (the script re-reads the
+    `SUMMARY` field to confirm payload fidelity).
+  * `docs/COMPATIBILITY.md` is a new doc covering the third-
+    party client contract: port matrix (25 / 465 / 587 / 143 /
+    993 / 8080), Thunderbird + Apple Mail (IMAP / SMTP /
+    CalDAV) manual setup, known limitations of Stalwart v0.16.0
+    (XOAUTH2 / CONDSTORE / SORT / BURL / DSN), and a manual
+    checklist for Mail + Spam / Junk + Calendar.
+  * `internal/migration/` goes from a two-line placeholder to a
+    full orchestrator: `Service` + `Config` + `MigrationJob`,
+    `CreateJob` / `StartJob` / `GetJob` / `ListJobs` /
+    `CancelJob`, an in-process worker goroutine pool capped by
+    `MaxConcurrent` that shells out to `imapsync`, parses its
+    `Messages N of M done` progress lines, and writes
+    `progress_pct` / `messages_synced` / `messages_total`
+    checkpoints back to Postgres; state transitions (`pending →
+    running → completed|failed|cancelled`) and the worker
+    cancel-func map are covered by unit tests, and the HTTP
+    surface (`POST / GET / GET /{jobId} / DELETE /{jobId}`
+    under `/api/v1/migrations`) is mounted alongside the tenant
+    and DNS handlers in `cmd/kmail-api/main.go`, all tenant-
+    scoped via OIDC + RLS.
+  * `migrations/002_migration_jobs.sql` adds the `migration_jobs`
+    table (tenant_id FK, `pending|running|paused|cancelled|failed|completed`
+    status enum, progress / message counters, started / completed
+    timestamps, encrypted source password, `kmail_set_updated_at`
+    trigger, tenant + status indexes, and a tenant-isolating
+    RLS policy against `app.tenant_id`).
+- **Previously (2026-04-24)**: Phase 2 Mail + Calendar UI batch
   landed. The React Mail UI now has full-text search: a new
   `searchEmails(query, opts)` method on `web/src/api/jmap.ts`
   builds a JMAP `Email/query` with an RFC 8621 §4.4.1 `text`
@@ -332,6 +395,31 @@ Delivered so far:
   route `/calendar/:eventId`. Speaks the draft JMAP calendars
   capability (`urn:ietf:params:jmap:calendars`) exposed by the Go
   BFF on top of Stalwart's CalDAV store.
+- **Spam / phishing filtering** — Stalwart built-in classifier
+  turned on via the JMAP admin registry in
+  `scripts/stalwart-init.sh` (threshold + DNSBL + Bayesian
+  auto-learn wiring + a Sieve rule that files into Junk), plus
+  a `markAsSpam` helper in `web/src/api/jmap.ts` and a row-level
+  `Spam` / `Not spam` action in `web/src/pages/Mail/Inbox.tsx`
+  that flips `$junk` / `$notjunk` keywords and moves the email
+  between Inbox and Junk atomically.
+- **IMAP / SMTP compatibility** — `scripts/test-imap-smtp.sh`
+  (STARTTLS capability checks + AUTH probe + RFC 5322
+  round-trip via curl) plus `docs/COMPATIBILITY.md` with the
+  full Thunderbird + Apple Mail setup matrix, port table, and
+  manual test checklist.
+- **CalDAV compatibility** — `scripts/test-caldav.sh`
+  (OPTIONS + PROPFIND Depth:0/1 + PUT / GET / DELETE
+  round-trip against `/dav/calendars/`) with matching Apple
+  Calendar + Thunderbird sections in `docs/COMPATIBILITY.md`.
+- **Migration Orchestrator** — `internal/migration/` ships the
+  full `Service` + `Handlers` pair (tenant-scoped
+  `/api/v1/migrations` CRUD, goroutine worker pool capped by
+  `MaxConcurrent`, `imapsync` subprocess with progress-line
+  parsing + checkpointing into Postgres), tenant-isolating
+  `migration_jobs` table in `migrations/002_migration_jobs.sql`,
+  and unit tests covering input validation + state transitions
+  + the imapsync progress regex.
 
 Checklist:
 
@@ -366,10 +454,26 @@ Checklist:
       `Mailbox/get` / `Email/query` / `Email/get` / `Email/set` /
       `EmailSubmission/set` helpers; RFC 8621 shapes in
       `web/src/types/index.ts`.)_
-- [ ] IMAP / SMTP compatibility testing (Thunderbird, Apple Mail).
-- [ ] CalDAV compatibility testing.
-- [ ] Basic spam / phishing filtering via Stalwart.
-- [ ] Gmail / IMAP migration orchestrator (Go + imapsync).
+- [x] IMAP / SMTP compatibility testing (Thunderbird, Apple Mail).
+      _(STARTTLS + AUTH probes, RFC 5322 round-trip via
+      `scripts/test-imap-smtp.sh`, setup matrix in
+      `docs/COMPATIBILITY.md`.)_
+- [x] CalDAV compatibility testing.
+      _(OPTIONS / PROPFIND / PUT / GET / DELETE round-trip via
+      `scripts/test-caldav.sh`, Apple Calendar + Thunderbird
+      client setup in `docs/COMPATIBILITY.md`.)_
+- [x] Basic spam / phishing filtering via Stalwart.
+      _(`spam-filter.*` settings + DNSBL + Bayesian auto-learn +
+      Sieve Junk rule in `scripts/stalwart-init.sh`, `markAsSpam`
+      helper in `web/src/api/jmap.ts`, Junk mailbox awareness +
+      per-row `Spam`/`Not spam` action in
+      `web/src/pages/Mail/Inbox.tsx`.)_
+- [x] Gmail / IMAP migration orchestrator (Go + imapsync).
+      _(`internal/migration/` Service + HTTP handlers under
+      `/api/v1/migrations`, goroutine worker pool, imapsync
+      progress parsing + Postgres checkpointing, RLS-scoped
+      `migration_jobs` table, unit tests for validation + state
+      transitions.)_
 - [ ] Email-to-chat bridge (share email to KChat channel).
 - [x] zk-object-fabric blob store integration verified end-to-end.
       _(PUT / GET round-trips via Stalwart's JMAP blob upload /

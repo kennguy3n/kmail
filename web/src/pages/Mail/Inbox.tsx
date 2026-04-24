@@ -234,6 +234,16 @@ export default function Inbox() {
     [mailboxes],
   );
 
+  const junkMailboxId = useMemo(
+    () => (mailboxes ?? []).find((m) => m.role === "junk")?.id ?? null,
+    [mailboxes],
+  );
+
+  const inboxMailboxId = useMemo(
+    () => (mailboxes ?? []).find((m) => m.role === "inbox")?.id ?? null,
+    [mailboxes],
+  );
+
   // Single source of truth for "this row behaves as if it lives in
   // trash". Used both for the row label (Trash vs Delete) and the
   // handler's delete-vs-move branch so they can't drift. In search
@@ -256,6 +266,23 @@ export default function Inbox() {
     [inSearchMode, selectedMailbox, trashMailboxId],
   );
 
+  // Mirror of isEmailInTrash for the Junk mailbox. Drives the
+  // row-level "Spam" / "Not spam" button label and the
+  // handleToggleSpam direction-of-move decision.
+  const isEmailInJunk = useCallback(
+    (email: Email): boolean => {
+      if (junkMailboxId === null) return false;
+      if (inSearchMode) {
+        return Object.prototype.hasOwnProperty.call(
+          email.mailboxIds,
+          junkMailboxId,
+        );
+      }
+      return selectedMailbox === junkMailboxId;
+    },
+    [inSearchMode, junkMailboxId, selectedMailbox],
+  );
+
   // Bump both refetch nonces after a successful write. The
   // mailbox-list effect reads `reloadNonce`; the search effect
   // above reads `searchReloadNonce`. Bumping both here keeps the
@@ -276,6 +303,49 @@ export default function Inbox() {
       }
     },
     [bumpAfterWrite],
+  );
+
+  const handleToggleSpam = useCallback(
+    async (email: Email) => {
+      if (!junkMailboxId) {
+        setError("Junk mailbox is not available on this account");
+        return;
+      }
+      const inJunk = isEmailInJunk(email);
+      // Source mailbox = the non-junk mailbox the email currently
+      // lives in (for Inbox → Junk) or the mailbox to move it back
+      // to (for Junk → Inbox). In search mode we pick the first
+      // mailbox id on the email other than Junk; otherwise fall
+      // back to the Inbox role, then to the sidebar selection.
+      const emailMailboxIds = Object.keys(email.mailboxIds);
+      const nonJunkOnEmail = emailMailboxIds.find(
+        (id) => id !== junkMailboxId,
+      );
+      const counterpart =
+        nonJunkOnEmail ?? inboxMailboxId ?? selectedMailbox;
+      if (!counterpart) {
+        setError("Could not determine source mailbox for this email");
+        return;
+      }
+      try {
+        await jmapClient.markAsSpam(
+          email.id,
+          counterpart,
+          junkMailboxId,
+          !inJunk,
+        );
+        bumpAfterWrite();
+      } catch (err: unknown) {
+        setError(errorMessage(err));
+      }
+    },
+    [
+      bumpAfterWrite,
+      inboxMailboxId,
+      isEmailInJunk,
+      junkMailboxId,
+      selectedMailbox,
+    ],
   );
 
   const handleMoveToTrash = useCallback(
@@ -340,6 +410,7 @@ export default function Inbox() {
           <ul style={layoutStyles.mailboxList}>
             {sortedMailboxes.map((mb) => {
               const isSelected = mb.id === selectedMailbox;
+              const isJunk = mb.role === "junk";
               return (
                 <li key={mb.id}>
                   <button
@@ -348,9 +419,18 @@ export default function Inbox() {
                     style={{
                       ...layoutStyles.mailboxItem,
                       ...(isSelected ? layoutStyles.mailboxItemActive : {}),
+                      ...(isJunk ? layoutStyles.mailboxItemJunk : {}),
                     }}
+                    title={isJunk ? "Spam / junk mail" : mb.name}
                   >
-                    <span>{mb.name}</span>
+                    <span>
+                      {isJunk && (
+                        <span aria-hidden="true" style={layoutStyles.junkIcon}>
+                          ⚠
+                        </span>
+                      )}
+                      {mb.name}
+                    </span>
                     {mb.unreadEmails > 0 && (
                       <span style={layoutStyles.unreadBadge}>
                         {mb.unreadEmails}
@@ -455,14 +535,24 @@ export default function Inbox() {
                       trashMailboxId,
                     )
                   : inTrashView;
+                const rowInJunk = inSearchMode
+                  ? junkMailboxId !== null &&
+                    Object.prototype.hasOwnProperty.call(
+                      email.mailboxIds,
+                      junkMailboxId,
+                    )
+                  : selectedMailbox === junkMailboxId;
                 return (
                   <EmailRow
                     key={email.id}
                     email={email}
                     inTrashView={rowInTrash}
+                    inJunkView={rowInJunk}
+                    hasJunkMailbox={junkMailboxId !== null}
                     onOpen={() => handleOpenEmail(email.id)}
                     onToggleRead={() => handleToggleRead(email)}
                     onMoveToTrash={() => handleMoveToTrash(email)}
+                    onToggleSpam={() => handleToggleSpam(email)}
                   />
                 );
               })}
@@ -477,17 +567,23 @@ export default function Inbox() {
 interface EmailRowProps {
   email: Email;
   inTrashView: boolean;
+  inJunkView: boolean;
+  hasJunkMailbox: boolean;
   onOpen: () => void;
   onToggleRead: () => void;
   onMoveToTrash: () => void;
+  onToggleSpam: () => void;
 }
 
 function EmailRow({
   email,
   inTrashView,
+  inJunkView,
+  hasJunkMailbox,
   onOpen,
   onToggleRead,
   onMoveToTrash,
+  onToggleSpam,
 }: EmailRowProps) {
   const isUnread = !email.keywords.$seen;
   const from = email.from?.[0];
@@ -500,8 +596,18 @@ function EmailRow({
         style={{
           ...layoutStyles.emailRow,
           ...(isUnread ? layoutStyles.emailRowUnread : {}),
+          ...(inJunkView ? layoutStyles.emailRowJunk : {}),
         }}
       >
+        {inJunkView && (
+          <span
+            style={layoutStyles.junkRowBadge}
+            title="Filed as spam by the server or by a user"
+            aria-label="Junk"
+          >
+            SPAM
+          </span>
+        )}
         <button
           type="button"
           onClick={onOpen}
@@ -523,6 +629,23 @@ function EmailRow({
           >
             {isUnread ? "Mark read" : "Mark unread"}
           </button>
+          {hasJunkMailbox && (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                onToggleSpam();
+              }}
+              style={layoutStyles.actionButton}
+              title={
+                inJunkView
+                  ? "Not spam — move back to Inbox and clear the junk flag"
+                  : "Mark as spam — move to Junk and train the spam classifier"
+              }
+            >
+              {inJunkView ? "Not spam" : "Spam"}
+            </button>
+          )}
           <button
             type="button"
             onClick={(e) => {
@@ -613,6 +736,13 @@ const layoutStyles: Record<string, React.CSSProperties> = {
   mailboxItemActive: {
     background: "#dbeafe",
     fontWeight: 600,
+  },
+  mailboxItemJunk: {
+    color: "#92400e",
+  },
+  junkIcon: {
+    marginRight: "0.35rem",
+    color: "#d97706",
   },
   unreadBadge: {
     background: "#2563eb",
@@ -737,6 +867,21 @@ const layoutStyles: Record<string, React.CSSProperties> = {
   emailRowUnread: {
     fontWeight: 600,
     background: "#eff6ff",
+  },
+  emailRowJunk: {
+    background: "#fef3c7",
+  },
+  junkRowBadge: {
+    display: "inline-flex",
+    alignItems: "center",
+    padding: "0.1rem 0.4rem",
+    fontSize: "0.65rem",
+    fontWeight: 700,
+    letterSpacing: "0.05em",
+    background: "#d97706",
+    color: "#fff",
+    borderRadius: "0.25rem",
+    flexShrink: 0,
   },
   emailSender: {
     overflow: "hidden",
