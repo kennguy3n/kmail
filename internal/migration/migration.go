@@ -97,9 +97,14 @@ type Service struct {
 	sema chan struct{}
 
 	// mu protects cancels, the jobID → cancel-func map used by
-	// CancelJob to signal a running worker.
+	// CancelJob to signal a running worker, and pausing, the set
+	// of jobIDs whose worker context was cancelled by PauseJob
+	// rather than CancelJob (so the worker knows not to overwrite
+	// the already-written `paused` status with `cancelled` on its
+	// terminal update).
 	mu      sync.Mutex
 	cancels map[string]context.CancelFunc
+	pausing map[string]struct{}
 }
 
 // NewService constructs a Service with sensible defaults.
@@ -117,6 +122,7 @@ func NewService(cfg Config) *Service {
 		cfg:     cfg,
 		sema:    make(chan struct{}, cfg.MaxConcurrent),
 		cancels: make(map[string]context.CancelFunc),
+		pausing: make(map[string]struct{}),
 	}
 }
 
@@ -392,6 +398,13 @@ func (s *Service) PauseJob(ctx context.Context, tenantID, jobID string) error {
 
 	s.mu.Lock()
 	cancel, running := s.cancels[jobID]
+	if running {
+		// Flag the job as pausing *before* calling cancel() so the
+		// worker goroutine sees the flag when it unwinds and skips
+		// its terminal updateStatus (which would otherwise race and
+		// overwrite `paused` with `cancelled`).
+		s.pausing[jobID] = struct{}{}
+	}
 	s.mu.Unlock()
 	if running {
 		// Worker will observe ctx.Err() and stop mid-batch;
@@ -501,10 +514,22 @@ func (s *Service) runWorker(
 		<-s.sema
 		s.mu.Lock()
 		delete(s.cancels, jobID)
+		delete(s.pausing, jobID)
 		s.mu.Unlock()
 	}()
 
 	runErr := s.runImapsync(ctx, tenantID, jobID, job)
+
+	// If PauseJob signalled this worker, it has already flipped
+	// the row to `paused`. Writing `cancelled` here would race and
+	// break ResumeJob (which only accepts rows in `paused`).
+	s.mu.Lock()
+	_, paused := s.pausing[jobID]
+	s.mu.Unlock()
+	if paused {
+		return
+	}
+
 	// Use a background context for the terminal write so we still
 	// record a final state when the worker's context was cancelled.
 	writeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

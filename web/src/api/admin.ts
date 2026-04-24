@@ -311,6 +311,10 @@ function auditQueryString(q?: AuditLogQuery): string {
 /**
  * Paginated query of the audit log. Backend route:
  * `GET /api/v1/tenants/{id}/audit-log`.
+ *
+ * The Go handler (`internal/audit/handlers.go#query`) wraps the
+ * rows in a `{ "entries": [...] }` envelope, so we unwrap here
+ * and expose the bare array to callers.
  */
 export async function getAuditLog(
   tenantId: string,
@@ -319,10 +323,11 @@ export async function getAuditLog(
   const url =
     `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/audit-log` +
     auditQueryString(filters);
-  return requestJSON<AuditLogEntry[]>(url, {
+  const body = await requestJSON<{ entries?: AuditLogEntry[] }>(url, {
     method: "GET",
     headers: adminAuthHeaders(tenantId, { Accept: "application/json" }),
   });
+  return body.entries ?? [];
 }
 
 /**
@@ -352,25 +357,27 @@ export async function exportAuditLog(
 }
 
 /**
- * Verify the hash chain. Returns `ok: true` when the full chain
- * validates; the backend returns HTTP 409 with `ok: false` and a
- * `broken_at` row id when a tamper is detected.
+ * Verify the hash chain. Returns `{ ok: true }` when the full
+ * chain validates; the backend returns HTTP 409 with an `error`
+ * body when a tamper is detected, which this helper surfaces as
+ * `{ ok: false, error }` so callers don't need a try/catch for
+ * the expected "chain broken" outcome.
  */
 export async function verifyAuditChain(
   tenantId: string,
-): Promise<{ ok: boolean; rows: number; broken_at?: string }> {
+): Promise<{ ok: boolean; error?: string }> {
   const url = `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/audit-log/verify`;
   const res = await fetch(url, {
     method: "POST",
     credentials: "include",
     headers: adminAuthHeaders(tenantId, { Accept: "application/json" }),
   });
-  if (!res.ok && res.status !== 409) {
-    throw new AdminApiError(url, res.status, await parseErrorBody(res));
+  if (res.ok) {
+    return { ok: true };
   }
-  return (await res.json()) as {
-    ok: boolean;
-    rows: number;
-    broken_at?: string;
-  };
+  if (res.status === 409) {
+    const body = (await res.json().catch(() => ({}))) as { error?: string };
+    return { ok: false, error: body.error ?? "audit chain broken" };
+  }
+  throw new AdminApiError(url, res.status, await parseErrorBody(res));
 }

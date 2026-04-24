@@ -112,6 +112,17 @@ func (s *Service) Log(ctx context.Context, e Entry) (*Entry, error) {
 			return err
 		}
 		e.PrevHash = prevHash
+		// Normalise the IP before hashing so VerifyChain — which
+		// reads the normalised form back from Postgres — recomputes
+		// an identical digest. Invalid IPs are dropped (NULL column)
+		// and excluded from the hash payload.
+		if e.IPAddress != "" {
+			if parsed := net.ParseIP(e.IPAddress); parsed != nil {
+				e.IPAddress = parsed.String()
+			} else {
+				e.IPAddress = ""
+			}
+		}
 		e.EntryHash = computeHash(prevHash, e)
 		meta := e.Metadata
 		if meta == nil {
@@ -120,9 +131,7 @@ func (s *Service) Log(ctx context.Context, e Entry) (*Entry, error) {
 		metaJSON, _ := json.Marshal(meta)
 		var ip any
 		if e.IPAddress != "" {
-			if parsed := net.ParseIP(e.IPAddress); parsed != nil {
-				ip = parsed.String()
-			}
+			ip = e.IPAddress
 		}
 		return tx.QueryRow(ctx, `
 			INSERT INTO audit_log
