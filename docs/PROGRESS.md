@@ -4,32 +4,55 @@
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
 - **Status**: Phase 1 — Foundation (in progress); Phase 2 —
   Prototype (in progress)
-- **Last updated**: 2026-04-24 — zk-object-fabric blob store
-  smoke test partially verified against the local compose stack.
-  Brought the full stack up (`docker compose up`); `zk-fabric`,
-  `postgres`, `valkey`, `meilisearch`, and `stalwart` all come up
-  healthy and the one-shot `zk-fabric-init` creates the
-  `kmail-blobs` bucket as expected. Verified from the host with
-  the dev `kmail-access-key` credentials that the gateway accepts
-  S3 `PutObject` / `ListObjectsV2` / `HeadObject` / `DeleteObject`
-  against `s3://kmail-blobs/` — i.e. the blob path Stalwart is
-  pointed at is a working S3 endpoint. The `kmail-blobs`
-  integration verified end-to-end checklist item (below) is still
-  left unchecked because this run did *not* exercise a round-trip
-  through Stalwart itself: `scripts/stalwart-init.sh` targets
-  `${ADMIN_URL}/api/settings/list` and `/api/settings` /
-  `/api/domain`, but Stalwart v0.16.0 serves the management API
-  under `/admin/api/...` (the `/api/...` paths 404 on the running
-  `stalwart:v0.16.0` image), so the one-shot config run aborts
-  with `timed out waiting for stalwart admin API`. The manual
-  admin-API probe (`curl -u admin:kmail-dev
-  http://localhost:8080/admin/api/settings/list`) also comes back
-  as the admin SPA's index HTML rather than a JSON payload, so
-  wiring this fully hands-off in compose needs a follow-up pass
-  against the exact v0.16.0 admin-API shape — tracked as the
-  first item of the Phase 2 follow-up list below. No KMail
-  application code depends on that fix; the BFF, JMAP proxy, and
-  web client are already written against the JMAP surface.
+- **Last updated**: 2026-04-24 — zk-object-fabric blob store is
+  now verified end-to-end through Stalwart, and the
+  `docker compose up` path is fully hands-off again.
+  `scripts/stalwart-init.sh` has been rewritten from the
+  legacy REST `/api/settings*` surface (which Stalwart v0.16.0
+  dropped) onto the JMAP admin registry — it POSTs
+  `x:BlobStore/set` (zk-fabric via the `S3StoreRegion::Custom`
+  endpoint/region pair), `x:InMemoryStore/set` (Valkey via the
+  Redis URL), `x:SearchStore/set` (Meilisearch via a Bearer
+  master key), and `x:Domain/set` (the dev tenant domain) with
+  Basic auth against `/jmap`. Stalwart v0.16.0 auto-creates
+  `Default` (Postgres-backed) singletons on first boot and only
+  resolves the concrete backends at startup, so the script now
+  also mounts `/var/run/docker.sock` and issues
+  `POST /containers/kmail-stalwart/restart` against the Docker
+  Engine API once the /set calls return — a one-time first-boot
+  restart that swaps the live pointer over to zk-object-fabric.
+  Verified from a fresh volume (`docker compose down -v` +
+  `docker compose up`): the init container completes with
+  `BlobStore configured` / `InMemoryStore configured` /
+  `SearchStore configured` / `domain kmail.dev created`, Stalwart
+  restarts, and a JMAP blob upload
+  (`POST /jmap/upload/d333333`) lands in `s3://kmail-blobs/`
+  visible via `aws s3api list-objects-v2 --bucket kmail-blobs`
+  on the host. Downloading the same blob via
+  `GET /jmap/download/d333333/{blobId}/...` returns the original
+  bytes — upload and download both flow through zk-fabric. As
+  part of the rewrite, `KMAIL_DEV_TENANT_DOMAIN` moved from
+  `kmail.local` to `kmail.dev`: Stalwart v0.16.0's domain
+  validator rejects the `.local` / `.test` /
+  `localhost.localdomain` RFC 2606 mDNS suffixes, and `.dev` is
+  a real TLD that passes validation without surprising the
+  mail-server's hostname checks. `docker-compose.yml` now
+  reflects the new domain and the socket mount.
+- **Previously (2026-04-24 earlier)**: zk-object-fabric blob
+  store smoke test partially verified against the local compose
+  stack. Brought the full stack up (`docker compose up`);
+  `zk-fabric`, `postgres`, `valkey`, `meilisearch`, and
+  `stalwart` all come up healthy and the one-shot
+  `zk-fabric-init` creates the `kmail-blobs` bucket as expected.
+  Verified from the host with the dev `kmail-access-key`
+  credentials that the gateway accepts S3 `PutObject` /
+  `ListObjectsV2` / `HeadObject` / `DeleteObject` against
+  `s3://kmail-blobs/` — i.e. the blob path Stalwart is pointed
+  at is a working S3 endpoint. Did *not* exercise a round-trip
+  through Stalwart itself because `scripts/stalwart-init.sh`
+  targeted the legacy REST `/api/settings*` surface that
+  Stalwart v0.16.0 dropped; the JMAP rewrite above closes that
+  gap.
 - **Previously (2026-04-23)**: Third Phase 2 batch landed. Mail
   UI is now end-to-end functional against the JMAP client:
   `web/src/pages/Mail/Compose.tsx` is a fully working composer
@@ -284,9 +307,13 @@ Checklist:
 - [ ] Basic spam / phishing filtering via Stalwart.
 - [ ] Gmail / IMAP migration orchestrator (Go + imapsync).
 - [ ] Email-to-chat bridge (share email to KChat channel).
-- [ ] zk-object-fabric blob store integration verified end-to-end
-      (PUT / GET mail blobs, attachment storage, presigned
-      attachment links).
+- [x] zk-object-fabric blob store integration verified end-to-end.
+      _(PUT / GET round-trips via Stalwart's JMAP blob upload /
+      download against `s3://kmail-blobs/` after the
+      `scripts/stalwart-init.sh` rewrite — see the
+      **Last updated** note for the verification method.
+      Attachment-to-link presigned sharing is deferred to
+      Phase 3.)_
 - [ ] Benchmark: inbox open P95 < 250 ms (warm), message open
       P95 < 300 ms, send accepted P99 < 1 s.
 

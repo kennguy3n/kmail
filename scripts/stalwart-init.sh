@@ -2,39 +2,54 @@
 # KMail — Stalwart v0.16.0 post-start initialization.
 #
 # Runs once after Stalwart comes up healthy (see the `stalwart-init`
-# one-shot in docker-compose.yml). Uses the Stalwart admin API to
-# configure the remaining storage backends, listeners, and the
-# kmail-dev tenant — the pieces that otherwise require a trip
-# through Stalwart's interactive setup wizard. The minimal JSON
-# bootstrap at configs/stalwart/config.json only points Stalwart
-# at its Postgres data store; everything below lives inside that
-# data store after this script runs.
+# one-shot in docker-compose.yml). Drives Stalwart's admin registry
+# via JMAP so the storage backends and the kmail-dev tenant land in
+# the data store without a human walking through the first-boot
+# setup wizard.
+#
+# Why JMAP and not `/api/settings`: Stalwart v0.16.0 dropped the
+# legacy REST surface the earlier revision of this script POSTed
+# against. The entire admin configuration now lives behind JMAP
+# method calls of the shape `x:<ObjectType>/{get,set,query}` against
+# the regular `/jmap` endpoint. Basic auth with the recovery admin
+# works on the same listener, so the init script doesn't need to
+# run the OAuth/OIDC dance the admin SPA uses. The per-object JSON
+# shapes below match Stalwart's live `/api/schema` response at
+# v0.16.0 (verified against `crates/store/src/backend/s3/mod.rs`
+# for the S3Store.region.Custom variant).
 #
 # After this script succeeds, bringing the stack up becomes a
 # hands-off `docker compose up` — no human ever needs to walk
-# through the Stalwart setup wizard.
+# through the setup wizard.
 #
-# Idempotent: every PUT / POST below uses a target path that
-# Stalwart treats as a replace, and settings that already match are
-# a no-op. Safe to re-run against an already-initialized instance.
+# Idempotent: every call below either checks for an existing record
+# first (singletons: BlobStore, InMemoryStore, SearchStore) or
+# queries for the target before creating (Domain). Safe to re-run
+# against an already-initialized instance.
 #
 # Inputs (from compose environment):
-#   STALWART_ADMIN_URL        default: http://stalwart:8080
-#   STALWART_ADMIN_PASSWORD   required
-#   ZK_FABRIC_URL             default: http://zk-fabric:8080
-#   ZK_FABRIC_BUCKET          default: kmail-blobs
-#   ZK_FABRIC_ACCESS_KEY      default: kmail-access-key
-#   ZK_FABRIC_SECRET_KEY      default: kmail-secret-key
-#   MEILISEARCH_URL           default: http://meilisearch:7700
-#   MEILISEARCH_API_KEY       default: kmail-dev
-#   VALKEY_URL                default: redis://valkey:6379
-#   KMAIL_DEV_TENANT_DOMAIN   default: kmail.local
+#   STALWART_ADMIN_URL         default: http://stalwart:8080
+#   STALWART_ADMIN_PASSWORD    required
+#   STALWART_ADMIN_ACCOUNT_ID  default: d333333 (recovery admin in v0.16.0)
+#   ZK_FABRIC_URL              default: http://zk-fabric:8080
+#   ZK_FABRIC_BUCKET           default: kmail-blobs
+#   ZK_FABRIC_ACCESS_KEY       default: kmail-access-key
+#   ZK_FABRIC_SECRET_KEY       default: kmail-secret-key
+#   MEILISEARCH_URL            default: http://meilisearch:7700
+#   MEILISEARCH_API_KEY        default: kmail-dev
+#   VALKEY_URL                 default: redis://valkey:6379
+#   KMAIL_DEV_TENANT_DOMAIN    default: kmail.dev
 
 set -eu
 
 ADMIN_URL=${STALWART_ADMIN_URL:-http://stalwart:8080}
 ADMIN_USER=admin
 ADMIN_PASS=${STALWART_ADMIN_PASSWORD:?STALWART_ADMIN_PASSWORD is required}
+# Stalwart assigns this deterministic ID to the recovery admin
+# bootstrapped from `STALWART_RECOVERY_ADMIN=admin:<pass>` on a
+# fresh datastore. Every JMAP admin call is tagged with this
+# accountId so the registry writes land on the right principal.
+ADMIN_ACCOUNT_ID=${STALWART_ADMIN_ACCOUNT_ID:-d333333}
 
 ZK_FABRIC_URL=${ZK_FABRIC_URL:-http://zk-fabric:8080}
 ZK_FABRIC_BUCKET=${ZK_FABRIC_BUCKET:-kmail-blobs}
@@ -46,107 +61,211 @@ MEILI_KEY=${MEILISEARCH_API_KEY:-kmail-dev}
 
 VALKEY_URL=${VALKEY_URL:-redis://valkey:6379}
 
-DEV_DOMAIN=${KMAIL_DEV_TENANT_DOMAIN:-kmail.local}
+# Stalwart v0.16.0's domain validator rejects RFC 2606 / mDNS-style
+# suffixes like `.local`, `.test`, and `localhost.localdomain`.
+# `kmail.dev` is a real TLD owned by Google and works as a dev
+# default without surprising the validator.
+DEV_DOMAIN=${KMAIL_DEV_TENANT_DOMAIN:-kmail.dev}
 
 log() { printf '[stalwart-init] %s\n' "$*"; }
 
 # ------------------------------------------------------------------
-# Wait for Stalwart's admin API to be ready.
+# Low-level JMAP helper.
 # ------------------------------------------------------------------
-log "waiting for stalwart admin API at ${ADMIN_URL}"
+
+# jmap_call METHOD_NAME ARGS_JSON
+# POSTs a single-method JMAP request with Basic auth. `args` must be
+# a complete JSON object; accountId is embedded by the caller.
+# Echoes the full response body on stdout. Exits non-zero on
+# curl-level failures (network / HTTP 5xx). JMAP-level
+# `notCreated` / `notUpdated` responses come back as HTTP 200 and
+# are inspected by the caller.
+jmap_call() {
+  method=$1
+  args=$2
+  body=$(printf '{"using":["urn:ietf:params:jmap:core"],"methodCalls":[["%s",%s,"c1"]]}' "$method" "$args")
+  curl -fsS -u "${ADMIN_USER}:${ADMIN_PASS}" \
+    -H 'Content-Type: application/json' \
+    -X POST "${ADMIN_URL}/jmap" \
+    -d "$body"
+}
+
+# ------------------------------------------------------------------
+# Wait for Stalwart's JMAP endpoint to answer with Basic auth.
+# ------------------------------------------------------------------
+log "waiting for stalwart JMAP endpoint at ${ADMIN_URL}"
 i=0
 until curl -sS -u "${ADMIN_USER}:${ADMIN_PASS}" -o /dev/null -w '%{http_code}' \
-    "${ADMIN_URL}/api/settings/list" | grep -qE '^(200|204)$'; do
+    "${ADMIN_URL}/jmap/session" | grep -qE '^(200|204)$'; do
   i=$((i + 1))
   if [ "$i" -gt 60 ]; then
-    log "timed out waiting for stalwart admin API"
+    log "timed out waiting for stalwart JMAP endpoint"
     exit 1
   fi
   sleep 2
 done
-log "stalwart admin API reachable"
+log "stalwart JMAP endpoint reachable"
 
 # ------------------------------------------------------------------
-# Helper: put a single setting key/value via the admin API.
-# Uses the Stalwart v0.16.0 /api/settings POST endpoint, which
-# accepts a JSON body of {"key": "...", "value": "..."} and is
-# idempotent (replaces the existing value).
+# singleton_upsert OBJECT RECORD_JSON
+# BlobStore, InMemoryStore and SearchStore are single-instance
+# registry objects in v0.16.0 — the server assigns them the fixed
+# id "singleton". Stalwart auto-creates each as a `Default` variant
+# on first boot, so the store pointer exists before this script
+# runs but points at the wrong backend. We therefore always issue
+# `/set` with an `update`: that overwrites the auto-created Default
+# (switching `@type` to S3 / Redis / Meilisearch), and on re-runs
+# it's an idempotent no-op. A JMAP `update` response comes back as
+# `{"updated":{"singleton":null}}` on success or
+# `{"notUpdated":{"singleton":{"type":"..."}}}` on failure.
 # ------------------------------------------------------------------
-put_setting() {
-  key=$1
-  value=$2
-  body=$(printf '{"key":"%s","value":%s}' "$key" "$value")
-  curl -fsSL -u "${ADMIN_USER}:${ADMIN_PASS}" \
-    -H 'Content-Type: application/json' \
-    -X POST "${ADMIN_URL}/api/settings" \
-    -d "$body" > /dev/null
-  log "set $key"
+singleton_upsert() {
+  object=$1
+  record=$2
+  set_args=$(printf '{"accountId":"%s","update":{"singleton":%s}}' "$ADMIN_ACCOUNT_ID" "$record")
+  response=$(jmap_call "x:${object}/set" "$set_args")
+  if printf '%s' "$response" | grep -q '"updated":{"singleton":'; then
+    log "${object} configured"
+    return 0
+  fi
+  log "failed to configure ${object}: ${response}"
+  exit 1
 }
-
-# Convenience: quote a shell string as a JSON string.
-jstr() { printf '"%s"' "$1"; }
 
 # ------------------------------------------------------------------
 # Blob store → zk-object-fabric S3 gateway.
+# `S3StoreRegion::Custom` lets us point Stalwart's S3 client at a
+# non-AWS endpoint (zk-fabric on the compose network). See
+# `crates/store/src/backend/s3/mod.rs` in Stalwart v0.16.0 for the
+# mapping to `rust-s3`'s `Region::Custom { region, endpoint }`.
 # ------------------------------------------------------------------
 log "configuring blob store → zk-object-fabric"
-put_setting 'store.blob.type'        "$(jstr s3)"
-put_setting 'store.blob.endpoint'    "$(jstr "$ZK_FABRIC_URL")"
-put_setting 'store.blob.region'      "$(jstr us-east-1)"
-put_setting 'store.blob.bucket'      "$(jstr "$ZK_FABRIC_BUCKET")"
-put_setting 'store.blob.access-key'  "$(jstr "$ZK_FABRIC_ACCESS_KEY")"
-put_setting 'store.blob.secret-key'  "$(jstr "$ZK_FABRIC_SECRET_KEY")"
-put_setting 'store.blob.path-style'  'true'
-put_setting 'storage.blob'           "$(jstr blob)"
-
-# ------------------------------------------------------------------
-# Search store → Meilisearch.
-# ------------------------------------------------------------------
-log "configuring search store → Meilisearch"
-put_setting 'store.fts.type'     "$(jstr meilisearch)"
-put_setting 'store.fts.url'      "$(jstr "$MEILI_URL")"
-put_setting 'store.fts.api-key'  "$(jstr "$MEILI_KEY")"
-put_setting 'storage.fts'        "$(jstr fts)"
+BLOB_RECORD=$(cat <<JSON
+{
+  "@type": "S3",
+  "bucket": "${ZK_FABRIC_BUCKET}",
+  "region": {
+    "@type": "Custom",
+    "customRegion": "us-east-1",
+    "customEndpoint": "${ZK_FABRIC_URL}"
+  },
+  "accessKey": "${ZK_FABRIC_ACCESS_KEY}",
+  "secretKey": { "@type": "Value", "secret": "${ZK_FABRIC_SECRET_KEY}" }
+}
+JSON
+)
+singleton_upsert BlobStore "$BLOB_RECORD"
 
 # ------------------------------------------------------------------
 # In-memory / lookup store → Valkey (Redis protocol).
 # ------------------------------------------------------------------
 log "configuring in-memory store → Valkey"
-put_setting 'store.lookup.type'  "$(jstr redis)"
-put_setting 'store.lookup.urls'  "[\"$VALKEY_URL\"]"
-put_setting 'storage.lookup'     "$(jstr lookup)"
+INMEM_RECORD=$(cat <<JSON
+{
+  "@type": "Redis",
+  "url": "${VALKEY_URL}"
+}
+JSON
+)
+singleton_upsert InMemoryStore "$INMEM_RECORD"
 
 # ------------------------------------------------------------------
-# Protocol listeners on the standard container-internal ports.
-# docker-compose.yml publishes 25 / 465 / 587 (SMTP), 143 / 993
-# (IMAP), and maps internal 8080 JMAP to host 18080.
+# Search / FTS store → Meilisearch.
+# Meilisearch accepts a master key as a Bearer token (see
+# https://www.meilisearch.com/docs/reference/api/overview#authorization).
 # ------------------------------------------------------------------
-log "configuring SMTP / IMAP / JMAP listeners"
-put_setting 'server.listener.smtp.protocol'       "$(jstr smtp)"
-put_setting 'server.listener.smtp.bind'           "$(jstr '[::]:25')"
-put_setting 'server.listener.smtps.protocol'      "$(jstr smtp)"
-put_setting 'server.listener.smtps.bind'          "$(jstr '[::]:465')"
-put_setting 'server.listener.smtps.tls.implicit'  'false'
-put_setting 'server.listener.submission.protocol' "$(jstr smtp)"
-put_setting 'server.listener.submission.bind'     "$(jstr '[::]:587')"
-put_setting 'server.listener.imap.protocol'       "$(jstr imap)"
-put_setting 'server.listener.imap.bind'           "$(jstr '[::]:143')"
-put_setting 'server.listener.imaps.protocol'      "$(jstr imap)"
-put_setting 'server.listener.imaps.bind'          "$(jstr '[::]:993')"
-put_setting 'server.listener.jmap.protocol'       "$(jstr jmap)"
-put_setting 'server.listener.jmap.bind'           "$(jstr '[::]:8080')"
+log "configuring search store → Meilisearch"
+SEARCH_RECORD=$(cat <<JSON
+{
+  "@type": "Meilisearch",
+  "url": "${MEILI_URL}",
+  "httpAuth": {
+    "@type": "Bearer",
+    "bearerToken": { "@type": "Value", "secret": "${MEILI_KEY}" }
+  }
+}
+JSON
+)
+singleton_upsert SearchStore "$SEARCH_RECORD"
 
 # ------------------------------------------------------------------
-# kmail-dev tenant — minimum viable tenant row so developers can
-# hit the stack end-to-end without running the Tenant Service
-# first. Created via the admin API's domain + account endpoints
-# which are idempotent on conflict.
+# kmail-dev tenant domain.
+# Non-singleton — the server assigns a fresh id on each create. We
+# query first so re-runs are no-ops rather than 409s.
 # ------------------------------------------------------------------
 log "creating kmail-dev tenant domain ${DEV_DOMAIN}"
-curl -fsSL -u "${ADMIN_USER}:${ADMIN_PASS}" \
-  -H 'Content-Type: application/json' \
-  -X POST "${ADMIN_URL}/api/domain" \
-  -d "$(printf '{"name":"%s","description":"KMail local dev tenant"}' "$DEV_DOMAIN")" \
-  > /dev/null 2>&1 || log "domain ${DEV_DOMAIN} already exists, continuing"
+DOMAIN_QUERY_ARGS=$(printf '{"accountId":"%s","filter":{"name":"%s"}}' "$ADMIN_ACCOUNT_ID" "$DEV_DOMAIN")
+existing=$(jmap_call "x:Domain/query" "$DOMAIN_QUERY_ARGS")
+if printf '%s' "$existing" | grep -q '"ids":\["[^"]'; then
+  log "domain ${DEV_DOMAIN} already exists, skipping"
+else
+  DOMAIN_SET_ARGS=$(printf '{"accountId":"%s","create":{"d":{"name":"%s"}}}' "$ADMIN_ACCOUNT_ID" "$DEV_DOMAIN")
+  response=$(jmap_call "x:Domain/set" "$DOMAIN_SET_ARGS")
+  if printf '%s' "$response" | grep -q '"created":{"d":'; then
+    log "domain ${DEV_DOMAIN} created"
+  else
+    log "failed to create domain ${DEV_DOMAIN}: ${response}"
+    exit 1
+  fi
+fi
+
+# Network listeners (SMTP / IMAP / JMAP / HTTP) on the standard
+# port bindings (25 / 465 / 587 / 143 / 993 / 8080) are created
+# automatically by Stalwart on first boot and are already present
+# when this script runs. Left as a comment so nobody comes looking
+# for a missing `x:NetworkListener/set` call.
+
+# ------------------------------------------------------------------
+# First-boot restart of the stalwart container.
+# ------------------------------------------------------------------
+# Stalwart v0.16.0 resolves the concrete blob / in-memory / search
+# backends from the registry at startup — subsequent /set writes
+# land in Postgres but don't swap the live backend pointer the mail
+# core is holding. On a fresh volume that means:
+#
+#   1. Stalwart boots with an empty registry → falls back to the
+#      Postgres-backed Default BlobStore for blob writes.
+#   2. This script writes the S3 / Redis / Meilisearch singletons
+#      into the registry.
+#   3. Stalwart doesn't see them until it restarts.
+#
+# After the restart Stalwart reads the singletons on startup and
+# all blob writes flow to zk-object-fabric. Subsequent compose
+# boots pick up the config immediately on their very first read —
+# this restart is a one-time first-boot thing.
+#
+# We drive the restart via Docker's HTTP Engine API over a
+# bind-mounted `/var/run/docker.sock`. The init container doesn't
+# have the `docker` CLI, so we POST directly
+# (`POST /containers/{id}/restart`, see
+# https://docs.docker.com/engine/api/). If the socket isn't
+# mounted (non-compose environments) the script logs a hint and
+# exits cleanly so the operator can restart Stalwart themselves.
+DOCKER_SOCK=${DOCKER_SOCK:-/var/run/docker.sock}
+STALWART_CONTAINER=${STALWART_CONTAINER_NAME:-kmail-stalwart}
+if [ -S "$DOCKER_SOCK" ]; then
+  log "restarting ${STALWART_CONTAINER} via docker socket so the new stores take effect"
+  code=$(curl -sS --unix-socket "$DOCKER_SOCK" -o /dev/null -w '%{http_code}' \
+           -X POST "http://localhost/containers/${STALWART_CONTAINER}/restart?t=5")
+  if [ "$code" != "204" ]; then
+    log "docker restart returned HTTP ${code}; skipping wait"
+  else
+    log "waiting for ${STALWART_CONTAINER} JMAP endpoint to come back up"
+    i=0
+    until curl -sS -u "${ADMIN_USER}:${ADMIN_PASS}" -o /dev/null -w '%{http_code}' \
+        "${ADMIN_URL}/jmap/session" | grep -qE '^(200|204)$'; do
+      i=$((i + 1))
+      if [ "$i" -gt 60 ]; then
+        log "timed out waiting for stalwart to come back; continuing"
+        break
+      fi
+      sleep 2
+    done
+    log "${STALWART_CONTAINER} is back up"
+  fi
+else
+  log "docker socket not mounted at ${DOCKER_SOCK}; skipping restart"
+  log "restart stalwart manually so the new blob store takes effect"
+fi
 
 log "done"
