@@ -38,6 +38,40 @@ func (h *Handlers) Register(mux *http.ServeMux, authMW *middleware.OIDC) {
 		authMW.Wrap(http.HandlerFunc(h.getJob)))
 	mux.Handle("DELETE /api/v1/migrations/{jobId}",
 		authMW.Wrap(http.HandlerFunc(h.cancelJob)))
+	mux.Handle("POST /api/v1/migrations/{jobId}/pause",
+		authMW.Wrap(http.HandlerFunc(h.pauseJob)))
+	mux.Handle("POST /api/v1/migrations/{jobId}/resume",
+		authMW.Wrap(http.HandlerFunc(h.resumeJob)))
+}
+
+func (h *Handlers) pauseJob(w http.ResponseWriter, r *http.Request) {
+	tenantID := middleware.TenantIDFrom(r.Context())
+	if tenantID == "" {
+		writeError(w, http.StatusForbidden, errors.New("missing tenant context"))
+		return
+	}
+	jobID := r.PathValue("jobId")
+	if err := h.svc.PauseJob(r.Context(), tenantID, jobID); err != nil {
+		h.logger.Printf("pauseJob: %v", err)
+		writeError(w, statusForServiceError(err), err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Handlers) resumeJob(w http.ResponseWriter, r *http.Request) {
+	tenantID := middleware.TenantIDFrom(r.Context())
+	if tenantID == "" {
+		writeError(w, http.StatusForbidden, errors.New("missing tenant context"))
+		return
+	}
+	jobID := r.PathValue("jobId")
+	if err := h.svc.ResumeJob(r.Context(), tenantID, jobID); err != nil {
+		h.logger.Printf("resumeJob: %v", err)
+		writeError(w, statusForServiceError(err), err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // createJob validates + inserts a new job, then immediately calls

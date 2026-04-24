@@ -341,7 +341,7 @@ func (s *Service) StartJob(ctx context.Context, tenantID, jobID string) error {
 	if err != nil {
 		return err
 	}
-	if job.Status != "pending" {
+	if job.Status != "pending" && job.Status != "paused" {
 		return fmt.Errorf("%w: job %s is already %s", ErrConflict, jobID, job.Status)
 	}
 
@@ -374,6 +374,51 @@ func (s *Service) StartJob(ctx context.Context, tenantID, jobID string) error {
 // CancelJob signals a worker to stop. Pending jobs flip straight
 // to `cancelled`; running jobs have their context cancelled and
 // the worker writes the terminal state.
+// PauseJob halts a running job. The running worker goroutine is
+// signalled via its cancel func; on the next progress checkpoint
+// the worker exits. The DB row is flipped to `paused` so operators
+// can distinguish it from a terminal `cancelled` row.
+func (s *Service) PauseJob(ctx context.Context, tenantID, jobID string) error {
+	job, err := s.GetJob(ctx, tenantID, jobID)
+	if err != nil {
+		return err
+	}
+	if job.Terminal() {
+		return fmt.Errorf("%w: job %s is already %s", ErrConflict, jobID, job.Status)
+	}
+	if job.Status != "running" && job.Status != "pending" {
+		return fmt.Errorf("%w: cannot pause job in status %s", ErrConflict, job.Status)
+	}
+
+	s.mu.Lock()
+	cancel, running := s.cancels[jobID]
+	s.mu.Unlock()
+	if running {
+		// Worker will observe ctx.Err() and stop mid-batch;
+		// imapsync's own checkpoint files (`--tmpdir`) persist
+		// progress for ResumeJob.
+		cancel()
+	}
+	return s.updateStatus(ctx, tenantID, jobID, updateFields{
+		Status: stringPtr("paused"),
+	})
+}
+
+// ResumeJob re-queues a paused job. The worker starts from
+// imapsync's last checkpoint under the job's `--tmpdir` so
+// already-synced messages are skipped.
+func (s *Service) ResumeJob(ctx context.Context, tenantID, jobID string) error {
+	job, err := s.GetJob(ctx, tenantID, jobID)
+	if err != nil {
+		return err
+	}
+	if job.Status != "paused" {
+		return fmt.Errorf("%w: cannot resume job in status %s", ErrConflict, job.Status)
+	}
+	// StartJob re-reads the row and spawns a fresh worker.
+	return s.StartJob(ctx, tenantID, jobID)
+}
+
 func (s *Service) CancelJob(ctx context.Context, tenantID, jobID string) error {
 	job, err := s.GetJob(ctx, tenantID, jobID)
 	if err != nil {

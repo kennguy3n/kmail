@@ -55,12 +55,16 @@ func main() {
 		ReportingMailbox:    cfg.DNS.ReportingMailbox,
 	})
 
-	authMW := middleware.NewOIDC(middleware.OIDCConfig{
+	authMW, err := middleware.NewOIDC(middleware.OIDCConfig{
 		Issuer:         cfg.KChatOIDCIssuer,
+		Audience:       cfg.KChatOIDCAudience,
 		DevBypassToken: cfg.DevBypassToken,
 		Pool:           pool,
 		Logger:         logger,
 	})
+	if err != nil {
+		logger.Fatalf("middleware.NewOIDC: %v", err)
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
