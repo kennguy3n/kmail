@@ -351,16 +351,29 @@ export class JMAPClient {
    * otherwise leave the draft sitting in the mailbox forever while
    * the caller believed the email had been sent.
    */
-  async sendEmail(draft: EmailDraft): Promise<string> {
+  async sendEmail(
+    draft: EmailDraft,
+    existingDraftId: string | null = null,
+  ): Promise<string> {
     const accountId = await this.getAccountId();
     const identityId = await this.resolveIdentityId(draft);
     const create = buildEmailCreate(draft);
+    const emailSetArgs: Record<string, unknown> = {
+      accountId,
+      create: { draft: create },
+    };
+    // If the user has already clicked Save draft in this compose
+    // session, destroy that stale draft in the same Email/set call
+    // so it doesn't linger in the Drafts mailbox after a successful
+    // Send. The server-side draft we submit and auto-destroy via
+    // `onSuccessDestroyEmail` below is a *different* email (the one
+    // this call creates) — without this destroy the prior saved
+    // draft would be orphaned.
+    if (existingDraftId) {
+      emailSetArgs.destroy = [existingDraftId];
+    }
     const response = await this.request([
-      [
-        "Email/set",
-        { accountId, create: { draft: create } },
-        "0",
-      ],
+      ["Email/set", emailSetArgs, "0"],
       [
         "EmailSubmission/set",
         {

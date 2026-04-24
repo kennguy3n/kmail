@@ -151,7 +151,12 @@ export default function Compose() {
     }
     setSending(true);
     try {
-      await jmapClient.sendEmail(draft);
+      // Pass the previously saved draft id so the client can
+      // destroy that stale draft in the same Email/set call as the
+      // submission; otherwise Save-then-Send would leave an
+      // orphaned draft in the Drafts mailbox.
+      await jmapClient.sendEmail(draft, savedDraftId);
+      setSavedDraftId(null);
       setSuccessMessage("Message sent.");
       // Give the user a brief moment to see the success confirmation
       // before we navigate them back to the inbox. We deliberately
