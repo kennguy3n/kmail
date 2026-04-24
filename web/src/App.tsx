@@ -30,6 +30,8 @@ export default function App() {
 
         <Route path="calendar" element={<CalendarView />} />
         <Route path="calendar/new" element={<EventCreate />} />
+        <Route path="calendar/:eventId" element={<CalendarView />} />
+        <Route path="calendar/:eventId/edit" element={<EventCreate />} />
 
         <Route path="admin/tenant" element={<TenantAdmin />} />
         <Route path="admin/domains" element={<DomainAdmin />} />

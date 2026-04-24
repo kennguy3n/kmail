@@ -227,10 +227,19 @@ client compatibility but are not the main UX path.
 
 ## Project status
 
-**Phase 1 — Foundation (in progress).** Architecture is being locked,
-project scaffolds are being created, Stalwart integration is being
-evaluated, zk-object-fabric blob store integration is being defined,
-and the MLS encryption synergy model is being written down.
+**Phase 1 — Foundation (in progress). Phase 2 — Prototype (in
+progress).** Phase 1 architecture is ratified and the scaffolds,
+schema, JMAP contract, and license evaluation are all landed — only
+the external MLS-key-derivation review remains before the gate
+closes. Phase 2 prototype work is underway: Tenant CRUD, the DNS
+Onboarding Service, and the automated Stalwart v0.16.0 bootstrap are
+live, `docker compose up` brings the whole stack up hands-off,
+zk-object-fabric blob round-trips are verified end-to-end through
+Stalwart's JMAP blob API, and the React KChat **Mail UI** (inbox,
+compose, read, full-text search, read/unread + move/delete) and
+**Calendar UI** (day / week / month views, event create / edit,
+RSVP, calendar-visibility sidebar, deep-link to event detail) are
+functional against the JMAP client.
 
 See [docs/PROGRESS.md](docs/PROGRESS.md) for the phase-gated tracker.
 

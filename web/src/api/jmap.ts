@@ -1,8 +1,14 @@
 import {
+  JMAP_CALENDARS_CAPABILITY,
   JMAP_MAIL_CAPABILITY,
   JMAP_SUBMISSION_CAPABILITY,
+  type Calendar,
+  type CalendarEvent,
+  type CalendarEventDraft,
   type Email,
   type EmailDraft,
+  type EventDateRange,
+  type EventParticipantResponse,
   type GetEmailsOptions,
   type Identity,
   type JmapInvocation,
@@ -10,6 +16,7 @@ import {
   type JmapResponseInvocation,
   type JmapSession,
   type Mailbox,
+  type SearchEmailsOptions,
 } from "../types";
 
 /**
@@ -147,8 +154,16 @@ export class JMAPClient {
    * etc.) call this under the hood; callers that need a spec-level
    * method not yet wrapped in a typed helper can use `request`
    * directly.
+   *
+   * `using` defaults to the Mail + Submission capabilities so every
+   * existing call site keeps working; calendar helpers pass the
+   * Core + Calendars capabilities instead so Stalwart resolves the
+   * `CalendarEvent/*` methods.
    */
-  async request(methodCalls: JmapInvocation[]): Promise<JmapResponse> {
+  async request(
+    methodCalls: JmapInvocation[],
+    using: string[] = [JMAP_MAIL_CAPABILITY, JMAP_SUBMISSION_CAPABILITY],
+  ): Promise<JmapResponse> {
     const session = await this.getSession();
     const res = await fetch(session.apiUrl, {
       method: "POST",
@@ -158,7 +173,7 @@ export class JMAPClient {
         Accept: "application/json",
       }),
       body: JSON.stringify({
-        using: [JMAP_MAIL_CAPABILITY, JMAP_SUBMISSION_CAPABILITY],
+        using,
         methodCalls,
       }),
     });
@@ -208,6 +223,104 @@ export class JMAPClient {
         {
           accountId,
           filter: { inMailbox: mailboxId },
+          sort,
+          position,
+          limit,
+          calculateTotal: true,
+        },
+        "0",
+      ],
+      [
+        "Email/get",
+        {
+          accountId,
+          "#ids": {
+            resultOf: "0",
+            name: "Email/query",
+            path: "/ids",
+          },
+          properties: [
+            "id",
+            "threadId",
+            "mailboxIds",
+            "keywords",
+            "from",
+            "to",
+            "subject",
+            "receivedAt",
+            "sentAt",
+            "size",
+            "preview",
+            "hasAttachment",
+            "privacyMode",
+          ],
+        },
+        "1",
+      ],
+    ]);
+    const result = expectResult(response, "Email/get", "1");
+    const list = result.list;
+    if (!Array.isArray(list)) {
+      throw new Error("kmail-web: Email/get returned no list");
+    }
+    return list as Email[];
+  }
+
+  /**
+   * Run a full-text search against Stalwart's FTS backend
+   * (Meilisearch in Phase 2 — see docs/PROGRESS.md) and hydrate
+   * the matching emails.
+   *
+   * Maps to JMAP `Email/query` with an RFC 8621 §4.4.1
+   * `FilterCondition.text` term, optionally `AND`-ed with an
+   * `inMailbox` condition when the caller scopes the search to a
+   * specific mailbox. The subsequent `Email/get` uses a
+   * back-reference (`#ids`) so the two calls share the query
+   * result in a single round-trip, matching the pattern used by
+   * `getEmails()`.
+   *
+   * Scope:
+   *
+   *   - `opts.mailboxId == null` (the default) → global search
+   *     across every mailbox the authenticated user can see. Vault
+   *     mailboxes are filtered out server-side per
+   *     docs/JMAP-CONTRACT.md §2.4.
+   *   - `opts.mailboxId == "..."` → scoped search; the BFF
+   *     combines `inMailbox` and `text` into a single
+   *     `FilterOperator.AND`.
+   *
+   * An empty query string returns no results without issuing a
+   * network request — Stalwart would otherwise interpret it as an
+   * unbounded search.
+   */
+  async searchEmails(
+    query: string,
+    opts: SearchEmailsOptions = {},
+  ): Promise<Email[]> {
+    const trimmed = query.trim();
+    if (trimmed.length === 0) return [];
+    const accountId = await this.getAccountId();
+    const {
+      limit = 50,
+      position = 0,
+      mailboxId = null,
+      sort = [{ property: "receivedAt", isAscending: false }],
+    } = opts;
+    const filter: Record<string, unknown> = mailboxId
+      ? {
+          operator: "AND",
+          conditions: [
+            { inMailbox: mailboxId },
+            { text: trimmed },
+          ],
+        }
+      : { text: trimmed };
+    const response = await this.request([
+      [
+        "Email/query",
+        {
+          accountId,
+          filter,
           sort,
           position,
           limit,
@@ -577,6 +690,294 @@ export class JMAPClient {
       throw new Error(`kmail-web: email ${emailId} was not destroyed`);
     }
   }
+
+  // ----------------------------------------------------------------
+  // Calendars (draft `urn:ietf:params:jmap:calendars`).
+  //
+  // Stalwart v0.16.0 ships a CalDAV store but does not yet
+  // advertise a JMAP calendars capability of its own — the Go BFF
+  // is expected to surface these objects on top of the CalDAV
+  // collections until upstream parity lands. The React client
+  // works against the JMAP shapes today and the BFF swaps its
+  // backend without a UI change.
+  // ----------------------------------------------------------------
+
+  /**
+   * Return the primary Calendar accountId for the current session.
+   * Falls back to the Mail accountId when the BFF advertises a
+   * single unified account per user (the Phase 2 default).
+   */
+  async getCalendarAccountId(): Promise<string> {
+    const session = await this.getSession();
+    const accountId =
+      session.primaryAccounts[JMAP_CALENDARS_CAPABILITY] ??
+      session.primaryAccounts[JMAP_MAIL_CAPABILITY];
+    if (!accountId) {
+      throw new Error(
+        "kmail-web: session has no primary Calendar account",
+      );
+    }
+    return accountId;
+  }
+
+  /**
+   * Issue a JMAP batch scoped to the Calendars capability. Mirrors
+   * `request()` but swaps the default `using` array so the server
+   * knows to resolve `Calendar/*` and `CalendarEvent/*` methods.
+   */
+  private async calendarRequest(
+    methodCalls: JmapInvocation[],
+  ): Promise<JmapResponse> {
+    return this.request(methodCalls, [
+      "urn:ietf:params:jmap:core",
+      JMAP_CALENDARS_CAPABILITY,
+    ]);
+  }
+
+  /** Fetch every calendar visible to the authenticated user. */
+  async getCalendars(): Promise<Calendar[]> {
+    const accountId = await this.getCalendarAccountId();
+    const response = await this.calendarRequest([
+      ["Calendar/get", { accountId, ids: null }, "0"],
+    ]);
+    const result = expectResult(response, "Calendar/get", "0");
+    const list = result.list;
+    if (!Array.isArray(list)) {
+      throw new Error("kmail-web: Calendar/get returned no list");
+    }
+    return list as Calendar[];
+  }
+
+  /**
+   * Fetch events in `range` from one or more calendars. When
+   * `calendarId` is a string the filter is scoped to that
+   * calendar; when it is an array every listed calendar is
+   * OR-ed; when it is null the query spans every calendar
+   * visible to the user.
+   *
+   * Uses `CalendarEvent/query` (`after` / `before` bounds from
+   * the draft spec) + a back-referenced `CalendarEvent/get` so
+   * the two calls share the query result in one round-trip.
+   */
+  async getEvents(
+    calendarId: string | string[] | null,
+    range: EventDateRange,
+  ): Promise<CalendarEvent[]> {
+    const accountId = await this.getCalendarAccountId();
+    const calendarFilter =
+      calendarId === null
+        ? null
+        : Array.isArray(calendarId)
+          ? {
+              operator: "OR",
+              conditions: calendarId.map((id) => ({ inCalendar: id })),
+            }
+          : { inCalendar: calendarId };
+    const rangeFilter = { after: range.start, before: range.end };
+    const filter = calendarFilter
+      ? { operator: "AND", conditions: [calendarFilter, rangeFilter] }
+      : rangeFilter;
+    const response = await this.calendarRequest([
+      [
+        "CalendarEvent/query",
+        { accountId, filter, sort: [{ property: "start", isAscending: true }] },
+        "0",
+      ],
+      [
+        "CalendarEvent/get",
+        {
+          accountId,
+          "#ids": {
+            resultOf: "0",
+            name: "CalendarEvent/query",
+            path: "/ids",
+          },
+          properties: [
+            "id",
+            "calendarId",
+            "title",
+            "description",
+            "start",
+            "end",
+            "location",
+            "participants",
+            "status",
+            "recurrenceRules",
+          ],
+        },
+        "1",
+      ],
+    ]);
+    const result = expectResult(response, "CalendarEvent/get", "1");
+    const list = result.list;
+    if (!Array.isArray(list)) {
+      throw new Error("kmail-web: CalendarEvent/get returned no list");
+    }
+    return list as CalendarEvent[];
+  }
+
+  /** Fetch a single event with every field populated. */
+  async getEvent(eventId: string): Promise<CalendarEvent> {
+    const accountId = await this.getCalendarAccountId();
+    const response = await this.calendarRequest([
+      [
+        "CalendarEvent/get",
+        {
+          accountId,
+          ids: [eventId],
+          properties: [
+            "id",
+            "calendarId",
+            "title",
+            "description",
+            "start",
+            "end",
+            "location",
+            "participants",
+            "status",
+            "recurrenceRules",
+          ],
+        },
+        "0",
+      ],
+    ]);
+    const result = expectResult(response, "CalendarEvent/get", "0");
+    const list = result.list;
+    if (!Array.isArray(list) || list.length === 0) {
+      throw new Error(`kmail-web: event ${eventId} not found`);
+    }
+    return list[0] as CalendarEvent;
+  }
+
+  /** Create a new calendar event and return the server-assigned id. */
+  async createEvent(draft: CalendarEventDraft): Promise<string> {
+    const accountId = await this.getCalendarAccountId();
+    const response = await this.calendarRequest([
+      [
+        "CalendarEvent/set",
+        {
+          accountId,
+          create: { event: buildEventCreate(draft) },
+        },
+        "0",
+      ],
+    ]);
+    const result = expectResult(response, "CalendarEvent/set", "0");
+    const notCreated = result.notCreated as
+      | Record<string, { type: string; description?: string }>
+      | undefined;
+    if (notCreated && notCreated.event) {
+      const entry = notCreated.event;
+      throw new Error(
+        `kmail-web: failed to create event: ${entry.type}${entry.description ? `: ${entry.description}` : ""}`,
+      );
+    }
+    const created = result.created as
+      | Record<string, { id: string }>
+      | null;
+    if (!created || !created.event) {
+      throw new Error("kmail-web: createEvent did not return an id");
+    }
+    return created.event.id;
+  }
+
+  /**
+   * Patch the fields listed in `changes` on `eventId`. Caller is
+   * responsible for providing only the fields that actually change;
+   * the BFF rejects no-op updates server-side.
+   */
+  async updateEvent(
+    eventId: string,
+    changes: Partial<CalendarEventDraft>,
+  ): Promise<void> {
+    const accountId = await this.getCalendarAccountId();
+    const response = await this.calendarRequest([
+      [
+        "CalendarEvent/set",
+        {
+          accountId,
+          update: { [eventId]: changes },
+        },
+        "0",
+      ],
+    ]);
+    const result = expectResult(response, "CalendarEvent/set", "0");
+    const notUpdated = result.notUpdated as
+      | Record<string, { type: string; description?: string }>
+      | undefined;
+    if (notUpdated && notUpdated[eventId]) {
+      const entry = notUpdated[eventId];
+      throw new Error(
+        `kmail-web: failed to update event ${eventId}: ${entry.type}${entry.description ? `: ${entry.description}` : ""}`,
+      );
+    }
+  }
+
+  /** Destroy a calendar event. */
+  async deleteEvent(eventId: string): Promise<void> {
+    const accountId = await this.getCalendarAccountId();
+    const response = await this.calendarRequest([
+      [
+        "CalendarEvent/set",
+        { accountId, destroy: [eventId] },
+        "0",
+      ],
+    ]);
+    const result = expectResult(response, "CalendarEvent/set", "0");
+    const destroyed = result.destroyed as string[] | undefined;
+    if (!destroyed || !destroyed.includes(eventId)) {
+      throw new Error(`kmail-web: event ${eventId} was not destroyed`);
+    }
+  }
+
+  /**
+   * Update the authenticated user's `rsvp` on `eventId`. Matches
+   * the draft JMAP calendars "participant response" semantics: the
+   * BFF locates the participant row whose email matches the
+   * authenticated user and patches `participants/<key>/rsvp` in a
+   * single `CalendarEvent/set update`.
+   *
+   * `participantEmail` pins the participant row to patch; when
+   * omitted the BFF assumes the authenticated user. Passing an
+   * explicit value lets delegated-access flows (e.g. an EA
+   * responding on behalf of a principal) work later without a
+   * second API surface.
+   */
+  async respondToEvent(
+    eventId: string,
+    response: EventParticipantResponse,
+    participantEmail?: string,
+  ): Promise<void> {
+    const accountId = await this.getCalendarAccountId();
+    const patch: Record<string, unknown> = {};
+    if (participantEmail) {
+      // Patch path uses the participant email as the key per the
+      // draft spec; the BFF normalises the key server-side.
+      patch[`participants/${participantEmail}/rsvp`] = response;
+    } else {
+      patch["participants/self/rsvp"] = response;
+    }
+    const raw = await this.calendarRequest([
+      [
+        "CalendarEvent/set",
+        {
+          accountId,
+          update: { [eventId]: patch },
+        },
+        "0",
+      ],
+    ]);
+    const result = expectResult(raw, "CalendarEvent/set", "0");
+    const notUpdated = result.notUpdated as
+      | Record<string, { type: string; description?: string }>
+      | undefined;
+    if (notUpdated && notUpdated[eventId]) {
+      const entry = notUpdated[eventId];
+      throw new Error(
+        `kmail-web: failed to RSVP to event ${eventId}: ${entry.type}${entry.description ? `: ${entry.description}` : ""}`,
+      );
+    }
+  }
 }
 
 /** Shared singleton. Callers just `import { jmapClient }`. */
@@ -653,6 +1054,33 @@ function buildEmailCreate(draft: EmailDraft): Record<string, unknown> {
   };
   if (draft.privacyMode) {
     create.privacyMode = draft.privacyMode;
+  }
+  return create;
+}
+
+/**
+ * Build the `create` object for a `CalendarEvent/set` call. The
+ * draft spec wire shape is close to the client-side one; this
+ * helper exists so optional fields get stripped (the BFF rejects
+ * `null` for fields not in the `null`-allowed set).
+ */
+function buildEventCreate(
+  draft: CalendarEventDraft,
+): Record<string, unknown> {
+  const create: Record<string, unknown> = {
+    calendarId: draft.calendarId,
+    title: draft.title,
+    start: draft.start,
+    end: draft.end,
+  };
+  if (draft.description) create.description = draft.description;
+  if (draft.location) create.location = draft.location;
+  if (draft.participants && draft.participants.length > 0) {
+    create.participants = draft.participants;
+  }
+  if (draft.status) create.status = draft.status;
+  if (draft.recurrenceRules && draft.recurrenceRules.length > 0) {
+    create.recurrenceRules = draft.recurrenceRules;
   }
   return create;
 }

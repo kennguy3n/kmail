@@ -56,6 +56,21 @@ export const JMAP_MAIL_CAPABILITY = "urn:ietf:params:jmap:mail";
 /** Well-known JMAP Submission capability URI (RFC 8621 §7). */
 export const JMAP_SUBMISSION_CAPABILITY =
   "urn:ietf:params:jmap:submission";
+/**
+ * JMAP Calendars capability URI
+ * (https://datatracker.ietf.org/doc/draft-ietf-jmap-calendars/).
+ * KMail advertises this capability through its Go BFF per
+ * docs/JMAP-CONTRACT.md §2.1; the underlying CalDAV store is
+ * Stalwart's (mail-server v0.16.0 ships a CalDAV implementation
+ * but does not yet advertise a `urn:ietf:params:jmap:calendars`
+ * capability of its own, so the BFF is expected to expose the
+ * capability on top of the CalDAV store until upstream parity
+ * lands). The React client uses this URI to scope `Calendar/*`
+ * and `CalendarEvent/*` method calls and to discover the
+ * calendar account ID from the session object.
+ */
+export const JMAP_CALENDARS_CAPABILITY =
+  "urn:ietf:params:jmap:calendars";
 
 /** KMail tenant plan, mirrored from `tenants.plan` in docs/SCHEMA.md. */
 export type TenantPlan = "core" | "pro" | "privacy";
@@ -222,4 +237,152 @@ export interface GetEmailsOptions {
 export interface EmailSort {
   property: "receivedAt" | "sentAt" | "size" | "subject";
   isAscending?: boolean;
+}
+
+/**
+ * Options accepted by `JMAPClient.searchEmails()`.
+ *
+ * `text` is the user-visible full-text query; the BFF passes it
+ * through to Stalwart as an RFC 8621 §4.4.1 `FilterCondition.text`
+ * term. When `mailboxId` is supplied the search is scoped to that
+ * mailbox (`inMailbox` AND `text`); when omitted the search spans
+ * every visible mailbox for the account (global search). Vault
+ * mailboxes are rejected server-side — see
+ * docs/JMAP-CONTRACT.md §2.4.
+ */
+export interface SearchEmailsOptions {
+  /** Max results per page; default 50. */
+  limit?: number;
+  /** Offset into the Email/query result set; default 0. */
+  position?: number;
+  /**
+   * Scope the search to a single mailbox id. Omit for a global
+   * search across every mailbox the authenticated user can see.
+   */
+  mailboxId?: string | null;
+  /** Sort order; default [{ property: "receivedAt", isAscending: false }]. */
+  sort?: EmailSort[];
+}
+
+/**
+ * A calendar belonging to the authenticated user.
+ *
+ * Mirrors the draft JMAP calendars spec: every calendar has a
+ * server-assigned `id`, a human-readable `name`, a CSS-compatible
+ * `color`, an `isVisible` flag the UI uses to gate whether to
+ * request events from that calendar, and an `isDefault` flag the
+ * BFF sets on exactly one calendar per account.
+ *
+ * Stalwart v0.16.0 ships a CalDAV store but does not yet advertise
+ * a JMAP calendars capability — the Go BFF is expected to surface
+ * these objects on top of CalDAV collections until upstream parity
+ * lands. The React client works against the JMAP shapes today and
+ * the BFF swaps its backend without a UI change.
+ */
+export interface Calendar {
+  id: string;
+  name: string;
+  color: string;
+  isVisible: boolean;
+  isDefault: boolean;
+}
+
+/**
+ * A participant on a calendar event.
+ *
+ * Matches the draft JMAP calendars `Participant` object narrowed
+ * to the fields the UI consults. `email` is the SMTP address the
+ * invite is sent to; `name` is a human-readable label; `role`
+ * tracks RFC 5545 PARTSTAT semantics (`required`, `optional`, or
+ * `chair` for the organizer); `rsvp` carries the invitee's current
+ * response.
+ */
+export interface EventParticipant {
+  email: string;
+  name?: string | null;
+  role?: "chair" | "required" | "optional";
+  rsvp?: EventParticipantResponse;
+}
+
+/**
+ * Invitee response on a calendar event. `needs-action` is the
+ * default state when the invite has been delivered but not yet
+ * answered. Mirrors RFC 5545 `PARTSTAT` values.
+ */
+export type EventParticipantResponse =
+  | "accepted"
+  | "declined"
+  | "tentative"
+  | "needs-action";
+
+/**
+ * Draft `RecurrenceRule` sketch (see RFC 5545 §3.3.10 / draft
+ * JMAP calendars). Narrowed to the properties the Phase 2 compose
+ * form needs (`frequency`, `count`, `until`, `byDay`, `interval`).
+ * Clients that don't recognise a field pass it through unchanged.
+ */
+export interface RecurrenceRule {
+  frequency:
+    | "yearly"
+    | "monthly"
+    | "weekly"
+    | "daily"
+    | "hourly"
+    | "minutely"
+    | "secondly";
+  interval?: number;
+  count?: number;
+  until?: string;
+  byDay?: string[];
+}
+
+/**
+ * A calendar event. `start` / `end` are ISO-8601 timestamps in the
+ * event's authoritative timezone; the UI renders them in the
+ * viewer's local timezone. `status` tracks RFC 5545 STATUS
+ * (`confirmed`, `tentative`, `cancelled`). `recurrenceRules` is
+ * non-null for recurring events; the UI expands instances
+ * client-side for Phase 2 and defers server-side expansion to
+ * Phase 3.
+ */
+export interface CalendarEvent {
+  id: string;
+  calendarId: string;
+  title: string;
+  description?: string | null;
+  start: string;
+  end: string;
+  location?: string | null;
+  participants?: EventParticipant[];
+  status?: "confirmed" | "tentative" | "cancelled";
+  recurrenceRules?: RecurrenceRule[] | null;
+}
+
+/**
+ * Shape accepted by `JMAPClient.createEvent()` /
+ * `updateEvent()`. Omits the server-assigned `id` on create;
+ * `calendarId` is required on create and optional on update
+ * (to move an event between calendars).
+ */
+export interface CalendarEventDraft {
+  calendarId: string;
+  title: string;
+  description?: string;
+  start: string;
+  end: string;
+  location?: string;
+  participants?: EventParticipant[];
+  status?: "confirmed" | "tentative" | "cancelled";
+  recurrenceRules?: RecurrenceRule[];
+}
+
+/**
+ * Date range used by `JMAPClient.getEvents()`. Both bounds are
+ * inclusive ISO-8601 timestamps. The BFF translates this to the
+ * draft JMAP `CalendarEvent/query` filter
+ * `{ after: start, before: end }`.
+ */
+export interface EventDateRange {
+  start: string;
+  end: string;
 }
