@@ -111,6 +111,8 @@ export interface TenantUser {
   display_name: string;
   role: string;
   status: string;
+  /** "user" = paid seat, "shared_inbox" / "service" = excluded from seat count */
+  account_type?: string;
   quota_bytes: number;
   created_at: string;
   updated_at: string;
@@ -380,4 +382,145 @@ export async function verifyAuditChain(
     return { ok: false, error: body.error ?? "audit chain broken" };
   }
   throw new AdminApiError(url, res.status, await parseErrorBody(res));
+}
+
+// ---------------------------------------------------------------
+// Billing / Quota
+// ---------------------------------------------------------------
+
+/** Mirrors `internal/billing/billing.go#Quota`. */
+export interface Quota {
+  tenant_id: string;
+  storage_used_bytes: number;
+  storage_limit_bytes: number;
+  seat_count: number;
+  seat_limit: number;
+  updated_at?: string;
+}
+
+/** Mirrors `internal/billing/billing.go#BillingSummary`. */
+export interface BillingSummary {
+  tenant_id: string;
+  plan: string;
+  seat_count: number;
+  seat_limit: number;
+  storage_used_bytes: number;
+  storage_limit_bytes: number;
+  per_seat_cents: number;
+  monthly_total_cents: number;
+  currency: string;
+}
+
+export interface UpdateQuotaLimitsInput {
+  storage_limit_bytes?: number;
+  seat_limit?: number;
+}
+
+export async function getBillingSummary(tenantId: string): Promise<BillingSummary> {
+  return requestJSON<BillingSummary>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/billing`,
+    { method: "GET", headers: adminAuthHeaders(tenantId, { Accept: "application/json" }) },
+  );
+}
+
+export async function getQuota(tenantId: string): Promise<Quota> {
+  return requestJSON<Quota>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/billing/usage`,
+    { method: "GET", headers: adminAuthHeaders(tenantId, { Accept: "application/json" }) },
+  );
+}
+
+export async function updateQuotaLimits(
+  tenantId: string,
+  input: UpdateQuotaLimitsInput,
+): Promise<Quota> {
+  return requestJSON<Quota>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/billing`,
+    {
+      method: "PATCH",
+      headers: adminAuthHeaders(tenantId, {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      }),
+      body: JSON.stringify(input),
+    },
+  );
+}
+
+// ---------------------------------------------------------------
+// DMARC reports
+// ---------------------------------------------------------------
+
+export interface DMARCReport {
+  id: string;
+  tenant_id: string;
+  domain_id?: string;
+  report_id: string;
+  org_name: string;
+  email: string;
+  date_range_begin: string;
+  date_range_end: string;
+  domain: string;
+  adkim: string;
+  aspf: string;
+  policy: string;
+  pass_count: number;
+  fail_count: number;
+  records: unknown;
+  created_at: string;
+}
+
+export interface DMARCSummary {
+  tenant_id: string;
+  domain_id?: string;
+  domain: string;
+  pass_count: number;
+  fail_count: number;
+  total: number;
+  pass_rate: number;
+  report_count: number;
+  window_days: number;
+}
+
+export async function listDmarcReports(
+  tenantId: string,
+  opts: { domainId?: string; limit?: number; offset?: number } = {},
+): Promise<DMARCReport[]> {
+  const params = new URLSearchParams();
+  if (opts.domainId) params.set("domain_id", opts.domainId);
+  if (opts.limit !== undefined) params.set("limit", String(opts.limit));
+  if (opts.offset !== undefined) params.set("offset", String(opts.offset));
+  const q = params.toString() ? `?${params.toString()}` : "";
+  return requestJSON<DMARCReport[]>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/dmarc-reports${q}`,
+    { method: "GET", headers: adminAuthHeaders(tenantId, { Accept: "application/json" }) },
+  );
+}
+
+export async function getDmarcSummary(
+  tenantId: string,
+  domainId?: string,
+): Promise<DMARCSummary> {
+  const q = domainId ? `?domain_id=${encodeURIComponent(domainId)}` : "";
+  return requestJSON<DMARCSummary>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/dmarc-reports/summary${q}`,
+    { method: "GET", headers: adminAuthHeaders(tenantId, { Accept: "application/json" }) },
+  );
+}
+
+export async function uploadDmarcReport(
+  tenantId: string,
+  xml: string,
+): Promise<DMARCReport> {
+  return requestJSON<DMARCReport>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/dmarc-reports`,
+    {
+      method: "POST",
+      headers: adminAuthHeaders(tenantId, {
+        Accept: "application/json",
+        "Content-Type": "application/xml",
+      }),
+      body: xml,
+    },
+  );
 }

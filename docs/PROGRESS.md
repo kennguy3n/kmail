@@ -3,8 +3,102 @@
 - **Project**: KMail — Privacy Email & Calendar for KChat B2B
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
 - **Status**: Phase 1 — Foundation (in progress); Phase 2 —
-  Prototype (in progress)
-- **Last updated**: 2026-04-24 — Phase 2 remainder + early
+  Prototype (in progress); Phase 3 — Private Beta (in progress)
+- **Last updated**: 2026-04-24 (later) — Phase 3 ten-task batch
+  landed. The Billing / Quota Service, the Deliverability Control
+  Plane (suppression lists, bounce processor, IP pools, send limits,
+  warmup schedule, DMARC ingest), the attachment-to-link conversion
+  path, shared-inbox seat exemption, the Observability stack
+  (Prometheus + OpenTelemetry), and three new admin console pages
+  are all live in `main`. Specifically:
+  * Billing / Quota Service — `internal/billing/` Service with
+    GetQuota / UpdateStorageUsage / CountSeats / EnforcePlanLimits
+    / GetPlanPricing / CalculateInvoice; `billing_events` table
+    (`migrations/005_billing.sql`) with RLS; handlers under
+    `/api/v1/tenants/{id}/billing[/usage|/invoice]` + PATCH for
+    admin limit overrides; per-seat pricing
+    ($3 / $6 / $9 for core / pro / privacy); unit tests for plan
+    pricing, quota enforcement, seat counting, and invoice math.
+  * Pooled storage quotas — `internal/billing/quota_worker.go`
+    background goroutine that polls the zk-object-fabric S3 API
+    (`StorageScanner` interface, `StaticScanner` for CI) every
+    `QuotaWorkerInterval` (default 5m) and rewrites
+    `quotas.storage_used_bytes`. Quota is pooled at the tenant
+    level; plan-based per-seat limits (5 / 15 / 50 GB) resolve
+    into the tenant's `storage_limit_bytes` via
+    `EnforcePlanLimits`. `internal/tenant/service.go` now enforces
+    the seat counter on `CreateUser` / `DeleteUser` via a narrow
+    `SeatAccounter` interface to avoid circular imports.
+  * Suppression lists and bounce tracking —
+    `internal/deliverability/suppression.go` and `bounce.go` own
+    `suppression_list` + `bounce_events`
+    (`migrations/006_suppression.sql`) with RLS. Hard bounces and
+    complaints escalate to suppression immediately; soft bounces
+    escalate after 3 within 72 h. `CheckRecipient` is the
+    pre-send hook wired into the JMAP proxy path.
+  * IP pool architecture — `internal/deliverability/ippool.go` +
+    `migrations/007_ip_pools.sql` give us the five canonical pools
+    (system_transactional, mature_trusted, new_warming,
+    restricted, dedicated_enterprise), per-IP reputation +
+    daily_volume + status, and a `SelectSendingIP` ranker that
+    picks the best active IP from the tenant's highest-priority
+    pool assignment. Admin HTTP surface under
+    `/api/v1/admin/ip-pools[/{id}/ips]` and tenant-scoped
+    `/api/v1/tenants/{id}/ip-pool`.
+  * Tenant send limits + warmup — `sendlimit.go` + `warmup.go`
+    provide daily / hourly cap enforcement (keyed in Valkey with
+    TTL) and a 30-day warmup ramp anchored at 50 / 100 / 500 /
+    1000 / 2000 / full on days 1 / 2 / 5 / 10 / 20 / 30.
+    `CheckSendLimit` is wired into the JMAP proxy path; default
+    plans are 500 / 2000 / 5000 per day with hourly = daily / 10.
+  * DMARC report ingestion — `dmarc.go` + sample-backed unit
+    tests parse RFC 7489 aggregate XML into `dmarc_reports`
+    (`migrations/008_dmarc_reports.sql`) and expose list /
+    summary / upload endpoints plus a per-domain 30-day pass-rate
+    roll-up at `/api/v1/tenants/{id}/dmarc-reports/summary`.
+  * Attachment-to-link conversion — `internal/jmap/attachment.go`
+    implements a minimal SigV4 presigner (no aws-sdk-go-v2
+    dependency) against the zk-object-fabric S3 endpoint,
+    `internal/jmap/attachment_handlers.go` exposes
+    `POST /api/v1/attachments/upload`,
+    `GET /api/v1/attachments/{id}/link`, and
+    `DELETE /api/v1/attachments/{id}`. Frontend
+    `web/src/pages/Mail/Compose.tsx` detects files over 10 MB and
+    routes them through the new endpoint, appending a presigned
+    download link to the body. Metadata persists in
+    `attachment_links` (`migrations/009_attachment_links.sql`)
+    with a `revoked` flag for link revocation.
+  * Shared inboxes without paid seats — `users.account_type`
+    column (already present) is now enforced end-to-end:
+    `billing.CountSeats` filters on
+    `status = 'active' AND account_type = 'user'`, the Tenant
+    Service rejects invalid account types, and the seat counter
+    only increments for `user` rows. Shared inboxes and service
+    accounts no longer consume billable seats.
+  * Observability — `internal/middleware/metrics.go` registers
+    the Prometheus collectors (`kmail_http_requests_total`,
+    `kmail_http_request_duration_seconds`,
+    `kmail_jmap_proxy_duration_seconds`, `kmail_active_tenants`,
+    `kmail_seats_total{plan=...}`) and exposes `/metrics`
+    unauthenticated; `tracing.go` initialises the
+    OTLP/HTTP exporter against `OTEL_EXPORTER_OTLP_ENDPOINT` and
+    registers the W3C `traceparent` propagator; `logger.go`
+    emits structured JSON lines (with `tenant_id`, `user_id`,
+    `trace_id`) when `KMAIL_LOG_FORMAT=json`. A new
+    `prometheus` service in `docker-compose.yml` scrapes the BFF
+    via `deploy/prometheus/prometheus.yml`.
+  * Admin console completion — new `web/src/pages/Admin/`
+    pages: `QuotaAdmin.tsx` (usage progress bars, seat + storage
+    counters, per-seat price, monthly total, PATCH form),
+    `AuditAdmin.tsx` (filterable audit-log table, JSON/CSV
+    export, hash-chain verify), `DmarcAdmin.tsx` (per-domain
+    pass-rate summary, per-report drill-down, manual XML
+    upload). `web/src/api/admin.ts` gains the billing + DMARC
+    helpers; `web/src/App.tsx` mounts `/admin/billing`,
+    `/admin/audit`, `/admin/dmarc`; `web/src/components/Layout.tsx`
+    gains the new nav links.
+
+- **Previously (2026-04-24)** — Phase 2 remainder + early
   Phase 3 batch landed. Three more Phase 2 items (BFF auth
   hardening, email-to-chat bridge, benchmark harness) and two
   Phase 3 items (admin audit logs, admin console backend) are
@@ -625,7 +719,7 @@ Checklist:
 
 ## Phase 3 — Private Beta (Weeks 11–18)
 
-**Status**: `NOT STARTED`
+**Status**: `IN PROGRESS`
 
 **Goal**: multi-tenant private beta with 5–10 SME design partners,
 deliverability infrastructure, IP reputation, and migration support.
@@ -633,30 +727,82 @@ deliverability infrastructure, IP reputation, and migration support.
 Checklist:
 
 - [ ] Multi-tenant Stalwart shard (5,000–10,000 mailbox target).
-- [ ] IP pool architecture (system transactional, mature trusted,
+- [x] IP pool architecture (system transactional, mature trusted,
       new / warming, restricted, dedicated enterprise).
-- [ ] Tenant send limits and warmup schedule.
+      _(`internal/deliverability/ippool.go` +
+      `migrations/007_ip_pools.sql` with RLS, per-IP reputation +
+      daily_volume + status, tenant pool assignment with
+      priority, `SelectSendingIP` ranker that picks the best
+      active IP from the tenant's highest-priority pool. Admin
+      CRUD under `/api/v1/admin/ip-pools[/{id}/ips]` and tenant
+      scoped `/api/v1/tenants/{id}/ip-pool`.)_
+- [x] Tenant send limits and warmup schedule.
+      _(`sendlimit.go` enforces daily + hourly caps via Valkey
+      counters with TTL and returns `ErrSendLimitExceeded`;
+      `warmup.go` implements a 30-day ramp anchored at 50 / 100
+      / 500 / 1000 / 2000 / full on days 1 / 2 / 5 / 10 / 20 /
+      30, clamped to the plan cap. Defaults 500 / 2000 / 5000
+      per day for core / pro / privacy; hourly = daily / 10.
+      Wired into the JMAP proxy path.)_
 - [ ] DNS wizard (MX, SPF, DKIM 2048-bit, DMARC, MTA-STS, TLS-RPT,
       autoconfig).
-- [ ] DMARC report ingestion.
+- [x] DMARC report ingestion.
+      _(`internal/deliverability/dmarc.go` parses RFC 7489
+      aggregate XML, persists to `dmarc_reports`
+      (`migrations/008_dmarc_reports.sql`) with RLS, exposes
+      list / summary / upload HTTP endpoints, and renders in
+      `web/src/pages/Admin/DmarcAdmin.tsx` with per-domain
+      pass-rate and drill-down.)_
 - [ ] Gmail Postmaster / Yahoo feedback loop monitoring.
-- [ ] Suppression lists and bounce tracking.
+- [x] Suppression lists and bounce tracking.
+      _(`internal/deliverability/suppression.go` +
+      `bounce.go` with `migrations/006_suppression.sql` (RLS on
+      `suppression_list` + `bounce_events`). Hard bounces /
+      complaints escalate immediately; soft bounces escalate at
+      3 within 72 h. `CheckRecipient` is the pre-send hook
+      consumed by the JMAP proxy.)_
 - [ ] Abuse scoring and compromised-account detection.
-- [ ] Pooled storage quotas (tenant pool, not per-user).
-- [ ] Shared inboxes (`sales@`, `support@`, `info@`) without
+- [x] Pooled storage quotas (tenant pool, not per-user).
+      _(`internal/billing/quota_worker.go` background goroutine
+      polls the zk-object-fabric S3 API every
+      `QuotaWorkerInterval` (default 5m) via the
+      `StorageScanner` interface and rewrites
+      `quotas.storage_used_bytes`. Plan-based per-seat limits
+      (5 / 15 / 50 GB) resolve into the tenant's pooled
+      `storage_limit_bytes`; `CheckStorageQuota` is the
+      pre-write hook.)_
+- [x] Shared inboxes (`sales@`, `support@`, `info@`) without
       requiring paid seats.
-- [ ] Attachment-to-link conversion (> 10–15 MB → zk-object-fabric
+      _(`users.account_type` is now enforced end-to-end:
+      `billing.CountSeats` filters
+      `status = 'active' AND account_type = 'user'`, the
+      Tenant Service validates the account_type enum on
+      CreateUser, and the `SeatAccounter` interface only
+      increments the seat counter for `user` rows. Shared
+      inboxes and service accounts do not consume billable
+      seats; unit test covers the exclusion.)_
+- [x] Attachment-to-link conversion (> 10–15 MB → zk-object-fabric
       presigned link with expiry / password / revocation).
-- [~] Admin console (React) — tenant management, domain management,
+      _(`internal/jmap/attachment.go` implements a minimal SigV4
+      presigner against the zk-object-fabric S3 endpoint;
+      `attachment_handlers.go` exposes
+      `POST /api/v1/attachments/upload`,
+      `GET /api/v1/attachments/{id}/link`,
+      `DELETE /api/v1/attachments/{id}`. Metadata persists in
+      `attachment_links` (`migrations/009_attachment_links.sql`)
+      with `revoked` flag. `web/src/pages/Mail/Compose.tsx`
+      detects files > 10 MB and routes them through the new
+      endpoint, appending a presigned link to the body.)_
+- [x] Admin console (React) — tenant management, domain management,
       user management, quota management.
-      _(React pages at `web/src/pages/Admin/TenantAdmin.tsx`,
-      `DomainAdmin.tsx`, `UserAdmin.tsx` with add/edit forms,
-      verification-status badges, DNS-records display, quota /
-      role / status editors, shared-inbox management; typed
-      client at `web/src/api/admin.ts` fronting
-      `/api/v1/tenants/...`. Backed by the existing Tenant / DNS
-      services and the new audit log. Quota-enforcement worker
-      and seat-pricing UI still pending.)_
+      _(Existing Tenant / Domain / User admin pages, plus new
+      `QuotaAdmin.tsx` (usage progress bars, seat + storage
+      counters, per-seat price, monthly total, PATCH form),
+      `AuditAdmin.tsx` (filterable table, JSON/CSV export,
+      hash-chain verify), and `DmarcAdmin.tsx` (per-domain
+      pass-rate, drill-down, manual XML upload). Routes and nav
+      links wired in `App.tsx` / `Layout.tsx`; typed client in
+      `admin.ts` gains billing + DMARC helpers.)_
 - [x] Admin audit logs.
       _(`internal/audit/` Service with hash-chained rows
       (SHA-256 over `prev_hash || canonical(payload)`),
@@ -671,9 +817,29 @@ Checklist:
 - [ ] Resource calendars and shared team calendars.
 - [ ] Confidential Send mode (MLS-derived envelope keys, encrypted
       portal for external recipients).
-- [ ] Billing / quota service (storage accounting, seat accounting,
+- [x] Billing / quota service (storage accounting, seat accounting,
       plan enforcement).
-- [ ] Observability (Prometheus, OpenTelemetry, Loki).
+      _(`internal/billing/` Service with
+      GetQuota / UpdateStorageUsage / CountSeats /
+      EnforcePlanLimits / GetPlanPricing / CalculateInvoice;
+      `billing_events` table (`migrations/005_billing.sql`) with
+      RLS; handlers under `/api/v1/tenants/{id}/billing[/usage
+      |/invoice]` + PATCH for admin limit overrides. Per-seat
+      pricing is $3 / $6 / $9 for core / pro / privacy.)_
+- [x] Observability (Prometheus, OpenTelemetry, Loki).
+      _(`internal/middleware/metrics.go` registers
+      `kmail_http_requests_total`,
+      `kmail_http_request_duration_seconds`,
+      `kmail_jmap_proxy_duration_seconds`, `kmail_active_tenants`,
+      and `kmail_seats_total{plan=...}`; `/metrics` is
+      unauthenticated. `internal/middleware/tracing.go` wires an
+      OTLP/HTTP exporter against `OTEL_EXPORTER_OTLP_ENDPOINT`
+      and the W3C `traceparent` propagator. `logger.go` emits
+      structured JSON lines (tenant_id, user_id, trace_id) when
+      `KMAIL_LOG_FORMAT=json`. A new `prometheus` service in
+      `docker-compose.yml` scrapes the BFF via
+      `deploy/prometheus/prometheus.yml`. Loki shipping is still
+      out-of-scope.)_
 - [ ] Beta customer onboarding (5–10 SMEs).
 
 ---

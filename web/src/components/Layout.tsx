@@ -36,6 +36,15 @@ export default function Layout() {
           <li>
             <Link to="/admin/users">User admin</Link>
           </li>
+          <li>
+            <Link to="/admin/billing">Billing</Link>
+          </li>
+          <li>
+            <Link to="/admin/audit">Audit log</Link>
+          </li>
+          <li>
+            <Link to="/admin/dmarc">DMARC</Link>
+          </li>
         </ul>
       </nav>
       <main className="kmail-main">

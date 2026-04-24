@@ -98,6 +98,95 @@ type Config struct {
 	// Audit controls the standalone `cmd/kmail-audit` CLI /
 	// listener.
 	Audit AuditConfig
+
+	// Billing holds per-seat pricing and per-seat default storage
+	// allocations for the Billing / Quota Service.
+	Billing BillingConfig
+
+	// Deliverability holds per-plan daily send caps, warmup ramp
+	// parameters, and the suppression / bounce escalation knobs.
+	Deliverability DeliverabilityConfig
+
+	// Observability wires the Prometheus /metrics exposition and
+	// the OpenTelemetry OTLP exporter endpoint.
+	Observability ObservabilityConfig
+
+	// Attachments controls attachment-to-link conversion — size
+	// threshold, default link expiry, and the bucket name on
+	// zk-object-fabric.
+	Attachments AttachmentsConfig
+}
+
+// BillingConfig wires the Billing / Quota Service.
+type BillingConfig struct {
+	// Per-seat price in cents for each published plan. Defaults:
+	// core=300 ($3), pro=600 ($6), privacy=900 ($9).
+	CoreSeatCents    int
+	ProSeatCents     int
+	PrivacySeatCents int
+
+	// Per-seat default storage allocation, in bytes. Defaults:
+	// core=5 GB, pro=15 GB, privacy=50 GB.
+	CorePerSeatBytes    int64
+	ProPerSeatBytes     int64
+	PrivacyPerSeatBytes int64
+
+	// QuotaWorkerInterval controls how often the quota worker
+	// polls zk-object-fabric. Defaults to 5m.
+	QuotaWorkerInterval time.Duration
+
+	// QuotaWorkerEnabled gates the worker. When false the worker
+	// goroutine is not started (e.g. tests, CI).
+	QuotaWorkerEnabled bool
+}
+
+// DeliverabilityConfig wires the Deliverability Control Plane.
+type DeliverabilityConfig struct {
+	// Plan-based daily send caps.
+	CoreDailyLimit    int
+	ProDailyLimit     int
+	PrivacyDailyLimit int
+
+	// WarmupDays is the length of the warmup ramp. Defaults to 30.
+	WarmupDays int
+
+	// BounceSoftEscalationCount is the number of soft bounces
+	// within `BounceSoftWindow` that escalate an address to
+	// suppression. Defaults to 3 / 72h.
+	BounceSoftEscalationCount int
+	BounceSoftWindow          time.Duration
+}
+
+// ObservabilityConfig wires Prometheus + OpenTelemetry.
+type ObservabilityConfig struct {
+	// MetricsEnabled gates the `/metrics` endpoint. Defaults to true.
+	MetricsEnabled bool
+
+	// TracingEnabled gates the OTEL SDK. Defaults to false so local
+	// dev doesn't require an OTLP collector.
+	TracingEnabled bool
+
+	// OTLPEndpoint is the OTLP/HTTP exporter endpoint (e.g.
+	// `http://tempo:4318`). Empty disables tracing.
+	OTLPEndpoint string
+
+	// LogFormat is either "text" (default) or "json" (structured).
+	LogFormat string
+}
+
+// AttachmentsConfig wires attachment-to-link conversion.
+type AttachmentsConfig struct {
+	// ThresholdBytes is the size above which attachments are
+	// converted to presigned links. Defaults to 10 MB.
+	ThresholdBytes int64
+
+	// DefaultExpiry is the lifetime of a presigned URL when the
+	// caller does not specify one. Defaults to 7 days.
+	DefaultExpiry time.Duration
+
+	// BucketName is the zk-object-fabric S3 bucket attachments
+	// are uploaded to.
+	BucketName string
 }
 
 // ChatBridgeConfig wires the standalone chat-bridge listener.
@@ -254,7 +343,49 @@ func Load() (*Config, error) {
 		Audit: AuditConfig{
 			Addr: getenv("KMAIL_AUDIT_ADDR", ":8092"),
 		},
+		Billing: BillingConfig{
+			CoreSeatCents:       GetenvInt("KMAIL_BILLING_CORE_CENTS", 300),
+			ProSeatCents:        GetenvInt("KMAIL_BILLING_PRO_CENTS", 600),
+			PrivacySeatCents:    GetenvInt("KMAIL_BILLING_PRIVACY_CENTS", 900),
+			CorePerSeatBytes:    getenvInt64("KMAIL_BILLING_CORE_PERSEAT_BYTES", 5*1024*1024*1024),
+			ProPerSeatBytes:     getenvInt64("KMAIL_BILLING_PRO_PERSEAT_BYTES", 15*1024*1024*1024),
+			PrivacyPerSeatBytes: getenvInt64("KMAIL_BILLING_PRIVACY_PERSEAT_BYTES", 50*1024*1024*1024),
+			QuotaWorkerInterval: getenvDuration("KMAIL_QUOTA_WORKER_INTERVAL", 5*time.Minute),
+			QuotaWorkerEnabled:  getenvBool("KMAIL_QUOTA_WORKER_ENABLED", false),
+		},
+		Deliverability: DeliverabilityConfig{
+			CoreDailyLimit:            GetenvInt("KMAIL_SEND_CORE_DAILY", 500),
+			ProDailyLimit:             GetenvInt("KMAIL_SEND_PRO_DAILY", 2000),
+			PrivacyDailyLimit:         GetenvInt("KMAIL_SEND_PRIVACY_DAILY", 5000),
+			WarmupDays:                GetenvInt("KMAIL_WARMUP_DAYS", 30),
+			BounceSoftEscalationCount: GetenvInt("KMAIL_BOUNCE_SOFT_COUNT", 3),
+			BounceSoftWindow:          getenvDuration("KMAIL_BOUNCE_SOFT_WINDOW", 72*time.Hour),
+		},
+		Observability: ObservabilityConfig{
+			MetricsEnabled: getenvBool("KMAIL_METRICS_ENABLED", true),
+			TracingEnabled: getenvBool("KMAIL_TRACING_ENABLED", false),
+			OTLPEndpoint:   getenv("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
+			LogFormat:      getenv("KMAIL_LOG_FORMAT", "text"),
+		},
+		Attachments: AttachmentsConfig{
+			ThresholdBytes: getenvInt64("KMAIL_ATTACHMENT_THRESHOLD_BYTES", 10*1024*1024),
+			DefaultExpiry:  getenvDuration("KMAIL_ATTACHMENT_EXPIRY", 7*24*time.Hour),
+			BucketName:     getenv("KMAIL_ATTACHMENT_BUCKET", "kmail-attachments"),
+		},
 	}, nil
+}
+
+// getenvInt64 parses the named environment variable as an int64.
+func getenvInt64(key string, fallback int64) int64 {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		return fallback
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return fallback
+	}
+	return n
 }
 
 // getenv returns the value of the named environment variable or the

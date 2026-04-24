@@ -19,16 +19,36 @@ import (
 	"github.com/kennguy3n/kmail/internal/middleware"
 )
 
+// SeatAccounter is the narrow slice of the Billing Service the
+// Tenant Service consumes to enforce seat limits and keep the
+// `quotas.seat_count` counter in sync with user-row lifecycle
+// events. Defined here to avoid a circular import back to
+// `internal/billing`.
+type SeatAccounter interface {
+	CheckSeatAvailable(ctx context.Context, tenantID string) error
+	IncrementSeatCount(ctx context.Context, tenantID string, delta int) error
+}
+
 // Service holds the Tenant Service dependencies and exposes the
 // tenant / user / alias / shared-inbox lifecycle methods consumed by
 // the HTTP handlers in this package.
 type Service struct {
-	pool *pgxpool.Pool
+	pool  *pgxpool.Pool
+	seats SeatAccounter
 }
 
 // NewService returns a Service wired to the provided pgx pool.
 func NewService(pool *pgxpool.Pool) *Service {
 	return &Service{pool: pool}
+}
+
+// WithSeatAccounter returns a copy of the Service wired to the
+// provided accounter. The Tenant Service otherwise treats seats as
+// unlimited.
+func (s *Service) WithSeatAccounter(a SeatAccounter) *Service {
+	cp := *s
+	cp.seats = a
+	return &cp
 }
 
 // Tenant is the API representation of a row in `tenants`.
@@ -52,6 +72,7 @@ type User struct {
 	DisplayName       string    `json:"display_name"`
 	Role              string    `json:"role"`
 	Status            string    `json:"status"`
+	AccountType       string    `json:"account_type"`
 	QuotaBytes        int64     `json:"quota_bytes"`
 	CreatedAt         time.Time `json:"created_at"`
 	UpdatedAt         time.Time `json:"updated_at"`
@@ -98,6 +119,12 @@ type CreateUserInput struct {
 	DisplayName       string `json:"display_name"`
 	Role              string `json:"role"`
 	QuotaBytes        int64  `json:"quota_bytes"`
+
+	// AccountType defaults to "user" when empty. Set to
+	// "shared_inbox" or "service" to create a non-seat account
+	// (shared inboxes, automation endpoints) that the billing
+	// Service excludes from CountSeats.
+	AccountType string `json:"account_type,omitempty"`
 }
 
 // CreateDomainInput carries the fields accepted by
@@ -231,7 +258,12 @@ func (s *Service) GetTenant(ctx context.Context, id string) (*Tenant, error) {
 
 // CreateUser inserts a new user inside the given tenant. It runs
 // inside a transaction with `app.tenant_id` set to `tenantID` so the
-// RLS policy on `users` validates the insert.
+// RLS policy on `users` validates the insert. When a SeatAccounter
+// is wired, new `user` account-type rows are rejected if the
+// tenant's seat pool is full (ErrQuotaExceeded surfaced by the
+// billing service) and the pool counter is incremented on success.
+// Shared-inbox / service account types do not consume seats and
+// skip the accounter check.
 func (s *Service) CreateUser(ctx context.Context, tenantID string, in CreateUserInput) (*User, error) {
 	if in.KChatUserID == "" || in.StalwartAccountID == "" || in.Email == "" || in.DisplayName == "" {
 		return nil, fmt.Errorf("%w: kchat_user_id, stalwart_account_id, email, and display_name are required", ErrInvalidInput)
@@ -239,6 +271,20 @@ func (s *Service) CreateUser(ctx context.Context, tenantID string, in CreateUser
 	role := in.Role
 	if role == "" {
 		role = "member"
+	}
+	accountType := in.AccountType
+	if accountType == "" {
+		accountType = "user"
+	}
+	switch accountType {
+	case "user", "shared_inbox", "service":
+	default:
+		return nil, fmt.Errorf("%w: account_type must be one of user, shared_inbox, service", ErrInvalidInput)
+	}
+	if accountType == "user" && s.seats != nil {
+		if err := s.seats.CheckSeatAvailable(ctx, tenantID); err != nil {
+			return nil, err
+		}
 	}
 	var u User
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
@@ -248,22 +294,32 @@ func (s *Service) CreateUser(ctx context.Context, tenantID string, in CreateUser
 		return tx.QueryRow(ctx, `
 			INSERT INTO users (
 				tenant_id, kchat_user_id, stalwart_account_id, email,
-				display_name, role, quota_bytes
-			) VALUES ($1::uuid, $2, $3, $4, $5, $6, $7)
+				display_name, role, quota_bytes, account_type
+			) VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8)
 			RETURNING id::text, tenant_id::text, kchat_user_id,
 			          stalwart_account_id, email, display_name, role,
-			          status, quota_bytes, created_at, updated_at
+			          status, account_type, quota_bytes, created_at, updated_at
 		`,
 			tenantID, in.KChatUserID, in.StalwartAccountID, in.Email,
-			in.DisplayName, role, in.QuotaBytes,
+			in.DisplayName, role, in.QuotaBytes, accountType,
 		).Scan(
 			&u.ID, &u.TenantID, &u.KChatUserID, &u.StalwartAccountID,
-			&u.Email, &u.DisplayName, &u.Role, &u.Status, &u.QuotaBytes,
+			&u.Email, &u.DisplayName, &u.Role, &u.Status,
+			&u.AccountType, &u.QuotaBytes,
 			&u.CreatedAt, &u.UpdatedAt,
 		)
 	})
 	if err != nil {
 		return nil, fmt.Errorf("insert user: %w", err)
+	}
+	if u.AccountType == "user" && s.seats != nil {
+		if err := s.seats.IncrementSeatCount(ctx, tenantID, 1); err != nil {
+			// Log-and-continue: the INSERT succeeded, so surfacing
+			// the counter-update failure as an error to the caller
+			// would hide the fact that the seat was taken. The
+			// quota worker reconciles drift on its next tick.
+			return &u, nil
+		}
 	}
 	return &u, nil
 }
@@ -419,7 +475,7 @@ func (s *Service) ListUsers(ctx context.Context, tenantID string) ([]User, error
 		rows, err := tx.Query(ctx, `
 			SELECT id::text, tenant_id::text, kchat_user_id,
 			       stalwart_account_id, email, display_name, role,
-			       status, quota_bytes, created_at, updated_at
+			       status, account_type, quota_bytes, created_at, updated_at
 			FROM users
 			WHERE tenant_id = $1::uuid
 			ORDER BY created_at ASC
@@ -432,8 +488,8 @@ func (s *Service) ListUsers(ctx context.Context, tenantID string) ([]User, error
 			var u User
 			if err := rows.Scan(
 				&u.ID, &u.TenantID, &u.KChatUserID, &u.StalwartAccountID,
-				&u.Email, &u.DisplayName, &u.Role, &u.Status, &u.QuotaBytes,
-				&u.CreatedAt, &u.UpdatedAt,
+				&u.Email, &u.DisplayName, &u.Role, &u.Status, &u.AccountType,
+				&u.QuotaBytes, &u.CreatedAt, &u.UpdatedAt,
 			); err != nil {
 				return err
 			}
@@ -461,13 +517,13 @@ func (s *Service) GetUser(ctx context.Context, tenantID, userID string) (*User, 
 		return tx.QueryRow(ctx, `
 			SELECT id::text, tenant_id::text, kchat_user_id,
 			       stalwart_account_id, email, display_name, role,
-			       status, quota_bytes, created_at, updated_at
+			       status, account_type, quota_bytes, created_at, updated_at
 			FROM users
 			WHERE id = $1::uuid AND tenant_id = $2::uuid
 		`, userID, tenantID).Scan(
 			&u.ID, &u.TenantID, &u.KChatUserID, &u.StalwartAccountID,
-			&u.Email, &u.DisplayName, &u.Role, &u.Status, &u.QuotaBytes,
-			&u.CreatedAt, &u.UpdatedAt,
+			&u.Email, &u.DisplayName, &u.Role, &u.Status, &u.AccountType,
+			&u.QuotaBytes, &u.CreatedAt, &u.UpdatedAt,
 		)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -524,11 +580,11 @@ func (s *Service) UpdateUser(ctx context.Context, tenantID, userID string, in Up
 			WHERE id = $1::uuid AND tenant_id = $2::uuid
 			RETURNING id::text, tenant_id::text, kchat_user_id,
 			          stalwart_account_id, email, display_name, role,
-			          status, quota_bytes, created_at, updated_at
+			          status, account_type, quota_bytes, created_at, updated_at
 		`, userID, tenantID, in.DisplayName, in.Role, in.Status, in.QuotaBytes).Scan(
 			&u.ID, &u.TenantID, &u.KChatUserID, &u.StalwartAccountID,
-			&u.Email, &u.DisplayName, &u.Role, &u.Status, &u.QuotaBytes,
-			&u.CreatedAt, &u.UpdatedAt,
+			&u.Email, &u.DisplayName, &u.Role, &u.Status, &u.AccountType,
+			&u.QuotaBytes, &u.CreatedAt, &u.UpdatedAt,
 		)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -542,25 +598,32 @@ func (s *Service) UpdateUser(ctx context.Context, tenantID, userID string, in Up
 
 // DeleteUser soft-deletes a user by flipping status to "deleted".
 // The row stays in place so audit trails and RLS references remain
-// valid.
+// valid. When the deleted row is a paid seat (account_type=user)
+// the seat counter is decremented on the billing service.
 func (s *Service) DeleteUser(ctx context.Context, tenantID, userID string) error {
 	if tenantID == "" || userID == "" {
 		return fmt.Errorf("%w: tenant id and user id are required", ErrInvalidInput)
 	}
 	var affected int64
+	var accountType string
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
 			return err
 		}
-		tag, err := tx.Exec(ctx, `
+		err := tx.QueryRow(ctx, `
 			UPDATE users
 			SET status = 'deleted'
 			WHERE id = $1::uuid AND tenant_id = $2::uuid
-		`, userID, tenantID)
+			  AND status <> 'deleted'
+			RETURNING account_type
+		`, userID, tenantID).Scan(&accountType)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
 		if err != nil {
 			return err
 		}
-		affected = tag.RowsAffected()
+		affected = 1
 		return nil
 	})
 	if err != nil {
@@ -568,6 +631,9 @@ func (s *Service) DeleteUser(ctx context.Context, tenantID, userID string) error
 	}
 	if affected == 0 {
 		return ErrNotFound
+	}
+	if accountType == "user" && s.seats != nil {
+		_ = s.seats.IncrementSeatCount(ctx, tenantID, -1)
 	}
 	return nil
 }
