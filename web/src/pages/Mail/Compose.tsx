@@ -129,11 +129,13 @@ export default function Compose() {
       await jmapClient.sendEmail(draft);
       setSuccessMessage("Message sent.");
       // Give the user a brief moment to see the success confirmation
-      // before we navigate them back to the inbox.
+      // before we navigate them back to the inbox. We deliberately
+      // leave `isSending` true so the Send button stays disabled
+      // through the navigation delay — resetting it here would let
+      // a rapid second click dispatch a duplicate submission.
       setTimeout(() => navigate("/mail"), 600);
     } catch (err: unknown) {
       setError(errorMessage(err));
-    } finally {
       setSending(false);
     }
   };
@@ -360,33 +362,92 @@ function buildQuoteHeader(seed: ComposeSeed): string {
   return `On ${when}, ${who} wrote:`;
 }
 
+/**
+ * Serialise an address list for the comma-separated text inputs.
+ * Display names that contain a comma or a double-quote are wrapped
+ * in double quotes (with embedded quotes backslash-escaped) so the
+ * round-trip through `parseAddresses` doesn't corrupt them — e.g.
+ * `{ name: "Smith, John", email: "j@x" }` round-trips as
+ * `"Smith, John" <j@x>` instead of splitting into two entries.
+ */
 function addressesToInput(list: EmailAddress[] | undefined): string {
   if (!list || list.length === 0) return "";
-  return list
-    .map((a) => (a.name ? `${a.name} <${a.email}>` : a.email))
-    .join(", ");
+  return list.map((a) => formatAddress(a)).join(", ");
+}
+
+function formatAddress(a: EmailAddress): string {
+  if (!a.name) return a.email;
+  const needsQuoting = /[,"<>]/.test(a.name);
+  const name = needsQuoting
+    ? `"${a.name.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`
+    : a.name;
+  return `${name} <${a.email}>`;
 }
 
 /**
- * Parse a comma-separated list of addresses. Accepts either bare
- * `user@host` or `Display Name <user@host>` forms. Blank entries
- * are silently dropped; malformed entries fall through as
+ * Parse a comma-separated list of addresses. Accepts bare
+ * `user@host`, `Display Name <user@host>`, and
+ * `"Quoted, Name" <user@host>` forms. Commas inside balanced
+ * double quotes do NOT split entries. Blank entries are silently
+ * dropped; malformed entries fall through as
  * `{ name: null, email: <raw> }` so the server can return a
  * JMAP-level `invalidProperties` error rather than us guessing.
  */
 function parseAddresses(input: string): EmailAddress[] {
-  return input
-    .split(",")
+  return splitOnTopLevelCommas(input)
     .map((s) => s.trim())
     .filter((s) => s.length > 0)
     .map((s) => {
       const match = s.match(/^(.*)<\s*([^>]+)\s*>\s*$/);
       if (match) {
-        const name = match[1].trim().replace(/^"|"$/g, "") || null;
+        const rawName = match[1].trim();
+        const name = unquoteName(rawName) || null;
         return { name, email: match[2].trim() };
       }
       return { name: null, email: s };
     });
+}
+
+/**
+ * Split on commas that are NOT inside a double-quoted segment.
+ * Handles backslash-escaped quotes within the quoted segment.
+ */
+function splitOnTopLevelCommas(input: string): string[] {
+  const out: string[] = [];
+  let current = "";
+  let inQuotes = false;
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i];
+    if (ch === "\\" && inQuotes && i + 1 < input.length) {
+      current += ch + input[i + 1];
+      i++;
+      continue;
+    }
+    if (ch === '"') {
+      inQuotes = !inQuotes;
+      current += ch;
+      continue;
+    }
+    if (ch === "," && !inQuotes) {
+      out.push(current);
+      current = "";
+      continue;
+    }
+    current += ch;
+  }
+  if (current.length > 0) out.push(current);
+  return out;
+}
+
+function unquoteName(raw: string): string {
+  const trimmed = raw.trim();
+  if (trimmed.length >= 2 && trimmed.startsWith('"') && trimmed.endsWith('"')) {
+    return trimmed
+      .slice(1, -1)
+      .replace(/\\"/g, '"')
+      .replace(/\\\\/g, "\\");
+  }
+  return trimmed;
 }
 
 function errorMessage(err: unknown): string {
