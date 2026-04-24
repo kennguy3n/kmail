@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 
 import { jmapClient } from "../../api/jmap";
@@ -130,12 +130,20 @@ export default function CalendarView() {
   // Deep link: /calendar/:eventId pops the corresponding event's
   // detail panel on mount. Once the events list loads we resolve
   // the id; if it is not in the current window we fetch it
-  // explicitly so the panel still opens.
+  // explicitly so the panel still opens. `resolvedRouteIdRef`
+  // tracks which route id has already been resolved so a later
+  // user click on a different event does not re-trigger the
+  // resolver and snap the selection back.
+  const resolvedRouteIdRef = useRef<string | null>(null);
   useEffect(() => {
-    if (!routeEventId) return;
-    if (selectedEvent && selectedEvent.id === routeEventId) return;
+    if (!routeEventId) {
+      resolvedRouteIdRef.current = null;
+      return;
+    }
+    if (resolvedRouteIdRef.current === routeEventId) return;
     const fromList = (events ?? []).find((e) => e.id === routeEventId);
     if (fromList) {
+      resolvedRouteIdRef.current = routeEventId;
       setSelectedEvent(fromList);
       return;
     }
@@ -143,7 +151,9 @@ export default function CalendarView() {
     jmapClient
       .getEvent(routeEventId)
       .then((e) => {
-        if (!cancelled) setSelectedEvent(e);
+        if (cancelled) return;
+        resolvedRouteIdRef.current = routeEventId;
+        setSelectedEvent(e);
       })
       .catch((err: unknown) => {
         if (!cancelled) setError(errorMessage(err));
@@ -151,7 +161,7 @@ export default function CalendarView() {
     return () => {
       cancelled = true;
     };
-  }, [routeEventId, events, selectedEvent]);
+  }, [routeEventId, events]);
 
   const handleToggleCalendar = useCallback((calendarId: string) => {
     setVisibility((prev) => ({

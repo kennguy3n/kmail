@@ -41,6 +41,13 @@ export default function Inbox() {
   const [searchScope, setSearchScope] = useState<"mailbox" | "global">(
     "mailbox",
   );
+  // Scope captured at the moment the last search was submitted;
+  // `searchScope` above is the live checkbox state and can diverge
+  // from what the currently-displayed results were actually
+  // searched under.
+  const [submittedScope, setSubmittedScope] = useState<"mailbox" | "global">(
+    "mailbox",
+  );
   const [searchResults, setSearchResults] = useState<Email[] | null>(null);
   const [isSearching, setIsSearching] = useState(false);
   const inSearchMode = submittedQuery.trim().length > 0;
@@ -125,6 +132,7 @@ export default function Inbox() {
     async (raw: string) => {
       const trimmed = raw.trim();
       setSubmittedQuery(trimmed);
+      setSubmittedScope(searchScope);
       if (trimmed.length === 0) {
         setSearchResults(null);
         return;
@@ -315,7 +323,9 @@ export default function Inbox() {
               : `Results for “${submittedQuery}” (${
                   searchResults?.length ?? 0
                 })${
-                  searchScope === "mailbox" ? " in this mailbox" : " across all mail"
+                  submittedScope === "mailbox"
+                    ? " in this mailbox"
+                    : " across all mail"
                 }`}
           </p>
         )}

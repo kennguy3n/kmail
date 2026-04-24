@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 
 import { jmapClient } from "../../api/jmap";
@@ -50,6 +50,10 @@ export default function EventCreate() {
   const [error, setError] = useState<string | null>(null);
   const [loadingEvent, setLoadingEvent] = useState(isEdit);
   const [loadingCalendars, setLoadingCalendars] = useState(true);
+  // The event we loaded in edit mode, kept so the submit handler
+  // can diff the form against it and ship only changed fields to
+  // `updateEvent()` (which rejects no-op updates server-side).
+  const originalEventRef = useRef<CalendarEvent | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -83,6 +87,7 @@ export default function EventCreate() {
       .getEvent(eventId)
       .then((e: CalendarEvent) => {
         if (cancelled) return;
+        originalEventRef.current = e;
         setCalendarId(e.calendarId);
         setTitle(e.title);
         setDescription(e.description ?? "");
@@ -144,7 +149,15 @@ export default function EventCreate() {
     setSubmitting(true);
     try {
       if (isEdit && eventId) {
-        await jmapClient.updateEvent(eventId, draft);
+        const original = originalEventRef.current;
+        const changes = original
+          ? diffEventDraft(original, draft)
+          : draft;
+        if (Object.keys(changes).length === 0) {
+          navigate("/calendar");
+          return;
+        }
+        await jmapClient.updateEvent(eventId, changes);
       } else {
         await jmapClient.createEvent(draft);
       }
@@ -338,6 +351,78 @@ export default function EventCreate() {
       </form>
     </section>
   );
+}
+
+/**
+ * Build a `Partial<CalendarEventDraft>` containing only the
+ * fields whose current form value differs from `original`. The
+ * BFF's `CalendarEvent/set update` rejects no-op updates, so the
+ * submit handler must strip unchanged fields before calling
+ * `updateEvent()`. Participants are compared by their normalised
+ * `(email, name, role, rsvp)` tuple sorted by email so reordering
+ * alone is not treated as a change.
+ */
+function diffEventDraft(
+  original: CalendarEvent,
+  draft: CalendarEventDraft,
+): Partial<CalendarEventDraft> {
+  const changes: Partial<CalendarEventDraft> = {};
+  if (draft.calendarId !== original.calendarId) {
+    changes.calendarId = draft.calendarId;
+  }
+  if (draft.title !== original.title) {
+    changes.title = draft.title;
+  }
+  if ((draft.description ?? "") !== (original.description ?? "")) {
+    changes.description = draft.description;
+  }
+  if ((draft.location ?? "") !== (original.location ?? "")) {
+    changes.location = draft.location;
+  }
+  if (!sameInstant(draft.start, original.start)) {
+    changes.start = draft.start;
+  }
+  if (!sameInstant(draft.end, original.end)) {
+    changes.end = draft.end;
+  }
+  if ((draft.status ?? undefined) !== (original.status ?? undefined)) {
+    changes.status = draft.status;
+  }
+  if (
+    !sameParticipants(
+      draft.participants ?? [],
+      original.participants ?? [],
+    )
+  ) {
+    changes.participants = draft.participants;
+  }
+  return changes;
+}
+
+function sameInstant(a: string, b: string): boolean {
+  const ta = Date.parse(a);
+  const tb = Date.parse(b);
+  if (Number.isNaN(ta) || Number.isNaN(tb)) return a === b;
+  return ta === tb;
+}
+
+function sameParticipants(
+  a: EventParticipant[],
+  b: EventParticipant[],
+): boolean {
+  if (a.length !== b.length) return false;
+  const norm = (ps: EventParticipant[]) =>
+    ps
+      .map((p) =>
+        [p.email, p.name ?? "", p.role ?? "", p.rsvp ?? ""].join("\u0000"),
+      )
+      .sort();
+  const na = norm(a);
+  const nb = norm(b);
+  for (let i = 0; i < na.length; i++) {
+    if (na[i] !== nb[i]) return false;
+  }
+  return true;
 }
 
 function parseParticipants(
