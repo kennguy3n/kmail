@@ -174,6 +174,28 @@ export default function Inbox() {
     [mailboxes],
   );
 
+  // Single source of truth for "this row behaves as if it lives in
+  // trash". Used both for the row label (Trash vs Delete) and the
+  // handler's delete-vs-move branch so they can't drift. In search
+  // mode, results can come from any mailbox so the decision is
+  // per-email; outside search mode, the user is viewing a specific
+  // mailbox and the old sidebar-based rule applies (so a message
+  // cross-labelled Inbox+Trash still moves when the user clicks
+  // Trash from Inbox, matching the pre-search-feature behaviour).
+  const isEmailInTrash = useCallback(
+    (email: Email): boolean => {
+      if (trashMailboxId === null) return false;
+      if (inSearchMode) {
+        return Object.prototype.hasOwnProperty.call(
+          email.mailboxIds,
+          trashMailboxId,
+        );
+      }
+      return selectedMailbox === trashMailboxId;
+    },
+    [inSearchMode, selectedMailbox, trashMailboxId],
+  );
+
   const handleToggleRead = useCallback(async (email: Email) => {
     const nextRead = !email.keywords.$seen;
     try {
@@ -190,25 +212,24 @@ export default function Inbox() {
         setError("Trash mailbox is not available on this account");
         return;
       }
-      // In search mode the email may live in a different mailbox
-      // than the sidebar selection; resolve the source mailbox from
-      // the email itself so the JMAP patch removes it from its
-      // actual location rather than a no-op key on selectedMailbox.
-      const emailMailboxIds = Object.keys(email.mailboxIds);
-      const sourceMailbox = inSearchMode
-        ? (emailMailboxIds[0] ?? selectedMailbox)
-        : selectedMailbox;
-      if (!sourceMailbox) {
-        setError("Could not determine source mailbox for this email");
-        return;
-      }
-      if (emailMailboxIds.includes(trashMailboxId)) {
+      if (isEmailInTrash(email)) {
         try {
           await jmapClient.deleteEmail(email.id);
           setReloadNonce((n) => n + 1);
         } catch (err: unknown) {
           setError(errorMessage(err));
         }
+        return;
+      }
+      // Resolve the source mailbox from the email itself in search
+      // mode so the JMAP patch removes it from its actual location
+      // rather than a no-op key on the sidebar selection.
+      const emailMailboxIds = Object.keys(email.mailboxIds);
+      const sourceMailbox = inSearchMode
+        ? (emailMailboxIds[0] ?? selectedMailbox)
+        : selectedMailbox;
+      if (!sourceMailbox) {
+        setError("Could not determine source mailbox for this email");
         return;
       }
       try {
@@ -218,7 +239,7 @@ export default function Inbox() {
         setError(errorMessage(err));
       }
     },
-    [inSearchMode, selectedMailbox, trashMailboxId],
+    [inSearchMode, isEmailInTrash, selectedMailbox, trashMailboxId],
   );
 
   const sortedMailboxes = useMemo(
