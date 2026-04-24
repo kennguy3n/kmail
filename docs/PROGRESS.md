@@ -4,7 +4,39 @@
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
 - **Status**: Phase 1 — Foundation (in progress); Phase 2 —
   Prototype (in progress)
-- **Last updated**: 2026-04-24 — Phase 2 compatibility + spam +
+- **Last updated**: 2026-04-24 — Admin UI Phase 2 batch landed.
+  The React admin pages stop being placeholders and start driving
+  the existing Tenant Service + DNS Onboarding REST endpoints.
+  Specifically:
+  * `web/src/api/admin.ts` is a new typed REST client for the
+    control-plane surface (`/api/v1/tenants/...`). It mirrors the
+    `authHeaders()` pattern from `web/src/api/jmap.ts` — bearer
+    token `kmail-dev` plus an optional `X-KMail-Dev-Tenant-Id`
+    header so the dev-bypass middleware (`devClaimsFromHeaders`
+    in `internal/middleware/auth.go`) resolves the same tenant ID
+    the URL path carries, which satisfies `checkTenantScope` on
+    the server side. Exposes typed `listTenants`, `listDomains`,
+    `verifyDomain`, `getDomainRecords`, `listUsers`, `updateUser`,
+    `deleteUser`, and an `AdminApiError` class.
+  * `web/src/pages/Admin/useTenantSelection.ts` is a shared hook
+    that loads the tenant list, tracks the selected tenant in
+    `localStorage`, and is consumed by both admin pages so they
+    agree on which tenant is being managed.
+  * `web/src/pages/Admin/DomainAdmin.tsx` now lists the selected
+    tenant's domains with the four persisted per-check flags
+    (MX / SPF / DKIM / DMARC) plus an aggregate verified column,
+    a **Verify** button that fires `POST .../domains/{id}/verify`
+    and refreshes the row, and a **Show DNS records** expander
+    that fetches `GET .../domains/{id}/dns-records` and renders
+    the MX / SPF / DKIM / DMARC / MTA-STS / TLS-RPT record rows
+    the tenant needs to publish.
+  * `web/src/pages/Admin/UserAdmin.tsx` now lists the selected
+    tenant's users (email, display name, role, status, quota),
+    supports inline **Edit** that PATCHes only the changed fields
+    through `PATCH .../users/{userId}`, and gates **Delete**
+    behind a confirm button that fires `DELETE .../users/{userId}`
+    and removes the row on success.
+- **Previously (2026-04-24)**: Phase 2 compatibility + spam +
   migration batch landed. Four Phase 2 checklist items graduate
   off the "planned" list: basic spam / phishing filtering via
   Stalwart, IMAP / SMTP compatibility testing, CalDAV
@@ -412,6 +444,19 @@ Delivered so far:
   (OPTIONS + PROPFIND Depth:0/1 + PUT / GET / DELETE
   round-trip against `/dav/calendars/`) with matching Apple
   Calendar + Thunderbird sections in `docs/COMPATIBILITY.md`.
+- **Admin UI** — Domain and User admin pages in
+  `web/src/pages/Admin/` go from placeholders to functional
+  screens wired to the Tenant Service REST surface. A new
+  `web/src/api/admin.ts` holds the typed REST client
+  (`listTenants`, `listDomains`, `verifyDomain`,
+  `getDomainRecords`, `listUsers`, `updateUser`, `deleteUser`)
+  and reuses the `authHeaders()` pattern from `jmap.ts`; a
+  shared `useTenantSelection` hook keeps the selected tenant
+  consistent across both pages via `localStorage`. DomainAdmin
+  surfaces MX / SPF / DKIM / DMARC flags with a per-row Verify
+  button and an expandable DNS-records panel; UserAdmin supports
+  inline edit (display name / role / status / quota) and a
+  confirmation-gated delete.
 - **Migration Orchestrator** — `internal/migration/` ships the
   full `Service` + `Handlers` pair (tenant-scoped
   `/api/v1/migrations` CRUD, goroutine worker pool capped by
@@ -474,6 +519,11 @@ Checklist:
       progress parsing + Postgres checkpointing, RLS-scoped
       `migration_jobs` table, unit tests for validation + state
       transitions.)_
+- [x] Admin UI (domains, users) wired to Tenant Service REST API.
+      _(`web/src/api/admin.ts` typed REST client, shared
+      `useTenantSelection` hook, DomainAdmin with MX/SPF/DKIM/DMARC
+      flags + per-row Verify + Show DNS records expander,
+      UserAdmin with inline Edit + confirmed Delete.)_
 - [ ] Email-to-chat bridge (share email to KChat channel).
 - [x] zk-object-fabric blob store integration verified end-to-end.
       _(PUT / GET round-trips via Stalwart's JMAP blob upload /

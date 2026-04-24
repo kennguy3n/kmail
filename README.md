@@ -236,10 +236,16 @@ Onboarding Service, and the automated Stalwart v0.16.0 bootstrap are
 live, `docker compose up` brings the whole stack up hands-off,
 zk-object-fabric blob round-trips are verified end-to-end through
 Stalwart's JMAP blob API, and the React KChat **Mail UI** (inbox,
-compose, read, full-text search, read/unread + move/delete) and
+compose, read, full-text search, read/unread + move/delete),
 **Calendar UI** (day / week / month views, event create / edit,
-RSVP, calendar-visibility sidebar, deep-link to event detail) are
-functional against the JMAP client.
+RSVP, calendar-visibility sidebar, deep-link to event detail), and
+**Admin UI** (Domain admin with MX / SPF / DKIM / DMARC flags +
+Verify + Show DNS records, User admin with inline Edit + confirmed
+Delete) are functional against the Go BFF. Stalwart's built-in
+spam / phishing classifier (thresholds + DNSBL + Bayesian
+auto-learn + Sieve Junk rule) is wired through the JMAP admin
+registry, and the Gmail / IMAP migration orchestrator is live under
+`/api/v1/migrations`.
 
 See [docs/PROGRESS.md](docs/PROGRESS.md) for the phase-gated tracker.
 
