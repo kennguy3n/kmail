@@ -92,10 +92,16 @@ export default function Compose() {
     !isSending &&
     !isSavingDraft;
 
-  const buildDraft = (): EmailDraft | null => {
+  /**
+   * Build the draft payload. `requireTo` defaults to `true` because
+   * sending without a recipient is an error; Save draft passes
+   * `false` so the user can stash work-in-progress messages before
+   * they've filled in the To field.
+   */
+  const buildDraft = (requireTo = true): EmailDraft | null => {
     if (!draftsMailbox || !identity) return null;
     const toList = parseAddresses(to);
-    if (toList.length === 0) return null;
+    if (requireTo && toList.length === 0) return null;
     return {
       mailboxIds: { [draftsMailbox.id]: true },
       from: [{ name: identity.name || null, email: identity.email }],
@@ -113,7 +119,7 @@ export default function Compose() {
     e.preventDefault();
     setError(null);
     setSuccessMessage(null);
-    const draft = buildDraft();
+    const draft = buildDraft(true);
     if (!draft) {
       setError("Please supply at least one recipient and a sender identity.");
       return;
@@ -135,9 +141,9 @@ export default function Compose() {
   const handleSaveDraft = async () => {
     setError(null);
     setSuccessMessage(null);
-    const draft = buildDraft();
+    const draft = buildDraft(false);
     if (!draft) {
-      setError("Please supply at least one recipient before saving a draft.");
+      setError("Drafts mailbox or sender identity is not yet available.");
       return;
     }
     setSavingDraft(true);

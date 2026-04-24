@@ -64,11 +64,17 @@ export default function MessageView() {
 
   const handleReply = (replyAll: boolean) => {
     if (!email) return;
+    // Prefer the Reply-To header when present (mailing lists,
+    // shared inboxes, newsletters) over the From address.
+    const replyTarget =
+      email.replyTo && email.replyTo.length > 0
+        ? email.replyTo
+        : (email.from ?? []);
     navigate("/mail/compose", {
       state: {
         mode: replyAll ? "replyAll" : "reply",
         sourceEmailId: email.id,
-        to: email.from ?? [],
+        to: replyTarget,
         cc: replyAll ? [...(email.to ?? []), ...(email.cc ?? [])] : [],
         subject: withPrefix(email.subject, "Re:"),
         quotedBody: bodyText,
