@@ -50,6 +50,11 @@ export default function Inbox() {
   );
   const [searchResults, setSearchResults] = useState<Email[] | null>(null);
   const [isSearching, setIsSearching] = useState(false);
+  // Bumped after every successful write (mark-read, move-to-trash,
+  // delete) so the search-mode refetch effect below re-runs the
+  // last submitted search and replaces stale hits with server
+  // state. `reloadNonce` still drives the mailbox-mode refetch.
+  const [searchReloadNonce, setSearchReloadNonce] = useState(0);
   const inSearchMode = submittedQuery.trim().length > 0;
 
   useEffect(() => {
@@ -155,6 +160,47 @@ export default function Inbox() {
     [searchScope, selectedMailbox],
   );
 
+  // After a successful write in search mode, re-run the last
+  // submitted search against the captured `submittedScope` so
+  // `searchResults` converges with server state. Using
+  // `submittedScope` (not the live `searchScope`) matches what the
+  // currently-displayed results were actually queried under.
+  useEffect(() => {
+    if (searchReloadNonce === 0) return;
+    if (!inSearchMode) return;
+    let cancelled = false;
+    setIsSearching(true);
+    jmapClient
+      .searchEmails(submittedQuery, {
+        mailboxId:
+          submittedScope === "mailbox"
+            ? (selectedMailbox ?? undefined)
+            : null,
+        limit: 50,
+      })
+      .then((results) => {
+        if (!cancelled) setSearchResults(results);
+      })
+      .catch((err: unknown) => {
+        if (!cancelled) {
+          setError(errorMessage(err));
+          setSearchResults([]);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setIsSearching(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    searchReloadNonce,
+    inSearchMode,
+    submittedQuery,
+    submittedScope,
+    selectedMailbox,
+  ]);
+
   const handleSubmitSearch = useCallback(
     (e: React.FormEvent) => {
       e.preventDefault();
@@ -196,15 +242,27 @@ export default function Inbox() {
     [inSearchMode, selectedMailbox, trashMailboxId],
   );
 
-  const handleToggleRead = useCallback(async (email: Email) => {
-    const nextRead = !email.keywords.$seen;
-    try {
-      await jmapClient.markRead(email.id, nextRead);
-      setReloadNonce((n) => n + 1);
-    } catch (err: unknown) {
-      setError(errorMessage(err));
-    }
+  // Bump both refetch nonces after a successful write. The
+  // mailbox-list effect reads `reloadNonce`; the search effect
+  // above reads `searchReloadNonce`. Bumping both here keeps the
+  // page converged regardless of which list is currently on screen.
+  const bumpAfterWrite = useCallback(() => {
+    setReloadNonce((n) => n + 1);
+    setSearchReloadNonce((n) => n + 1);
   }, []);
+
+  const handleToggleRead = useCallback(
+    async (email: Email) => {
+      const nextRead = !email.keywords.$seen;
+      try {
+        await jmapClient.markRead(email.id, nextRead);
+        bumpAfterWrite();
+      } catch (err: unknown) {
+        setError(errorMessage(err));
+      }
+    },
+    [bumpAfterWrite],
+  );
 
   const handleMoveToTrash = useCallback(
     async (email: Email) => {
@@ -215,7 +273,7 @@ export default function Inbox() {
       if (isEmailInTrash(email)) {
         try {
           await jmapClient.deleteEmail(email.id);
-          setReloadNonce((n) => n + 1);
+          bumpAfterWrite();
         } catch (err: unknown) {
           setError(errorMessage(err));
         }
@@ -234,12 +292,12 @@ export default function Inbox() {
       }
       try {
         await jmapClient.moveEmail(email.id, sourceMailbox, trashMailboxId);
-        setReloadNonce((n) => n + 1);
+        bumpAfterWrite();
       } catch (err: unknown) {
         setError(errorMessage(err));
       }
     },
-    [inSearchMode, isEmailInTrash, selectedMailbox, trashMailboxId],
+    [bumpAfterWrite, inSearchMode, isEmailInTrash, selectedMailbox, trashMailboxId],
   );
 
   const sortedMailboxes = useMemo(
