@@ -19,8 +19,11 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/kennguy3n/kmail/internal/calendarbridge"
+	"github.com/kennguy3n/kmail/internal/chatbridge"
 	"github.com/kennguy3n/kmail/internal/config"
 	"github.com/kennguy3n/kmail/internal/dns"
+	"github.com/kennguy3n/kmail/internal/audit"
 	"github.com/kennguy3n/kmail/internal/jmap"
 	"github.com/kennguy3n/kmail/internal/middleware"
 	"github.com/kennguy3n/kmail/internal/migration"
@@ -50,12 +53,44 @@ func main() {
 	mux.HandleFunc("GET /healthz", healthzHandler)
 	mux.HandleFunc("GET /readyz", readyzHandler(pool))
 
-	authMW := middleware.NewOIDC(middleware.OIDCConfig{
+	authMW, err := middleware.NewOIDC(middleware.OIDCConfig{
 		Issuer:         cfg.KChatOIDCIssuer,
+		Audience:       cfg.KChatOIDCAudience,
 		DevBypassToken: cfg.DevBypassToken,
 		Pool:           pool,
 		Logger:         logger,
 	})
+	if err != nil {
+		logger.Fatalf("middleware.NewOIDC: %v", err)
+	}
+
+	// Valkey-backed rate limiter. Enabled via config; when
+	// disabled the limiter is a no-op and the middleware passes
+	// the request through untouched. Plumbed in between the OIDC
+	// gate (needs identity) and the JMAP + tenant handlers.
+	var rateLimiter *middleware.RateLimiter
+	if cfg.RateLimit.Enabled {
+		store, err := middleware.NewRedisStore(cfg.ValkeyURL)
+		if err != nil {
+			logger.Fatalf("middleware.NewRedisStore: %v", err)
+		}
+		rateLimiter = middleware.NewRateLimiter(middleware.RateLimiterConfig{
+			Client:    store,
+			TenantRPM: cfg.RateLimit.TenantRPM,
+			UserRPM:   cfg.RateLimit.UserRPM,
+			Window:    cfg.RateLimit.Window,
+			Logger:    logger,
+		})
+	}
+	wrapAuthRL := func(h http.Handler) http.Handler {
+		wrapped := authMW.Wrap(h)
+		if rateLimiter != nil {
+			// Rate limit AFTER auth so tenant / user IDs are in
+			// context when the limiter consults Valkey.
+			wrapped = authMW.Wrap(rateLimiter.Wrap(h))
+		}
+		return wrapped
+	}
 
 	proxy, err := jmap.NewProxy(jmap.ProxyConfig{
 		StalwartURL: cfg.StalwartURL,
@@ -69,8 +104,8 @@ func main() {
 	// Stalwart. The trailing-slash pattern owns every path below
 	// /jmap/ so subpaths like /jmap/session and /jmap/upload route
 	// here, while the bare /jmap lands on the session endpoint.
-	mux.Handle("/jmap", authMW.Wrap(proxy))
-	mux.Handle("/jmap/", authMW.Wrap(proxy))
+	mux.Handle("/jmap", wrapAuthRL(proxy))
+	mux.Handle("/jmap/", wrapAuthRL(proxy))
 
 	tenantSvc := tenant.NewService(pool)
 	dnsSvc := dns.NewService(dns.Config{
@@ -95,6 +130,23 @@ func main() {
 	})
 	migrationHandlers := migration.NewHandlers(migrationSvc, logger)
 	migrationHandlers.Register(mux, authMW)
+
+	calendarSvc := calendarbridge.NewService(calendarbridge.Config{
+		StalwartURL: cfg.StalwartURL,
+	})
+	calendarbridge.NewHandlers(calendarSvc, logger).Register(mux, authMW)
+
+	chatbridgeSvc := chatbridge.NewService(chatbridge.Config{
+		KChatAPIURL:   cfg.KChatAPIURL,
+		KChatAPIToken: cfg.KChatAPIToken,
+		StalwartURL:   cfg.StalwartURL,
+		Pool:          pool,
+		Logger:        logger,
+	})
+	chatbridge.NewHandlers(chatbridgeSvc, logger).Register(mux, authMW)
+
+	auditSvc := audit.NewService(pool)
+	audit.NewHandlers(auditSvc, logger).Register(mux, authMW)
 
 	srv := &http.Server{
 		Addr:              cfg.HTTP.Addr,

@@ -97,9 +97,14 @@ type Service struct {
 	sema chan struct{}
 
 	// mu protects cancels, the jobID → cancel-func map used by
-	// CancelJob to signal a running worker.
+	// CancelJob to signal a running worker, and pausing, the set
+	// of jobIDs whose worker context was cancelled by PauseJob
+	// rather than CancelJob (so the worker knows not to overwrite
+	// the already-written `paused` status with `cancelled` on its
+	// terminal update).
 	mu      sync.Mutex
 	cancels map[string]context.CancelFunc
+	pausing map[string]struct{}
 }
 
 // NewService constructs a Service with sensible defaults.
@@ -117,6 +122,7 @@ func NewService(cfg Config) *Service {
 		cfg:     cfg,
 		sema:    make(chan struct{}, cfg.MaxConcurrent),
 		cancels: make(map[string]context.CancelFunc),
+		pausing: make(map[string]struct{}),
 	}
 }
 
@@ -341,7 +347,7 @@ func (s *Service) StartJob(ctx context.Context, tenantID, jobID string) error {
 	if err != nil {
 		return err
 	}
-	if job.Status != "pending" {
+	if job.Status != "pending" && job.Status != "paused" {
 		return fmt.Errorf("%w: job %s is already %s", ErrConflict, jobID, job.Status)
 	}
 
@@ -374,6 +380,58 @@ func (s *Service) StartJob(ctx context.Context, tenantID, jobID string) error {
 // CancelJob signals a worker to stop. Pending jobs flip straight
 // to `cancelled`; running jobs have their context cancelled and
 // the worker writes the terminal state.
+// PauseJob halts a running job. The running worker goroutine is
+// signalled via its cancel func; on the next progress checkpoint
+// the worker exits. The DB row is flipped to `paused` so operators
+// can distinguish it from a terminal `cancelled` row.
+func (s *Service) PauseJob(ctx context.Context, tenantID, jobID string) error {
+	job, err := s.GetJob(ctx, tenantID, jobID)
+	if err != nil {
+		return err
+	}
+	if job.Terminal() {
+		return fmt.Errorf("%w: job %s is already %s", ErrConflict, jobID, job.Status)
+	}
+	if job.Status != "running" && job.Status != "pending" {
+		return fmt.Errorf("%w: cannot pause job in status %s", ErrConflict, job.Status)
+	}
+
+	s.mu.Lock()
+	cancel, running := s.cancels[jobID]
+	if running {
+		// Flag the job as pausing *before* calling cancel() so the
+		// worker goroutine sees the flag when it unwinds and skips
+		// its terminal updateStatus (which would otherwise race and
+		// overwrite `paused` with `cancelled`).
+		s.pausing[jobID] = struct{}{}
+	}
+	s.mu.Unlock()
+	if running {
+		// Worker will observe ctx.Err() and stop mid-batch;
+		// imapsync's own checkpoint files (`--tmpdir`) persist
+		// progress for ResumeJob.
+		cancel()
+	}
+	return s.updateStatus(ctx, tenantID, jobID, updateFields{
+		Status: stringPtr("paused"),
+	})
+}
+
+// ResumeJob re-queues a paused job. The worker starts from
+// imapsync's last checkpoint under the job's `--tmpdir` so
+// already-synced messages are skipped.
+func (s *Service) ResumeJob(ctx context.Context, tenantID, jobID string) error {
+	job, err := s.GetJob(ctx, tenantID, jobID)
+	if err != nil {
+		return err
+	}
+	if job.Status != "paused" {
+		return fmt.Errorf("%w: cannot resume job in status %s", ErrConflict, job.Status)
+	}
+	// StartJob re-reads the row and spawns a fresh worker.
+	return s.StartJob(ctx, tenantID, jobID)
+}
+
 func (s *Service) CancelJob(ctx context.Context, tenantID, jobID string) error {
 	job, err := s.GetJob(ctx, tenantID, jobID)
 	if err != nil {
@@ -456,10 +514,22 @@ func (s *Service) runWorker(
 		<-s.sema
 		s.mu.Lock()
 		delete(s.cancels, jobID)
+		delete(s.pausing, jobID)
 		s.mu.Unlock()
 	}()
 
 	runErr := s.runImapsync(ctx, tenantID, jobID, job)
+
+	// If PauseJob signalled this worker, it has already flipped
+	// the row to `paused`. Writing `cancelled` here would race and
+	// break ResumeJob (which only accepts rows in `paused`).
+	s.mu.Lock()
+	_, paused := s.pausing[jobID]
+	s.mu.Unlock()
+	if paused {
+		return
+	}
+
 	// Use a background context for the terminal write so we still
 	// record a final state when the worker's context was cancelled.
 	writeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -48,11 +49,23 @@ type Config struct {
 	// the auth middleware accepts a static token.
 	KChatOIDCIssuer string
 
+	// KChatOIDCAudience is the expected `aud` claim on OIDC tokens
+	// minted for the KMail BFF. When non-empty the auth middleware
+	// rejects tokens whose `aud` list does not include this value.
+	// Empty disables audience checking (dev-bypass / trust-all
+	// posture).
+	KChatOIDCAudience string
+
 	// DevBypassToken is a static bearer token that the auth
 	// middleware accepts when running in dev mode. Never set this in
 	// production; the value is a convenience for local development
 	// only. Empty disables the bypass.
 	DevBypassToken string
+
+	// RateLimit controls the Valkey-backed rate limiter mounted in
+	// front of the JMAP proxy and tenant handlers (per
+	// docs/PROPOSAL.md §9.4 and docs/JMAP-CONTRACT.md §3.5).
+	RateLimit RateLimitConfig
 
 	// ZKFabric holds the zk-object-fabric S3 gateway wiring Stalwart
 	// talks to for blob storage (see docs/ARCHITECTURE.md §4). The
@@ -68,6 +81,36 @@ type Config struct {
 	// same surface on its own port for operators that want to
 	// split the service out.
 	DNS DNSConfig
+
+	// KChatAPIURL is the base URL for the KChat channel-message
+	// API; the Email-to-Chat bridge POSTs rich-card messages to
+	// channels under this host.
+	KChatAPIURL string
+
+	// KChatAPIToken is the service-account bearer token the
+	// bridge presents to the KChat API.
+	KChatAPIToken string
+
+	// ChatBridge controls the standalone `cmd/kmail-chat-bridge`
+	// listener. The in-process BFF integration ignores this.
+	ChatBridge ChatBridgeConfig
+
+	// Audit controls the standalone `cmd/kmail-audit` CLI /
+	// listener.
+	Audit AuditConfig
+}
+
+// ChatBridgeConfig wires the standalone chat-bridge listener.
+type ChatBridgeConfig struct {
+	// Addr is the listen address for the chat-bridge HTTP surface.
+	Addr string
+}
+
+// AuditConfig wires the audit-log service.
+type AuditConfig struct {
+	// Addr is the listen address for the standalone kmail-audit
+	// CLI / HTTP surface.
+	Addr string
 }
 
 // ZKFabricConfig is the connection surface for the zk-object-fabric
@@ -89,6 +132,25 @@ type ZKFabricConfig struct {
 	// template.
 	AccessKey string
 	SecretKey string
+}
+
+// RateLimitConfig wires the Valkey-backed rate limiter middleware.
+// Tenant and per-user limits are applied as a sliding window keyed
+// on the authenticated identity.
+type RateLimitConfig struct {
+	// Enabled gates the middleware. When false the limiter is a
+	// no-op and neither reads from Valkey nor allocates a client
+	// connection.
+	Enabled bool
+	// TenantRPM is the per-tenant request-per-minute ceiling.
+	// Defaults to 1000 rpm.
+	TenantRPM int
+	// UserRPM is the per-user request-per-minute ceiling (keyed
+	// on `tenant_id + user_id`). Defaults to 200 rpm.
+	UserRPM int
+	// Window sizes the sliding window. Defaults to 60s so RPM
+	// values match wall-clock minutes without arithmetic.
+	Window time.Duration
 }
 
 // DNSConfig wires the DNS Onboarding Service. The defaults target
@@ -155,8 +217,15 @@ func Load() (*Config, error) {
 		// this with `STALWART_URL=http://stalwart:8080`.
 		StalwartURL:     getenv("STALWART_URL", "http://localhost:18080"),
 		ValkeyURL:       getenv("VALKEY_URL", "valkey:6379"),
-		KChatOIDCIssuer: getenv("KCHAT_OIDC_ISSUER", ""),
-		DevBypassToken:  getenv("KMAIL_DEV_BYPASS_TOKEN", ""),
+		KChatOIDCIssuer:   getenv("KCHAT_OIDC_ISSUER", ""),
+		KChatOIDCAudience: getenv("KCHAT_OIDC_AUDIENCE", ""),
+		DevBypassToken:    getenv("KMAIL_DEV_BYPASS_TOKEN", ""),
+		RateLimit: RateLimitConfig{
+			Enabled:   getenvBool("KMAIL_RATELIMIT_ENABLED", false),
+			TenantRPM: GetenvInt("KMAIL_RATELIMIT_TENANT_RPM", 1000),
+			UserRPM:   GetenvInt("KMAIL_RATELIMIT_USER_RPM", 200),
+			Window:    getenvDuration("KMAIL_RATELIMIT_WINDOW", 60*time.Second),
+		},
 		ZKFabric: ZKFabricConfig{
 			// Host-mapped defaults match docker-compose.yml, which
 			// publishes zk-fabric on host `:9080` (S3) and `:9081`
@@ -176,6 +245,14 @@ func Load() (*Config, error) {
 			DKIMPublicKey:    getenv("KMAIL_DNS_DKIM_PUBLIC_KEY", ""),
 			DMARCPolicy:      getenv("KMAIL_DNS_DMARC_POLICY", "none"),
 			ReportingMailbox: getenv("KMAIL_DNS_REPORTING_MAILBOX", "dmarc@kmail.local"),
+		},
+		KChatAPIURL:   getenv("KCHAT_API_URL", ""),
+		KChatAPIToken: getenv("KCHAT_API_TOKEN", ""),
+		ChatBridge: ChatBridgeConfig{
+			Addr: getenv("KMAIL_CHAT_BRIDGE_ADDR", ":8091"),
+		},
+		Audit: AuditConfig{
+			Addr: getenv("KMAIL_AUDIT_ADDR", ":8092"),
 		},
 	}, nil
 }
@@ -202,6 +279,24 @@ func getenvDuration(key string, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	return d
+}
+
+// getenvBool parses the named environment variable as a boolean.
+// Accepted truthy values: 1, t, true, y, yes (case-insensitive);
+// everything else (including unset) falls back to the provided
+// default.
+func getenvBool(key string, fallback bool) bool {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		return fallback
+	}
+	switch strings.ToLower(v) {
+	case "1", "t", "true", "y", "yes", "on":
+		return true
+	case "0", "f", "false", "n", "no", "off":
+		return false
+	}
+	return fallback
 }
 
 // GetenvInt parses the named environment variable as an integer. If

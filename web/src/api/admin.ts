@@ -263,3 +263,121 @@ export async function deleteUser(
     { expectJson: false },
   );
 }
+
+/**
+ * Mirrors `internal/audit/audit.go#Entry`. Each row carries a
+ * hash-chain link (`prev_hash`, `entry_hash`) so `VerifyChain`
+ * can detect tampering.
+ */
+export interface AuditLogEntry {
+  id: string;
+  tenant_id: string;
+  actor_id: string;
+  actor_type: "user" | "admin" | "system";
+  action: string;
+  resource_type: string;
+  resource_id: string;
+  metadata: Record<string, unknown> | null;
+  ip_address: string;
+  user_agent: string;
+  prev_hash: string;
+  entry_hash: string;
+  created_at: string;
+}
+
+/** Filters accepted by the audit-log paginated query. */
+export interface AuditLogQuery {
+  action?: string;
+  actor?: string;
+  resource_type?: string;
+  resource_id?: string;
+  since?: string;
+  until?: string;
+  limit?: number;
+  offset?: number;
+}
+
+function auditQueryString(q?: AuditLogQuery): string {
+  if (!q) return "";
+  const params = new URLSearchParams();
+  for (const [k, v] of Object.entries(q)) {
+    if (v === undefined || v === null || v === "") continue;
+    params.set(k, String(v));
+  }
+  const s = params.toString();
+  return s ? `?${s}` : "";
+}
+
+/**
+ * Paginated query of the audit log. Backend route:
+ * `GET /api/v1/tenants/{id}/audit-log`.
+ *
+ * The Go handler (`internal/audit/handlers.go#query`) wraps the
+ * rows in a `{ "entries": [...] }` envelope, so we unwrap here
+ * and expose the bare array to callers.
+ */
+export async function getAuditLog(
+  tenantId: string,
+  filters?: AuditLogQuery,
+): Promise<AuditLogEntry[]> {
+  const url =
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/audit-log` +
+    auditQueryString(filters);
+  const body = await requestJSON<{ entries?: AuditLogEntry[] }>(url, {
+    method: "GET",
+    headers: adminAuthHeaders(tenantId, { Accept: "application/json" }),
+  });
+  return body.entries ?? [];
+}
+
+/**
+ * Export the audit log as JSON or CSV. Returns the raw response
+ * body as a string so the caller can trigger a file download.
+ */
+export async function exportAuditLog(
+  tenantId: string,
+  format: "json" | "csv" = "json",
+  range?: { since?: string; until?: string },
+): Promise<string> {
+  const params = new URLSearchParams({ format });
+  if (range?.since) params.set("since", range.since);
+  if (range?.until) params.set("until", range.until);
+  const url =
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/audit-log/export?` +
+    params.toString();
+  const res = await fetch(url, {
+    method: "GET",
+    credentials: "include",
+    headers: adminAuthHeaders(tenantId),
+  });
+  if (!res.ok) {
+    throw new AdminApiError(url, res.status, await parseErrorBody(res));
+  }
+  return res.text();
+}
+
+/**
+ * Verify the hash chain. Returns `{ ok: true }` when the full
+ * chain validates; the backend returns HTTP 409 with an `error`
+ * body when a tamper is detected, which this helper surfaces as
+ * `{ ok: false, error }` so callers don't need a try/catch for
+ * the expected "chain broken" outcome.
+ */
+export async function verifyAuditChain(
+  tenantId: string,
+): Promise<{ ok: boolean; error?: string }> {
+  const url = `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/audit-log/verify`;
+  const res = await fetch(url, {
+    method: "POST",
+    credentials: "include",
+    headers: adminAuthHeaders(tenantId, { Accept: "application/json" }),
+  });
+  if (res.ok) {
+    return { ok: true };
+  }
+  if (res.status === 409) {
+    const body = (await res.json().catch(() => ({}))) as { error?: string };
+    return { ok: false, error: body.error ?? "audit chain broken" };
+  }
+  throw new AdminApiError(url, res.status, await parseErrorBody(res));
+}

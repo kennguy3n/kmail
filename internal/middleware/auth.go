@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -35,29 +36,57 @@ const (
 )
 
 // OIDCConfig wires the OIDC middleware. `Issuer` is the KChat OIDC
-// issuer URL (JWKS discovery happens here in Phase 2). `DevBypassToken`
-// is a static bearer token that is accepted verbatim when non-empty;
-// it exists so local dev can hit authenticated endpoints without
-// standing up a real OIDC issuer. `Pool` is used by
-// `LoadTenantScope` to resolve the acting user's tenant and push the
-// `app.tenant_id` GUC before handler code runs.
+// issuer URL (JWKS discovery happens here). `Audience` is the
+// expected `aud` claim — when non-empty the middleware rejects
+// tokens that don't carry it. `DevBypassToken` is a static bearer
+// token that is accepted verbatim when non-empty; it exists so
+// local dev can hit authenticated endpoints without standing up a
+// real OIDC issuer. `Pool` is used by `LoadTenantScope` to resolve
+// the acting user's tenant and push the `app.tenant_id` GUC before
+// handler code runs.
 type OIDCConfig struct {
 	Issuer         string
+	Audience       string
 	DevBypassToken string
 	Pool           *pgxpool.Pool
 	Logger         *log.Logger
+	// JWKS, when non-nil, is used to verify RS/ES/PS tokens.
+	// Leaving this nil disables signature verification — only the
+	// dev-bypass path is then usable. NewOIDC auto-populates this
+	// field from cfg.Issuer when Issuer is non-empty.
+	JWKS *JWKSFetcher
 }
 
-// OIDC is the middleware factory. It is stateless today (JWKS cache
-// will live here in Phase 2) but constructed once per process so the
-// handler type does not leak `OIDCConfig` to every call site.
+// OIDC is the middleware factory. The JWKS cache lives on this
+// struct so one fetcher is shared across every request.
 type OIDC struct {
 	cfg OIDCConfig
 }
 
 // NewOIDC returns an OIDC middleware with the provided configuration.
-func NewOIDC(cfg OIDCConfig) *OIDC {
-	return &OIDC{cfg: cfg}
+// When cfg.Issuer is non-empty but cfg.JWKS is nil, a JWKSFetcher
+// is built automatically so production code does not have to wire
+// one up manually. Returns an error when JWKS construction fails.
+func NewOIDC(cfg OIDCConfig) (*OIDC, error) {
+	if cfg.Issuer != "" && cfg.JWKS == nil {
+		fetcher, err := NewJWKSFetcher(JWKSConfig{Issuer: cfg.Issuer})
+		if err != nil {
+			return nil, fmt.Errorf("build JWKS fetcher: %w", err)
+		}
+		cfg.JWKS = fetcher
+	}
+	return &OIDC{cfg: cfg}, nil
+}
+
+// MustNewOIDC is the panicking convenience constructor retained so
+// test helpers that don't care about the JWKS-build error can
+// continue calling a one-liner.
+func MustNewOIDC(cfg OIDCConfig) *OIDC {
+	o, err := NewOIDC(cfg)
+	if err != nil {
+		panic(err)
+	}
+	return o
 }
 
 // Wrap returns middleware that authenticates the request and stores
@@ -95,8 +124,9 @@ type Claims struct {
 
 // authenticate extracts and validates the bearer token, returning
 // the Claims it carries. In dev-bypass mode the token is trusted
-// unverified; in real mode (Phase 2) the JWT is verified against the
-// KChat OIDC issuer's JWKS before the claims are returned.
+// unverified; in real mode the JWT is verified against the KChat
+// OIDC issuer's JWKS and the `iss` / `exp` / `aud` claims are
+// validated before the claims are returned.
 func (o *OIDC) authenticate(r *http.Request) (*Claims, error) {
 	authz := r.Header.Get("Authorization")
 	if authz == "" {
@@ -118,13 +148,15 @@ func (o *OIDC) authenticate(r *http.Request) (*Claims, error) {
 		return devClaimsFromHeaders(r), nil
 	}
 
-	// Real path: decode the JWT. We parse the payload so the claims
-	// can be surfaced immediately, but we MUST NOT mark the token as
-	// trusted until signature verification is implemented in Phase 2
-	// (see docs/JMAP-CONTRACT.md §3.1). Until then the middleware
-	// only runs when either (a) DevBypassToken is set, or (b) the
-	// token parses as a JWT with the required custom claims — both
-	// of which are dev-only postures documented on OIDCConfig.
+	if o.cfg.JWKS != nil {
+		return o.verifyAndExtract(r.Context(), token)
+	}
+
+	// Last-resort path: no JWKS configured (no issuer set) and not
+	// the dev-bypass token. Decode the claims but do NOT mark the
+	// token as trusted. This keeps local dev without an OIDC
+	// issuer working while refusing to surface identity data in
+	// deployments that forgot to configure an issuer.
 	claims, err := decodeJWTClaims(token)
 	if err != nil {
 		return nil, fmt.Errorf("invalid JWT: %w", err)
@@ -135,9 +167,76 @@ func (o *OIDC) authenticate(r *http.Request) (*Claims, error) {
 	return claims, nil
 }
 
-// decodeJWTClaims parses the unverified payload of a compact JWT. It
-// does NOT verify the signature. See the caller for the
-// Phase 1 / Phase 2 contract around this.
+// oidcTokenClaims mirrors the JWT payload shape KMail consumes.
+// It embeds jwt.RegisteredClaims so standard claim validation
+// (exp / iss / aud) runs through the jwt library.
+type oidcTokenClaims struct {
+	TenantID          string `json:"tenant_id"`
+	KChatUserID       string `json:"kchat_user_id"`
+	StalwartAccountID string `json:"stalwart_account_id,omitempty"`
+	jwt.RegisteredClaims
+}
+
+func (o *OIDC) verifyAndExtract(ctx context.Context, tokenStr string) (*Claims, error) {
+	parser := jwt.NewParser(
+		jwt.WithValidMethods([]string{
+			"RS256", "RS384", "RS512",
+			"PS256", "PS384", "PS512",
+			"ES256", "ES384", "ES512",
+		}),
+		jwt.WithIssuedAt(),
+	)
+
+	var claims oidcTokenClaims
+	tok, err := parser.ParseWithClaims(tokenStr, &claims, func(t *jwt.Token) (any, error) {
+		kid, _ := t.Header["kid"].(string)
+		return o.cfg.JWKS.KeyFunc(ctx, kid)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("JWT: %w", err)
+	}
+	if !tok.Valid {
+		return nil, errors.New("JWT: signature invalid")
+	}
+
+	// Issuer check: a non-empty configured issuer must match the
+	// `iss` claim exactly. This protects against a mis-pointed
+	// JWKS (e.g. against a different OIDC issuer that trusts the
+	// same key material).
+	if o.cfg.Issuer != "" && claims.Issuer != o.cfg.Issuer {
+		return nil, fmt.Errorf("JWT: iss %q does not match expected issuer", claims.Issuer)
+	}
+
+	// Audience check: when configured, `aud` must include the
+	// expected value.
+	if o.cfg.Audience != "" {
+		if !audienceContains(claims.Audience, o.cfg.Audience) {
+			return nil, fmt.Errorf("JWT: aud does not contain %q", o.cfg.Audience)
+		}
+	}
+
+	if claims.TenantID == "" || claims.KChatUserID == "" {
+		return nil, errors.New("JWT is missing tenant_id or kchat_user_id claim")
+	}
+	return &Claims{
+		TenantID:          claims.TenantID,
+		KChatUserID:       claims.KChatUserID,
+		StalwartAccountID: claims.StalwartAccountID,
+	}, nil
+}
+
+func audienceContains(aud jwt.ClaimStrings, want string) bool {
+	for _, v := range aud {
+		if v == want {
+			return true
+		}
+	}
+	return false
+}
+
+// decodeJWTClaims parses the unverified payload of a compact JWT.
+// Retained for the no-issuer fallback path; production traffic
+// flows through verifyAndExtract instead.
 func decodeJWTClaims(token string) (*Claims, error) {
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
