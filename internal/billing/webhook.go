@@ -183,6 +183,7 @@ func (h *WebhookHandler) applySubscriptionUpdate(r *http.Request, ev stripeEvent
 	if !validSubscriptionStatus(status) {
 		return fmt.Errorf("unknown stripe status %q", status)
 	}
+	dbStatus := mapStripeStatus(status)
 	periodStart := time.Unix(sub.CurrentPeriodStart, 0).UTC()
 	periodEnd := time.Unix(sub.CurrentPeriodEnd, 0).UTC()
 	_, err := pool.Exec(r.Context(), `
@@ -192,8 +193,30 @@ func (h *WebhookHandler) applySubscriptionUpdate(r *http.Request, ev stripeEvent
 		    current_period_start = $4,
 		    current_period_end = $5
 		WHERE tenant_id = $1::uuid
-	`, tenantID, status, sub.ID, periodStart, periodEnd)
+	`, tenantID, dbStatus, sub.ID, periodStart, periodEnd)
 	return err
+}
+
+// mapStripeStatus translates the wider Stripe subscription status
+// vocabulary to the three-value enum the `billing_subscriptions`
+// table CHECK constraint allows (`active`, `past_due`, `cancelled`).
+// `trialing` is treated as `active` (the customer is in good
+// standing for billing purposes); `unpaid`, `incomplete`, and
+// `incomplete_expired` map to `past_due` (we owe money / payment
+// failed); `canceled`/`cancelled` map to `cancelled`. Any unknown
+// value defaults to `active` so the UPDATE doesn't violate the
+// CHECK constraint and force Stripe into an infinite retry loop.
+func mapStripeStatus(s string) string {
+	switch s {
+	case "active", "trialing":
+		return "active"
+	case "past_due", "unpaid", "incomplete", "incomplete_expired":
+		return "past_due"
+	case "canceled", "cancelled":
+		return "cancelled"
+	default:
+		return "active"
+	}
 }
 
 func validSubscriptionStatus(s string) bool {

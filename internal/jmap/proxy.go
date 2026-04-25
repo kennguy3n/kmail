@@ -9,9 +9,11 @@
 package jmap
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/http/httputil"
@@ -164,6 +166,32 @@ func (t *shardFailoverTransport) RoundTrip(req *http.Request) (*http.Response, e
 	if threshold <= 0 {
 		threshold = 3
 	}
+	// Buffer the request body once so each retry can rewind. JMAP
+	// payloads are small JSON envelopes, so the in-memory cost is
+	// bounded; large attachment uploads go through a separate
+	// upload endpoint, not this proxy. `req.GetBody` is preferred
+	// when callers set it (e.g. net/http internal redirects), but
+	// the BFF does not, so we fall back to draining the body.
+	var bodyBuf []byte
+	if req.Body != nil && req.Body != http.NoBody {
+		if req.GetBody != nil {
+			// GetBody returns a fresh reader each call; cheaper
+			// than buffering. Probe once to confirm it works.
+			if rc, err := req.GetBody(); err == nil {
+				rc.Close()
+			} else {
+				req.GetBody = nil
+			}
+		}
+		if req.GetBody == nil {
+			b, err := io.ReadAll(req.Body)
+			req.Body.Close()
+			if err != nil {
+				return nil, fmt.Errorf("jmap proxy: buffer body: %w", err)
+			}
+			bodyBuf = b
+		}
+	}
 	var lastErr error
 	for i, candidate := range urls {
 		u, err := url.Parse(candidate)
@@ -181,6 +209,19 @@ func (t *shardFailoverTransport) RoundTrip(req *http.Request) (*http.Response, e
 		clone.URL.Scheme = u.Scheme
 		clone.URL.Host = u.Host
 		clone.Host = u.Host
+		// Re-attach a fresh body for each attempt so the previous
+		// retry's consumed reader doesn't leak into the next.
+		if req.GetBody != nil {
+			rc, err := req.GetBody()
+			if err != nil {
+				lastErr = fmt.Errorf("jmap proxy: rewind body: %w", err)
+				continue
+			}
+			clone.Body = rc
+		} else if bodyBuf != nil {
+			clone.Body = io.NopCloser(bytes.NewReader(bodyBuf))
+			clone.ContentLength = int64(len(bodyBuf))
+		}
 		resp, err := t.base.RoundTrip(clone)
 		if err != nil {
 			t.proxy.breakerInc(u.Host)

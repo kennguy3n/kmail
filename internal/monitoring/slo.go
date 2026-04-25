@@ -96,7 +96,11 @@ type AvailabilityResult struct {
 // (caller responsibility to record into the same key).
 func (s *SLOTracker) GetAvailability(ctx context.Context, tenantID string, window time.Duration) (*AvailabilityResult, error) {
 	if s == nil || s.valkey == nil {
-		return &AvailabilityResult{TenantID: tenantID, Target: s.target}, nil
+		t := DefaultTarget
+		if s != nil {
+			t = s.target
+		}
+		return &AvailabilityResult{TenantID: tenantID, Target: t}, nil
 	}
 	low, high := s.windowBounds(window)
 	members, err := s.valkey.ZRangeByScore(ctx, requestsKey(tenantID), &redis.ZRangeBy{Min: low, Max: high}).Result()

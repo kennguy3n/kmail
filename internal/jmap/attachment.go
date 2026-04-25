@@ -359,7 +359,7 @@ func (s *AttachmentService) s3PutToBucket(ctx context.Context, bucket, objectKey
 	req.Header.Set("X-Amz-Date", amzDate)
 	req.Header.Set("X-Amz-Content-Sha256", "UNSIGNED-PAYLOAD")
 
-	canonURI := "/" + s.cfg.Bucket + "/" + strings.TrimPrefix(objectKey, "/")
+	canonURI := "/" + bucket + "/" + strings.TrimPrefix(objectKey, "/")
 	canonHeaders := "host:" + req.URL.Host + "\n" +
 		"x-amz-content-sha256:UNSIGNED-PAYLOAD\n" +
 		"x-amz-date:" + amzDate + "\n"

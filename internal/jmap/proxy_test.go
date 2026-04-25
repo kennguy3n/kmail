@@ -219,3 +219,45 @@ func TestErrorHandler(t *testing.T) {
 		t.Errorf("body = %q, want serverUnavailable", rec.Body.String())
 	}
 }
+
+// TestShardFailoverTransport_BufersBodyAcrossRetries verifies a
+// 5xx response from the primary shard does not consume the request
+// body for the secondary attempt. Without buffering the second
+// shard would receive an empty payload and reject the request.
+func TestShardFailoverTransport_BuffersBodyAcrossRetries(t *testing.T) {
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer primary.Close()
+
+	var got string
+	secondary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		got = string(b)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer secondary.Close()
+
+	p := newTestProxy(t)
+	tr := &shardFailoverTransport{proxy: p, base: http.DefaultTransport}
+	body := strings.NewReader(`{"using":["urn:ietf:params:jmap:core"]}`)
+	req, err := http.NewRequest(http.MethodPost, "http://placeholder/jmap", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := withShardURLs(req.Context(), []string{primary.URL, secondary.URL})
+	req = req.WithContext(ctx)
+
+	resp, err := tr.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+	if got != `{"using":["urn:ietf:params:jmap:core"]}` {
+		t.Errorf("secondary body = %q, want full payload", got)
+	}
+}
