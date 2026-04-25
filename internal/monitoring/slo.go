@@ -62,7 +62,7 @@ func (s *SLOTracker) WithTarget(t float64) *SLOTracker {
 // completed request. `success` is true iff the response was a
 // non-5xx, non-transport-error response.
 func (s *SLOTracker) RecordRequest(ctx context.Context, tenantID string, success bool, latencyMs int64) {
-	if s == nil || s.valkey == nil || tenantID == "" {
+	if s == nil || s.valkey == nil {
 		return
 	}
 	now := s.now().UTC()
@@ -71,12 +71,24 @@ func (s *SLOTracker) RecordRequest(ctx context.Context, tenantID string, success
 	if !success {
 		status = 1
 	}
-	pipe := s.valkey.Pipeline()
-	pipe.ZAdd(ctx, requestsKey(tenantID), redis.Z{Score: score, Member: fmt.Sprintf("%d:%d", now.UnixNano(), status)})
-	pipe.ZAdd(ctx, latencyKey(tenantID), redis.Z{Score: score, Member: fmt.Sprintf("%d:%d", now.UnixNano(), latencyMs)})
 	cutoff := float64(now.Add(-s.maxWindow).UnixNano())
-	pipe.ZRemRangeByScore(ctx, requestsKey(tenantID), "0", strconv.FormatFloat(cutoff, 'f', 0, 64))
-	pipe.ZRemRangeByScore(ctx, latencyKey(tenantID), "0", strconv.FormatFloat(cutoff, 'f', 0, 64))
+	cutoffStr := strconv.FormatFloat(cutoff, 'f', 0, 64)
+	pipe := s.valkey.Pipeline()
+	// Always mirror every sample to the platform-wide sentinel key
+	// so `GET /api/v1/admin/slo` (which calls GetAvailability with
+	// tenantID == "") aggregates across all tenants. When tenantID
+	// is empty (e.g. an unauthenticated request) we still record
+	// to the platform key so platform availability stays correct.
+	pipe.ZAdd(ctx, requestsKey(""), redis.Z{Score: score, Member: fmt.Sprintf("%d:%d", now.UnixNano(), status)})
+	pipe.ZAdd(ctx, latencyKey(""), redis.Z{Score: score, Member: fmt.Sprintf("%d:%d", now.UnixNano(), latencyMs)})
+	pipe.ZRemRangeByScore(ctx, requestsKey(""), "0", cutoffStr)
+	pipe.ZRemRangeByScore(ctx, latencyKey(""), "0", cutoffStr)
+	if tenantID != "" {
+		pipe.ZAdd(ctx, requestsKey(tenantID), redis.Z{Score: score, Member: fmt.Sprintf("%d:%d", now.UnixNano(), status)})
+		pipe.ZAdd(ctx, latencyKey(tenantID), redis.Z{Score: score, Member: fmt.Sprintf("%d:%d", now.UnixNano(), latencyMs)})
+		pipe.ZRemRangeByScore(ctx, requestsKey(tenantID), "0", cutoffStr)
+		pipe.ZRemRangeByScore(ctx, latencyKey(tenantID), "0", cutoffStr)
+	}
 	_, _ = pipe.Exec(ctx)
 }
 
@@ -235,8 +247,22 @@ func (s *SLOTracker) windowBounds(window time.Duration) (low, high string) {
 	return strconv.FormatInt(from.UnixNano(), 10), strconv.FormatInt(now.UnixNano(), 10)
 }
 
-func requestsKey(tenantID string) string { return "slo:" + tenantID + ":requests" }
-func latencyKey(tenantID string) string  { return "slo:" + tenantID + ":latency" }
+// platformKeyToken is the sentinel used in the Valkey key when no
+// tenant scope applies (the platform-wide rollup). We prefer an
+// explicit token over an empty segment so the key shape is
+// unambiguous and an accidental empty-tenantID write doesn't
+// silently land in another tenant's namespace.
+const platformKeyToken = "_platform"
+
+func keyTenant(tenantID string) string {
+	if tenantID == "" {
+		return platformKeyToken
+	}
+	return tenantID
+}
+
+func requestsKey(tenantID string) string { return "slo:" + keyTenant(tenantID) + ":requests" }
+func latencyKey(tenantID string) string  { return "slo:" + keyTenant(tenantID) + ":latency" }
 
 func splitMember(m string) (ts int64, value int64, ok bool) {
 	idx := strings.LastIndex(m, ":")

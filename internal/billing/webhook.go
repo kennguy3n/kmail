@@ -26,9 +26,15 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
+
+// stripeReplayWindow is the maximum age the Stripe-Signature
+// timestamp may have before we reject the webhook as a replay.
+// Stripe's own SDKs default to 5 minutes (300s).
+const stripeReplayWindow = 5 * time.Minute
 
 // WebhookConfig wires the Stripe webhook handler.
 type WebhookConfig struct {
@@ -264,6 +270,18 @@ func (h *WebhookHandler) verify(r *http.Request, body []byte) error {
 	expected := hex.EncodeToString(mac.Sum(nil))
 	if !hmac.Equal([]byte(expected), []byte(v1)) {
 		return errors.New("signature mismatch")
+	}
+	// Reject signatures older than `stripeReplayWindow` so an
+	// attacker who captures a valid payload cannot replay it later
+	// (e.g. re-trigger `payment_intent.succeeded` to re-activate a
+	// cancelled subscription, or `invoice.payment_failed` to push a
+	// tenant into `past_due`).
+	tsSeconds, err := strconv.ParseInt(t, 10, 64)
+	if err != nil {
+		return errors.New("malformed Stripe-Signature timestamp")
+	}
+	if delta := h.cfg.Now().Sub(time.Unix(tsSeconds, 0)); delta > stripeReplayWindow || delta < -stripeReplayWindow {
+		return errors.New("Stripe-Signature timestamp outside replay window")
 	}
 	return nil
 }
