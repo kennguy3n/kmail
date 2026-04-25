@@ -1,8 +1,13 @@
 package migration
 
 import (
+	"bufio"
 	"context"
 	"errors"
+	"net"
+	"strconv"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -185,4 +190,203 @@ func TestNewService_AppliesDefaults(t *testing.T) {
 	if s.cancels == nil {
 		t.Errorf("cancels map not initialised")
 	}
+}
+
+// ------------------------------------------------------------------
+// TestConnection
+// ------------------------------------------------------------------
+
+func TestTestConnection_ValidationErrors(t *testing.T) {
+	svc := newTestService()
+	cases := []struct {
+		name string
+		in   TestConnectionInput
+	}{
+		{"no host", TestConnectionInput{Port: 993, Username: "u", Password: "p"}},
+		{"bad port", TestConnectionInput{Host: "h", Port: 0, Username: "u", Password: "p"}},
+		{"no user", TestConnectionInput{Host: "h", Port: 993, Password: "p"}},
+		{"no pass", TestConnectionInput{Host: "h", Port: 993, Username: "u"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := svc.TestConnection(context.Background(), tc.in)
+			if !errors.Is(err, ErrInvalidInput) {
+				t.Errorf("expected ErrInvalidInput, got %v", err)
+			}
+		})
+	}
+}
+
+// fakeIMAPServer replays a scripted IMAP exchange so we can exercise
+// TestConnection without touching the network. It accepts a single
+// connection, sends the configured greeting, then returns OK / NO
+// responses for each tagged command depending on `acceptLogin`.
+type fakeIMAPServer struct {
+	listener    net.Listener
+	acceptLogin bool
+	greeting    string
+	wg          sync.WaitGroup
+}
+
+func newFakeIMAPServer(t *testing.T, acceptLogin bool) *fakeIMAPServer {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	srv := &fakeIMAPServer{
+		listener:    l,
+		acceptLogin: acceptLogin,
+		greeting:    "* OK fake-imap ready\r\n",
+	}
+	srv.wg.Add(1)
+	go srv.serve()
+	t.Cleanup(func() {
+		_ = l.Close()
+		srv.wg.Wait()
+	})
+	return srv
+}
+
+func (s *fakeIMAPServer) addr() (host string, port int) {
+	a := s.listener.Addr().(*net.TCPAddr)
+	return "127.0.0.1", a.Port
+}
+
+func (s *fakeIMAPServer) serve() {
+	defer s.wg.Done()
+	for {
+		conn, err := s.listener.Accept()
+		if err != nil {
+			return
+		}
+		go s.handle(conn)
+	}
+}
+
+func (s *fakeIMAPServer) handle(conn net.Conn) {
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := conn.Write([]byte(s.greeting)); err != nil {
+		return
+	}
+	br := bufio.NewReader(conn)
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			return
+		}
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) < 2 {
+			return
+		}
+		tag, cmd := fields[0], strings.ToUpper(fields[1])
+		switch cmd {
+		case "LOGIN":
+			if s.acceptLogin {
+				_, _ = conn.Write([]byte(tag + " OK LOGIN completed\r\n"))
+			} else {
+				_, _ = conn.Write([]byte(tag + " NO authentication failed\r\n"))
+			}
+		case "LOGOUT":
+			_, _ = conn.Write([]byte("* BYE goodbye\r\n"))
+			_, _ = conn.Write([]byte(tag + " OK LOGOUT completed\r\n"))
+			return
+		default:
+			_, _ = conn.Write([]byte(tag + " BAD unsupported\r\n"))
+		}
+	}
+}
+
+func TestTestConnection_LoginSuccess(t *testing.T) {
+	srv := newFakeIMAPServer(t, true)
+	host, port := srv.addr()
+	err := newTestService().TestConnection(context.Background(), TestConnectionInput{
+		Host:     host,
+		Port:     port,
+		Username: "alice",
+		Password: "hunter2",
+		UseTLS:   false,
+	})
+	if err != nil {
+		t.Fatalf("TestConnection: %v", err)
+	}
+}
+
+func TestTestConnection_LoginRejected(t *testing.T) {
+	srv := newFakeIMAPServer(t, false)
+	host, port := srv.addr()
+	err := newTestService().TestConnection(context.Background(), TestConnectionInput{
+		Host:     host,
+		Port:     port,
+		Username: "alice",
+		Password: "wrong",
+	})
+	if err == nil {
+		t.Fatal("expected login rejection")
+	}
+	if !strings.Contains(err.Error(), "authentication failed") {
+		t.Errorf("expected NO line in error, got %v", err)
+	}
+}
+
+func TestTestConnection_DialFailure(t *testing.T) {
+	// Listener bound to :0 then immediately closed gives us a port
+	// that is guaranteed not to be listening.
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	addr := l.Addr().(*net.TCPAddr)
+	_ = l.Close()
+	err = newTestService().TestConnection(context.Background(), TestConnectionInput{
+		Host:     "127.0.0.1",
+		Port:     addr.Port,
+		Username: "u",
+		Password: "p",
+	})
+	if err == nil {
+		t.Fatal("expected dial error")
+	}
+	if !strings.Contains(err.Error(), "dial") {
+		t.Errorf("expected dial error wrapper, got %v", err)
+	}
+}
+
+func TestQuoteIMAP(t *testing.T) {
+	cases := map[string]string{
+		"":              `""`,
+		"alice":         `"alice"`,
+		`a"b`:           `"a\"b"`,
+		`back\slash`:    `"back\\slash"`,
+		"unicode-ünder": `"unicode-ünder"`,
+		// RFC 3501 §4.3 — CR, LF, NUL must be stripped so they
+		// can't terminate the LOGIN line and let a crafted
+		// password inject a follow-up IMAP command.
+		"foo\r\nbar":   `"foobar"`,
+		"a\x00b":       `"ab"`,
+	}
+	for in, want := range cases {
+		if got := quoteIMAP(in); got != want {
+			t.Errorf("quoteIMAP(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestImapCommand_RejectsUnexpectedCompletion(t *testing.T) {
+	server, client := net.Pipe()
+	t.Cleanup(func() { _ = server.Close(); _ = client.Close() })
+	go func() {
+		br := bufio.NewReader(server)
+		_, _ = br.ReadString('\n')
+		_, _ = server.Write([]byte("a1 WEIRD whatever\r\n"))
+	}()
+	br := bufio.NewReader(client)
+	if err := imapCommand(client, br, "a1", "NOOP"); err == nil ||
+		!strings.Contains(err.Error(), "unexpected completion") {
+		t.Errorf("expected unexpected-completion error, got %v", err)
+	}
+	// strconv import keeps the build green even if the smoke
+	// helpers above are removed in future cleanup.
+	_ = strconv.Itoa(0)
 }

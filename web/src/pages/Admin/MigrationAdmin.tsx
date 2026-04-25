@@ -6,6 +6,7 @@ import {
   listMigrationJobs,
   pauseMigrationJob,
   resumeMigrationJob,
+  testMigrationConnection,
   type CreateMigrationJobInput,
   type MigrationJob,
 } from "../../api/admin";
@@ -36,6 +37,34 @@ export default function MigrationAdmin() {
   });
   const [step, setStep] = useState<1 | 2 | 3>(1);
   const [error, setError] = useState<string | null>(null);
+  const [testResult, setTestResult] = useState<
+    { ok: true } | { ok: false; error: string } | null
+  >(null);
+  const [testing, setTesting] = useState(false);
+
+  const runTestConnection = async () => {
+    if (!selectedTenantId) return;
+    setTesting(true);
+    setTestResult(null);
+    try {
+      const res = await testMigrationConnection(selectedTenantId, {
+        host: draft.source_host,
+        port: draft.source_port ?? 993,
+        username: draft.source_user,
+        password: draft.source_password,
+        use_tls: (draft.source_port ?? 993) === 993,
+      });
+      if (res.ok) {
+        setTestResult({ ok: true });
+      } else {
+        setTestResult({ ok: false, error: res.error ?? "unknown error" });
+      }
+    } catch (e) {
+      setTestResult({ ok: false, error: String(e) });
+    } finally {
+      setTesting(false);
+    }
+  };
 
   const reload = async () => {
     if (!selectedTenantId) return;
@@ -60,9 +89,18 @@ export default function MigrationAdmin() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedTenantId]);
 
+  // updateCredential mutates draft fields that feed into the
+  // "Test connection" probe (host / port / user / password) and
+  // clears any prior green/red banner so the operator never sees
+  // a stale success indicator after editing credentials.
+  const updateCredential = (patch: Partial<CreateMigrationJobInput>) => {
+    setDraft({ ...draft, ...patch });
+    setTestResult(null);
+  };
+
   const pickProvider = (source_type: CreateMigrationJobInput["source_type"]) => {
     const d = PROVIDER_DEFAULTS[source_type];
-    setDraft({ ...draft, source_type, source_host: d.host, source_port: d.port });
+    updateCredential({ source_type, source_host: d.host, source_port: d.port });
   };
 
   const submit = async () => {
@@ -124,32 +162,53 @@ export default function MigrationAdmin() {
           <h3>Step 2: Credentials</h3>
           <label>
             Host
-            <input value={draft.source_host} onChange={(e) => setDraft({ ...draft, source_host: e.target.value })} />
+            <input value={draft.source_host} onChange={(e) => updateCredential({ source_host: e.target.value })} />
           </label>
           <label>
             Port
             <input
               type="number"
               value={draft.source_port ?? 993}
-              onChange={(e) => setDraft({ ...draft, source_port: Number(e.target.value) })}
+              onChange={(e) => updateCredential({ source_port: Number(e.target.value) })}
             />
           </label>
           <label>
             Source user
-            <input value={draft.source_user} onChange={(e) => setDraft({ ...draft, source_user: e.target.value })} />
+            <input value={draft.source_user} onChange={(e) => updateCredential({ source_user: e.target.value })} />
           </label>
           <label>
             Source password
             <input
               type="password"
               value={draft.source_password}
-              onChange={(e) => setDraft({ ...draft, source_password: e.target.value })}
+              onChange={(e) => updateCredential({ source_password: e.target.value })}
             />
           </label>
           <label>
             Destination user
             <input value={draft.destination_user_id} onChange={(e) => setDraft({ ...draft, destination_user_id: e.target.value })} />
           </label>
+          <div className="kmail-wizard-actions">
+            <button
+              type="button"
+              onClick={runTestConnection}
+              disabled={
+                testing ||
+                !selectedTenantId ||
+                !draft.source_host ||
+                !draft.source_user ||
+                !draft.source_password
+              }
+            >
+              {testing ? "Testing…" : "Test connection"}
+            </button>
+            {testResult?.ok === true && (
+              <span className="kmail-success">IMAP login succeeded.</span>
+            )}
+            {testResult?.ok === false && (
+              <span className="kmail-error">Connection failed: {testResult.error}</span>
+            )}
+          </div>
           <button type="button" onClick={() => setStep(1)}>← Back</button>
           <button type="button" onClick={() => setStep(3)}>Next →</button>
         </div>

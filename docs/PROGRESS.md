@@ -4,6 +4,29 @@
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
 - **Status**: Phase 1 — Foundation (in progress); Phase 2 —
   Prototype (in progress); Phase 3 — Private Beta (in progress)
+- **Last updated**: 2026-04-25 (later) — Migration wizard
+  "Test connection" flow + Pricing & plan-management page round
+  out the Phase 4 batch landed earlier today. Backend adds
+  `migration.Service.TestConnection` (drives a real IMAP LOGIN
+  with a 10 s deadline, supports implicit-TLS on 993 and plain
+  TCP otherwise) and `POST /api/v1/migrations/test-connection`;
+  `billing.Service.ChangePlan` validates the plan, updates
+  `tenants.plan`, syncs `quotas.storage_limit_bytes` to the new
+  per-seat default (preserving operator overrides), re-runs
+  `EnforcePlanLimits`, and writes a `plan_changed` row to
+  `billing_events`; `PATCH /api/v1/tenants/{id}/billing/plan`
+  surfaces it to the admin console. Frontend adds a "Test
+  connection" button to `MigrationAdmin.tsx` step 2 (success /
+  failure inline) and a new `PricingAdmin.tsx` page with a
+  three-column plan matrix ($3 / $6 / $9 per seat — Core /
+  Pro / Privacy), current-plan highlight, seat × price monthly
+  total, and upgrade / downgrade buttons. Typed client helpers
+  `testMigrationConnection` and `changePlan` plus a static
+  `PLAN_CATALOG` in `web/src/api/admin.ts`. Route
+  `/admin/pricing` registered in `App.tsx`; nav link in
+  `Layout.tsx`. Unit tests cover plan validation, IMAP
+  LOGIN success / NO rejection / dial failure, and the
+  IMAP-quote helper.
 - **Last updated**: 2026-04-25 — Phase 3 / Phase 4 ten-task batch
   landed. Multi-tenant Stalwart shard routing, the DNS onboarding
   wizard, Gmail Postmaster + Yahoo ARF feedback-loop ingestion,
@@ -1005,8 +1028,27 @@ Checklist:
 - [ ] Calendar bridge (KChat scheduling, meeting rooms, reminders,
       chat notifications).
 - [ ] Tenant-level billing integration.
-- [ ] Published pricing: KChat Core Email, KChat Mail Pro,
+- [x] Published pricing: KChat Core Email, KChat Mail Pro,
       KChat Privacy.
+      _(Three-tier matrix — KChat Core Email ($3 / seat / mo,
+      500 sends / day, 5 GB / seat), KChat Mail Pro ($6, 2,000,
+      15 GB), KChat Privacy ($9, 5,000, 50 GB) — surfaced via
+      `web/src/pages/Admin/PricingAdmin.tsx`. The page reads the
+      tenant's current plan from `getBillingSummary`, highlights
+      the matching column, shows seat count × per-seat cents as
+      a current monthly total, and offers upgrade / downgrade
+      buttons that POST to the new
+      `PATCH /api/v1/tenants/{id}/billing/plan` endpoint. Backend
+      `billing.Service.ChangePlan` validates the plan name,
+      updates `tenants.plan` under RLS, syncs the per-seat
+      default on `quotas.storage_limit_bytes` only when the
+      existing limit matches the previous plan default
+      (preserving operator overrides made via PATCH .../billing),
+      re-runs `EnforcePlanLimits` so a downgrade past current
+      usage surfaces `ErrQuotaExceeded` (HTTP 402), and writes a
+      `plan_changed` row to `billing_events` for audit. Static
+      `PLAN_CATALOG` in `web/src/api/admin.ts` keeps marketing
+      copy and the upgrade flow on a single source of truth.)_
 - [x] Migration automation (Gmail / IMAP import wizard, staged
       sync, cutover checklist).
       _(Backend orchestrator + worker pool and staged sync were
@@ -1020,7 +1062,16 @@ Checklist:
       `createMigrationJob`, `getMigrationJob`,
       `pauseMigrationJob`, `resumeMigrationJob`, and
       `cancelMigrationJob` in `admin.ts`. Route
-      `/admin/migrations` in `App.tsx`; nav in `Layout.tsx`.)_
+      `/admin/migrations` in `App.tsx`; nav in `Layout.tsx`.
+      A follow-up patch in the same window adds
+      `migration.Service.TestConnection` (real IMAP LOGIN / LOGOUT
+      with a 10 s deadline, implicit-TLS on 993 and plain TCP
+      otherwise, IMAP NO / BAD lines surfaced verbatim) and
+      `POST /api/v1/migrations/test-connection`. The wizard's
+      step-2 credentials form gains a "Test connection" button
+      that calls `testMigrationConnection` in `admin.ts` and
+      renders a green / red inline result, so operators can
+      validate IMAP credentials before committing to a job.)_
 - [ ] Availability target: 99.9%.
 
 ---
