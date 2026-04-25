@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -158,8 +159,14 @@ func (s *Service) claimNextJob(ctx context.Context) (*Job, error) {
 		&j.DownloadURL, &j.ErrorMessage, &j.CreatedAt, &j.StartedAt, &j.CompletedAt,
 	)
 	if err != nil {
-		// no rows == empty queue
-		return nil, nil
+		// pgx.ErrNoRows == empty queue, sleep until next tick.
+		// Any other error (pool exhaustion, context cancelled,
+		// transient network blip, syntax bug) MUST be surfaced so
+		// the worker logs it instead of silently stalling.
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("claim next job: %w", err)
 	}
 	return &j, nil
 }
