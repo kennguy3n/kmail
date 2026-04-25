@@ -61,9 +61,10 @@ export async function assignEmail(
 }
 
 export async function unassignEmail(inboxId: string, emailId: string): Promise<void> {
-  await fetch(
+  await requestJSON<void>(
     `${ADMIN_API_BASE}/shared-inboxes/${encodeURIComponent(inboxId)}/emails/${encodeURIComponent(emailId)}/assign`,
     { method: "DELETE", headers: adminAuthHeaders() },
+    { expectJson: false },
   );
 }
 

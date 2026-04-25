@@ -40,10 +40,11 @@ export async function subscribe(input: Partial<PushSubscription>): Promise<PushS
 }
 
 export async function unsubscribe(subscriptionId: string): Promise<void> {
-  await fetch(`${ADMIN_API_BASE}/push/subscriptions/${encodeURIComponent(subscriptionId)}`, {
-    method: "DELETE",
-    headers: adminAuthHeaders(),
-  });
+  await requestJSON<void>(
+    `${ADMIN_API_BASE}/push/subscriptions/${encodeURIComponent(subscriptionId)}`,
+    { method: "DELETE", headers: adminAuthHeaders() },
+    { expectJson: false },
+  );
 }
 
 export async function listSubscriptions(): Promise<PushSubscription[]> {

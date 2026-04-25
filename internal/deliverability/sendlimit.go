@@ -211,6 +211,9 @@ func (s *SendLimitService) AverageDailyVolume(ctx context.Context, tenantID stri
 }
 
 func parseInt64(s string) (int64, error) {
+	if s == "" {
+		return 0, fmt.Errorf("empty string")
+	}
 	var n int64
 	for _, r := range s {
 		if r < '0' || r > '9' {

@@ -777,9 +777,10 @@ export async function listDeliverabilityAlerts(tenantId: string): Promise<Delive
 }
 
 export async function ackDeliverabilityAlert(tenantId: string, alertId: string): Promise<void> {
-  await fetch(
+  await requestJSON<void>(
     `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/deliverability/alerts/${encodeURIComponent(alertId)}/acknowledge`,
     { method: "POST", headers: adminAuthHeaders(tenantId) },
+    { expectJson: false },
   );
 }
 
