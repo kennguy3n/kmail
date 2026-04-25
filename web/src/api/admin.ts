@@ -924,3 +924,263 @@ export async function updateAlertThresholds(
   );
   return res.thresholds ?? [];
 }
+
+// =====================================================================
+// Phase 4 — Availability SLO dashboard
+// =====================================================================
+
+export interface SLOAvailability {
+  tenant_id: string;
+  window_seconds: number;
+  total: number;
+  successes: number;
+  failures: number;
+  availability: number;
+  target: number;
+}
+export interface SLOLatency {
+  tenant_id: string;
+  window_seconds: number;
+  count: number;
+  p50_ms: number;
+  p95_ms: number;
+  p99_ms: number;
+}
+export interface SLOResponse {
+  availability: SLOAvailability;
+  latency: SLOLatency;
+}
+export interface SLOBreach {
+  tenant_id: string;
+  started_at: string;
+  ended_at: string;
+  availability: number;
+  target: number;
+}
+
+export async function getSloOverview(): Promise<SLOResponse> {
+  return requestJSON<SLOResponse>(`${ADMIN_API_BASE}/admin/slo`, {
+    headers: adminAuthHeaders(undefined, { Accept: "application/json" }),
+  });
+}
+export async function getTenantSlo(tenantId: string): Promise<SLOResponse> {
+  return requestJSON<SLOResponse>(
+    `${ADMIN_API_BASE}/admin/slo/${encodeURIComponent(tenantId)}`,
+    { headers: adminAuthHeaders(tenantId, { Accept: "application/json" }) },
+  );
+}
+export async function getSloBreaches(tenantId?: string): Promise<SLOBreach[]> {
+  const url = tenantId
+    ? `${ADMIN_API_BASE}/admin/slo/breaches?tenant_id=${encodeURIComponent(tenantId)}`
+    : `${ADMIN_API_BASE}/admin/slo/breaches`;
+  return requestJSON<SLOBreach[]>(url, {
+    headers: adminAuthHeaders(tenantId, { Accept: "application/json" }),
+  });
+}
+
+// =====================================================================
+// Phase 5 — Storage placement controls
+// =====================================================================
+
+export interface PlacementPolicy {
+  tenant_id: string;
+  policy_ref: string;
+  countries: string[];
+  preferred_provider?: string;
+  encryption_mode: string;
+  erasure_profile?: string;
+  updated_at?: string;
+}
+export interface AvailableRegion { code: string; name: string }
+
+export async function getPlacementPolicy(tenantId: string): Promise<PlacementPolicy> {
+  return requestJSON<PlacementPolicy>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/storage/placement`,
+    { headers: adminAuthHeaders(tenantId, { Accept: "application/json" }) },
+  );
+}
+export async function updatePlacementPolicy(
+  tenantId: string,
+  policy: PlacementPolicy,
+): Promise<PlacementPolicy> {
+  return requestJSON<PlacementPolicy>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/storage/placement`,
+    {
+      method: "PUT",
+      headers: adminAuthHeaders(tenantId, {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      }),
+      body: JSON.stringify(policy),
+    },
+  );
+}
+export async function listRegions(): Promise<AvailableRegion[]> {
+  return requestJSON<AvailableRegion[]>(`${ADMIN_API_BASE}/storage/regions`, {
+    headers: adminAuthHeaders(undefined, { Accept: "application/json" }),
+  });
+}
+
+// =====================================================================
+// Phase 5 — Retention policies
+// =====================================================================
+
+export interface RetentionPolicy {
+  id: string;
+  tenant_id: string;
+  policy_type: "archive" | "delete";
+  retention_days: number;
+  applies_to: "all" | "mailbox" | "label";
+  target_ref?: string;
+  enabled: boolean;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export async function listRetentionPolicies(tenantId: string): Promise<RetentionPolicy[]> {
+  return requestJSON<RetentionPolicy[]>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/retention`,
+    { headers: adminAuthHeaders(tenantId, { Accept: "application/json" }) },
+  );
+}
+export async function createRetentionPolicy(tenantId: string, policy: RetentionPolicy): Promise<RetentionPolicy> {
+  return requestJSON<RetentionPolicy>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/retention`,
+    {
+      method: "POST",
+      headers: adminAuthHeaders(tenantId, {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      }),
+      body: JSON.stringify(policy),
+    },
+  );
+}
+export async function deleteRetentionPolicy(tenantId: string, id: string): Promise<void> {
+  await requestJSON<void>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/retention/${encodeURIComponent(id)}`,
+    { method: "DELETE", headers: adminAuthHeaders(tenantId) },
+    { expectJson: false },
+  );
+}
+
+// =====================================================================
+// Phase 5 — Approval workflow
+// =====================================================================
+
+export interface ApprovalRequest {
+  id: string;
+  tenant_id: string;
+  requester_id: string;
+  action: string;
+  target_resource: string;
+  status: "pending" | "approved" | "rejected" | "expired";
+  approver_id?: string;
+  reason?: string;
+  created_at: string;
+  resolved_at?: string;
+  expires_at: string;
+}
+
+export async function listApprovals(tenantId: string, status?: string): Promise<ApprovalRequest[]> {
+  const qs = status ? `?status=${encodeURIComponent(status)}` : "";
+  return requestJSON<ApprovalRequest[]>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/approvals${qs}`,
+    { headers: adminAuthHeaders(tenantId, { Accept: "application/json" }) },
+  );
+}
+export async function approveApprovalRequest(tenantId: string, id: string, approverId: string): Promise<ApprovalRequest> {
+  return requestJSON<ApprovalRequest>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/approvals/${encodeURIComponent(id)}/approve`,
+    {
+      method: "POST",
+      headers: adminAuthHeaders(tenantId, {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      }),
+      body: JSON.stringify({ approver_id: approverId }),
+    },
+  );
+}
+export async function rejectApprovalRequest(tenantId: string, id: string, approverId: string, reason: string): Promise<ApprovalRequest> {
+  return requestJSON<ApprovalRequest>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/approvals/${encodeURIComponent(id)}/reject`,
+    {
+      method: "POST",
+      headers: adminAuthHeaders(tenantId, {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      }),
+      body: JSON.stringify({ approver_id: approverId, reason }),
+    },
+  );
+}
+export async function getApprovalConfig(tenantId: string): Promise<Record<string, boolean>> {
+  return requestJSON<Record<string, boolean>>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/approvals/config`,
+    { headers: adminAuthHeaders(tenantId, { Accept: "application/json" }) },
+  );
+}
+export async function setApprovalConfig(tenantId: string, config: Record<string, boolean>): Promise<Record<string, boolean>> {
+  return requestJSON<Record<string, boolean>>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/approvals/config`,
+    {
+      method: "PUT",
+      headers: adminAuthHeaders(tenantId, {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      }),
+      body: JSON.stringify(config),
+    },
+  );
+}
+
+// =====================================================================
+// Phase 5 — Tenant data export / eDiscovery
+// =====================================================================
+
+export interface ExportJob {
+  id: string;
+  tenant_id: string;
+  requester_id: string;
+  format: "mbox" | "eml" | "pst_stub";
+  scope: "all" | "mailbox" | "date_range";
+  scope_ref?: string;
+  status: "pending" | "running" | "completed" | "failed";
+  download_url?: string;
+  error_message?: string;
+  created_at: string;
+  started_at?: string;
+  completed_at?: string;
+}
+
+export async function listExports(tenantId: string): Promise<ExportJob[]> {
+  return requestJSON<ExportJob[]>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/exports`,
+    { headers: adminAuthHeaders(tenantId, { Accept: "application/json" }) },
+  );
+}
+export async function createExport(
+  tenantId: string,
+  requesterId: string,
+  format: ExportJob["format"],
+  scope: ExportJob["scope"],
+  scopeRef: string,
+): Promise<ExportJob> {
+  return requestJSON<ExportJob>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/exports`,
+    {
+      method: "POST",
+      headers: adminAuthHeaders(tenantId, {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      }),
+      body: JSON.stringify({
+        requester_id: requesterId,
+        format,
+        scope,
+        scope_ref: scopeRef,
+      }),
+    },
+  );
+}

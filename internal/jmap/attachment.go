@@ -91,6 +91,13 @@ func NewAttachmentService(cfg AttachmentConfig) *AttachmentService {
 // UploadLargeAttachment streams an attachment to zk-object-fabric
 // and records the metadata in `attachment_links`. The presigned URL
 // returned in the response has the configured expiry (default 7d).
+//
+// The Phase 4 zk-object-fabric integration adds a per-tenant bucket
+// lookup (`tenant_storage_credentials`) — when a tenant has a
+// dedicated bucket provisioned the upload targets it instead of
+// the global `cfg.Bucket`. Tenants created before per-tenant
+// provisioning landed continue to upload to the global bucket so
+// the attachment flow stays backward-compatible.
 func (s *AttachmentService) UploadLargeAttachment(
 	ctx context.Context,
 	tenantID, filename, contentType string,
@@ -100,9 +107,10 @@ func (s *AttachmentService) UploadLargeAttachment(
 	if tenantID == "" || filename == "" {
 		return nil, fmt.Errorf("tenantID and filename required")
 	}
+	bucket := s.resolveTenantBucket(ctx, tenantID)
 	objectKey := fmt.Sprintf("%s/%d-%s", tenantID, time.Now().UnixNano(), sanitizeFilename(filename))
-	if s.cfg.S3URL != "" && s.cfg.Bucket != "" {
-		if err := s.s3Put(ctx, objectKey, contentType, body, size); err != nil {
+	if s.cfg.S3URL != "" && bucket != "" {
+		if err := s.s3PutToBucket(ctx, bucket, objectKey, contentType, body, size); err != nil {
 			return nil, fmt.Errorf("s3 put: %w", err)
 		}
 	}
@@ -131,7 +139,7 @@ func (s *AttachmentService) UploadLargeAttachment(
 			return nil, fmt.Errorf("insert attachment_link: %w", err)
 		}
 	}
-	signed, err := s.GeneratePresignedURL(objectKey, s.cfg.Expiry)
+	signed, err := s.presignForBucket(bucket, objectKey, s.cfg.Expiry)
 	if err != nil {
 		return nil, err
 	}
@@ -182,7 +190,8 @@ func (s *AttachmentService) GetAttachmentLink(ctx context.Context, tenantID, lin
 	if ttl <= 0 {
 		return nil, fmt.Errorf("attachment expired")
 	}
-	signed, err := s.GeneratePresignedURL(row.ObjectKey, ttl)
+	bucket := s.resolveTenantBucket(ctx, tenantID)
+	signed, err := s.presignForBucket(bucket, row.ObjectKey, ttl)
 	if err != nil {
 		return nil, err
 	}
@@ -225,7 +234,17 @@ func (s *AttachmentService) RevokeAttachment(ctx context.Context, tenantID, link
 // https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-query-string-auth.html
 // to avoid adding the full aws-sdk-go-v2 dependency tree.
 func (s *AttachmentService) GeneratePresignedURL(objectKey string, expiry time.Duration) (string, error) {
-	if s.cfg.S3URL == "" || s.cfg.Bucket == "" || s.cfg.AccessKey == "" || s.cfg.SecretKey == "" {
+	return s.presignForBucket(s.cfg.Bucket, objectKey, expiry)
+}
+
+// presignForBucket is the bucket-parameterized presign helper. The
+// public GeneratePresignedURL retains its signature for callers
+// that haven't been migrated to per-tenant buckets.
+func (s *AttachmentService) presignForBucket(bucket, objectKey string, expiry time.Duration) (string, error) {
+	if bucket == "" {
+		bucket = s.cfg.Bucket
+	}
+	if s.cfg.S3URL == "" || bucket == "" || s.cfg.AccessKey == "" || s.cfg.SecretKey == "" {
 		return "", fmt.Errorf("s3 endpoint not configured")
 	}
 	if expiry <= 0 {
@@ -244,7 +263,7 @@ func (s *AttachmentService) GeneratePresignedURL(objectKey string, expiry time.D
 	if scheme == "" {
 		scheme = "https"
 	}
-	canonURI := "/" + s.cfg.Bucket + "/" + strings.TrimPrefix(objectKey, "/")
+	canonURI := "/" + bucket + "/" + strings.TrimPrefix(objectKey, "/")
 
 	now := time.Now().UTC()
 	amzDate := now.Format("20060102T150405Z")
@@ -283,10 +302,45 @@ func (s *AttachmentService) GeneratePresignedURL(objectKey string, expiry time.D
 	return fmt.Sprintf("%s://%s%s?%s", scheme, host, canonURI, q.Encode()), nil
 }
 
+// resolveTenantBucket reads the tenant's dedicated bucket from
+// `tenant_storage_credentials`. Falls back to `cfg.Bucket` when no
+// row is present (legacy tenants) or when the lookup fails — the
+// global bucket continues to work for read paths even when the
+// per-tenant provisioner has not yet run.
+func (s *AttachmentService) resolveTenantBucket(ctx context.Context, tenantID string) string {
+	if s.cfg.Pool == nil || tenantID == "" {
+		return s.cfg.Bucket
+	}
+	var bucket string
+	err := pgx.BeginFunc(ctx, s.cfg.Pool, func(tx pgx.Tx) error {
+		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `
+			SELECT bucket_name FROM tenant_storage_credentials
+			WHERE tenant_id = $1::uuid
+		`, tenantID).Scan(&bucket)
+	})
+	if err != nil || bucket == "" {
+		return s.cfg.Bucket
+	}
+	return bucket
+}
+
 // s3Put uploads `body` to the configured S3 endpoint using SigV4
 // query-style signing. Content-Length is inferred from `size`.
 func (s *AttachmentService) s3Put(ctx context.Context, objectKey, contentType string, body io.Reader, size int64) error {
-	putURL := strings.TrimRight(s.cfg.S3URL, "/") + "/" + s.cfg.Bucket + "/" + strings.TrimPrefix(objectKey, "/")
+	return s.s3PutToBucket(ctx, s.cfg.Bucket, objectKey, contentType, body, size)
+}
+
+// s3PutToBucket is the bucket-parameterized PUT helper used by the
+// per-tenant upload path. Falls back to `cfg.Bucket` when `bucket`
+// is empty so the global single-bucket deployment still works.
+func (s *AttachmentService) s3PutToBucket(ctx context.Context, bucket, objectKey, contentType string, body io.Reader, size int64) error {
+	if bucket == "" {
+		bucket = s.cfg.Bucket
+	}
+	putURL := strings.TrimRight(s.cfg.S3URL, "/") + "/" + bucket + "/" + strings.TrimPrefix(objectKey, "/")
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, putURL, body)
 	if err != nil {
 		return err

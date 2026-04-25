@@ -26,6 +26,15 @@ import (
 	"github.com/kennguy3n/kmail/internal/middleware"
 )
 
+// ShardResolver is the slice of `tenant.ShardService` the JMAP
+// proxy needs. Defining it here lets the proxy depend on a narrow
+// interface and lets tests stub the resolver without touching the
+// full ShardService surface.
+type ShardResolver interface {
+	GetTenantShard(ctx context.Context, tenantID string) (string, error)
+	GetSecondaryShards(ctx context.Context, tenantID string) ([]string, error)
+}
+
 // ProxyConfig wires the JMAP reverse proxy. `StalwartURL` is the
 // internal Stalwart JMAP endpoint (e.g., `http://stalwart:8080` in
 // the local compose stack). `Pool` is used to resolve the acting
@@ -41,6 +50,17 @@ type ProxyConfig struct {
 	// → stalwart_account_id` cache entries live. Defaults to 5
 	// minutes per `docs/JMAP-CONTRACT.md` §3.3.
 	AccountCacheTTL time.Duration
+
+	// Shards resolves the per-tenant Stalwart URL + failover
+	// list. nil = single-shard deployment, every request goes to
+	// `StalwartURL`. Wired in `cmd/kmail-api/main.go` for the
+	// production multi-shard topology.
+	Shards ShardResolver
+
+	// CircuitBreakThreshold is the consecutive 5xx / transport
+	// failure count after which the proxy marks a shard URL
+	// unhealthy and routes to the next backup. Defaults to 3.
+	CircuitBreakThreshold int
 }
 
 // Proxy forwards authenticated JMAP requests from the React client
@@ -53,6 +73,13 @@ type ProxyConfig struct {
 // signing-key dance lands in Phase 2. The header-based account
 // identification is a deliberate placeholder that the upstream
 // Stalwart config pairs with a trusted-network rule in local dev.
+//
+// Phase 4 adds shard-aware routing: when `cfg.Shards` is wired, the
+// proxy resolves each tenant's primary Stalwart URL on every
+// request and falls back to the configured secondary shards on
+// 5xx / transport errors. Falls back to `cfg.StalwartURL` for
+// tenants without a shard assignment so single-shard dev stays
+// working.
 type Proxy struct {
 	cfg     ProxyConfig
 	rp      *httputil.ReverseProxy
@@ -60,6 +87,25 @@ type Proxy struct {
 	cache   *accountCache
 	target  *url.URL
 	stripPR string
+
+	// breakerMu guards the circuit-breaker counters keyed by
+	// shard host (URL.Host). Counters live in-process for Phase 4 —
+	// a Valkey-backed shared breaker is a Phase 5 follow-up.
+	breakerMu sync.Mutex
+	breakers  map[string]int
+}
+
+// shardCtxKey carries the resolved shard URL list (primary first)
+// to the custom transport so retries can switch hosts without
+// re-querying Postgres on every attempt.
+type shardCtxKey struct{}
+
+func withShardURLs(ctx context.Context, urls []string) context.Context {
+	return context.WithValue(ctx, shardCtxKey{}, urls)
+}
+func shardURLsFrom(ctx context.Context) []string {
+	v, _ := ctx.Value(shardCtxKey{}).([]string)
+	return v
 }
 
 // NewProxy builds a Proxy pointed at the configured Stalwart URL.
@@ -83,17 +129,95 @@ func NewProxy(cfg ProxyConfig) (*Proxy, error) {
 		ttl = 5 * time.Minute
 	}
 	p := &Proxy{
-		cfg:     cfg,
-		logger:  logger,
-		cache:   newAccountCache(ttl),
-		target:  target,
-		stripPR: "/jmap",
+		cfg:      cfg,
+		logger:   logger,
+		cache:    newAccountCache(ttl),
+		target:   target,
+		stripPR:  "/jmap",
+		breakers: map[string]int{},
 	}
 	p.rp = &httputil.ReverseProxy{
 		Rewrite:      p.rewrite,
 		ErrorHandler: p.errorHandler,
+		Transport:    &shardFailoverTransport{proxy: p, base: http.DefaultTransport},
 	}
 	return p, nil
+}
+
+// shardFailoverTransport is the custom RoundTripper that retries a
+// request against secondary shards when the primary returns a 5xx
+// or fails at the transport layer. The list of candidate URLs is
+// stamped onto the request context by ServeHTTP so the transport
+// does not re-query Postgres per attempt.
+type shardFailoverTransport struct {
+	proxy *Proxy
+	base  http.RoundTripper
+}
+
+func (t *shardFailoverTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	urls := shardURLsFrom(req.Context())
+	if len(urls) == 0 {
+		// No shard wiring; behave as the unmodified proxy.
+		return t.base.RoundTrip(req)
+	}
+	threshold := t.proxy.cfg.CircuitBreakThreshold
+	if threshold <= 0 {
+		threshold = 3
+	}
+	var lastErr error
+	for i, candidate := range urls {
+		u, err := url.Parse(candidate)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		// Skip hosts that have tripped the breaker. The breaker
+		// auto-resets when a healthy probe rolls through (see the
+		// shard HealthWorker).
+		if t.proxy.breakerOpen(u.Host, threshold) && i+1 < len(urls) {
+			continue
+		}
+		clone := req.Clone(req.Context())
+		clone.URL.Scheme = u.Scheme
+		clone.URL.Host = u.Host
+		clone.Host = u.Host
+		resp, err := t.base.RoundTrip(clone)
+		if err != nil {
+			t.proxy.breakerInc(u.Host)
+			lastErr = err
+			continue
+		}
+		if resp.StatusCode >= 500 && i+1 < len(urls) {
+			resp.Body.Close()
+			t.proxy.breakerInc(u.Host)
+			lastErr = fmt.Errorf("upstream %s returned %d", u.Host, resp.StatusCode)
+			continue
+		}
+		t.proxy.breakerReset(u.Host)
+		return resp, nil
+	}
+	if lastErr == nil {
+		lastErr = errors.New("jmap proxy: no candidate shards available")
+	}
+	return nil, lastErr
+}
+
+func (p *Proxy) breakerOpen(host string, threshold int) bool {
+	p.breakerMu.Lock()
+	defer p.breakerMu.Unlock()
+	return p.breakers[host] >= threshold
+}
+
+func (p *Proxy) breakerInc(host string) {
+	p.breakerMu.Lock()
+	p.breakers[host]++
+	p.breakerMu.Unlock()
+}
+
+func (p *Proxy) breakerReset(host string) {
+	p.breakerMu.Lock()
+	delete(p.breakers, host)
+	p.breakerMu.Unlock()
 }
 
 // ServeHTTP implements http.Handler. It expects to run behind the
@@ -130,7 +254,31 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := middleware.WithStalwartAccountID(r.Context(), accountID)
+	if urls := p.resolveShardURLs(ctx, tenantID); len(urls) > 0 {
+		ctx = withShardURLs(ctx, urls)
+	}
 	p.rp.ServeHTTP(w, r.WithContext(ctx))
+}
+
+// resolveShardURLs returns the ordered candidate Stalwart URLs for
+// the tenant: primary first, then `shard_failover_config` backups.
+// Falls back to an empty list when no shard service is wired or the
+// tenant has no assignment, which the transport interprets as
+// "no failover available".
+func (p *Proxy) resolveShardURLs(ctx context.Context, tenantID string) []string {
+	if p.cfg.Shards == nil || tenantID == "" {
+		return nil
+	}
+	primary, err := p.cfg.Shards.GetTenantShard(ctx, tenantID)
+	if err != nil || primary == "" {
+		return nil
+	}
+	urls := []string{primary}
+	secondaries, err := p.cfg.Shards.GetSecondaryShards(ctx, tenantID)
+	if err == nil {
+		urls = append(urls, secondaries...)
+	}
+	return urls
 }
 
 // rewrite adapts the incoming request to the upstream Stalwart URL.

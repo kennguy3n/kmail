@@ -1,0 +1,79 @@
+{
+  "_comment": "KMail Phase 4 — Stalwart v0.16.0 multi-node HA template. One file per shard, with per-node identity and the shared multi-tenant infrastructure pinned identically across the cluster. See deploy/stalwart/README.md for operator guidance.",
+  "version": "0.16.0",
+  "node": {
+    "id": "REPLACE_PER_NODE_e.g._stalwart-shard-1-node-a",
+    "cluster": "kmail-prod",
+    "shard": "REPLACE_e.g._shard-1",
+    "smtp": {
+      "stable_outbound_ip": "REPLACE_PER_NODE_e.g._203.0.113.10",
+      "ptr_record": "mta-shard1a.kmail.example.com"
+    },
+    "jmap": {
+      "behind_load_balancer": true,
+      "advertised_origin": "https://mail.kmail.example.com"
+    }
+  },
+  "stores": {
+    "data": {
+      "type": "postgres",
+      "url": "REPLACE_postgres://kmail:****@postgres-prod:5432/kmail",
+      "comment": "Shared across every shard so account/auth state is consistent."
+    },
+    "blob": {
+      "type": "s3",
+      "endpoint": "https://zk-fabric.kmail.example.com",
+      "region": "us-east-1",
+      "bucket": "REPLACE_kmail-{tenant_id}",
+      "access_key_env": "STALWART_S3_ACCESS_KEY",
+      "secret_key_env": "STALWART_S3_SECRET_KEY",
+      "comment": "Per-tenant bucket provisioned by internal/tenant/zkfabric.go. Production automation rewrites this entry per shard per tenant during the BFF CreateTenant lifecycle hook."
+    },
+    "search": {
+      "type": "meilisearch",
+      "url": "https://meilisearch.kmail.example.com",
+      "api_key_env": "STALWART_MEILISEARCH_KEY",
+      "comment": "Shared across every shard."
+    },
+    "lookup": {
+      "type": "valkey",
+      "url": "redis://valkey.kmail.example.com:6379",
+      "comment": "Shared rate-limit / suppression cache."
+    }
+  },
+  "tls": {
+    "acme": {
+      "directory": "https://acme-v02.api.letsencrypt.org/directory",
+      "contact_email": "ops@kmail.example.com",
+      "challenge": "http-01"
+    }
+  },
+  "smtp": {
+    "session": {
+      "ehlo_hostname": "REPLACE_PER_NODE_PTR",
+      "starttls": "required"
+    },
+    "queue": {
+      "consistent_hash_outbound_pool": true,
+      "comment": "Pin tenants to the same outbound pool every send so warmup credit accumulates on a single PTR. Never share an outbound IP across unrelated pools."
+    }
+  },
+  "jmap": {
+    "session_resource": {
+      "session_state_ttl_seconds": 300
+    },
+    "push": {
+      "queue": "valkey",
+      "queue_url_env": "STALWART_VALKEY_URL"
+    }
+  },
+  "auth": {
+    "trusted_network_for_internal_oidc": ["10.0.0.0/8", "REPLACE_VPC_CIDR"],
+    "comment": "The KMail BFF's JMAP proxy injects X-KMail-Stalwart-Account-Id over a trusted network. Phase 5 swaps this for the signed internal-OIDC token in docs/JMAP-CONTRACT.md §3.2."
+  },
+  "metrics": {
+    "prometheus": {
+      "listen": "0.0.0.0:9081"
+    }
+  }
+}

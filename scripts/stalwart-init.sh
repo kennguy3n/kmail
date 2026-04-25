@@ -38,6 +38,20 @@
 #   MEILISEARCH_URL            default: http://meilisearch:7700
 #   MEILISEARCH_API_KEY        default: kmail-dev
 #   VALKEY_URL                 default: redis://valkey:6379
+#
+# Phase 4 production wiring: this script seeds the *single-shard*
+# dev/staging Stalwart with a single global blob bucket. Production
+# deployments run a multi-shard topology (see
+# `deploy/stalwart/ha-config.json` and `deploy/stalwart/README.md`)
+# where every shard's S3 store points at the per-tenant bucket
+# provisioned by `internal/tenant/zkfabric.go` (`kmail-{tenant_id}`).
+# The deployment automation walks `tenant_storage_credentials` and
+# writes one BlobStore record per tenant per shard before that shard
+# accepts traffic. The init script is intentionally NOT extended to
+# do that loop because the BFF's CreateTenant path already
+# provisions the bucket on demand — the shard-level wiring is an
+# infra concern handled by the operator playbook in
+# `deploy/stalwart/README.md`.
 #   KMAIL_DEV_TENANT_DOMAIN    default: kmail.dev
 
 set -eu

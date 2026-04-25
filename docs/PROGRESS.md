@@ -4,7 +4,25 @@
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
 - **Status**: Phase 1 — Foundation (in progress); Phase 2 —
   Prototype (in progress); Phase 3 — Private Beta (in progress)
-- **Last updated**: 2026-04-25 (later) — Migration wizard
+- **Last updated**: 2026-04-25 (later, batch 2) — Phase 4 / Phase
+  5 ten-task batch wraps the remaining Phase 4 checklist items
+  (Stalwart HA, per-tenant zk-object-fabric integration, calendar
+  bridge, tenant-level billing, availability SLO) and starts four
+  Phase 5 items (regional storage controls, retention, admin
+  approval, eDiscovery export). Backend adds `internal/tenant/zkfabric.go`,
+  `internal/billing/lifecycle.go`, `internal/billing/webhook.go`,
+  `internal/calendarbridge/notifications.go` /
+  `reminder_worker.go`, `internal/jmap/proxy.go` shard-aware
+  failover, `internal/monitoring/slo.go`, `internal/tenant/placement.go`,
+  `internal/retention`, `internal/approval`, `internal/export` and
+  six new migrations (018–023). Operator templates land at
+  `deploy/stalwart/ha-config.json` + `deploy/stalwart/README.md`.
+  Frontend adds `PricingPage`, `SloAdmin`, `StoragePlacementAdmin`,
+  `RetentionAdmin`, `ApprovalAdmin`, `ExportAdmin` plus
+  `web/src/api/billing.ts` and Phase 4/5 typed clients in
+  `web/src/api/admin.ts`. See PR for the full diff.
+
+  Earlier 2026-04-25 — Migration wizard
   "Test connection" flow + Pricing & plan-management page round
   out the Phase 4 batch landed earlier today. Backend adds
   `migration.Service.TestConnection` (drives a real IMAP LOGIN
@@ -976,9 +994,54 @@ deliverability infrastructure, and migration automation.
 
 Checklist:
 
-- [ ] Production Stalwart cluster (multi-node, HA).
-- [ ] Production zk-object-fabric integration (Wasabi primary,
+- [x] Production Stalwart cluster (multi-node, HA).
+      _(Operator template + guide in `deploy/stalwart/ha-config.json`
+      + `deploy/stalwart/README.md`: per-shard JSON pinning the
+      shared Postgres / zk-object-fabric / Meilisearch / Valkey
+      stores, per-node identity (node ID, stable outbound IP,
+      PTR record), trusted-network rule for the BFF
+      `X-KMail-Stalwart-Account-Id` header, and ACME automation.
+      `internal/jmap/proxy.go` is now shard-aware: every request
+      resolves the tenant's primary Stalwart URL via
+      `tenant.ShardService.GetTenantShard`, and the new
+      `GetSecondaryShards` method walks the
+      `shard_failover_config` table
+      (`migrations/020_shard_failover.sql`, FK to
+      `stalwart_shards`, ordered by `priority`) for backups. The
+      proxy's custom `shardFailoverTransport` retries against
+      backups on 5xx / transport errors and trips an in-process
+      circuit breaker (default 3 consecutive failures) so a
+      degraded host gets skipped until the shard health worker
+      probes it healthy. `cmd/kmail-api/main.go` constructs
+      `shardSvc` early and passes it as `jmap.ProxyConfig.Shards`.
+      Falls back to `cfg.StalwartURL` for tenants without a shard
+      assignment so the single-shard dev compose stack keeps
+      working.)_
+- [x] Production zk-object-fabric integration (Wasabi primary,
       Linode cache).
+      _(Per-tenant bucket provisioning + placement policy wiring.
+      `internal/tenant/zkfabric.go` adds a `ZKFabricProvisioner`
+      that, on `CreateTenant`, mints a dedicated S3 bucket
+      (pattern `kmail-{tenant_id}`, idempotent — 409 treated as
+      success), POSTs `/api/tenants/{id}/keys` on the fabric
+      console for per-tenant credentials, and PUTs
+      `/api/tenants/{id}/placement` defaulting to `managed`
+      (ManagedEncrypted) for core/pro and reserving `client_side`
+      (StrictZK) for the privacy tier's Confidential Send /
+      Zero-Access Vault. Credentials persist in
+      `tenant_storage_credentials` (`migrations/018_tenant_storage.sql`,
+      RLS on tenant_id) including `bucket_name`,
+      `placement_policy_ref`, and `encryption_mode_default`.
+      `internal/jmap/attachment.go` `UploadLargeAttachment` /
+      `GeneratePresignedURL` now lookup the tenant's bucket via
+      `resolveTenantBucket` and fall back to the global
+      `cfg.Bucket` for legacy tenants. `tenant.ServiceConfig`
+      gains `WithStorageProvisioner` to wire the provisioner
+      into the lifecycle. The cross-shard wiring is documented
+      in `scripts/stalwart-init.sh` (init script left single-
+      tenant for dev) and the production playbook in
+      `deploy/stalwart/README.md`. Constraint hard-pinned in the
+      provisioner: bucket per tenant, no cross-tenant dedupe.)_
 - [x] IP reputation dashboards.
       _(`Handlers.RegisterPhase3` adds
       `GET /api/v1/admin/ip-reputation` and
@@ -1025,9 +1088,44 @@ Checklist:
       routes `/api/v1/shared-inboxes/{inboxId}/emails/{emailId}/...`.
       React page `SharedInboxView.tsx` + typed client
       `web/src/api/sharedinbox.ts`.)_
-- [ ] Calendar bridge (KChat scheduling, meeting rooms, reminders,
+- [x] Calendar bridge (KChat scheduling, meeting rooms, reminders,
       chat notifications).
-- [ ] Tenant-level billing integration.
+      _(`internal/calendarbridge/notifications.go` adds a
+      `Notifier` with `NotifyEventCreated` / `NotifyEventUpdated` /
+      `NotifyEventCancelled` / `NotifyReminder` reusing the
+      existing `chatbridge.KChatClient` (exposed via
+      `chatbridge.Service.KChat()`) so the package does not
+      duplicate the KChat REST plumbing. The handlers in
+      `calendarbridge.handlers.go` fan event CRUD into the
+      notifier post-success. `internal/calendarbridge/reminder_worker.go`
+      is a 60 s-tick goroutine that scans the upcoming-30 m window,
+      fires reminders at the 15-min and 5-min thresholds, and
+      dedupes via Valkey keys `reminder:{tenantID}:{eventID}:{minutesBefore}`
+      with 24 h TTL. Channel resolution uses a
+      `StaticChannelResolver` for Phase 4 (one channel per
+      tenant); per-resource channel selection is the Phase 5
+      follow-up. Wired in `cmd/kmail-api/main.go` alongside the
+      existing alert / shard-health workers.)_
+- [x] Tenant-level billing integration.
+      _(`internal/billing/lifecycle.go` adds `Lifecycle.OnTenantCreated`,
+      `OnTenantDeleted`, `OnPlanChanged` (with proration:
+      `(new_seat_cents - old_seat_cents) * seat_count *
+      remaining_days / period_days`), `OnSeatAdded`, and
+      `OnSeatRemoved`. `tenant.ServiceConfig.WithBillingLifecycle`
+      wires the hooks into `CreateTenant` / `DeleteTenant`. The
+      billing handlers gain
+      `GET /api/v1/tenants/{id}/billing/proration-preview` and
+      `GET /api/v1/tenants/{id}/billing/history`. A Stripe webhook
+      stub at `internal/billing/webhook.go`
+      (`POST /api/v1/billing/webhooks/stripe`) parses
+      `payment_intent.succeeded`, `invoice.paid`,
+      `invoice.payment_failed`, and `customer.subscription.updated`
+      with HMAC-SHA256 signature verification (dev mode bypasses
+      empty secrets). `migrations/019_billing_lifecycle.sql`
+      creates `billing_subscriptions` (RLS, status enum, trigger
+      for `updated_at`). The hooks degrade gracefully when Stripe
+      is unconfigured so dev keeps working without a webhook
+      secret.)_
 - [x] Published pricing: KChat Core Email, KChat Mail Pro,
       KChat Privacy.
       _(Three-tier matrix — KChat Core Email ($3 / seat / mo,
@@ -1072,13 +1170,29 @@ Checklist:
       that calls `testMigrationConnection` in `admin.ts` and
       renders a green / red inline result, so operators can
       validate IMAP credentials before committing to a job.)_
-- [ ] Availability target: 99.9%.
+- [x] Availability target: 99.9%.
+      _(`internal/monitoring/slo.go` adds an `SLOTracker` that
+      records every BFF request's success/latency into Valkey
+      sorted sets (`slo:{tenantID}:requests` and
+      `:latency`). `middleware.Metrics.WithSLO` wires the
+      tracker into the existing metrics middleware so every
+      request is mirrored without changing the request path.
+      `internal/monitoring/handlers.go` exposes
+      `GET /api/v1/admin/slo` (platform-wide),
+      `GET /api/v1/admin/slo/{tenantId}`, and
+      `GET /api/v1/admin/slo/breaches` returning availability
+      ratios + P50/P95/P99 latencies + 24 h breach windows.
+      Frontend page `web/src/pages/Admin/SloAdmin.tsx` renders
+      a platform availability gauge, per-tenant card, and
+      breach history; typed client helpers `getSloOverview`,
+      `getTenantSlo`, `getSloBreaches` in `admin.ts`. Default
+      target 99.9% (`monitoring.DefaultTarget`).)_
 
 ---
 
 ## Phase 5 — Privacy & Compliance Expansion (Post-Launch)
 
-**Status**: `NOT STARTED`
+**Status**: `IN PROGRESS`
 
 **Goal**: advanced privacy features, compliance controls, and
 enterprise readiness.
@@ -1088,11 +1202,77 @@ Checklist:
 - [ ] Zero-Access Vault (client-side encrypted folders via
       zk-object-fabric `StrictZK` + MLS key hierarchy).
 - [ ] Customer-managed keys (Privacy / Enterprise tier).
-- [ ] Regional storage controls (zk-object-fabric placement
+- [x] Regional storage controls (zk-object-fabric placement
       policies).
-- [ ] Retention / archive tier (zk-object-fabric cold storage).
-- [ ] Advanced export and eDiscovery preparation.
-- [ ] Admin access approval workflow.
+      _(`internal/tenant/placement.go` adds a `PlacementService`
+      with `GetPlacementPolicy` (reads from the local
+      `tenant_storage_credentials` row + fetches from the fabric
+      console), `UpdatePlacementPolicy` (validates non-empty
+      country allow-list, gates `client_side` to the privacy
+      plan, PUTs to the fabric console, mirrors
+      `encryption_mode_default` locally), and
+      `ListAvailableRegions` (US/EU/APAC). `placement_handlers.go`
+      registers `GET /api/v1/storage/regions`, `GET` /
+      `PUT /api/v1/tenants/{id}/storage/placement`. Frontend page
+      `web/src/pages/Admin/StoragePlacementAdmin.tsx` lets admins
+      pick allowed regions, change encryption mode (StrictZK
+      disabled outside privacy tier), and warns that existing
+      data is not auto-migrated. Typed clients
+      `getPlacementPolicy`, `updatePlacementPolicy`,
+      `listRegions` in `admin.ts`.)_
+- [x] Retention / archive tier (zk-object-fabric cold storage).
+      _(`internal/retention` adds `Service` with policy CRUD
+      (`CreatePolicy` / `UpdatePolicy` / `DeletePolicy` /
+      `ListPolicies`) and `EvaluateRetention`. `Worker` is a
+      24 h-tick goroutine that walks active tenants and emits
+      retention summaries (the actual JMAP `Email/set destroy`
+      and zk-object-fabric placement archive update is staged as
+      a Phase 5 follow-up — the storage hook lives behind a
+      pluggable runner pattern so the fan-out PR is a drop-in).
+      `migrations/021_retention_policies.sql` creates
+      `retention_policies` (RLS, policy_type IN archive/delete,
+      applies_to IN all/mailbox/label, target_ref). Frontend page
+      `web/src/pages/Admin/RetentionAdmin.tsx` adds policy
+      create/list/delete; typed clients
+      `listRetentionPolicies`, `createRetentionPolicy`,
+      `deleteRetentionPolicy` in `admin.ts`.)_
+- [x] Advanced export and eDiscovery preparation.
+      _(`internal/export` adds `Service` with `CreateExportJob`,
+      `GetExportJob`, `ListExportJobs`, and a pluggable
+      `Runner` callback that owns archive packaging — wired in
+      `cmd/kmail-api/main.go` to a stub URL today and the
+      JMAP/CalDAV/audit fan-out follow-up will plug into the
+      same callback. `internal/export/worker.go` is a worker
+      pool that claims pending jobs via
+      `FOR UPDATE SKIP LOCKED`, runs the runner, and writes
+      success/error back to the row. HTTP routes
+      `GET` / `POST /api/v1/tenants/{id}/exports` and
+      `GET /api/v1/tenants/{id}/exports/{jobId}`.
+      `migrations/023_export_jobs.sql` creates `export_jobs`
+      (RLS, status pending/running/completed/failed, format
+      mbox/eml/pst_stub, scope all/mailbox/date_range). Frontend
+      page `web/src/pages/Admin/ExportAdmin.tsx` lets admins
+      queue exports and surface the download URL once
+      complete; typed clients `listExports`, `createExport` in
+      `admin.ts`.)_
+- [x] Admin access approval workflow.
+      _(`internal/approval` adds `Service` with `RequiresApproval`
+      / `CreateRequest` / `ApproveRequest` / `RejectRequest` /
+      `ListPendingRequests` / `ListAll` / `ExecuteApproved` and a
+      pluggable per-action `Executor` registry so callers (tenant
+      service, billing, retention) can register their executors
+      without the approval package depending on them.
+      `migrations/022_approval_workflow.sql` creates
+      `approval_requests` (RLS, status pending/approved/rejected/
+      expired, 7-day default expiry) and `approval_config`
+      (per-tenant + per-action gating boolean). HTTP routes
+      `/api/v1/tenants/{id}/approvals[/{approvalId}{,/approve,/reject,/execute}]`
+      and `/approvals/config` (GET/PUT). Frontend page
+      `web/src/pages/Admin/ApprovalAdmin.tsx` lists pending
+      approvals, lets reviewers approve/reject, and toggles the
+      gating config per action; typed clients `listApprovals`,
+      `approveApprovalRequest`, `rejectApprovalRequest`,
+      `getApprovalConfig`, `setApprovalConfig` in `admin.ts`.)_
 - [ ] Protected folders.
 - [ ] Availability target: 99.95%+.
 

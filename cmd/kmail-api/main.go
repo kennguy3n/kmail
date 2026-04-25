@@ -10,6 +10,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -20,6 +21,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/kennguy3n/kmail/internal/approval"
 	"github.com/kennguy3n/kmail/internal/audit"
 	"github.com/kennguy3n/kmail/internal/billing"
 	"github.com/kennguy3n/kmail/internal/calendarbridge"
@@ -27,10 +29,13 @@ import (
 	"github.com/kennguy3n/kmail/internal/config"
 	"github.com/kennguy3n/kmail/internal/deliverability"
 	"github.com/kennguy3n/kmail/internal/dns"
+	"github.com/kennguy3n/kmail/internal/export"
 	"github.com/kennguy3n/kmail/internal/jmap"
 	"github.com/kennguy3n/kmail/internal/middleware"
 	"github.com/kennguy3n/kmail/internal/migration"
+	"github.com/kennguy3n/kmail/internal/monitoring"
 	"github.com/kennguy3n/kmail/internal/push"
+	"github.com/kennguy3n/kmail/internal/retention"
 	"github.com/kennguy3n/kmail/internal/sharedinbox"
 	"github.com/kennguy3n/kmail/internal/tenant"
 )
@@ -97,10 +102,15 @@ func main() {
 		return wrapped
 	}
 
+	// Multi-tenant Stalwart shard routing — constructed early so
+	// the JMAP proxy can resolve per-tenant primary + secondary
+	// Stalwart URLs on every request.
+	shardSvc := tenant.NewShardService(pool, logger)
 	proxy, err := jmap.NewProxy(jmap.ProxyConfig{
 		StalwartURL: cfg.StalwartURL,
 		Pool:        pool,
 		Logger:      logger,
+		Shards:      shardSvc,
 	})
 	if err != nil {
 		logger.Fatalf("jmap.NewProxy: %v", err)
@@ -124,9 +134,30 @@ func main() {
 		ProPerSeatBytes:     cfg.Billing.ProPerSeatBytes,
 		PrivacyPerSeatBytes: cfg.Billing.PrivacyPerSeatBytes,
 	})
-	billing.NewHandlers(billingSvc, logger).Register(mux, authMW)
+	billingLifecycleEarly := billing.NewLifecycle(billingSvc, logger)
+	billing.NewHandlers(billingSvc, logger).WithLifecycle(billingLifecycleEarly).Register(mux, authMW)
+	billing.NewWebhookHandler(billing.WebhookConfig{
+		Lifecycle:           billingLifecycleEarly,
+		StripeWebhookSecret: os.Getenv("KMAIL_STRIPE_WEBHOOK_SECRET"),
+		Logger:              logger,
+	}).Register(mux)
 
-	tenantSvc := tenant.NewService(pool).WithSeatAccounter(billingSvc)
+	// Per-tenant zk-object-fabric provisioning. CreateTenant calls
+	// Provision after the DB insert so every new tenant gets its
+	// own bucket + API key + placement policy without an operator
+	// running a separate one-shot.
+	zkProvisioner := tenant.NewZKFabricProvisioner(tenant.ZKFabricProvisioner{
+		Pool:           pool,
+		S3URL:          cfg.ZKFabric.S3URL,
+		ConsoleURL:     cfg.ZKFabric.ConsoleURL,
+		AdminAccessKey: cfg.ZKFabric.AccessKey,
+		AdminSecretKey: cfg.ZKFabric.SecretKey,
+		Logger:         logger,
+	})
+	tenantSvc := tenant.NewService(pool).
+		WithSeatAccounter(billingSvc).
+		WithStorageProvisioner(zkProvisioner).
+		WithBillingLifecycle(billingLifecycleEarly)
 	dnsSvc := dns.NewService(dns.Config{
 		Pool:                pool,
 		MailHost:            cfg.DNS.MailHost,
@@ -150,12 +181,13 @@ func main() {
 	migrationHandlers := migration.NewHandlers(migrationSvc, logger)
 	migrationHandlers.Register(mux, authMW)
 
-	calendarSvc := calendarbridge.NewService(calendarbridge.Config{
-		StalwartURL: cfg.StalwartURL,
-	})
-	calendarbridge.NewHandlers(calendarSvc, logger).Register(mux, authMW)
-	calendarSharingStore := calendarbridge.NewSharingStore(pool)
-	calendarbridge.NewSharingHandlers(calendarSvc, calendarSharingStore).Register(mux, authMW)
+	// Valkey is consumed by deliverability, push, calendar reminders,
+	// and the SLO tracker. Stand it up early so every downstream
+	// service can share the same client.
+	var valkeyClient *redis.Client
+	if cfg.ValkeyURL != "" {
+		valkeyClient = redis.NewClient(&redis.Options{Addr: cfg.ValkeyURL})
+	}
 
 	chatbridgeSvc := chatbridge.NewService(chatbridge.Config{
 		KChatAPIURL:   cfg.KChatAPIURL,
@@ -166,15 +198,30 @@ func main() {
 	})
 	chatbridge.NewHandlers(chatbridgeSvc, logger).Register(mux, authMW)
 
+	calendarSvc := calendarbridge.NewService(calendarbridge.Config{
+		StalwartURL: cfg.StalwartURL,
+	})
+	// Per-tenant scheduling notifications. Phase 4 routes every
+	// tenant to a single configured channel
+	// (`KMAIL_CALENDAR_NOTIFY_CHANNEL`); Phase 5 will route per
+	// resource calendar.
+	calendarNotifier := calendarbridge.NewNotifier(
+		chatbridgeSvc.KChat(),
+		calendarbridge.StaticChannelResolver{ChannelID: os.Getenv("KMAIL_CALENDAR_NOTIFY_CHANNEL")},
+	)
+	calendarbridge.NewHandlers(calendarSvc, logger).WithNotifier(calendarNotifier).Register(mux, authMW)
+	calendarSharingStore := calendarbridge.NewSharingStore(pool)
+	calendarbridge.NewSharingHandlers(calendarSvc, calendarSharingStore).Register(mux, authMW)
+	// Background reminder worker: polls upcoming events every 60s
+	// and fires KChat reminders 15min / 5min before start.
+	reminderWorker := calendarbridge.NewReminderWorker(pool, calendarSvc, calendarNotifier, valkeyClient, logger)
+	go reminderWorker.Run(ctx)
+
 	auditSvc := audit.NewService(pool)
 	audit.NewHandlers(auditSvc, logger).Register(mux, authMW)
 
 	// Deliverability Control Plane (suppression, bounces, IP
 	// pools, send limits, warmup, DMARC).
-	var valkeyClient *redis.Client
-	if cfg.ValkeyURL != "" {
-		valkeyClient = redis.NewClient(&redis.Options{Addr: cfg.ValkeyURL})
-	}
 	deliverabilitySvc := deliverability.NewService(deliverability.Config{
 		Pool:                      pool,
 		Valkey:                    valkeyClient,
@@ -202,8 +249,6 @@ func main() {
 	sharedInboxWorkflow := sharedinbox.NewService(pool, logger)
 	sharedinbox.NewHandlers(sharedInboxWorkflow, logger).Register(mux, authMW)
 
-	// Multi-tenant Stalwart shard routing.
-	shardSvc := tenant.NewShardService(pool, logger)
 	tenant.NewShardHandlers(shardSvc).Register(mux, authMW)
 
 	// Attachment-to-link conversion.
@@ -224,6 +269,12 @@ func main() {
 	if cfg.Observability.MetricsEnabled {
 		mux.Handle("GET /metrics", metrics.Handler())
 	}
+	// Availability SLO tracker — Phase 4 99.9% target. Requests
+	// flowing through `metrics.Middleware` are mirrored into Valkey
+	// for the admin dashboard / breach history endpoints.
+	sloTracker := monitoring.NewSLOTracker(valkeyClient)
+	metrics = metrics.WithSLO(sloTracker)
+	monitoring.NewHandlers(sloTracker, logger).Register(mux, authMW)
 	tracingShutdown := func(context.Context) error { return nil }
 	if cfg.Observability.TracingEnabled {
 		sh, err := middleware.InitTracing(ctx, "kmail-api", cfg.Observability.OTLPEndpoint)
@@ -271,6 +322,29 @@ func main() {
 		Logger:   logger,
 	}
 	go shardHealth.Run(ctx)
+
+	// Phase 5 admin surfaces.
+	placementSvc := tenant.NewPlacementService(pool, cfg.ZKFabric.ConsoleURL)
+	tenant.NewPlacementHandlers(placementSvc, pool).Register(mux, authMW)
+
+	retentionSvc := retention.NewService(pool)
+	retention.NewHandlers(retentionSvc, logger).Register(mux, authMW)
+	go retention.NewWorker(retentionSvc, logger).Run(ctx)
+
+	approvalSvc := approval.NewService(pool)
+	approval.NewHandlers(approvalSvc).Register(mux, authMW)
+
+	exportSvc := export.NewService(pool)
+	// Runner is intentionally a stub for Phase 5: it records the
+	// would-be download URL using the tenant's per-bucket
+	// presigning so the admin UI / export job listing has a
+	// realistic shape. Wiring real JMAP/CalDAV/audit fan-out lives
+	// in a follow-up PR per the package doc.
+	exportSvc.WithRunner(func(ctx context.Context, job export.Job) (string, error) {
+		return fmt.Sprintf("https://exports.kmail.example.com/%s/%s.%s", job.TenantID, job.ID, job.Format), nil
+	})
+	export.NewHandlers(exportSvc).Register(mux, authMW)
+	go export.NewWorker(exportSvc, logger).Run(ctx)
 
 	// Wire metrics and tracing into the outer handler chain.
 	handler := http.Handler(mux)

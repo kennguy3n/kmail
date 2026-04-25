@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"context"
 	"net/http"
 	"strconv"
 	"sync"
@@ -9,6 +10,13 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
+
+// SLORecorder is the slice of `monitoring.SLOTracker` the metrics
+// middleware needs. Defining it locally avoids an import cycle and
+// lets tests stub the tracker without standing up Valkey.
+type SLORecorder interface {
+	RecordRequest(ctx context.Context, tenantID string, success bool, latencyMs int64)
+}
 
 // Metrics wires the Prometheus collectors for the BFF. Collectors
 // are registered with a dedicated registry so tests can construct
@@ -22,6 +30,17 @@ type Metrics struct {
 	JMAPProxyDuration   prometheus.Histogram
 	ActiveTenants       prometheus.Gauge
 	SeatsTotal          *prometheus.GaugeVec
+
+	slo SLORecorder
+}
+
+// WithSLO wires an SLO tracker into the metrics middleware. Every
+// completed request is then mirrored to the tracker so the
+// availability dashboard / breach history endpoints have data to
+// report.
+func (m *Metrics) WithSLO(s SLORecorder) *Metrics {
+	m.slo = s
+	return m
 }
 
 // NewMetrics builds a Metrics collector set and registers it with a
@@ -106,6 +125,10 @@ func (m *Metrics) Middleware(next http.Handler) http.Handler {
 		status := strconv.Itoa(sr.status)
 		m.HTTPRequestsTotal.WithLabelValues(r.Method, path, status).Inc()
 		m.HTTPRequestDuration.WithLabelValues(r.Method, path).Observe(elapsed)
+		if m.slo != nil {
+			tenantID := TenantIDFrom(r.Context())
+			m.slo.RecordRequest(r.Context(), tenantID, sr.status < 500, time.Since(start).Milliseconds())
+		}
 	})
 }
 

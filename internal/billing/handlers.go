@@ -12,8 +12,9 @@ import (
 // Handlers exposes the Billing / Quota Service over REST under
 // `/api/v1/tenants/{id}/billing`.
 type Handlers struct {
-	svc    *Service
-	logger *log.Logger
+	svc       *Service
+	lifecycle *Lifecycle
+	logger    *log.Logger
 }
 
 // NewHandlers returns Handlers bound to the provided Service.
@@ -24,6 +25,15 @@ func NewHandlers(svc *Service, logger *log.Logger) *Handlers {
 	return &Handlers{svc: svc, logger: logger}
 }
 
+// WithLifecycle returns a copy of the Handlers wired to the given
+// lifecycle helper. Required for the proration-preview and
+// billing-history endpoints.
+func (h *Handlers) WithLifecycle(lc *Lifecycle) *Handlers {
+	cp := *h
+	cp.lifecycle = lc
+	return &cp
+}
+
 // Register installs every billing route onto the provided mux.
 func (h *Handlers) Register(mux *http.ServeMux, authMW *middleware.OIDC) {
 	mux.Handle("GET /api/v1/tenants/{id}/billing", authMW.Wrap(http.HandlerFunc(h.summary)))
@@ -31,6 +41,53 @@ func (h *Handlers) Register(mux *http.ServeMux, authMW *middleware.OIDC) {
 	mux.Handle("PATCH /api/v1/tenants/{id}/billing", authMW.Wrap(http.HandlerFunc(h.updateLimits)))
 	mux.Handle("PATCH /api/v1/tenants/{id}/billing/plan", authMW.Wrap(http.HandlerFunc(h.changePlan)))
 	mux.Handle("POST /api/v1/tenants/{id}/billing/invoice", authMW.Wrap(http.HandlerFunc(h.invoice)))
+	mux.Handle("GET /api/v1/tenants/{id}/billing/proration-preview", authMW.Wrap(http.HandlerFunc(h.prorationPreview)))
+	mux.Handle("GET /api/v1/tenants/{id}/billing/history", authMW.Wrap(http.HandlerFunc(h.history)))
+}
+
+func (h *Handlers) prorationPreview(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.PathValue("id")
+	if err := checkTenantScope(r, tenantID); err != nil {
+		writeError(w, http.StatusForbidden, err)
+		return
+	}
+	plan := r.URL.Query().Get("plan")
+	if err := ValidatePlan(plan); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if h.lifecycle == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"proration_cents": 0})
+		return
+	}
+	cents, err := h.lifecycle.ProrationPreview(r.Context(), tenantID, plan)
+	if err != nil {
+		writeError(w, statusFor(err), err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"tenant_id":       tenantID,
+		"new_plan":        plan,
+		"proration_cents": cents,
+	})
+}
+
+func (h *Handlers) history(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.PathValue("id")
+	if err := checkTenantScope(r, tenantID); err != nil {
+		writeError(w, http.StatusForbidden, err)
+		return
+	}
+	if h.lifecycle == nil {
+		writeJSON(w, http.StatusOK, []BillingHistoryEntry{})
+		return
+	}
+	out, err := h.lifecycle.ListBillingHistory(r.Context(), tenantID, 50)
+	if err != nil {
+		writeError(w, statusFor(err), err)
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // ChangePlanInput is the request body for PATCH .../billing/plan.
@@ -49,11 +106,20 @@ func (h *Handlers) changePlan(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	// Capture old plan before the mutation so the lifecycle hook
+	// can prorate. ChangePlan is idempotent on (oldPlan == newPlan)
+	// so re-reading the plan column does not race the UPDATE.
+	prev, _ := h.svc.Summary(r.Context(), tenantID)
 	sum, err := h.svc.ChangePlan(r.Context(), tenantID, in.Plan)
 	if err != nil {
 		h.logger.Printf("billing.changePlan: %v", err)
 		writeError(w, statusFor(err), err)
 		return
+	}
+	if h.lifecycle != nil && prev != nil && prev.Plan != "" {
+		if err := h.lifecycle.OnPlanChanged(r.Context(), tenantID, prev.Plan, in.Plan); err != nil {
+			h.logger.Printf("billing.lifecycle.OnPlanChanged: %v", err)
+		}
 	}
 	writeJSON(w, http.StatusOK, sum)
 }
