@@ -163,6 +163,17 @@ func (s *ShardService) UpdateShard(ctx context.Context, shardID string, in Shard
 	if err != nil {
 		return nil, fmt.Errorf("update shard: %w", err)
 	}
+	// stalwart_url may have just changed; the per-tenant URL cache
+	// in GetTenantShard has no TTL, so flush every tenant on this
+	// shard. Worst case: each tenant pays one extra DB lookup on
+	// the next JMAP request.
+	tenants, terr := s.ListTenantsOnShard(ctx, shardID)
+	if terr != nil {
+		return nil, fmt.Errorf("update shard: refresh cache: %w", terr)
+	}
+	for _, tid := range tenants {
+		s.invalidate(tid)
+	}
 	return s.GetShard(ctx, shardID)
 }
 

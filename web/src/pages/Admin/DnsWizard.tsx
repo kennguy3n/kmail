@@ -2,7 +2,6 @@ import { useEffect, useState } from "react";
 
 import {
   getDnsWizardStatus,
-  verifyDomain,
   listDomains,
   type DnsWizardStatus,
   type DnsWizardStep,
@@ -56,8 +55,10 @@ export default function DnsWizard() {
   const runVerify = async () => {
     if (!selectedTenantId || !selectedDomainId) return;
     setVerifying(true);
+    // reload() -> getDnsWizardStatus() already POSTs /verify
+    // internally (Promise.all with getDomainRecords), so we just
+    // call reload() once instead of double-firing the verifier.
     try {
-      await verifyDomain(selectedTenantId, selectedDomainId);
       await reload();
     } catch (e) {
       setError(String(e));

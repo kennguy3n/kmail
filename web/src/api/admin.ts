@@ -677,24 +677,27 @@ export async function getMigrationJob(
 }
 
 export async function pauseMigrationJob(tenantId: string, jobId: string): Promise<void> {
-  await fetch(`${ADMIN_API_BASE}/migrations/${encodeURIComponent(jobId)}/pause`, {
-    method: "POST",
-    headers: adminAuthHeaders(tenantId),
-  });
+  await requestJSON<void>(
+    `${ADMIN_API_BASE}/migrations/${encodeURIComponent(jobId)}/pause`,
+    { method: "POST", headers: adminAuthHeaders(tenantId) },
+    { expectJson: false },
+  );
 }
 
 export async function resumeMigrationJob(tenantId: string, jobId: string): Promise<void> {
-  await fetch(`${ADMIN_API_BASE}/migrations/${encodeURIComponent(jobId)}/resume`, {
-    method: "POST",
-    headers: adminAuthHeaders(tenantId),
-  });
+  await requestJSON<void>(
+    `${ADMIN_API_BASE}/migrations/${encodeURIComponent(jobId)}/resume`,
+    { method: "POST", headers: adminAuthHeaders(tenantId) },
+    { expectJson: false },
+  );
 }
 
 export async function cancelMigrationJob(tenantId: string, jobId: string): Promise<void> {
-  await fetch(`${ADMIN_API_BASE}/migrations/${encodeURIComponent(jobId)}`, {
-    method: "DELETE",
-    headers: adminAuthHeaders(tenantId),
-  });
+  await requestJSON<void>(
+    `${ADMIN_API_BASE}/migrations/${encodeURIComponent(jobId)}`,
+    { method: "DELETE", headers: adminAuthHeaders(tenantId) },
+    { expectJson: false },
+  );
 }
 
 // ---------------------------------------------------------------

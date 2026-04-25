@@ -350,6 +350,10 @@ func (h *Handlers) ipReputation(w http.ResponseWriter, r *http.Request) {
 		}
 		out = append(out, m)
 	}
+	if err := rows.Err(); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"ips": out})
 }
 

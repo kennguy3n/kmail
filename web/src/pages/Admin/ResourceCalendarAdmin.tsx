@@ -70,7 +70,12 @@ export default function ResourceCalendarAdmin() {
                   type="button"
                   onClick={() =>
                     setBooking({
-                      id: r.id,
+                      // BookResource hits CalDAV via calendarPath()
+                      // and needs the collection slug, not the DB
+                      // UUID. Fall back to id when caldav_id is empty
+                      // (e.g. fixtures created before the column
+                      // existed).
+                      id: r.caldav_id || r.id,
                       start: new Date().toISOString(),
                       end: new Date(Date.now() + 3600_000).toISOString(),
                       subject: `Booking ${r.name}`,
