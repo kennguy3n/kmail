@@ -29,6 +29,10 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5"
+
+	"github.com/kennguy3n/kmail/internal/middleware"
 )
 
 // stripeReplayWindow is the maximum age the Stripe-Signature
@@ -138,11 +142,16 @@ func (h *WebhookHandler) markActive(r *http.Request, ev stripeEvent) error {
 	if pool == nil {
 		return nil
 	}
-	_, err := pool.Exec(r.Context(), `
-		UPDATE billing_subscriptions SET status = 'active'
-		WHERE tenant_id = $1::uuid
-	`, tenantID)
-	return err
+	return pgx.BeginFunc(r.Context(), pool, func(tx pgx.Tx) error {
+		if err := middleware.SetTenantGUC(r.Context(), tx, tenantID); err != nil {
+			return err
+		}
+		_, err := tx.Exec(r.Context(), `
+			UPDATE billing_subscriptions SET status = 'active'
+			WHERE tenant_id = $1::uuid
+		`, tenantID)
+		return err
+	})
 }
 
 func (h *WebhookHandler) markPastDue(r *http.Request, ev stripeEvent) error {
@@ -154,11 +163,16 @@ func (h *WebhookHandler) markPastDue(r *http.Request, ev stripeEvent) error {
 	if pool == nil {
 		return nil
 	}
-	_, err := pool.Exec(r.Context(), `
-		UPDATE billing_subscriptions SET status = 'past_due'
-		WHERE tenant_id = $1::uuid
-	`, tenantID)
-	return err
+	return pgx.BeginFunc(r.Context(), pool, func(tx pgx.Tx) error {
+		if err := middleware.SetTenantGUC(r.Context(), tx, tenantID); err != nil {
+			return err
+		}
+		_, err := tx.Exec(r.Context(), `
+			UPDATE billing_subscriptions SET status = 'past_due'
+			WHERE tenant_id = $1::uuid
+		`, tenantID)
+		return err
+	})
 }
 
 type subscriptionObject struct {
@@ -192,16 +206,23 @@ func (h *WebhookHandler) applySubscriptionUpdate(r *http.Request, ev stripeEvent
 	dbStatus := mapStripeStatus(status)
 	periodStart := time.Unix(sub.CurrentPeriodStart, 0).UTC()
 	periodEnd := time.Unix(sub.CurrentPeriodEnd, 0).UTC()
-	_, err := pool.Exec(r.Context(), `
-		UPDATE billing_subscriptions
-		SET status = $2,
-		    stripe_subscription_id = $3,
-		    current_period_start = $4,
-		    current_period_end = $5
-		WHERE tenant_id = $1::uuid
-	`, tenantID, dbStatus, sub.ID, periodStart, periodEnd)
-	return err
+	return pgx.BeginFunc(r.Context(), pool, func(tx pgx.Tx) error {
+		if err := middleware.SetTenantGUC(r.Context(), tx, tenantID); err != nil {
+			return err
+		}
+		_, err := tx.Exec(r.Context(), `
+			UPDATE billing_subscriptions
+			SET status = $2,
+			    stripe_subscription_id = $3,
+			    current_period_start = $4,
+			    current_period_end = $5
+			WHERE tenant_id = $1::uuid
+		`, tenantID, dbStatus, sub.ID, periodStart, periodEnd)
+		return err
+	})
 }
+
+
 
 // mapStripeStatus translates the wider Stripe subscription status
 // vocabulary to the three-value enum the `billing_subscriptions`

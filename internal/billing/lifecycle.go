@@ -27,6 +27,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/kennguy3n/kmail/internal/middleware"
 )
 
 // Lifecycle bundles the tenant-lifecycle transitions the Tenant
@@ -187,18 +189,23 @@ func (l *Lifecycle) GetSubscription(ctx context.Context, tenantID string) (*Subs
 		return nil, ErrNotFound
 	}
 	var sub Subscription
-	err := l.svc.cfg.Pool.QueryRow(ctx, `
-		SELECT tenant_id::text, plan, status,
-		       COALESCE(stripe_subscription_id, ''),
-		       current_period_start, current_period_end,
-		       created_at, updated_at
-		FROM billing_subscriptions
-		WHERE tenant_id = $1::uuid
-	`, tenantID).Scan(
-		&sub.TenantID, &sub.Plan, &sub.Status, &sub.StripeSubscriptionID,
-		&sub.CurrentPeriodStart, &sub.CurrentPeriodEnd,
-		&sub.CreatedAt, &sub.UpdatedAt,
-	)
+	err := pgx.BeginFunc(ctx, l.svc.cfg.Pool, func(tx pgx.Tx) error {
+		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `
+			SELECT tenant_id::text, plan, status,
+			       COALESCE(stripe_subscription_id, ''),
+			       current_period_start, current_period_end,
+			       created_at, updated_at
+			FROM billing_subscriptions
+			WHERE tenant_id = $1::uuid
+		`, tenantID).Scan(
+			&sub.TenantID, &sub.Plan, &sub.Status, &sub.StripeSubscriptionID,
+			&sub.CurrentPeriodStart, &sub.CurrentPeriodEnd,
+			&sub.CreatedAt, &sub.UpdatedAt,
+		)
+	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -218,27 +225,36 @@ func (l *Lifecycle) ListBillingHistory(ctx context.Context, tenantID string, lim
 	if limit <= 0 || limit > 200 {
 		limit = 50
 	}
-	rows, err := l.svc.cfg.Pool.Query(ctx, `
-		SELECT id::text, event_type, COALESCE(amount_cents, 0),
-		       COALESCE(seat_count, 0), COALESCE(metadata, '{}'::jsonb)::text, created_at
-		FROM billing_events
-		WHERE tenant_id = $1::uuid
-		ORDER BY created_at DESC
-		LIMIT $2
-	`, tenantID, limit)
+	var out []BillingHistoryEntry
+	err := pgx.BeginFunc(ctx, l.svc.cfg.Pool, func(tx pgx.Tx) error {
+		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
+			return err
+		}
+		rows, err := tx.Query(ctx, `
+			SELECT id::text, event_type, COALESCE(amount_cents, 0),
+			       COALESCE(seat_count, 0), COALESCE(metadata, '{}'::jsonb)::text, created_at
+			FROM billing_events
+			WHERE tenant_id = $1::uuid
+			ORDER BY created_at DESC
+			LIMIT $2
+		`, tenantID, limit)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var e BillingHistoryEntry
+			if err := rows.Scan(&e.ID, &e.EventType, &e.AmountCents, &e.SeatCount, &e.Metadata, &e.CreatedAt); err != nil {
+				return err
+			}
+			out = append(out, e)
+		}
+		return rows.Err()
+	})
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var out []BillingHistoryEntry
-	for rows.Next() {
-		var e BillingHistoryEntry
-		if err := rows.Scan(&e.ID, &e.EventType, &e.AmountCents, &e.SeatCount, &e.Metadata, &e.CreatedAt); err != nil {
-			return nil, err
-		}
-		out = append(out, e)
-	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // BillingHistoryEntry is one row of `billing_events` flattened for
@@ -261,31 +277,41 @@ func (l *Lifecycle) upsertSubscription(ctx context.Context, tenantID, plan strin
 	if stripeID != "" {
 		stripe = stripeID
 	}
-	_, err := l.svc.cfg.Pool.Exec(ctx, `
-		INSERT INTO billing_subscriptions (
-			tenant_id, plan, status, stripe_subscription_id,
-			current_period_start, current_period_end
-		) VALUES ($1::uuid, $2, $3, $4, $5, $6)
-		ON CONFLICT (tenant_id) DO UPDATE
-		SET plan = EXCLUDED.plan,
-		    status = EXCLUDED.status,
-		    stripe_subscription_id = COALESCE(EXCLUDED.stripe_subscription_id, billing_subscriptions.stripe_subscription_id),
-		    current_period_start = EXCLUDED.current_period_start,
-		    current_period_end = EXCLUDED.current_period_end
-	`, tenantID, plan, string(status), stripe, periodStart, periodEnd)
-	return err
+	return pgx.BeginFunc(ctx, l.svc.cfg.Pool, func(tx pgx.Tx) error {
+		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `
+			INSERT INTO billing_subscriptions (
+				tenant_id, plan, status, stripe_subscription_id,
+				current_period_start, current_period_end
+			) VALUES ($1::uuid, $2, $3, $4, $5, $6)
+			ON CONFLICT (tenant_id) DO UPDATE
+			SET plan = EXCLUDED.plan,
+			    status = EXCLUDED.status,
+			    stripe_subscription_id = COALESCE(EXCLUDED.stripe_subscription_id, billing_subscriptions.stripe_subscription_id),
+			    current_period_start = EXCLUDED.current_period_start,
+			    current_period_end = EXCLUDED.current_period_end
+		`, tenantID, plan, string(status), stripe, periodStart, periodEnd)
+		return err
+	})
 }
 
 func (l *Lifecycle) markSubscriptionCancelled(ctx context.Context, tenantID string) error {
 	if l.svc.cfg.Pool == nil {
 		return nil
 	}
-	_, err := l.svc.cfg.Pool.Exec(ctx, `
-		UPDATE billing_subscriptions
-		SET status = $2
-		WHERE tenant_id = $1::uuid
-	`, tenantID, string(SubscriptionCancelled))
-	return err
+	return pgx.BeginFunc(ctx, l.svc.cfg.Pool, func(tx pgx.Tx) error {
+		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `
+			UPDATE billing_subscriptions
+			SET status = $2
+			WHERE tenant_id = $1::uuid
+		`, tenantID, string(SubscriptionCancelled))
+		return err
+	})
 }
 
 func (l *Lifecycle) recordEvent(ctx context.Context, tenantID, eventType string, metadata map[string]any, amountCents int64) error {
@@ -296,11 +322,16 @@ func (l *Lifecycle) recordEvent(ctx context.Context, tenantID, eventType string,
 	if err != nil {
 		return err
 	}
-	_, err = l.svc.cfg.Pool.Exec(ctx, `
-		INSERT INTO billing_events (tenant_id, event_type, metadata, amount_cents)
-		VALUES ($1::uuid, $2, $3::jsonb, $4)
-	`, tenantID, eventType, string(body), amountCents)
-	return err
+	return pgx.BeginFunc(ctx, l.svc.cfg.Pool, func(tx pgx.Tx) error {
+		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `
+			INSERT INTO billing_events (tenant_id, event_type, metadata, amount_cents)
+			VALUES ($1::uuid, $2, $3::jsonb, $4)
+		`, tenantID, eventType, string(body), amountCents)
+		return err
+	})
 }
 
 // computeProration returns prorated cents for changing from
