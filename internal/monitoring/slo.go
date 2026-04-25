@@ -29,8 +29,22 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// DefaultTarget is the platform availability SLO (99.9%).
-const DefaultTarget = 0.999
+// DefaultTarget is the platform availability SLO. Phase 5 raises
+// the target from 99.9% to 99.95% — the historical 99.9% value is
+// kept as `LegacyTarget` for environments still tracking against
+// the original Phase 4 baseline.
+const DefaultTarget = 0.9995
+
+// LegacyTarget is the original Phase 4 99.9% SLO. Kept for
+// dashboards and tests that reference the pre-Phase-5 baseline.
+const LegacyTarget = 0.999
+
+// HighAvailabilityTarget is the explicit Phase 5 99.95% target.
+// Equal to DefaultTarget today; declared as a constant so call
+// sites can document intent ("require HA, not just default") and
+// so a future Phase 6 bump can keep DefaultTarget moving without
+// reclassifying historical Phase 5 work.
+const HighAvailabilityTarget = 0.9995
 
 // SLOTracker is the in-process recorder + Valkey reader.
 type SLOTracker struct {

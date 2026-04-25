@@ -1,4 +1,4 @@
-.PHONY: build test lint fmt vet tidy docker-build clean help migrate bench
+.PHONY: build test lint fmt vet tidy docker-build clean help migrate bench e2e
 
 # ---------------------------------------------------------------
 # KMail Go control plane — developer Makefile.
@@ -24,6 +24,7 @@ help:
 	@echo "  tidy           Run go mod tidy"
 	@echo "  migrate        Apply migrations/*.sql to \$$DATABASE_URL (idempotent)"
 	@echo "  docker-build   Build the multi-stage Docker image"
+	@echo "  e2e            Run the scripts/test-e2e.sh smoke harness"
 	@echo "  clean          Remove built binaries"
 
 build:
@@ -63,3 +64,9 @@ bench:
 	$(GO) run ./scripts/bench/bench-jmap.go --iterations $(BENCH_ITER)
 	./scripts/bench/bench-smtp.sh $(BENCH_SMTP_N)
 	./scripts/bench/bench-caldav.sh $(BENCH_CALDAV_N)
+
+# e2e runs scripts/test-e2e.sh against the running compose stack.
+# Override KMAIL_API_URL to point at a remote BFF.
+KMAIL_API_URL ?= http://localhost:8080
+e2e:
+	KMAIL_API_URL=$(KMAIL_API_URL) ./scripts/test-e2e.sh

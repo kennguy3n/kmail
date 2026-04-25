@@ -26,7 +26,9 @@ import (
 	"github.com/kennguy3n/kmail/internal/billing"
 	"github.com/kennguy3n/kmail/internal/calendarbridge"
 	"github.com/kennguy3n/kmail/internal/chatbridge"
+	"github.com/kennguy3n/kmail/internal/cmk"
 	"github.com/kennguy3n/kmail/internal/config"
+	"github.com/kennguy3n/kmail/internal/confidentialsend"
 	"github.com/kennguy3n/kmail/internal/deliverability"
 	"github.com/kennguy3n/kmail/internal/dns"
 	"github.com/kennguy3n/kmail/internal/export"
@@ -38,6 +40,7 @@ import (
 	"github.com/kennguy3n/kmail/internal/retention"
 	"github.com/kennguy3n/kmail/internal/sharedinbox"
 	"github.com/kennguy3n/kmail/internal/tenant"
+	"github.com/kennguy3n/kmail/internal/vault"
 )
 
 func main() {
@@ -274,7 +277,17 @@ func main() {
 	// for the admin dashboard / breach history endpoints.
 	sloTracker := monitoring.NewSLOTracker(valkeyClient)
 	metrics = metrics.WithSLO(sloTracker)
-	monitoring.NewHandlers(sloTracker, logger).Register(mux, authMW)
+	// Phase 5: multi-region SLO aggregator targets the 99.95%
+	// availability roll-up across BFF instances. `KMAIL_SLO_REGIONS`
+	// is a comma-separated list of region tokens (e.g. "us-east-1,
+	// eu-west-1"); empty falls back to the single-region rollup.
+	sloAggregator := monitoring.NewMultiRegionAggregator(
+		valkeyClient,
+		middleware.SplitOrigins(os.Getenv("KMAIL_SLO_REGIONS")),
+	)
+	monitoring.NewHandlers(sloTracker, logger).
+		WithMultiRegion(sloAggregator).
+		Register(mux, authMW)
 	tracingShutdown := func(context.Context) error { return nil }
 	if cfg.Observability.TracingEnabled {
 		sh, err := middleware.InitTracing(ctx, "kmail-api", cfg.Observability.OTLPEndpoint)
@@ -334,6 +347,26 @@ func main() {
 	approvalSvc := approval.NewService(pool)
 	approval.NewHandlers(approvalSvc).Register(mux, authMW)
 
+	// Phase 5 — Zero-Access Vault folders.
+	vaultSvc := vault.NewVaultService(pool)
+	vault.NewVaultHandlers(vaultSvc, logger).Register(mux, authMW)
+
+	// Phase 5 — Protected folders + sharing.
+	protectedSvc := vault.NewProtectedFolderService(pool)
+	vault.NewProtectedFolderHandlers(protectedSvc, logger).Register(mux, authMW)
+
+	// Phase 5 — Customer-managed keys (privacy plan only; the
+	// handler enforces the plan gate via a per-request lookup).
+	cmkSvc := cmk.NewCMKService(pool)
+	cmk.NewHandlers(cmkSvc, pool, logger).Register(mux, authMW)
+
+	// Phase 5 — Confidential Send portal. The public portal route
+	// (`GET /api/v1/secure/{token}`) is registered *without* the
+	// auth middleware by the handler; tenant-scoped admin routes
+	// stay behind authMW.
+	confidentialSendSvc := confidentialsend.NewService(pool)
+	confidentialsend.NewHandlers(confidentialSendSvc, valkeyClient, logger).Register(mux, authMW)
+
 	exportSvc := export.NewService(pool)
 	// Runner is intentionally a stub for Phase 5: it records the
 	// would-be download URL using the tenant's per-bucket
@@ -354,10 +387,22 @@ func main() {
 	if cfg.Observability.MetricsEnabled {
 		handler = metrics.Middleware(handler)
 	}
+	handler = middleware.RequestLogger(logger, cfg.Observability.LogFormat)(handler)
+
+	// Outermost wrapper: security headers + CORS. The CORS allow
+	// list comes from `KMAIL_CORS_ORIGINS` (comma-separated). The
+	// CSP `app-src` allows the same origins so the React bundle
+	// can load. Wrapped last so every response — including
+	// /metrics, /healthz, and the confidential-send public portal
+	// — picks up the headers.
+	securityMW := middleware.NewSecurity(middleware.SecurityConfig{
+		WebOrigins: middleware.SplitOrigins(os.Getenv("KMAIL_CORS_ORIGINS")),
+	})
+	handler = securityMW.Wrap(handler)
 
 	srv := &http.Server{
 		Addr:              cfg.HTTP.Addr,
-		Handler:           middleware.RequestLogger(logger, cfg.Observability.LogFormat)(handler),
+		Handler:           handler,
 		ReadHeaderTimeout: cfg.HTTP.ReadHeaderTimeout,
 	}
 

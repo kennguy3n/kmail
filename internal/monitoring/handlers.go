@@ -11,8 +11,9 @@ import (
 
 // Handlers exposes the SLO tracker over `/api/v1/admin/slo`.
 type Handlers struct {
-	tracker *SLOTracker
-	logger  *log.Logger
+	tracker    *SLOTracker
+	aggregator *MultiRegionAggregator
+	logger     *log.Logger
 }
 
 // NewHandlers returns Handlers bound to the given tracker.
@@ -23,10 +24,18 @@ func NewHandlers(t *SLOTracker, logger *log.Logger) *Handlers {
 	return &Handlers{tracker: t, logger: logger}
 }
 
+// WithMultiRegion attaches a multi-region aggregator so the
+// `/api/v1/admin/slo/regions` route can return per-region rollups.
+func (h *Handlers) WithMultiRegion(a *MultiRegionAggregator) *Handlers {
+	h.aggregator = a
+	return h
+}
+
 // Register installs the admin SLO routes onto the provided mux.
 func (h *Handlers) Register(mux *http.ServeMux, authMW *middleware.OIDC) {
 	mux.Handle("GET /api/v1/admin/slo", authMW.Wrap(http.HandlerFunc(h.platform)))
 	mux.Handle("GET /api/v1/admin/slo/breaches", authMW.Wrap(http.HandlerFunc(h.breaches)))
+	mux.Handle("GET /api/v1/admin/slo/regions", authMW.Wrap(http.HandlerFunc(h.regions)))
 	mux.Handle("GET /api/v1/admin/slo/{tenantId}", authMW.Wrap(http.HandlerFunc(h.tenant)))
 }
 
@@ -53,6 +62,22 @@ func (h *Handlers) respond(w http.ResponseWriter, r *http.Request, tenantID stri
 		"availability": avail,
 		"latency":      lat,
 	})
+}
+
+func (h *Handlers) regions(w http.ResponseWriter, r *http.Request) {
+	if h.aggregator == nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"target":  DefaultTarget,
+			"regions": []RegionAvailability{},
+		})
+		return
+	}
+	out, err := h.aggregator.Aggregate(r.Context(), 24*time.Hour)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (h *Handlers) breaches(w http.ResponseWriter, r *http.Request) {

@@ -5,6 +5,9 @@ import Inbox from "./pages/Mail/Inbox";
 import Compose from "./pages/Mail/Compose";
 import MessageView from "./pages/Mail/MessageView";
 import SharedInboxView from "./pages/Mail/SharedInboxView";
+import VaultView from "./pages/Mail/VaultView";
+import ProtectedFolderView from "./pages/Mail/ProtectedFolderView";
+import SecurePortal from "./pages/Mail/SecurePortal";
 import CalendarView from "./pages/Calendar/CalendarView";
 import EventCreate from "./pages/Calendar/EventCreate";
 import SharedCalendars from "./pages/Calendar/SharedCalendars";
@@ -26,6 +29,7 @@ import StoragePlacementAdmin from "./pages/Admin/StoragePlacementAdmin";
 import RetentionAdmin from "./pages/Admin/RetentionAdmin";
 import ApprovalAdmin from "./pages/Admin/ApprovalAdmin";
 import ExportAdmin from "./pages/Admin/ExportAdmin";
+import CmkAdmin from "./pages/Admin/CmkAdmin";
 
 /**
  * App is the KMail React entrypoint.
@@ -38,12 +42,19 @@ import ExportAdmin from "./pages/Admin/ExportAdmin";
 export default function App() {
   return (
     <Routes>
+      {/* Confidential Send portal lives outside the Layout shell —
+          the recipient is unauthenticated and should not see the
+          KMail nav or admin chrome. */}
+      <Route path="secure/:token" element={<SecurePortal />} />
+
       <Route element={<Layout />}>
         <Route index element={<Navigate to="/mail" replace />} />
 
         <Route path="mail" element={<Inbox />} />
         <Route path="mail/compose" element={<Compose />} />
         <Route path="mail/shared" element={<SharedInboxView />} />
+        <Route path="mail/vault" element={<VaultView />} />
+        <Route path="mail/protected-folders" element={<ProtectedFolderView />} />
         <Route path="mail/:mailboxId/:emailId" element={<MessageView />} />
 
         <Route path="calendar" element={<CalendarView />} />
@@ -70,6 +81,7 @@ export default function App() {
         <Route path="admin/retention" element={<RetentionAdmin />} />
         <Route path="admin/approvals" element={<ApprovalAdmin />} />
         <Route path="admin/exports" element={<ExportAdmin />} />
+        <Route path="admin/cmk" element={<CmkAdmin />} />
 
         <Route path="*" element={<Navigate to="/mail" replace />} />
       </Route>

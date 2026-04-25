@@ -13,6 +13,8 @@ import {
   uploadLargeAttachment,
   type AttachmentLinkResponse,
 } from "../../api/jmap";
+import { createSecureMessage } from "../../api/confidentialSend";
+import { useTenantSelection } from "../Admin/useTenantSelection";
 import type {
   EmailAddress,
   EmailDraft,
@@ -20,6 +22,22 @@ import type {
   Mailbox,
   PrivacyMode,
 } from "../../types";
+
+/** Compose-side options that only apply when privacyMode is "confidential-send". */
+type ConfidentialOptions = {
+  expirySeconds: number;
+  passwordEnabled: boolean;
+  password: string;
+  /** -1 represents "unlimited"; the BFF clamps via `max_views`. */
+  maxViews: number;
+};
+
+const DEFAULT_CONFIDENTIAL: ConfidentialOptions = {
+  expirySeconds: 24 * 60 * 60,
+  passwordEnabled: false,
+  password: "",
+  maxViews: 1,
+};
 
 /**
  * Compose is the message composition view.
@@ -53,6 +71,14 @@ export default function Compose() {
   const [subject, setSubject] = useState(seed?.subject ?? "");
   const [body, setBody] = useState(initialBody(seed));
   const [privacyMode, setPrivacyMode] = useState<PrivacyMode>("standard");
+  const [confidential, setConfidential] = useState<ConfidentialOptions>(
+    DEFAULT_CONFIDENTIAL,
+  );
+  const [secureLink, setSecureLink] = useState<string | null>(null);
+  const [linkCopied, setLinkCopied] = useState(false);
+  // Confidential-send portal needs a tenant id; reuse the same
+  // hook the admin pages use so the selection survives reloads.
+  const { selectedTenantId } = useTenantSelection();
   const [selectedIdentityId, setSelectedIdentityId] = useState<string>("");
   const [isSending, setSending] = useState(false);
   const [isSavingDraft, setSavingDraft] = useState(false);
@@ -168,8 +194,36 @@ export default function Compose() {
       // destroy that stale draft in the same Email/set call as the
       // submission; otherwise Save-then-Send would leave an
       // orphaned draft in the Drafts mailbox.
-      await jmapClient.sendEmail(draft, savedDraftId);
+      const sentId = await jmapClient.sendEmail(draft, savedDraftId);
       setSavedDraftId(null);
+
+      if (privacyMode === "confidential-send") {
+        // For Confidential Send we *additionally* mint a one-time
+        // portal link. The encrypted blob ref is the JMAP message
+        // id — the actual ciphertext envelope still lives in
+        // zk-object-fabric (see do-not-do: do not reimplement
+        // object storage / encryption envelopes here).
+        if (!selectedTenantId) {
+          setSuccessMessage(
+            "Message sent, but Confidential Send requires a tenant selection (see Admin).",
+          );
+          setSending(false);
+          return;
+        }
+        const link = await createSecureMessage({
+          tenantId: selectedTenantId,
+          senderId: identity?.email ?? "unknown",
+          encryptedBlobRef: sentId,
+          password: confidential.passwordEnabled ? confidential.password : undefined,
+          expiresInSeconds: confidential.expirySeconds,
+          maxViews: confidential.maxViews <= 0 ? 0 : confidential.maxViews,
+        });
+        setSecureLink(`${window.location.origin}/secure/${link.link_token}`);
+        setSuccessMessage("Confidential message sent. Share the secure link with the recipient.");
+        setSending(false);
+        return;
+      }
+
       setSuccessMessage("Message sent.");
       // Give the user a brief moment to see the success confirmation
       // before we navigate them back to the inbox. We deliberately
@@ -185,6 +239,17 @@ export default function Compose() {
     } catch (err: unknown) {
       setError(errorMessage(err));
       setSending(false);
+    }
+  };
+
+  const onCopyLink = async () => {
+    if (!secureLink) return;
+    try {
+      await navigator.clipboard.writeText(secureLink);
+      setLinkCopied(true);
+      setTimeout(() => setLinkCopied(false), 1500);
+    } catch {
+      // ignore clipboard errors — the link is still rendered.
     }
   };
 
@@ -329,6 +394,86 @@ export default function Compose() {
             <option value="zero-access-vault">Zero-Access Vault</option>
           </select>
         </div>
+        {privacyMode === "confidential-send" && (
+          <div style={styles.row}>
+            <label style={styles.label}>Secure portal</label>
+            <div style={{ display: "grid", gap: "0.5rem" }}>
+              <label>
+                Expires in&nbsp;
+                <select
+                  value={confidential.expirySeconds}
+                  onChange={(e) =>
+                    setConfidential((c) => ({
+                      ...c,
+                      expirySeconds: Number(e.target.value),
+                    }))
+                  }
+                >
+                  <option value={60 * 60}>1 hour</option>
+                  <option value={24 * 60 * 60}>24 hours</option>
+                  <option value={7 * 24 * 60 * 60}>7 days</option>
+                  <option value={30 * 24 * 60 * 60}>30 days</option>
+                </select>
+              </label>
+              <label>
+                <input
+                  type="checkbox"
+                  checked={confidential.passwordEnabled}
+                  onChange={(e) =>
+                    setConfidential((c) => ({
+                      ...c,
+                      passwordEnabled: e.target.checked,
+                    }))
+                  }
+                />
+                &nbsp;Require password
+              </label>
+              {confidential.passwordEnabled && (
+                <input
+                  type="password"
+                  placeholder="Recipient password"
+                  value={confidential.password}
+                  onChange={(e) =>
+                    setConfidential((c) => ({ ...c, password: e.target.value }))
+                  }
+                />
+              )}
+              <label>
+                Max views&nbsp;
+                <select
+                  value={confidential.maxViews}
+                  onChange={(e) =>
+                    setConfidential((c) => ({
+                      ...c,
+                      maxViews: Number(e.target.value),
+                    }))
+                  }
+                >
+                  <option value={1}>1</option>
+                  <option value={3}>3</option>
+                  <option value={-1}>Unlimited</option>
+                </select>
+              </label>
+            </div>
+          </div>
+        )}
+        {secureLink && (
+          <div style={styles.row}>
+            <label style={styles.label}>Secure link</label>
+            <div style={{ display: "grid", gap: "0.25rem" }}>
+              <code style={{ wordBreak: "break-all" }}>{secureLink}</code>
+              <div>
+                <button type="button" onClick={onCopyLink}>
+                  {linkCopied ? "Copied!" : "Copy link"}
+                </button>
+              </div>
+              <p style={{ margin: 0, color: "#475569", fontSize: "0.85rem" }}>
+                Share this link with the recipient. The portal enforces
+                expiry, password, and max-views automatically.
+              </p>
+            </div>
+          </div>
+        )}
         <div style={styles.row}>
           <label style={styles.label}>Attachments</label>
           <div>

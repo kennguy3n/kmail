@@ -1184,3 +1184,330 @@ export async function createExport(
     },
   );
 }
+
+// =====================================================================
+// Phase 5 — Zero-Access Vault folders
+// =====================================================================
+
+export interface VaultFolder {
+  id: string;
+  tenant_id: string;
+  user_id: string;
+  folder_name: string;
+  encryption_mode: "StrictZK";
+  /** Wrapped DEK (base64url) — server stores opaque bytes only. */
+  wrapped_dek?: string;
+  key_algorithm: string;
+  /** Wrapping nonce (base64url). */
+  nonce?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export async function listVaultFolders(
+  tenantId: string,
+  userId?: string,
+): Promise<VaultFolder[]> {
+  const url = userId
+    ? `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/vault/folders?user_id=${encodeURIComponent(userId)}`
+    : `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/vault/folders`;
+  return requestJSON<VaultFolder[]>(url, {
+    headers: adminAuthHeaders(tenantId, { Accept: "application/json" }),
+  });
+}
+
+export async function createVaultFolder(
+  tenantId: string,
+  userId: string,
+  folderName: string,
+): Promise<VaultFolder> {
+  return requestJSON<VaultFolder>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/vault/folders`,
+    {
+      method: "POST",
+      headers: adminAuthHeaders(tenantId, {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      }),
+      body: JSON.stringify({
+        user_id: userId,
+        folder_name: folderName,
+        encryption_mode: "StrictZK",
+      }),
+    },
+  );
+}
+
+export async function deleteVaultFolder(
+  tenantId: string,
+  folderId: string,
+): Promise<void> {
+  await fetch(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/vault/folders/${encodeURIComponent(folderId)}`,
+    { method: "DELETE", headers: adminAuthHeaders(tenantId) },
+  );
+}
+
+export async function setVaultFolderEncryptionMeta(
+  tenantId: string,
+  folderId: string,
+  wrappedDek: string,
+  keyAlgorithm: string,
+  nonce: string,
+): Promise<VaultFolder> {
+  return requestJSON<VaultFolder>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/vault/folders/${encodeURIComponent(folderId)}/encryption-meta`,
+    {
+      method: "PUT",
+      headers: adminAuthHeaders(tenantId, {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      }),
+      body: JSON.stringify({
+        wrapped_dek: wrappedDek,
+        key_algorithm: keyAlgorithm,
+        nonce,
+      }),
+    },
+  );
+}
+
+// =====================================================================
+// Phase 5 — Customer-managed keys (CMK)
+// =====================================================================
+
+export interface CmkKey {
+  id: string;
+  tenant_id: string;
+  key_fingerprint: string;
+  public_key_pem: string;
+  status: "active" | "deprecated" | "revoked";
+  algorithm: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export async function listCmkKeys(tenantId: string): Promise<CmkKey[]> {
+  return requestJSON<CmkKey[]>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/cmk`,
+    { headers: adminAuthHeaders(tenantId, { Accept: "application/json" }) },
+  );
+}
+
+export async function registerCmkKey(
+  tenantId: string,
+  publicKeyPem: string,
+  algorithm = "RSA-OAEP-256",
+): Promise<CmkKey> {
+  return requestJSON<CmkKey>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/cmk`,
+    {
+      method: "POST",
+      headers: adminAuthHeaders(tenantId, {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      }),
+      body: JSON.stringify({
+        public_key_pem: publicKeyPem,
+        algorithm,
+      }),
+    },
+  );
+}
+
+export async function rotateCmkKey(
+  tenantId: string,
+  keyId: string,
+  publicKeyPem: string,
+  algorithm = "RSA-OAEP-256",
+): Promise<CmkKey> {
+  return requestJSON<CmkKey>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/cmk/${encodeURIComponent(keyId)}/rotate`,
+    {
+      method: "PUT",
+      headers: adminAuthHeaders(tenantId, {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      }),
+      body: JSON.stringify({
+        public_key_pem: publicKeyPem,
+        algorithm,
+      }),
+    },
+  );
+}
+
+export async function revokeCmkKey(
+  tenantId: string,
+  keyId: string,
+): Promise<void> {
+  await fetch(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/cmk/${encodeURIComponent(keyId)}/revoke`,
+    { method: "DELETE", headers: adminAuthHeaders(tenantId) },
+  );
+}
+
+export async function getActiveCmkKey(
+  tenantId: string,
+): Promise<CmkKey | null> {
+  const out = await requestJSON<CmkKey | { key: null }>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/cmk/active`,
+    { headers: adminAuthHeaders(tenantId, { Accept: "application/json" }) },
+  );
+  if (out && "key" in out && out.key === null) return null;
+  return out as CmkKey;
+}
+
+// =====================================================================
+// Phase 5 — Protected folders
+// =====================================================================
+
+export interface ProtectedFolder {
+  id: string;
+  tenant_id: string;
+  owner_id: string;
+  folder_name: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface FolderAccess {
+  id: string;
+  tenant_id: string;
+  folder_id: string;
+  grantee_id: string;
+  permission: "read" | "read_write";
+  granted_at: string;
+}
+
+export interface FolderAccessLogEntry {
+  id: string;
+  tenant_id: string;
+  folder_id: string;
+  actor_id: string;
+  action: string;
+  created_at: string;
+}
+
+export async function listProtectedFolders(
+  tenantId: string,
+  ownerId?: string,
+): Promise<ProtectedFolder[]> {
+  const url = ownerId
+    ? `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/protected-folders?owner_id=${encodeURIComponent(ownerId)}`
+    : `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/protected-folders`;
+  return requestJSON<ProtectedFolder[]>(url, {
+    headers: adminAuthHeaders(tenantId, { Accept: "application/json" }),
+  });
+}
+
+export async function createProtectedFolder(
+  tenantId: string,
+  ownerId: string,
+  folderName: string,
+): Promise<ProtectedFolder> {
+  return requestJSON<ProtectedFolder>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/protected-folders`,
+    {
+      method: "POST",
+      headers: adminAuthHeaders(tenantId, {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      }),
+      body: JSON.stringify({ owner_id: ownerId, folder_name: folderName }),
+    },
+  );
+}
+
+export async function shareProtectedFolder(
+  tenantId: string,
+  folderId: string,
+  ownerId: string,
+  granteeId: string,
+  permission: FolderAccess["permission"],
+): Promise<FolderAccess> {
+  return requestJSON<FolderAccess>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/protected-folders/${encodeURIComponent(folderId)}/share`,
+    {
+      method: "POST",
+      headers: adminAuthHeaders(tenantId, {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      }),
+      body: JSON.stringify({
+        owner_id: ownerId,
+        grantee_id: granteeId,
+        permission,
+      }),
+    },
+  );
+}
+
+export async function unshareProtectedFolder(
+  tenantId: string,
+  folderId: string,
+  ownerId: string,
+  granteeId: string,
+): Promise<void> {
+  await fetch(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/protected-folders/${encodeURIComponent(folderId)}/unshare`,
+    {
+      method: "POST",
+      headers: adminAuthHeaders(tenantId, {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      }),
+      body: JSON.stringify({ owner_id: ownerId, grantee_id: granteeId }),
+    },
+  );
+}
+
+export async function listProtectedFolderAccess(
+  tenantId: string,
+  folderId: string,
+): Promise<FolderAccess[]> {
+  return requestJSON<FolderAccess[]>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/protected-folders/${encodeURIComponent(folderId)}/access`,
+    { headers: adminAuthHeaders(tenantId, { Accept: "application/json" }) },
+  );
+}
+
+export async function getProtectedFolderAccessLog(
+  tenantId: string,
+  folderId: string,
+): Promise<FolderAccessLogEntry[]> {
+  return requestJSON<FolderAccessLogEntry[]>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/protected-folders/${encodeURIComponent(folderId)}/access-log`,
+    { headers: adminAuthHeaders(tenantId, { Accept: "application/json" }) },
+  );
+}
+
+// =====================================================================
+// Phase 5 — Multi-region SLO rollup
+// =====================================================================
+
+export interface RegionAvailability {
+  region: string;
+  total: number;
+  successes: number;
+  failures: number;
+  availability: number;
+  target: number;
+}
+
+export interface MultiRegionResult {
+  window_seconds: number;
+  target: number;
+  regions: RegionAvailability[];
+  global_total: number;
+  global_success: number;
+  global_failures: number;
+  global_availability: number;
+}
+
+export async function getSloRegions(): Promise<MultiRegionResult> {
+  return requestJSON<MultiRegionResult>(
+    `${ADMIN_API_BASE}/admin/slo/regions`,
+    { headers: adminAuthHeaders(undefined, { Accept: "application/json" }) },
+  );
+}

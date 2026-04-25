@@ -18,6 +18,8 @@ export default function Layout() {
           <li><Link to="/mail">Mail</Link></li>
           <li><Link to="/mail/compose">Compose</Link></li>
           <li><Link to="/mail/shared">Shared inboxes</Link></li>
+          <li><Link to="/mail/vault">Zero-Access Vault</Link></li>
+          <li><Link to="/mail/protected-folders">Protected folders</Link></li>
           <li><Link to="/calendar">Calendar</Link></li>
           <li><Link to="/calendar/new">New event</Link></li>
           <li><Link to="/calendar/shared">Shared calendars</Link></li>
@@ -39,6 +41,7 @@ export default function Layout() {
           <li><Link to="/admin/retention">Retention</Link></li>
           <li><Link to="/admin/approvals">Approvals</Link></li>
           <li><Link to="/admin/exports">Exports</Link></li>
+          <li><Link to="/admin/cmk">Customer-managed keys</Link></li>
         </ul>
       </nav>
       <main className="kmail-main">
