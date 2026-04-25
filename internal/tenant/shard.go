@@ -394,7 +394,9 @@ func (s *ShardService) probe(ctx context.Context, stalwartURL string) bool {
 		return false
 	}
 	defer resp.Body.Close()
-	return resp.StatusCode >= 200 && resp.StatusCode < 500
+	// Only treat 2xx as healthy. 4xx (auth/route errors) and 5xx
+	// should drain the shard rather than keep it in rotation.
+	return resp.StatusCode >= 200 && resp.StatusCode < 300
 }
 
 // HealthWorker is the background probe loop.

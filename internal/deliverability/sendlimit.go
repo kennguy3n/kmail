@@ -131,6 +131,96 @@ func (s *SendLimitService) SetLimit(ctx context.Context, tenantID string, daily,
 	})
 }
 
+// dailyKey returns the Valkey key used for the per-tenant per-day
+// send counter.
+func dailyKey(tenantID string, day time.Time) string {
+	return fmt.Sprintf("kmail:sends:daily:%s:%s", tenantID, day.UTC().Format("20060102"))
+}
+
+// GetDailyVolume returns the persisted send count for the given UTC
+// day. Returns 0 when Valkey is unconfigured or the key has
+// expired.
+func (s *SendLimitService) GetDailyVolume(ctx context.Context, tenantID string, day time.Time) (int64, error) {
+	if s == nil || s.valkey == nil || tenantID == "" {
+		return 0, nil
+	}
+	v, err := s.valkey.Get(ctx, dailyKey(tenantID, day)).Int64()
+	if errors.Is(err, redis.Nil) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("get daily volume: %w", err)
+	}
+	return v, nil
+}
+
+// GetVolumeHistory returns up to `days` daily send counts in
+// reverse-chronological order (index 0 = today, index 1 = yesterday,
+// …). Missing keys count as 0.
+func (s *SendLimitService) GetVolumeHistory(ctx context.Context, tenantID string, days int) ([]int64, error) {
+	if days <= 0 {
+		return nil, nil
+	}
+	if s == nil || s.valkey == nil || tenantID == "" {
+		return make([]int64, days), nil
+	}
+	now := time.Now().UTC()
+	keys := make([]string, days)
+	for i := 0; i < days; i++ {
+		keys[i] = dailyKey(tenantID, now.AddDate(0, 0, -i))
+	}
+	raw, err := s.valkey.MGet(ctx, keys...).Result()
+	if err != nil {
+		return nil, fmt.Errorf("get volume history: %w", err)
+	}
+	out := make([]int64, days)
+	for i, v := range raw {
+		switch tv := v.(type) {
+		case nil:
+			out[i] = 0
+		case string:
+			n, perr := parseInt64(tv)
+			if perr != nil {
+				return nil, fmt.Errorf("get volume history: %w", perr)
+			}
+			out[i] = n
+		default:
+			return nil, fmt.Errorf("get volume history: unexpected type %T", v)
+		}
+	}
+	return out, nil
+}
+
+// AverageDailyVolume returns the mean of the last `days` daily send
+// counts (entry 0 = today is excluded so that an in-progress day
+// does not skew the baseline). Returns 0 when no history is
+// available.
+func (s *SendLimitService) AverageDailyVolume(ctx context.Context, tenantID string, days int) (float64, error) {
+	hist, err := s.GetVolumeHistory(ctx, tenantID, days+1)
+	if err != nil {
+		return 0, err
+	}
+	if len(hist) <= 1 {
+		return 0, nil
+	}
+	var sum int64
+	for _, v := range hist[1:] {
+		sum += v
+	}
+	return float64(sum) / float64(len(hist)-1), nil
+}
+
+func parseInt64(s string) (int64, error) {
+	var n int64
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return 0, fmt.Errorf("non-numeric byte %q in %q", r, s)
+		}
+		n = n*10 + int64(r-'0')
+	}
+	return n, nil
+}
+
 // CheckSendLimit increments the Valkey daily + hourly counters for
 // the tenant and returns ErrSendLimitExceeded when either is over
 // the configured cap. When Valkey is not wired the check is a
@@ -151,7 +241,9 @@ func (s *SendLimitService) CheckSendLimit(ctx context.Context, tenantID string) 
 	hourKey := fmt.Sprintf("kmail:sends:hourly:%s:%s", tenantID, now.Format("2006010215"))
 	pipe := s.valkey.TxPipeline()
 	dCmd := pipe.Incr(ctx, dayKey)
-	pipe.ExpireNX(ctx, dayKey, 25*time.Hour)
+	// Keep daily counters for 9 days so the deliverability
+	// alert + abuse signals can read a 7-day history.
+	pipe.ExpireNX(ctx, dayKey, 9*24*time.Hour)
 	hCmd := pipe.Incr(ctx, hourKey)
 	pipe.ExpireNX(ctx, hourKey, 2*time.Hour)
 	if _, err := pipe.Exec(ctx); err != nil {

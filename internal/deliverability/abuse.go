@@ -64,7 +64,8 @@ type ListAlertsOptions struct {
 // AbuseScorer computes per-tenant / per-user abuse scores and
 // persists anomalies to `abuse_alerts`.
 type AbuseScorer struct {
-	pool *pgxpool.Pool
+	pool      *pgxpool.Pool
+	sendLimit *SendLimitService
 }
 
 // ScoreTenant recomputes the tenant-level score from the
@@ -392,38 +393,37 @@ func severityForRatio(value, warn, crit float64) string {
 // caller's signal to run the migrations.
 func (a *AbuseScorer) computeTenantSignals(ctx context.Context, tenantID string) (abuseSignals, int, error) {
 	sig := abuseSignals{}
-	err := pgx.BeginFunc(ctx, a.pool, func(tx pgx.Tx) error {
+	// 24h send count + 7-day average come from the
+	// SendLimitService Valkey counters; bounce / complaint counts
+	// come from the deliverability tables. Using the send count as
+	// the denominator is what the thresholds in
+	// docs/PROPOSAL.md §9.4 are calibrated for.
+	sends24h, err := a.sendLimit.GetDailyVolume(ctx, tenantID, time.Now().UTC())
+	if err != nil {
+		return sig, 0, fmt.Errorf("compute tenant signals: %w", err)
+	}
+	avgSends, err := a.sendLimit.AverageDailyVolume(ctx, tenantID, 7)
+	if err != nil {
+		return sig, 0, fmt.Errorf("compute tenant signals: %w", err)
+	}
+	sig.SendsLast24h = int(sends24h)
+	sig.VolumeLast24h = int(sends24h)
+	sig.VolumeAverage7d = avgSends
+	if avgSends > 0 {
+		sig.VolumeSpikeRatio = float64(sends24h) / avgSends
+	}
+	err = pgx.BeginFunc(ctx, a.pool, func(tx pgx.Tx) error {
 		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
 			return err
 		}
-		// 24h hard-bounce count + 24h send approximation (we don't
-		// persist a per-tenant `sends` counter; the bounce_events
-		// row count is a reasonable lower bound).
 		if err := tx.QueryRow(ctx, `
 			SELECT
 				COUNT(*) FILTER (WHERE bounce_type = 'hard'),
-				COUNT(*) FILTER (WHERE bounce_type IN ('hard', 'soft')),
 				COUNT(*) FILTER (WHERE bounce_type = 'complaint')
 			FROM bounce_events
 			WHERE tenant_id = $1::uuid AND created_at >= now() - interval '24 hours'
-		`, tenantID).Scan(&sig.HardBouncesLast24h, &sig.VolumeLast24h, &sig.ComplaintsLast24h); err != nil {
+		`, tenantID).Scan(&sig.HardBouncesLast24h, &sig.ComplaintsLast24h); err != nil {
 			return err
-		}
-		// 7-day rolling average for the volume spike signal.
-		if err := tx.QueryRow(ctx, `
-			SELECT COALESCE(AVG(c), 0) FROM (
-				SELECT date_trunc('day', created_at) AS d, COUNT(*)::float AS c
-				FROM bounce_events
-				WHERE tenant_id = $1::uuid
-				  AND created_at >= now() - interval '7 days'
-				GROUP BY 1
-			) t
-		`, tenantID).Scan(&sig.VolumeAverage7d); err != nil {
-			return err
-		}
-		sig.SendsLast24h = sig.VolumeLast24h
-		if sig.VolumeAverage7d > 0 {
-			sig.VolumeSpikeRatio = float64(sig.VolumeLast24h) / sig.VolumeAverage7d
 		}
 		if sig.SendsLast24h > 0 {
 			sig.BounceRate = float64(sig.HardBouncesLast24h) / float64(sig.SendsLast24h)

@@ -102,8 +102,8 @@ func NewService(cfg Config) *Service {
 	}
 	s.DMARC = &DMARCService{pool: cfg.Pool}
 	s.FeedbackLoop = &FeedbackLoopService{pool: cfg.Pool}
-	s.Abuse = &AbuseScorer{pool: cfg.Pool}
-	s.Alerts = &AlertService{pool: cfg.Pool, bounce: s.Bounce}
+	s.Abuse = &AbuseScorer{pool: cfg.Pool, sendLimit: s.SendLimit}
+	s.Alerts = &AlertService{pool: cfg.Pool, bounce: s.Bounce, sendLimit: s.SendLimit}
 	return s
 }
 

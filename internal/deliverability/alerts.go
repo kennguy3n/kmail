@@ -66,9 +66,10 @@ type ListDeliverabilityAlertsOptions struct {
 // It is read from by the admin UI and by the background evaluator
 // goroutine wired up in `cmd/kmail-api/main.go`.
 type AlertService struct {
-	pool   *pgxpool.Pool
-	bounce *BounceProcessor
-	logger *log.Logger
+	pool      *pgxpool.Pool
+	bounce    *BounceProcessor
+	sendLimit *SendLimitService
+	logger    *log.Logger
 }
 
 // defaultThresholds matches the numbers called out in
@@ -325,43 +326,41 @@ func (a *AlertService) sampleMetrics(ctx context.Context, tenantID string) (map[
 	if a.pool == nil {
 		return out, nil
 	}
-	err := pgx.BeginFunc(ctx, a.pool, func(tx pgx.Tx) error {
+	// Pull the 24h send count + 7-day average from the
+	// SendLimitService Valkey counters so bounce / complaint
+	// rates use the actual send total as the denominator (the
+	// thresholds in docs/PROPOSAL.md §9.4 are calibrated for
+	// `bounces / sent`, not `bounces / bounce_events`).
+	sends24h, err := a.sendLimit.GetDailyVolume(ctx, tenantID, time.Now().UTC())
+	if err != nil {
+		return nil, fmt.Errorf("sample metrics: %w", err)
+	}
+	avgSends, err := a.sendLimit.AverageDailyVolume(ctx, tenantID, 7)
+	if err != nil {
+		return nil, fmt.Errorf("sample metrics: %w", err)
+	}
+	err = pgx.BeginFunc(ctx, a.pool, func(tx pgx.Tx) error {
 		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
 			return err
 		}
-		// bounce_rate / complaint_rate over the last 24 h using
-		// bounce_events as the denominator proxy (same approximation
-		// the abuse scorer uses).
-		var hard, soft, complaint int
+		var hard, complaint int
 		if err := tx.QueryRow(ctx, `
 			SELECT
 				COUNT(*) FILTER (WHERE bounce_type = 'hard'),
-				COUNT(*) FILTER (WHERE bounce_type IN ('hard', 'soft')),
 				COUNT(*) FILTER (WHERE bounce_type = 'complaint')
 			FROM bounce_events
 			WHERE tenant_id = $1::uuid AND created_at >= now() - interval '24 hours'
-		`, tenantID).Scan(&hard, &soft, &complaint); err != nil {
+		`, tenantID).Scan(&hard, &complaint); err != nil {
 			return err
 		}
-		if soft > 0 {
-			out[MetricBounceRate] = float64(hard) / float64(soft)
-			out[MetricComplaintRate] = float64(complaint) / float64(soft)
+		if sends24h > 0 {
+			out[MetricBounceRate] = float64(hard) / float64(sends24h)
+			out[MetricComplaintRate] = float64(complaint) / float64(sends24h)
 		}
-		// daily_volume_spike — 24h count vs. 7-day average.
-		var avg float64
-		if err := tx.QueryRow(ctx, `
-			SELECT COALESCE(AVG(c), 0) FROM (
-				SELECT date_trunc('day', created_at) AS d, COUNT(*)::float AS c
-				FROM bounce_events
-				WHERE tenant_id = $1::uuid
-				  AND created_at >= now() - interval '7 days'
-				GROUP BY 1
-			) t
-		`, tenantID).Scan(&avg); err != nil {
-			return err
-		}
-		if avg > 0 {
-			out[MetricDailyVolumeSpike] = float64(soft) / avg
+		// daily_volume_spike — today's send count vs. the 7-day
+		// average from the SendLimitService history.
+		if avgSends > 0 {
+			out[MetricDailyVolumeSpike] = float64(sends24h) / avgSends
 		}
 		// reputation_drop — biggest drop across the tenant's IP
 		// pool in the last 24 h. Today we derive it from the live

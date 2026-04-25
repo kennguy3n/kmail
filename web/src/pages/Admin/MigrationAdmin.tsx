@@ -49,10 +49,12 @@ export default function MigrationAdmin() {
 
   useEffect(() => {
     void reload();
+    // The previous version closed over the initial empty `jobs`
+    // array, so the running-job check was always false and the
+    // poll never fired. Just reload unconditionally — `reload`
+    // is a no-op when no tenant is selected.
     const id = setInterval(() => {
-      if (jobs.some((j) => j.status === "running")) {
-        void reload();
-      }
+      void reload();
     }, 5000);
     return () => clearInterval(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
