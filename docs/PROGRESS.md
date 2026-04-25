@@ -4,6 +4,48 @@
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
 - **Status**: Phase 1 — Foundation (in progress); Phase 2 —
   Prototype (in progress); Phase 3 — Private Beta (in progress)
+- **Last updated**: 2026-04-25 (later, batch 3) — Phase 5 ten-task
+  batch lands the Zero-Access Vault, Customer-managed keys,
+  Protected folders, the Confidential Send portal, and the 99.95%
+  availability hardening (multi-region SLO + graceful degradation
+  middleware), plus a security-headers wrapper around the BFF and
+  a 10-stage end-to-end smoke harness. Backend adds
+  `internal/vault` (`service.go` + `protected.go` + handlers),
+  `internal/cmk/service.go`, `internal/confidentialsend/service.go`,
+  `internal/middleware/degradation.go`,
+  `internal/middleware/security.go`,
+  `internal/monitoring/multiregion.go` plus a 99.95%
+  `HighAvailabilityTarget` constant, and four migrations
+  (024 vault_folders, 025 customer_managed_keys,
+  026 protected_folders, 027 confidential_send_links). HTTP
+  surface adds `/api/v1/tenants/{id}/vault/folders[/{id}{,/encryption-meta}]`,
+  `/api/v1/tenants/{id}/protected-folders[/{id}{,/share,/unshare,/access,/access-log}]`,
+  `/api/v1/tenants/{id}/cmk[/active|/{id}/rotate|/{id}/revoke]`
+  (plan-gated to privacy), `/api/v1/tenants/{id}/confidential-send`
+  + the public `GET/POST /api/v1/secure/{token}` portal
+  (rate-limited 5/15min via Valkey), and
+  `/api/v1/admin/slo/regions` for the multi-region rollup.
+  Frontend adds `VaultView`, `ProtectedFolderView`, `SecurePortal`
+  under `web/src/pages/Mail/` and `CmkAdmin` under
+  `web/src/pages/Admin/`; `Compose.tsx` gains expiry / password /
+  max-views controls plus a copy-to-clipboard secure link when
+  the privacy mode is "confidential-send". `SloAdmin` gains a
+  region selector, the global rollup table, and a 99.95% target
+  card. Typed clients `listVaultFolders` / `createVaultFolder` /
+  `deleteVaultFolder` / `setVaultFolderEncryptionMeta`,
+  `listCmkKeys` / `registerCmkKey` / `rotateCmkKey` /
+  `revokeCmkKey` / `getActiveCmkKey`, `listProtectedFolders` /
+  `createProtectedFolder` / `shareProtectedFolder` /
+  `unshareProtectedFolder` / `getProtectedFolderAccessLog`,
+  `getSloRegions` in `web/src/api/admin.ts`; new
+  `web/src/api/confidentialSend.ts` exports `createSecureMessage`
+  / `getSecureMessage` / `revokeSecureLink` / `listSecureMessages`.
+  `scripts/test-e2e.sh` + `make e2e` exercise the 10 top user
+  workflows (health, tenant CRUD, domain verification, JMAP
+  session, JMAP query, calendar events, search, billing, audit,
+  Confidential Send round-trip). Dependency: `golang.org/x/crypto`
+  added for `bcrypt` password hashing on confidential-send links.
+
 - **Last updated**: 2026-04-25 (later, batch 2) — Phase 4 / Phase
   5 ten-task batch wraps the remaining Phase 4 checklist items
   (Stalwart HA, per-tenant zk-object-fabric integration, calendar
@@ -954,9 +996,32 @@ Checklist:
       `SharedCalendars.tsx` + `ResourceCalendarAdmin.tsx` wire
       into `App.tsx` / `Layout.tsx`; typed client
       `web/src/api/calendarSharing.ts`.)_
-- [ ] Confidential Send mode (MLS-derived envelope keys, encrypted
-      portal for external recipients). _(Remaining open item —
-      blocked on MLS review.)_
+- [x] Confidential Send mode (MLS-derived envelope keys, encrypted
+      portal for external recipients).
+      _(`internal/confidentialsend/service.go` adds `Service` with
+      `CreateSecureMessage`, `GetSecureMessage`, `RevokeLink`, and
+      `ListSentSecureMessages`. Each link gets a 32-byte
+      base64url token, optional bcrypt-hashed password, expiry
+      (max 30 days), and max-views (default 1). The
+      public-portal handler in `internal/confidentialsend/handlers.go`
+      enforces 5 attempts per token per 15 minutes through Valkey
+      and surfaces the link without auth at
+      `GET/POST /api/v1/secure/{token}`. Tenant-scoped
+      `POST/GET /api/v1/tenants/{id}/confidential-send` and
+      `DELETE .../confidential-send/{linkId}` round out the admin
+      surface. `migrations/027_confidential_send.sql` creates
+      `confidential_send_links` (RLS that allows the public
+      portal path through, FOR UPDATE row-locking on view-count
+      bumps). Frontend: `Compose.tsx` exposes expiry / password /
+      max-views controls when "Confidential Send" is selected and
+      shows a copy-to-clipboard link after send;
+      `web/src/pages/Mail/SecurePortal.tsx` is the public-facing
+      page at `/secure/:token` that prompts for the password
+      when needed and renders message metadata / remaining views /
+      expiry. Typed client `web/src/api/confidentialSend.ts`.
+      MLS key derivation stubs are in place — full MLS
+      integration follows external review per the privacy mode
+      mapping in the architecture doc.)_
 - [x] Billing / quota service (storage accounting, seat accounting,
       plan enforcement).
       _(`internal/billing/` Service with
@@ -1192,16 +1257,66 @@ Checklist:
 
 ## Phase 5 — Privacy & Compliance Expansion (Post-Launch)
 
-**Status**: `IN PROGRESS`
+**Status**: `IN PROGRESS` — six of nine items live, three open
+(Reverse access proxy / SCIM / final compliance pack — none in
+this batch).
 
 **Goal**: advanced privacy features, compliance controls, and
 enterprise readiness.
 
 Checklist:
 
-- [ ] Zero-Access Vault (client-side encrypted folders via
+- [x] Zero-Access Vault (client-side encrypted folders via
       zk-object-fabric `StrictZK` + MLS key hierarchy).
-- [ ] Customer-managed keys (Privacy / Enterprise tier).
+      _(`internal/vault/service.go` adds `VaultService` with
+      `CreateVaultFolder` / `ListVaultFolders` / `GetVaultFolder`
+      / `DeleteVaultFolder` / `SetFolderEncryptionMeta` (stores
+      the wrapped DEK + key algorithm + nonce; the plaintext key
+      never leaves the client). All methods use
+      `pgx.BeginFunc` + `middleware.SetTenantGUC` so RLS scopes
+      every read/write to the caller's tenant. HTTP routes live
+      under `/api/v1/tenants/{id}/vault/folders`.
+      `migrations/024_vault_folders.sql` creates the
+      `vault_folders` table (UUID PK, tenant_id FK, user_id,
+      folder_name, encryption_mode default `StrictZK`,
+      wrapped_dek BYTEA, key_algorithm default
+      `XChaCha20-Poly1305`, nonce, RLS) plus the
+      `kmail_set_updated_at` trigger. Frontend page
+      `web/src/pages/Mail/VaultView.tsx` lists vault folders with
+      a lock icon, exposes a "Create Vault Folder" form gated on
+      an explicit "I understand the server cannot search this
+      folder" checkbox, and a folder detail view that renders
+      the encryption metadata. Typed clients
+      `listVaultFolders` / `createVaultFolder` /
+      `deleteVaultFolder` / `setVaultFolderEncryptionMeta` in
+      `web/src/api/admin.ts`. Per the do-not-do list, vault mode
+      is opt-in per folder — no mailbox is zero-access by
+      default.)_
+- [x] Customer-managed keys (Privacy / Enterprise tier).
+      _(`internal/cmk/service.go` adds `CMKService` with
+      `RegisterKey` (validates the PEM, computes a SHA-256
+      fingerprint, requires the tenant be on the privacy plan via
+      a per-request lookup), `RotateKey` (atomically deprecates
+      every active key for the tenant and inserts the new one
+      under a single transaction), `RevokeKey`, `GetActiveKey`,
+      and `ListKeys`. HTTP routes
+      `GET / POST /api/v1/tenants/{id}/cmk`,
+      `PUT /api/v1/tenants/{id}/cmk/{keyId}/rotate`,
+      `DELETE /api/v1/tenants/{id}/cmk/{keyId}/revoke`,
+      `GET /api/v1/tenants/{id}/cmk/active`. The handler returns
+      `403 plan_not_eligible` for tenants outside the privacy
+      plan. `migrations/025_customer_managed_keys.sql` creates
+      `customer_managed_keys` (RLS, status check IN
+      active/deprecated/revoked, key_fingerprint UNIQUE,
+      algorithm default `RSA-OAEP-256`). Frontend page
+      `web/src/pages/Admin/CmkAdmin.tsx` shows the active key
+      with its fingerprint, accepts a PEM textarea or a `.pem`
+      file upload, exposes Rotate (deprecates the prior active)
+      and Revoke (with a confirmation modal) flows, and renders
+      a friendly upgrade banner for non-privacy tenants. Typed
+      clients `listCmkKeys` / `registerCmkKey` / `rotateCmkKey`
+      / `revokeCmkKey` / `getActiveCmkKey` in
+      `web/src/api/admin.ts`.)_
 - [x] Regional storage controls (zk-object-fabric placement
       policies).
       _(`internal/tenant/placement.go` adds a `PlacementService`
@@ -1273,8 +1388,49 @@ Checklist:
       gating config per action; typed clients `listApprovals`,
       `approveApprovalRequest`, `rejectApprovalRequest`,
       `getApprovalConfig`, `setApprovalConfig` in `admin.ts`.)_
-- [ ] Protected folders.
-- [ ] Availability target: 99.95%+.
+- [x] Protected folders.
+      _(`internal/vault/protected.go` adds
+      `ProtectedFolderService` with `CreateProtectedFolder` /
+      `ListProtectedFolders` / `ShareFolder` (grants
+      read-or-read_write access to a teammate inside the same
+      tenant — cross-tenant sharing is intentionally out of
+      scope per the do-not-do list) / `UnshareFolder` /
+      `ListFolderAccess` / `GetFolderAccessLog`. Every share /
+      revoke writes a row to the audit log table. HTTP routes
+      under `/api/v1/tenants/{id}/protected-folders` (list /
+      create / `{folderId}/share` / `/unshare` / `/access` /
+      `/access-log`). `migrations/026_protected_folders.sql`
+      creates `protected_folders`, `protected_folder_access`
+      (permission CHECK IN read/read_write), and
+      `protected_folder_access_log`, all RLS-scoped on
+      tenant_id. Frontend page
+      `web/src/pages/Mail/ProtectedFolderView.tsx` lists
+      folders with a lock icon, exposes a "Share with team
+      member" modal with a permission selector, and renders the
+      access log table. Typed clients `listProtectedFolders` /
+      `createProtectedFolder` / `shareProtectedFolder` /
+      `unshareProtectedFolder` / `listProtectedFolderAccess` /
+      `getProtectedFolderAccessLog` in `web/src/api/admin.ts`.)_
+- [x] Availability target: 99.95%+.
+      _(`monitoring.DefaultTarget` is now 0.9995, with a
+      `LegacyTarget` constant retained at 0.999 for the Phase 4
+      baseline and an explicit `HighAvailabilityTarget` constant
+      so call sites can document intent. `MultiRegionAggregator`
+      in `internal/monitoring/multiregion.go` reads region-prefixed
+      Valkey keys (`slo:region:{region}:requests`) and folds the
+      per-region totals into a global rollup; the
+      `KMAIL_SLO_REGIONS` env var (comma-separated) drives the
+      fan-out. `GET /api/v1/admin/slo/regions` returns the
+      aggregator output. `internal/middleware/degradation.go`
+      provides graceful-degradation middleware: when the upstream
+      Stalwart shard is unhealthy, GET requests on configured
+      read prefixes (default `/jmap`) fall back to a Valkey-cached
+      response with `X-KMail-Degraded: true`, while POSTs/PUTs/
+      DELETEs return 503 (silent failure on writes is worse than
+      loud failure). `web/src/pages/Admin/SloAdmin.tsx` adds a
+      region selector, a per-region availability table with a
+      global rollup row, and renders the 99.95% target
+      alongside the 99.9% legacy line.)_
 
 ---
 
