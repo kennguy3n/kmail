@@ -63,7 +63,19 @@ export default function PricingAdmin() {
       setSummary(next);
       setInfo(`Plan changed to ${planLabel(plan)}.`);
     } catch (e) {
-      setError(errorMessage(e));
+      // ChangePlan commits the new `tenants.plan` row first and
+      // only then runs EnforcePlanLimits, so a 402 means the
+      // database is on the new plan but is over its quota.
+      // Refresh the summary so the UI matches reality and surface
+      // the quota warning as info rather than a hard failure.
+      if (e instanceof AdminApiError && e.status === 402) {
+        reload(selectedTenantId);
+        setInfo(
+          `Plan changed to ${planLabel(plan)}, but the tenant is over the new plan's quota — adjust seats or storage.`,
+        );
+      } else {
+        setError(errorMessage(e));
+      }
     } finally {
       setPendingPlan(null);
     }
