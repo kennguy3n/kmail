@@ -74,7 +74,7 @@ async function parseErrorBody(res: Response): Promise<string> {
   return text;
 }
 
-async function requestJSON<T>(
+export async function requestJSON<T>(
   url: string,
   init: RequestInit,
   { expectJson = true }: { expectJson?: boolean } = {},
@@ -523,4 +523,285 @@ export async function uploadDmarcReport(
       body: xml,
     },
   );
+}
+
+// ---------------------------------------------------------------
+// DNS wizard
+// ---------------------------------------------------------------
+
+/** One step in the DNS wizard walkthrough. */
+export interface DnsWizardStep {
+  key: "mx" | "spf" | "dkim" | "dmarc" | "mta_sts" | "tls_rpt" | "autoconfig";
+  label: string;
+  record: DomainRecord | null;
+  verified: boolean;
+  errorMessage?: string;
+}
+
+/** Summary state for the DNS wizard. */
+export interface DnsWizardStatus {
+  steps: DnsWizardStep[];
+  allVerified: boolean;
+}
+
+// Which backend flags map to which wizard step.
+const WIZARD_STEP_LABELS: Record<DnsWizardStep["key"], string> = {
+  mx: "MX records",
+  spf: "SPF (TXT)",
+  dkim: "DKIM",
+  dmarc: "DMARC",
+  mta_sts: "MTA-STS",
+  tls_rpt: "TLS-RPT",
+  autoconfig: "Autoconfig",
+};
+
+function pickRecord(
+  records: DomainRecord[],
+  key: DnsWizardStep["key"],
+): DomainRecord | null {
+  switch (key) {
+    case "mx":
+      return records.find((r) => r.type === "MX") ?? null;
+    case "spf":
+      return records.find((r) => r.type === "TXT" && r.value.startsWith("v=spf1")) ?? null;
+    case "dkim":
+      return records.find((r) => r.name.includes("._domainkey.")) ?? null;
+    case "dmarc":
+      return records.find((r) => r.name.startsWith("_dmarc.")) ?? null;
+    case "mta_sts":
+      return records.find((r) => r.name.startsWith("_mta-sts.") || r.name.startsWith("mta-sts.")) ?? null;
+    case "tls_rpt":
+      return records.find((r) => r.name.startsWith("_smtp._tls.")) ?? null;
+    case "autoconfig":
+      return records.find((r) => r.name.startsWith("autoconfig.") || r.name.startsWith("autodiscover.")) ?? null;
+  }
+}
+
+/**
+ * Fetch the DNS wizard status for a given domain by composing the
+ * existing records + verification endpoints. The backend only
+ * surfaces per-check booleans for MX/SPF/DKIM/DMARC today; the
+ * MTA-STS / TLS-RPT / autoconfig steps render the expected records
+ * and rely on the tenant to verify manually.
+ */
+export async function getDnsWizardStatus(
+  tenantId: string,
+  domainId: string,
+): Promise<DnsWizardStatus> {
+  const [records, verification] = await Promise.all([
+    getDomainRecords(tenantId, domainId),
+    verifyDomain(tenantId, domainId),
+  ]);
+  const flags: Record<DnsWizardStep["key"], boolean> = {
+    mx: verification.mx_verified,
+    spf: verification.spf_verified,
+    dkim: verification.dkim_verified,
+    dmarc: verification.dmarc_verified,
+    mta_sts: false,
+    tls_rpt: false,
+    autoconfig: false,
+  };
+  const steps: DnsWizardStep[] = (Object.keys(WIZARD_STEP_LABELS) as DnsWizardStep["key"][]).map(
+    (key) => ({
+      key,
+      label: WIZARD_STEP_LABELS[key],
+      record: pickRecord(records.records ?? [], key),
+      verified: flags[key],
+    }),
+  );
+  return {
+    steps,
+    allVerified: verification.verified,
+  };
+}
+
+// ---------------------------------------------------------------
+// Migration wizard
+// ---------------------------------------------------------------
+
+export interface MigrationJob {
+  id: string;
+  tenant_id: string;
+  source_type: string;
+  source_host: string;
+  source_user: string;
+  destination_user_id: string;
+  status: "pending" | "running" | "paused" | "completed" | "failed" | "cancelled";
+  messages_total: number;
+  messages_synced: number;
+  error_message?: string;
+  started_at?: string;
+  completed_at?: string;
+  created_at: string;
+}
+
+export interface CreateMigrationJobInput {
+  source_type: "gmail_imap" | "generic_imap" | "ms365_imap";
+  source_host: string;
+  source_port?: number;
+  source_user: string;
+  source_password: string;
+  destination_user_id: string;
+}
+
+export async function listMigrationJobs(tenantId: string): Promise<MigrationJob[]> {
+  const res = await requestJSON<{ jobs: MigrationJob[] }>(
+    `${ADMIN_API_BASE}/migrations`,
+    { method: "GET", headers: adminAuthHeaders(tenantId, { Accept: "application/json" }) },
+  );
+  return res.jobs ?? [];
+}
+
+export async function createMigrationJob(
+  tenantId: string,
+  input: CreateMigrationJobInput,
+): Promise<MigrationJob> {
+  return requestJSON<MigrationJob>(`${ADMIN_API_BASE}/migrations`, {
+    method: "POST",
+    headers: adminAuthHeaders(tenantId, {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    }),
+    body: JSON.stringify(input),
+  });
+}
+
+export async function getMigrationJob(
+  tenantId: string,
+  jobId: string,
+): Promise<MigrationJob> {
+  return requestJSON<MigrationJob>(
+    `${ADMIN_API_BASE}/migrations/${encodeURIComponent(jobId)}`,
+    { method: "GET", headers: adminAuthHeaders(tenantId, { Accept: "application/json" }) },
+  );
+}
+
+export async function pauseMigrationJob(tenantId: string, jobId: string): Promise<void> {
+  await fetch(`${ADMIN_API_BASE}/migrations/${encodeURIComponent(jobId)}/pause`, {
+    method: "POST",
+    headers: adminAuthHeaders(tenantId),
+  });
+}
+
+export async function resumeMigrationJob(tenantId: string, jobId: string): Promise<void> {
+  await fetch(`${ADMIN_API_BASE}/migrations/${encodeURIComponent(jobId)}/resume`, {
+    method: "POST",
+    headers: adminAuthHeaders(tenantId),
+  });
+}
+
+export async function cancelMigrationJob(tenantId: string, jobId: string): Promise<void> {
+  await fetch(`${ADMIN_API_BASE}/migrations/${encodeURIComponent(jobId)}`, {
+    method: "DELETE",
+    headers: adminAuthHeaders(tenantId),
+  });
+}
+
+// ---------------------------------------------------------------
+// IP reputation
+// ---------------------------------------------------------------
+
+export interface IPReputationMetrics {
+  ip_id: string;
+  address: string;
+  pool_id: string;
+  pool_name: string;
+  pool_type: string;
+  reputation_score: number;
+  daily_volume: number;
+  bounce_rate: number;
+  complaint_rate: number;
+  status: string;
+  warmup_day: number;
+  updated_at: string;
+}
+
+export interface IPReputationHistoryPoint {
+  day: string;
+  reputation_score: number;
+  daily_volume: number;
+}
+
+export async function listIpReputation(): Promise<IPReputationMetrics[]> {
+  const res = await requestJSON<{ ips: IPReputationMetrics[] }>(
+    `${ADMIN_API_BASE}/admin/ip-reputation`,
+    { method: "GET", headers: { Accept: "application/json" } },
+  );
+  return res.ips ?? [];
+}
+
+export async function getIpReputationHistory(
+  ipId: string,
+): Promise<IPReputationHistoryPoint[]> {
+  const res = await requestJSON<{ history: IPReputationHistoryPoint[] }>(
+    `${ADMIN_API_BASE}/admin/ip-reputation/${encodeURIComponent(ipId)}/history`,
+    { method: "GET", headers: { Accept: "application/json" } },
+  );
+  return res.history ?? [];
+}
+
+// ---------------------------------------------------------------
+// Deliverability alerts
+// ---------------------------------------------------------------
+
+export interface DeliverabilityAlert {
+  id: string;
+  tenant_id: string;
+  alert_type: string;
+  severity: "info" | "warning" | "critical";
+  metric_name: string;
+  metric_value: number;
+  threshold_value: number;
+  message: string;
+  acknowledged: boolean;
+  created_at: string;
+}
+
+export interface AlertThreshold {
+  tenant_id: string;
+  metric_name: string;
+  warning_threshold: number;
+  critical_threshold: number;
+  updated_at: string;
+}
+
+export async function listDeliverabilityAlerts(tenantId: string): Promise<DeliverabilityAlert[]> {
+  const res = await requestJSON<{ alerts: DeliverabilityAlert[] }>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/deliverability/alerts`,
+    { method: "GET", headers: adminAuthHeaders(tenantId, { Accept: "application/json" }) },
+  );
+  return res.alerts ?? [];
+}
+
+export async function ackDeliverabilityAlert(tenantId: string, alertId: string): Promise<void> {
+  await fetch(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/deliverability/alerts/${encodeURIComponent(alertId)}/acknowledge`,
+    { method: "POST", headers: adminAuthHeaders(tenantId) },
+  );
+}
+
+export async function listAlertThresholds(tenantId: string): Promise<AlertThreshold[]> {
+  const res = await requestJSON<{ thresholds: AlertThreshold[] }>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/deliverability/thresholds`,
+    { method: "GET", headers: adminAuthHeaders(tenantId, { Accept: "application/json" }) },
+  );
+  return res.thresholds ?? [];
+}
+
+export async function updateAlertThresholds(
+  tenantId: string,
+  thresholds: AlertThreshold[],
+): Promise<AlertThreshold[]> {
+  const res = await requestJSON<{ thresholds: AlertThreshold[] }>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/deliverability/thresholds`,
+    {
+      method: "PUT",
+      headers: adminAuthHeaders(tenantId, {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      }),
+      body: JSON.stringify({ thresholds }),
+    },
+  );
+  return res.thresholds ?? [];
 }

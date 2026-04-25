@@ -30,6 +30,8 @@ import (
 	"github.com/kennguy3n/kmail/internal/jmap"
 	"github.com/kennguy3n/kmail/internal/middleware"
 	"github.com/kennguy3n/kmail/internal/migration"
+	"github.com/kennguy3n/kmail/internal/push"
+	"github.com/kennguy3n/kmail/internal/sharedinbox"
 	"github.com/kennguy3n/kmail/internal/tenant"
 )
 
@@ -152,6 +154,8 @@ func main() {
 		StalwartURL: cfg.StalwartURL,
 	})
 	calendarbridge.NewHandlers(calendarSvc, logger).Register(mux, authMW)
+	calendarSharingStore := calendarbridge.NewSharingStore(pool)
+	calendarbridge.NewSharingHandlers(calendarSvc, calendarSharingStore).Register(mux, authMW)
 
 	chatbridgeSvc := chatbridge.NewService(chatbridge.Config{
 		KChatAPIURL:   cfg.KChatAPIURL,
@@ -182,7 +186,25 @@ func main() {
 		BounceSoftEscalationCount: cfg.Deliverability.BounceSoftEscalationCount,
 		BounceSoftWindow:          cfg.Deliverability.BounceSoftWindow,
 	})
-	deliverability.NewHandlers(deliverabilitySvc, logger).Register(mux, authMW)
+	deliverabilityHandlers := deliverability.NewHandlers(deliverabilitySvc, logger)
+	deliverabilityHandlers.Register(mux, authMW)
+	deliverabilityHandlers.RegisterPhase3(mux, authMW)
+
+	// Push notifications (web / iOS / Android fan-out).
+	pushSvc := push.NewService(push.Config{
+		Pool:        pool,
+		StalwartURL: cfg.StalwartURL,
+		Logger:      logger,
+	})
+	push.NewHandlers(pushSvc, logger).Register(mux, authMW)
+
+	// Shared-inbox workflow state machine.
+	sharedInboxWorkflow := sharedinbox.NewService(pool, logger)
+	sharedinbox.NewHandlers(sharedInboxWorkflow, logger).Register(mux, authMW)
+
+	// Multi-tenant Stalwart shard routing.
+	shardSvc := tenant.NewShardService(pool, logger)
+	tenant.NewShardHandlers(shardSvc).Register(mux, authMW)
 
 	// Attachment-to-link conversion.
 	attachmentSvc := jmap.NewAttachmentService(jmap.AttachmentConfig{
@@ -230,6 +252,25 @@ func main() {
 		})
 		go worker.Run(ctx)
 	}
+
+	// Deliverability alert evaluator: walks every tenant every
+	// 15 minutes and raises alerts on threshold breaches.
+	alertEvaluator := &deliverability.AlertEvaluator{
+		Service:  deliverabilitySvc.Alerts,
+		Pool:     pool,
+		Interval: getenvDuration("KMAIL_ALERT_EVAL_INTERVAL", 15*time.Minute),
+		Logger:   logger,
+	}
+	go alertEvaluator.Run(ctx)
+
+	// Shard health worker: probes every registered Stalwart
+	// shard every 60s and flips offline shards out of rotation.
+	shardHealth := &tenant.HealthWorker{
+		Service:  shardSvc,
+		Interval: getenvDuration("KMAIL_SHARD_HEALTH_INTERVAL", 60*time.Second),
+		Logger:   logger,
+	}
+	go shardHealth.Run(ctx)
 
 	// Wire metrics and tracing into the outer handler chain.
 	handler := http.Handler(mux)
@@ -305,4 +346,17 @@ func readyzHandler(pool *pgxpool.Pool) http.HandlerFunc {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ready\n"))
 	}
+}
+
+// getenvDuration reads a duration env var with a fallback.
+func getenvDuration(key string, fallback time.Duration) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return fallback
+	}
+	return d
 }

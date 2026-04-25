@@ -4,13 +4,31 @@
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
 - **Status**: Phase 1 — Foundation (in progress); Phase 2 —
   Prototype (in progress); Phase 3 — Private Beta (in progress)
-- **Last updated**: 2026-04-24 (later) — Phase 3 ten-task batch
-  landed. The Billing / Quota Service, the Deliverability Control
-  Plane (suppression lists, bounce processor, IP pools, send limits,
-  warmup schedule, DMARC ingest), the attachment-to-link conversion
-  path, shared-inbox seat exemption, the Observability stack
-  (Prometheus + OpenTelemetry), and three new admin console pages
-  are all live in `main`. Specifically:
+- **Last updated**: 2026-04-25 — Phase 3 / Phase 4 ten-task batch
+  landed. Multi-tenant Stalwart shard routing, the DNS onboarding
+  wizard, Gmail Postmaster + Yahoo ARF feedback-loop ingestion,
+  abuse scoring, mobile push notifications, resource + shared-team
+  calendars, the IP reputation dashboard, automated deliverability
+  alerts, shared-mailbox workflows, and the migration wizard UI
+  are all live in `main`. New Go packages `internal/push`,
+  `internal/sharedinbox`, new `tenant.ShardService` /
+  `tenant.HealthWorker`, and the deliverability sub-services
+  `FeedbackLoopService`, `AbuseScorer`, and `AlertService` /
+  `AlertEvaluator` land together. Migrations 011–017 add
+  `feedback_loop_events`, `abuse_alerts` / `abuse_scores`,
+  `push_subscriptions` / `notification_preferences`,
+  `calendar_shares` / `resource_calendars`, `deliverability_alerts`
+  / `alert_thresholds`, `shared_inbox_assignments` /
+  `shared_inbox_notes`, and `stalwart_shards` /
+  `tenant_shard_assignments`. Seven new React pages
+  (`DnsWizard`, `IpReputationAdmin`, `NotificationPrefs`,
+  `MigrationAdmin`, `ResourceCalendarAdmin`, `SharedCalendars`,
+  `SharedInboxView`) wire into `App.tsx` / `Layout.tsx`. Earlier
+  Phase 3 work (Billing / Quota Service, the Deliverability
+  Control Plane — suppression, bounces, IP pools, send limits,
+  warmup, DMARC — attachment-to-link conversion, shared-inbox
+  seat exemption, Observability, and three admin console pages)
+  remains live. Specifically:
   * Billing / Quota Service — `internal/billing/` Service with
     GetQuota / UpdateStorageUsage / CountSeats / EnforcePlanLimits
     / GetPlanPricing / CalculateInvoice; `billing_events` table
@@ -726,7 +744,21 @@ deliverability infrastructure, IP reputation, and migration support.
 
 Checklist:
 
-- [ ] Multi-tenant Stalwart shard (5,000–10,000 mailbox target).
+- [x] Multi-tenant Stalwart shard (5,000–10,000 mailbox target).
+      _(`internal/tenant/shard.go` registers the
+      `ShardService` with `AssignTenantToShard` /
+      `GetTenantShard` / `ListShards` / `RegisterShard` /
+      `UpdateShardHealth` / `RebalanceShard`; assignments are
+      least-loaded-with-capacity against `stalwart_shards` +
+      `tenant_shard_assignments` (`migrations/017_stalwart_shards.sql`,
+      no RLS on the shard registry, unique tenant assignment).
+      `HealthWorker` probes every shard's `/healthz` on a 60 s
+      ticker and flips offline shards out of rotation.
+      `GetTenantShard` caches the lookup in-process and falls
+      back to `cfg.StalwartURL` when no assignment exists, so
+      the JMAP proxy stays backward-compatible. Admin routes
+      under `/api/v1/admin/shards[/{id}[/rebalance]]` are
+      mounted by `ShardHandlers`.)_
 - [x] IP pool architecture (system transactional, mature trusted,
       new / warming, restricted, dedicated enterprise).
       _(`internal/deliverability/ippool.go` +
@@ -744,8 +776,17 @@ Checklist:
       30, clamped to the plan cap. Defaults 500 / 2000 / 5000
       per day for core / pro / privacy; hourly = daily / 10.
       Wired into the JMAP proxy path.)_
-- [ ] DNS wizard (MX, SPF, DKIM 2048-bit, DMARC, MTA-STS, TLS-RPT,
+- [x] DNS wizard (MX, SPF, DKIM 2048-bit, DMARC, MTA-STS, TLS-RPT,
       autoconfig).
+      _(`web/src/pages/Admin/DnsWizard.tsx` walks a tenant admin
+      through seven ordered steps, rendering the expected
+      record from `GET /api/v1/tenants/{id}/domains/{domainId}/dns-records`
+      with a copy-to-clipboard button and driving verification
+      via `POST /api/v1/tenants/{id}/domains/{domainId}/verify`.
+      `getDnsWizardStatus` in `web/src/api/admin.ts` composes
+      the records + verification payloads and pattern-matches
+      each record to a wizard step. Route `/admin/dns-wizard`
+      in `App.tsx`; nav link in `Layout.tsx`.)_
 - [x] DMARC report ingestion.
       _(`internal/deliverability/dmarc.go` parses RFC 7489
       aggregate XML, persists to `dmarc_reports`
@@ -753,7 +794,19 @@ Checklist:
       list / summary / upload HTTP endpoints, and renders in
       `web/src/pages/Admin/DmarcAdmin.tsx` with per-domain
       pass-rate and drill-down.)_
-- [ ] Gmail Postmaster / Yahoo feedback loop monitoring.
+- [x] Gmail Postmaster / Yahoo feedback loop monitoring.
+      _(`internal/deliverability/feedbackloop.go` exposes
+      `ProcessGmailPostmasterData`, `ProcessYahooARF`,
+      `GetFeedbackSummary`, and `ListFeedbackEvents`; ARF parsing
+      lives in `feedbackloop_helpers.go` per RFC 5965.
+      `feedback_loop_events` (`migrations/011_feedback_loops.sql`)
+      stores normalized events with RLS on `tenant_id` and
+      indexes `(tenant_id, source, created_at DESC)` +
+      `(tenant_id, domain, created_at DESC)`. HTTP routes
+      `POST /api/v1/tenants/{id}/feedback-loops/{gmail,yahoo}`
+      ingest data and `GET .../feedback-loops[/summary]` drives
+      the UI. Wired via `deliverabilitySvc.FeedbackLoop` and
+      `Handlers.RegisterPhase3`.)_
 - [x] Suppression lists and bounce tracking.
       _(`internal/deliverability/suppression.go` +
       `bounce.go` with `migrations/006_suppression.sql` (RLS on
@@ -761,7 +814,19 @@ Checklist:
       complaints escalate immediately; soft bounces escalate at
       3 within 72 h. `CheckRecipient` is the pre-send hook
       consumed by the JMAP proxy.)_
-- [ ] Abuse scoring and compromised-account detection.
+- [x] Abuse scoring and compromised-account detection.
+      _(`internal/deliverability/abuse.go` implements an
+      `AbuseScorer` with `ScoreTenant`, `ScoreUser`,
+      `DetectAnomalies`, `ListAlerts`, and `AcknowledgeAlert`.
+      Signals computed over a rolling window: volume spike
+      (>3× 7-day average), recipient-domain anomaly (>50% new
+      domains in 24 h), failed-auth storms (>10 in 5 min), high
+      bounce (>5%/24 h), and high complaint (>0.1%/24 h).
+      Alerts persist in `abuse_alerts` + cached composite
+      `abuse_scores` (`migrations/012_abuse_scoring.sql`) with
+      RLS and a severity enum (low/medium/high/critical).
+      Routes `GET /api/v1/tenants/{id}/abuse/{score,alerts}` +
+      `POST .../alerts/{alertId}/acknowledge`.)_
 - [x] Pooled storage quotas (tenant pool, not per-user).
       _(`internal/billing/quota_worker.go` background goroutine
       polls the zk-object-fabric S3 API every
@@ -813,10 +878,44 @@ Checklist:
       HTTP routes under `/api/v1/tenants/{id}/audit-log[/export|
       /verify]`; `cmd/kmail-audit` CLI exposes
       `serve | verify | export`.)_
-- [ ] Mobile push notifications.
-- [ ] Resource calendars and shared team calendars.
+- [x] Mobile push notifications.
+      _(`internal/push` ships a transport-agnostic `PushService`
+      with `Subscribe` / `Unsubscribe` / `ListSubscriptions` /
+      `SendNotification` / `GetPreferences` /
+      `UpdatePreferences`. `push_subscriptions` +
+      `notification_preferences` (`migrations/013_push_notifications.sql`)
+      store device tokens (web/ios/android, `user_id TEXT` to
+      admit either users.id UUIDs or Stalwart/KChat opaque IDs)
+      with RLS and a unique `(tenant_id, user_id, push_endpoint)`
+      constraint. Quiet-hours logic (`inQuietHours`) suppresses
+      deliveries in the user-configured window. The
+      `Transport` interface keeps actual APNs/FCM/Web Push
+      shippers behind an interface; `loggingTransport` is the
+      no-op dev default. HTTP routes under `/api/v1/push/...`
+      mount via `push.Handlers.Register`. Typed client
+      `web/src/api/push.ts` + `NotificationPrefs.tsx` page.)_
+- [x] Resource calendars and shared team calendars.
+      _(`internal/calendarbridge/sharing.go` adds
+      `CreateCalendar` / `UpdateCalendar` / `DeleteCalendar` /
+      `ShareCalendar` / `ListSharedCalendars` / `BookResource`
+      and a `SharingStore` for the
+      `calendar_shares` + `resource_calendars` tables
+      (`migrations/014_shared_calendars.sql`, RLS, share matrix
+      on `(tenant_id, calendar_id, target_account_id)`,
+      resource registry with type = room/equipment/vehicle).
+      `BookResource` runs a pre-insert conflict check via
+      upstream `GetEvents` + overlap comparison and synthesizes
+      a minimal iCalendar event when the caller doesn't provide
+      one. HTTP routes
+      `POST/GET/PUT/DELETE /api/v1/calendars` +
+      `/api/v1/calendars/shared` + `/api/v1/resource-calendars`
+      via `SharingHandlers`. React pages
+      `SharedCalendars.tsx` + `ResourceCalendarAdmin.tsx` wire
+      into `App.tsx` / `Layout.tsx`; typed client
+      `web/src/api/calendarSharing.ts`.)_
 - [ ] Confidential Send mode (MLS-derived envelope keys, encrypted
-      portal for external recipients).
+      portal for external recipients). _(Remaining open item —
+      blocked on MLS review.)_
 - [x] Billing / quota service (storage accounting, seat accounting,
       plan enforcement).
       _(`internal/billing/` Service with
@@ -840,7 +939,8 @@ Checklist:
       `docker-compose.yml` scrapes the BFF via
       `deploy/prometheus/prometheus.yml`. Loki shipping is still
       out-of-scope.)_
-- [ ] Beta customer onboarding (5–10 SMEs).
+- [ ] Beta customer onboarding (5–10 SMEs). _(Remaining open
+      item — operational gate, not a code task.)_
 
 ---
 
@@ -856,16 +956,71 @@ Checklist:
 - [ ] Production Stalwart cluster (multi-node, HA).
 - [ ] Production zk-object-fabric integration (Wasabi primary,
       Linode cache).
-- [ ] IP reputation dashboards.
-- [ ] Automated deliverability alerts.
-- [ ] Shared mailbox workflows.
+- [x] IP reputation dashboards.
+      _(`Handlers.RegisterPhase3` adds
+      `GET /api/v1/admin/ip-reputation` and
+      `GET /api/v1/admin/ip-reputation/{ipId}/history` which
+      join `IPPoolService`, `BounceProcessor`, and
+      `DMARCService` into per-IP metrics (reputation, daily
+      volume, bounce rate, complaint rate, pool, status,
+      warmup day). `web/src/pages/Admin/IpReputationAdmin.tsx`
+      renders a pool roll-up, a per-IP detail table with
+      color-coded reputation indicators (green ≥ 80, yellow
+      50–80, red < 50), and an expandable 30-day trend row.
+      Typed client helpers `listIpReputation` +
+      `getIpReputationHistory` in `admin.ts`. Route
+      `/admin/ip-reputation` in `App.tsx`; nav in `Layout.tsx`.)_
+- [x] Automated deliverability alerts.
+      _(`internal/deliverability/alerts.go` implements
+      `AlertService` with `EvaluateThresholds` / `ListAlerts` /
+      `AcknowledgeAlert` / `ConfigureThresholds` /
+      `ListThresholds`. Default thresholds: bounce_rate
+      5% warning / 10% critical, complaint_rate 0.1% / 0.3%,
+      reputation_drop 20 / 40 points / 24 h, daily_volume
+      spike 5× / 10× 7-day average. `deliverability_alerts` +
+      `alert_thresholds` (`migrations/015_deliverability_alerts.sql`)
+      with RLS. `AlertEvaluator` is a background goroutine that
+      iterates every tenant on a 15-min ticker (pattern mirrors
+      `billing.QuotaWorker`). HTTP routes
+      `GET/POST /api/v1/tenants/{id}/deliverability/alerts[/acknowledge]`
+      and `GET/PUT .../thresholds`. Typed client helpers
+      `listDeliverabilityAlerts`, `ackDeliverabilityAlert`,
+      `listAlertThresholds`, `updateAlertThresholds` in
+      `admin.ts`.)_
+- [x] Shared mailbox workflows.
+      _(`internal/sharedinbox` adds a `WorkflowService` with
+      `AssignEmail` / `UnassignEmail` / `AddNote` / `ListNotes`
+      / `SetStatus` / `ListAssignments` over the
+      `shared_inbox_assignments` + `shared_inbox_notes` tables
+      (`migrations/016_shared_inbox_workflows.sql`, RLS,
+      indexes on (tenant_id, shared_inbox_id, status) and
+      (tenant_id, shared_inbox_id, email_id)). Status enum
+      `open → in_progress → waiting → resolved → closed`; the
+      assignment row is upserted via
+      `ON CONFLICT (tenant_id, shared_inbox_id, email_id)` so
+      assign and status updates share the same code path. HTTP
+      routes `/api/v1/shared-inboxes/{inboxId}/emails/{emailId}/...`.
+      React page `SharedInboxView.tsx` + typed client
+      `web/src/api/sharedinbox.ts`.)_
 - [ ] Calendar bridge (KChat scheduling, meeting rooms, reminders,
       chat notifications).
 - [ ] Tenant-level billing integration.
 - [ ] Published pricing: KChat Core Email, KChat Mail Pro,
       KChat Privacy.
-- [ ] Migration automation (Gmail / IMAP import wizard, staged
+- [x] Migration automation (Gmail / IMAP import wizard, staged
       sync, cutover checklist).
+      _(Backend orchestrator + worker pool and staged sync were
+      already landed in `internal/migration/`. This batch adds
+      the tenant-facing UI: `web/src/pages/Admin/MigrationAdmin.tsx`
+      is a 3-step wizard (source → credentials → confirm) with
+      pre-filled IMAP host/port for Gmail and Microsoft 365, a
+      job table with pause / resume / cancel actions, a 5 s
+      auto-refresh while any job is running, and a post-cutover
+      checklist. Typed client helpers `listMigrationJobs`,
+      `createMigrationJob`, `getMigrationJob`,
+      `pauseMigrationJob`, `resumeMigrationJob`, and
+      `cancelMigrationJob` in `admin.ts`. Route
+      `/admin/migrations` in `App.tsx`; nav in `Layout.tsx`.)_
 - [ ] Availability target: 99.9%.
 
 ---
