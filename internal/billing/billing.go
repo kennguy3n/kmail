@@ -10,6 +10,7 @@ package billing
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -651,7 +652,18 @@ func (s *Service) ChangePlan(ctx context.Context, tenantID, newPlan string) (*Bi
 				return fmt.Errorf("sync quota storage default: %w", err)
 			}
 		}
-		meta := fmt.Sprintf(`{"old_plan":%q,"new_plan":%q}`, oldPlan, newPlan)
+		// Use encoding/json rather than fmt.Sprintf %q — %q emits Go
+		// escapes (\a, \v, \xNN) which aren't valid JSON, so any
+		// future plan name with control or non-ASCII characters
+		// would silently break the JSONB insert.
+		metaBytes, err := json.Marshal(map[string]string{
+			"old_plan": oldPlan,
+			"new_plan": newPlan,
+		})
+		if err != nil {
+			return fmt.Errorf("marshal plan_changed metadata: %w", err)
+		}
+		meta := string(metaBytes)
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO billing_events (tenant_id, event_type, metadata)
 			VALUES ($1::uuid, 'plan_changed', $2::jsonb)

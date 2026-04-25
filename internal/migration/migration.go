@@ -816,10 +816,19 @@ func imapCommand(conn net.Conn, br *bufio.Reader, tag, command string) error {
 // quoteIMAP wraps a string in IMAP-quoted form, escaping `"` and
 // `\`. Sufficient for usernames / passwords; literal{N} form is
 // not needed for the LOGIN command we use.
+//
+// Per RFC 3501 §4.3 a quoted string cannot contain CR, LF, or NUL,
+// so we strip those bytes — embedding them would prematurely
+// terminate the LOGIN line and let an attacker inject an extra
+// IMAP command. Callers should normally validate input before it
+// reaches here; this is the last line of defence.
 func quoteIMAP(s string) string {
 	var b strings.Builder
 	b.WriteByte('"')
 	for _, r := range s {
+		if r == '\r' || r == '\n' || r == 0 {
+			continue
+		}
 		if r == '"' || r == '\\' {
 			b.WriteByte('\\')
 		}
