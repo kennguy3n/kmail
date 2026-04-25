@@ -4,7 +4,7 @@
  * JSON / manage fetch options by hand.
  */
 
-import { ADMIN_API_BASE, requestJSON } from "./admin";
+import { ADMIN_API_BASE, adminAuthHeaders, requestJSON } from "./admin";
 
 export interface PushSubscription {
   id: string;
@@ -31,7 +31,10 @@ export interface NotificationPreference {
 export async function subscribe(input: Partial<PushSubscription>): Promise<PushSubscription> {
   return requestJSON<PushSubscription>(`${ADMIN_API_BASE}/push/subscribe`, {
     method: "POST",
-    headers: { Accept: "application/json", "Content-Type": "application/json" },
+    headers: adminAuthHeaders(undefined, {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    }),
     body: JSON.stringify(input),
   });
 }
@@ -39,13 +42,14 @@ export async function subscribe(input: Partial<PushSubscription>): Promise<PushS
 export async function unsubscribe(subscriptionId: string): Promise<void> {
   await fetch(`${ADMIN_API_BASE}/push/subscriptions/${encodeURIComponent(subscriptionId)}`, {
     method: "DELETE",
+    headers: adminAuthHeaders(),
   });
 }
 
 export async function listSubscriptions(): Promise<PushSubscription[]> {
   const res = await requestJSON<{ subscriptions: PushSubscription[] }>(
     `${ADMIN_API_BASE}/push/subscriptions`,
-    { method: "GET", headers: { Accept: "application/json" } },
+    { method: "GET", headers: adminAuthHeaders(undefined, { Accept: "application/json" }) },
   );
   return res.subscriptions ?? [];
 }
@@ -53,7 +57,7 @@ export async function listSubscriptions(): Promise<PushSubscription[]> {
 export async function getPreferences(): Promise<NotificationPreference> {
   return requestJSON<NotificationPreference>(`${ADMIN_API_BASE}/push/preferences`, {
     method: "GET",
-    headers: { Accept: "application/json" },
+    headers: adminAuthHeaders(undefined, { Accept: "application/json" }),
   });
 }
 
@@ -62,7 +66,10 @@ export async function updatePreferences(
 ): Promise<NotificationPreference> {
   return requestJSON<NotificationPreference>(`${ADMIN_API_BASE}/push/preferences`, {
     method: "PUT",
-    headers: { Accept: "application/json", "Content-Type": "application/json" },
+    headers: adminAuthHeaders(undefined, {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    }),
     body: JSON.stringify(prefs),
   });
 }

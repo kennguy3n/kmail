@@ -725,7 +725,7 @@ export interface IPReputationHistoryPoint {
 export async function listIpReputation(): Promise<IPReputationMetrics[]> {
   const res = await requestJSON<{ ips: IPReputationMetrics[] }>(
     `${ADMIN_API_BASE}/admin/ip-reputation`,
-    { method: "GET", headers: { Accept: "application/json" } },
+    { method: "GET", headers: adminAuthHeaders(undefined, { Accept: "application/json" }) },
   );
   return res.ips ?? [];
 }
@@ -735,7 +735,7 @@ export async function getIpReputationHistory(
 ): Promise<IPReputationHistoryPoint[]> {
   const res = await requestJSON<{ history: IPReputationHistoryPoint[] }>(
     `${ADMIN_API_BASE}/admin/ip-reputation/${encodeURIComponent(ipId)}/history`,
-    { method: "GET", headers: { Accept: "application/json" } },
+    { method: "GET", headers: adminAuthHeaders(undefined, { Accept: "application/json" }) },
   );
   return res.history ?? [];
 }

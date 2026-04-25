@@ -1,4 +1,4 @@
-import { ADMIN_API_BASE, requestJSON } from "./admin";
+import { ADMIN_API_BASE, adminAuthHeaders, requestJSON } from "./admin";
 
 export type AssignmentStatus =
   | "open"
@@ -37,7 +37,7 @@ export async function listAssignments(
   if (opts.assigneeUserId) params.set("assignee_user_id", opts.assigneeUserId);
   const res = await requestJSON<{ assignments: EmailAssignment[] }>(
     `${ADMIN_API_BASE}/shared-inboxes/${encodeURIComponent(inboxId)}/assignments?${params}`,
-    { method: "GET", headers: { Accept: "application/json" } },
+    { method: "GET", headers: adminAuthHeaders(undefined, { Accept: "application/json" }) },
   );
   return res.assignments ?? [];
 }
@@ -51,7 +51,10 @@ export async function assignEmail(
     `${ADMIN_API_BASE}/shared-inboxes/${encodeURIComponent(inboxId)}/emails/${encodeURIComponent(emailId)}/assign`,
     {
       method: "POST",
-      headers: { Accept: "application/json", "Content-Type": "application/json" },
+      headers: adminAuthHeaders(undefined, {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      }),
       body: JSON.stringify({ assignee_user_id: assigneeUserId }),
     },
   );
@@ -60,7 +63,7 @@ export async function assignEmail(
 export async function unassignEmail(inboxId: string, emailId: string): Promise<void> {
   await fetch(
     `${ADMIN_API_BASE}/shared-inboxes/${encodeURIComponent(inboxId)}/emails/${encodeURIComponent(emailId)}/assign`,
-    { method: "DELETE" },
+    { method: "DELETE", headers: adminAuthHeaders() },
   );
 }
 
@@ -73,7 +76,10 @@ export async function setStatus(
     `${ADMIN_API_BASE}/shared-inboxes/${encodeURIComponent(inboxId)}/emails/${encodeURIComponent(emailId)}/status`,
     {
       method: "PUT",
-      headers: { Accept: "application/json", "Content-Type": "application/json" },
+      headers: adminAuthHeaders(undefined, {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      }),
       body: JSON.stringify({ status }),
     },
   );
@@ -82,7 +88,7 @@ export async function setStatus(
 export async function listNotes(inboxId: string, emailId: string): Promise<InternalNote[]> {
   const res = await requestJSON<{ notes: InternalNote[] }>(
     `${ADMIN_API_BASE}/shared-inboxes/${encodeURIComponent(inboxId)}/emails/${encodeURIComponent(emailId)}/notes`,
-    { method: "GET", headers: { Accept: "application/json" } },
+    { method: "GET", headers: adminAuthHeaders(undefined, { Accept: "application/json" }) },
   );
   return res.notes ?? [];
 }
@@ -96,7 +102,10 @@ export async function addNote(
     `${ADMIN_API_BASE}/shared-inboxes/${encodeURIComponent(inboxId)}/emails/${encodeURIComponent(emailId)}/notes`,
     {
       method: "POST",
-      headers: { Accept: "application/json", "Content-Type": "application/json" },
+      headers: adminAuthHeaders(undefined, {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      }),
       body: JSON.stringify({ note_text: noteText }),
     },
   );

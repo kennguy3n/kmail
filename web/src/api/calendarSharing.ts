@@ -1,4 +1,4 @@
-import { ADMIN_API_BASE, requestJSON } from "./admin";
+import { ADMIN_API_BASE, adminAuthHeaders, requestJSON } from "./admin";
 
 export interface CalendarShare {
   id: string;
@@ -30,7 +30,10 @@ export async function createCalendar(input: {
 }): Promise<{ id: string; name: string }> {
   return requestJSON(`${ADMIN_API_BASE}/calendars`, {
     method: "POST",
-    headers: { Accept: "application/json", "Content-Type": "application/json" },
+    headers: adminAuthHeaders(undefined, {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    }),
     body: JSON.stringify(input),
   });
 }
@@ -44,7 +47,10 @@ export async function shareCalendar(
     `${ADMIN_API_BASE}/calendars/${encodeURIComponent(calendarId)}/share`,
     {
       method: "POST",
-      headers: { Accept: "application/json", "Content-Type": "application/json" },
+      headers: adminAuthHeaders(undefined, {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      }),
       body: JSON.stringify({ target_account_id: targetAccountId, permission }),
     },
   );
@@ -53,7 +59,7 @@ export async function shareCalendar(
 export async function listSharedCalendars(): Promise<CalendarShare[]> {
   const res = await requestJSON<{ shares: CalendarShare[] }>(
     `${ADMIN_API_BASE}/calendars/shared`,
-    { method: "GET", headers: { Accept: "application/json" } },
+    { method: "GET", headers: adminAuthHeaders(undefined, { Accept: "application/json" }) },
   );
   return res.shares ?? [];
 }
@@ -61,7 +67,7 @@ export async function listSharedCalendars(): Promise<CalendarShare[]> {
 export async function listResourceCalendars(): Promise<ResourceCalendar[]> {
   const res = await requestJSON<{ resources: ResourceCalendar[] }>(
     `${ADMIN_API_BASE}/resource-calendars`,
-    { method: "GET", headers: { Accept: "application/json" } },
+    { method: "GET", headers: adminAuthHeaders(undefined, { Accept: "application/json" }) },
   );
   return res.resources ?? [];
 }
@@ -71,7 +77,10 @@ export async function createResourceCalendar(
 ): Promise<ResourceCalendar> {
   return requestJSON(`${ADMIN_API_BASE}/resource-calendars`, {
     method: "POST",
-    headers: { Accept: "application/json", "Content-Type": "application/json" },
+    headers: adminAuthHeaders(undefined, {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    }),
     body: JSON.stringify(input),
   });
 }
@@ -84,7 +93,10 @@ export async function bookResource(
 ): Promise<{ uid: string }> {
   return requestJSON(`${ADMIN_API_BASE}/calendars/${encodeURIComponent(calendarId)}/book`, {
     method: "POST",
-    headers: { Accept: "application/json", "Content-Type": "application/json" },
+    headers: adminAuthHeaders(undefined, {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    }),
     body: JSON.stringify({ start, end, subject }),
   });
 }

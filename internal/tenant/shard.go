@@ -199,10 +199,20 @@ func (s *ShardService) AssignTenantToShard(ctx context.Context, tenantID string)
 	}
 	var assignment TenantShardAssignment
 	err := pgx.BeginFunc(ctx, s.Pool, func(tx pgx.Tx) error {
+		// Look up any existing assignment so we can decrement the
+		// old shard's counter if the tenant is being reassigned.
+		var oldShardID string
+		err := tx.QueryRow(ctx, `
+			SELECT shard_id::text FROM tenant_shard_assignments
+			WHERE tenant_id = $1::uuid
+		`, tenantID).Scan(&oldShardID)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
 		// Pick the shard with the fewest current_mailboxes that
 		// still has capacity and is active.
 		var shardID string
-		err := tx.QueryRow(ctx, `
+		err = tx.QueryRow(ctx, `
 			SELECT id::text FROM stalwart_shards
 			WHERE status = 'active' AND current_mailboxes < max_mailboxes
 			ORDER BY current_mailboxes::float / NULLIF(max_mailboxes, 0) ASC, id
@@ -223,7 +233,23 @@ func (s *ShardService) AssignTenantToShard(ctx context.Context, tenantID string)
 		`, tenantID, shardID).Scan(&assignment.TenantID, &assignment.ShardID, &assignment.AssignedAt); err != nil {
 			return err
 		}
-		// Bump the mailbox counter on the winning shard.
+		// Decrement the old shard's counter if this is a reassignment
+		// to a different shard. Mirrors the pattern in RebalanceShard.
+		if oldShardID != "" && oldShardID != shardID {
+			if _, err := tx.Exec(ctx, `
+				UPDATE stalwart_shards
+				SET current_mailboxes = GREATEST(current_mailboxes - 1, 0), updated_at = now()
+				WHERE id = $1::uuid
+			`, oldShardID); err != nil {
+				return err
+			}
+		}
+		// Bump the mailbox counter on the winning shard only when
+		// we actually moved; a no-op reassignment to the same shard
+		// should leave the counter alone.
+		if oldShardID == shardID {
+			return nil
+		}
 		_, err = tx.Exec(ctx, `
 			UPDATE stalwart_shards SET current_mailboxes = current_mailboxes + 1, updated_at = now()
 			WHERE id = $1::uuid
