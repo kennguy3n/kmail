@@ -107,6 +107,16 @@ func NewService(cfg Config) *Service {
 	return &Service{cfg: cfg, kchat: k}
 }
 
+// KChat returns the KChat client the service is wired to. Sibling
+// packages (calendarbridge.Notifier) use this to post directly
+// without re-implementing the KChat REST client.
+func (s *Service) KChat() KChatClient {
+	if s == nil {
+		return nil
+	}
+	return s.kchat
+}
+
 // Route describes a configured email-alias → KChat-channel route.
 type Route struct {
 	ID           string    `json:"id"`

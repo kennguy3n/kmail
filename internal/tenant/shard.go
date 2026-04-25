@@ -410,6 +410,41 @@ func (s *ShardService) probe(ctx context.Context, stalwartURL string) bool {
 	return resp.StatusCode >= 200 && resp.StatusCode < 300
 }
 
+// GetSecondaryShards returns the failover Stalwart URLs for the
+// tenant's primary shard, ordered by `shard_failover_config.priority`.
+// The list is intentionally empty when no backups are configured —
+// the caller (JMAP proxy) treats that as "no failover available"
+// and falls through to the global default.
+func (s *ShardService) GetSecondaryShards(ctx context.Context, tenantID string) ([]string, error) {
+	if tenantID == "" {
+		return nil, fmt.Errorf("tenantID required")
+	}
+	if s.Pool == nil {
+		return nil, nil
+	}
+	rows, err := s.Pool.Query(ctx, `
+		SELECT bsh.stalwart_url
+		FROM tenant_shard_assignments tsa
+		JOIN shard_failover_config fc ON fc.shard_id = tsa.shard_id
+		JOIN stalwart_shards bsh       ON bsh.id     = fc.backup_shard_id
+		WHERE tsa.tenant_id = $1::uuid AND bsh.status = 'active'
+		ORDER BY fc.priority ASC, bsh.created_at ASC
+	`, tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("get secondary shards: %w", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var u string
+		if err := rows.Scan(&u); err != nil {
+			return nil, err
+		}
+		out = append(out, u)
+	}
+	return out, rows.Err()
+}
+
 // HealthWorker is the background probe loop.
 type HealthWorker struct {
 	Service  *ShardService

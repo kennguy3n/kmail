@@ -21,8 +21,9 @@ type Registrar interface {
 
 // Handlers wires the Calendar Bridge into the BFF's HTTP mux.
 type Handlers struct {
-	svc    *Service
-	logger *log.Logger
+	svc      *Service
+	notifier *Notifier
+	logger   *log.Logger
 }
 
 // NewHandlers constructs the Handlers facade.
@@ -31,6 +32,15 @@ func NewHandlers(svc *Service, logger *log.Logger) *Handlers {
 		logger = log.Default()
 	}
 	return &Handlers{svc: svc, logger: logger}
+}
+
+// WithNotifier returns a copy of the Handlers wired to the given
+// Notifier. Handlers post create/update/delete events to KChat
+// after the CalDAV mutation succeeds.
+func (h *Handlers) WithNotifier(n *Notifier) *Handlers {
+	cp := *h
+	cp.notifier = n
+	return &cp
 }
 
 // Register mounts calendar routes under `/api/v1/calendars/...`.
@@ -96,6 +106,7 @@ func (h *Handlers) createEvent(w http.ResponseWriter, r *http.Request) {
 		h.respondError(w, err)
 		return
 	}
+	h.notifyEvent(r, calendarID, uid, in.ICalData, "created", "")
 	h.writeResult(w, map[string]string{"uid": uid}, nil)
 }
 
@@ -117,6 +128,7 @@ func (h *Handlers) updateEvent(w http.ResponseWriter, r *http.Request) {
 		h.respondError(w, err)
 		return
 	}
+	h.notifyEvent(r, calendarID, eventUID, in.ICalData, "updated", "")
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -128,7 +140,36 @@ func (h *Handlers) deleteEvent(w http.ResponseWriter, r *http.Request) {
 		h.respondError(w, err)
 		return
 	}
+	h.notifyEvent(r, calendarID, eventUID, "", "cancelled", "")
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// notifyEvent dispatches a KChat notification for a calendar
+// transition. nil-notifier-safe so dev environments without a chat
+// bridge configured are no-ops.
+func (h *Handlers) notifyEvent(r *http.Request, calendarID, uid, icalData, kind, changes string) {
+	if h.notifier == nil {
+		return
+	}
+	tenantID := middleware.TenantIDFrom(r.Context())
+	if tenantID == "" {
+		return
+	}
+	info := summaryFromICal(icalData)
+	info.UID = uid
+	info.CalendarID = calendarID
+	var err error
+	switch kind {
+	case "created":
+		err = h.notifier.NotifyEventCreated(r.Context(), tenantID, info)
+	case "updated":
+		err = h.notifier.NotifyEventUpdated(r.Context(), tenantID, info, changes)
+	case "cancelled":
+		err = h.notifier.NotifyEventCancelled(r.Context(), tenantID, info)
+	}
+	if err != nil {
+		h.logger.Printf("calendarbridge.notify %s: %v", kind, err)
+	}
 }
 
 type respondRequest struct {

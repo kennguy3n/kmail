@@ -33,8 +33,27 @@ type SeatAccounter interface {
 // tenant / user / alias / shared-inbox lifecycle methods consumed by
 // the HTTP handlers in this package.
 type Service struct {
-	pool  *pgxpool.Pool
-	seats SeatAccounter
+	pool        *pgxpool.Pool
+	seats       SeatAccounter
+	provisioner StorageProvisioner
+	billing     BillingLifecycleHook
+}
+
+// StorageProvisioner is the narrow slice of `ZKFabricProvisioner`
+// the Tenant Service consumes on CreateTenant. Defined here so
+// tests can substitute a stub without standing up a fake
+// zk-object-fabric console.
+type StorageProvisioner interface {
+	Provision(ctx context.Context, tenantID, plan string) (*StorageCredential, error)
+}
+
+// BillingLifecycleHook is the narrow slice of the Billing Service's
+// `Lifecycle` helper the Tenant Service calls on tenant create /
+// delete. Defined here to break the circular import back to
+// `internal/billing`.
+type BillingLifecycleHook interface {
+	OnTenantCreated(ctx context.Context, tenantID, plan string) error
+	OnTenantDeleted(ctx context.Context, tenantID string) error
 }
 
 // NewService returns a Service wired to the provided pgx pool.
@@ -48,6 +67,25 @@ func NewService(pool *pgxpool.Pool) *Service {
 func (s *Service) WithSeatAccounter(a SeatAccounter) *Service {
 	cp := *s
 	cp.seats = a
+	return &cp
+}
+
+// WithStorageProvisioner returns a copy of the Service wired to a
+// per-tenant zk-object-fabric provisioner. CreateTenant calls
+// Provision after the DB insert; failures surface to the caller so
+// half-provisioned tenants do not slip through silently.
+func (s *Service) WithStorageProvisioner(p StorageProvisioner) *Service {
+	cp := *s
+	cp.provisioner = p
+	return &cp
+}
+
+// WithBillingLifecycle returns a copy of the Service wired to the
+// provided billing-lifecycle hook. CreateTenant / DeleteTenant call
+// the hook after the DB mutation succeeds.
+func (s *Service) WithBillingLifecycle(b BillingLifecycleHook) *Service {
+	cp := *s
+	cp.billing = b
 	return &cp
 }
 
@@ -204,6 +242,21 @@ func (s *Service) CreateTenant(ctx context.Context, in CreateTenantInput) (*Tena
 	)
 	if err != nil {
 		return nil, fmt.Errorf("insert tenant: %w", err)
+	}
+	// Best-effort post-insert hooks. We surface errors to the caller
+	// so a half-provisioned tenant doesn't slip into the control
+	// plane silently — operators can re-run provisioning idempotently
+	// (CreateBucket / placement PUT both no-op when the resource
+	// already exists for the same tenant).
+	if s.provisioner != nil {
+		if _, err := s.provisioner.Provision(ctx, t.ID, t.Plan); err != nil {
+			return &t, fmt.Errorf("zk-fabric provision: %w", err)
+		}
+	}
+	if s.billing != nil {
+		if err := s.billing.OnTenantCreated(ctx, t.ID, t.Plan); err != nil {
+			return &t, fmt.Errorf("billing.OnTenantCreated: %w", err)
+		}
 	}
 	return &t, nil
 }
@@ -458,6 +511,11 @@ func (s *Service) DeleteTenant(ctx context.Context, id string) error {
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrNotFound
+	}
+	if s.billing != nil {
+		if err := s.billing.OnTenantDeleted(ctx, id); err != nil {
+			return fmt.Errorf("billing.OnTenantDeleted: %w", err)
+		}
 	}
 	return nil
 }
