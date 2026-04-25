@@ -69,12 +69,13 @@ func (h *Handlers) create(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) approve(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.PathValue("id")
 	id := r.PathValue("approvalId")
 	var in struct {
 		ApproverID string `json:"approver_id"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&in)
-	out, err := h.svc.ApproveRequest(r.Context(), id, in.ApproverID)
+	out, err := h.svc.ApproveRequest(r.Context(), tenantID, id, in.ApproverID)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
@@ -83,13 +84,14 @@ func (h *Handlers) approve(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) reject(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.PathValue("id")
 	id := r.PathValue("approvalId")
 	var in struct {
 		ApproverID string `json:"approver_id"`
 		Reason     string `json:"reason"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&in)
-	out, err := h.svc.RejectRequest(r.Context(), id, in.ApproverID, in.Reason)
+	out, err := h.svc.RejectRequest(r.Context(), tenantID, id, in.ApproverID, in.Reason)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
@@ -98,8 +100,9 @@ func (h *Handlers) reject(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) execute(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.PathValue("id")
 	id := r.PathValue("approvalId")
-	if err := h.svc.ExecuteApproved(r.Context(), id); err != nil {
+	if err := h.svc.ExecuteApproved(r.Context(), tenantID, id); err != nil {
 		status := http.StatusBadRequest
 		if err == ErrNoExecutor {
 			status = http.StatusNotImplemented

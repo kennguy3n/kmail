@@ -20,7 +20,10 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/kennguy3n/kmail/internal/middleware"
 )
 
 // Status values mirror the SQL CHECK constraint.
@@ -110,39 +113,63 @@ func (s *Service) CreateRequest(ctx context.Context, tenantID, requesterID, acti
 	return &r, nil
 }
 
-// ApproveRequest marks the request approved.
-func (s *Service) ApproveRequest(ctx context.Context, approvalID, approverID string) (*Request, error) {
-	return s.resolve(ctx, approvalID, approverID, StatusApproved)
+// ApproveRequest marks the request approved. The tenantID is
+// taken from the authenticated request path and is enforced by
+// both an explicit `AND tenant_id = ...` clause and a Postgres
+// session GUC that engages RLS, so a caller cannot resolve another
+// tenant's pending approval by guessing the UUID.
+func (s *Service) ApproveRequest(ctx context.Context, tenantID, approvalID, approverID string) (*Request, error) {
+	return s.resolve(ctx, tenantID, approvalID, approverID, StatusApproved)
 }
 
-// RejectRequest marks the request rejected.
-func (s *Service) RejectRequest(ctx context.Context, approvalID, approverID, reason string) (*Request, error) {
-	r, err := s.resolve(ctx, approvalID, approverID, StatusRejected)
+// RejectRequest marks the request rejected. Same tenant scoping as
+// ApproveRequest applies.
+func (s *Service) RejectRequest(ctx context.Context, tenantID, approvalID, approverID, reason string) (*Request, error) {
+	r, err := s.resolve(ctx, tenantID, approvalID, approverID, StatusRejected)
 	if err != nil {
 		return nil, err
 	}
 	if reason != "" {
-		_, _ = s.pool.Exec(ctx, `UPDATE approval_requests SET reason = $2 WHERE id = $1::uuid`, approvalID, reason)
-		r.Reason = reason
+		err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+			if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
+				return err
+			}
+			_, err := tx.Exec(ctx, `
+				UPDATE approval_requests SET reason = $2
+				WHERE id = $1::uuid AND tenant_id = $3::uuid
+			`, approvalID, reason, tenantID)
+			return err
+		})
+		if err == nil {
+			r.Reason = reason
+		}
 	}
 	return r, nil
 }
 
-func (s *Service) resolve(ctx context.Context, approvalID, approverID string, status Status) (*Request, error) {
+func (s *Service) resolve(ctx context.Context, tenantID, approvalID, approverID string, status Status) (*Request, error) {
+	if tenantID == "" {
+		return nil, errors.New("approval: tenantID required")
+	}
 	if s.pool == nil {
 		return nil, errors.New("approval: pool not configured")
 	}
 	var r Request
-	err := s.pool.QueryRow(ctx, `
-		UPDATE approval_requests
-		SET status = $2, approver_id = $3, resolved_at = now()
-		WHERE id = $1::uuid AND status = 'pending'
-		RETURNING id::text, tenant_id::text, requester_id, action, target_resource, status,
-		          COALESCE(approver_id, ''), reason, created_at, resolved_at, expires_at
-	`, approvalID, string(status), approverID).Scan(
-		&r.ID, &r.TenantID, &r.RequesterID, &r.Action, &r.TargetResource, &r.Status,
-		&r.ApproverID, &r.Reason, &r.CreatedAt, &r.ResolvedAt, &r.ExpiresAt,
-	)
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `
+			UPDATE approval_requests
+			SET status = $2, approver_id = $3, resolved_at = now()
+			WHERE id = $1::uuid AND tenant_id = $4::uuid AND status = 'pending'
+			RETURNING id::text, tenant_id::text, requester_id, action, target_resource, status,
+			          COALESCE(approver_id, ''), reason, created_at, resolved_at, expires_at
+		`, approvalID, string(status), approverID, tenantID).Scan(
+			&r.ID, &r.TenantID, &r.RequesterID, &r.Action, &r.TargetResource, &r.Status,
+			&r.ApproverID, &r.Reason, &r.CreatedAt, &r.ResolvedAt, &r.ExpiresAt,
+		)
+	})
 	if err != nil {
 		return nil, fmt.Errorf("resolve: %w", err)
 	}
@@ -193,20 +220,31 @@ func (s *Service) ListAll(ctx context.Context, tenantID string, limit int) ([]Re
 
 // ExecuteApproved runs the registered executor for the approved
 // request. Returns ErrNoExecutor when no executor is wired so the
-// caller can fall back to manual operator action.
-func (s *Service) ExecuteApproved(ctx context.Context, approvalID string) error {
+// caller can fall back to manual operator action. Like the other
+// resolve methods, the lookup is tenant-scoped (explicit predicate
+// + RLS) so a caller cannot execute another tenant's approval.
+func (s *Service) ExecuteApproved(ctx context.Context, tenantID, approvalID string) error {
+	if tenantID == "" {
+		return errors.New("approval: tenantID required")
+	}
 	if s.pool == nil {
 		return errors.New("approval: pool not configured")
 	}
 	var r Request
-	err := s.pool.QueryRow(ctx, `
-		SELECT id::text, tenant_id::text, requester_id, action, target_resource, status,
-		       COALESCE(approver_id, ''), reason, created_at, resolved_at, expires_at
-		FROM approval_requests WHERE id = $1::uuid
-	`, approvalID).Scan(
-		&r.ID, &r.TenantID, &r.RequesterID, &r.Action, &r.TargetResource, &r.Status,
-		&r.ApproverID, &r.Reason, &r.CreatedAt, &r.ResolvedAt, &r.ExpiresAt,
-	)
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `
+			SELECT id::text, tenant_id::text, requester_id, action, target_resource, status,
+			       COALESCE(approver_id, ''), reason, created_at, resolved_at, expires_at
+			FROM approval_requests
+			WHERE id = $1::uuid AND tenant_id = $2::uuid
+		`, approvalID, tenantID).Scan(
+			&r.ID, &r.TenantID, &r.RequesterID, &r.Action, &r.TargetResource, &r.Status,
+			&r.ApproverID, &r.Reason, &r.CreatedAt, &r.ResolvedAt, &r.ExpiresAt,
+		)
+	})
 	if err != nil {
 		return err
 	}

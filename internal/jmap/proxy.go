@@ -228,11 +228,21 @@ func (t *shardFailoverTransport) RoundTrip(req *http.Request) (*http.Response, e
 			lastErr = err
 			continue
 		}
-		if resp.StatusCode >= 500 && i+1 < len(urls) {
-			resp.Body.Close()
+		if resp.StatusCode >= 500 {
+			// Always count a 5xx against the breaker, even on the
+			// last candidate. The previous code only incremented
+			// when a fallback existed (`i+1 < len(urls)`), so the
+			// last shard could fail forever without ever tripping
+			// its breaker.
 			t.proxy.breakerInc(u.Host)
-			lastErr = fmt.Errorf("upstream %s returned %d", u.Host, resp.StatusCode)
-			continue
+			if i+1 < len(urls) {
+				resp.Body.Close()
+				lastErr = fmt.Errorf("upstream %s returned %d", u.Host, resp.StatusCode)
+				continue
+			}
+			// No more candidates; surface the last shard's 5xx to
+			// the client without resetting its breaker.
+			return resp, nil
 		}
 		t.proxy.breakerReset(u.Host)
 		return resp, nil

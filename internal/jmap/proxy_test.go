@@ -261,3 +261,35 @@ func TestShardFailoverTransport_BuffersBodyAcrossRetries(t *testing.T) {
 		t.Errorf("secondary body = %q, want full payload", got)
 	}
 }
+
+// TestShardFailoverTransport_LastShardBreaker verifies that a 5xx
+// from the last candidate URL still increments the circuit breaker
+// for that host instead of falling through to breakerReset. The old
+// code reset the counter on every last-shard 5xx, so the breaker
+// could never trip for the only remaining shard.
+func TestShardFailoverTransport_LastShardBreaker(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	p := newTestProxy(t)
+	tr := &shardFailoverTransport{proxy: p, base: http.DefaultTransport}
+
+	// One candidate (the last == only shard). Each request should
+	// increment the breaker counter and on the threshold open it.
+	for i := 0; i < 3; i++ {
+		req := httptest.NewRequest(http.MethodPost, "http://placeholder/jmap", nil)
+		req = req.WithContext(withShardURLs(req.Context(), []string{srv.URL}))
+		resp, err := tr.RoundTrip(req)
+		if err != nil {
+			t.Fatalf("RoundTrip[%d]: %v", i, err)
+		}
+		resp.Body.Close()
+	}
+
+	srvURL, _ := url.Parse(srv.URL)
+	if !p.breakerOpen(srvURL.Host, 3) {
+		t.Errorf("breaker for %s did not open after 3 consecutive 5xx", srvURL.Host)
+	}
+}
