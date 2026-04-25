@@ -43,12 +43,15 @@ type Config struct {
 type Service struct {
 	cfg Config
 
-	Suppression *SuppressionService
-	Bounce      *BounceProcessor
-	IPPool      *IPPoolService
-	SendLimit   *SendLimitService
-	Warmup      *WarmupScheduler
-	DMARC       *DMARCService
+	Suppression  *SuppressionService
+	Bounce       *BounceProcessor
+	IPPool       *IPPoolService
+	SendLimit    *SendLimitService
+	Warmup       *WarmupScheduler
+	DMARC        *DMARCService
+	FeedbackLoop *FeedbackLoopService
+	Abuse        *AbuseScorer
+	Alerts       *AlertService
 }
 
 // NewService builds every sub-service from a Config. Defaults are
@@ -98,6 +101,9 @@ func NewService(cfg Config) *Service {
 		sendLimit:  s.SendLimit,
 	}
 	s.DMARC = &DMARCService{pool: cfg.Pool}
+	s.FeedbackLoop = &FeedbackLoopService{pool: cfg.Pool}
+	s.Abuse = &AbuseScorer{pool: cfg.Pool, sendLimit: s.SendLimit}
+	s.Alerts = &AlertService{pool: cfg.Pool, bounce: s.Bounce, sendLimit: s.SendLimit}
 	return s
 }
 
