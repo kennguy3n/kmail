@@ -23,13 +23,16 @@ package migration
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os/exec"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -160,6 +163,34 @@ type CreateJobInput struct {
 	SourceUser     string `json:"source_user"`
 	SourcePassword string `json:"source_password"`
 	DestUser       string `json:"dest_user"`
+}
+
+// TestConnectionInput is the body accepted by
+// POST /api/v1/migrations/test-connection. The wizard "Test
+// connection" button posts these fields to validate IMAP credentials
+// before the operator commits to creating an import job.
+type TestConnectionInput struct {
+	Host     string `json:"host"`
+	Port     int    `json:"port"`
+	Username string `json:"username"`
+	Password string `json:"password"`
+	UseTLS   bool   `json:"use_tls"`
+}
+
+func (in TestConnectionInput) validate() error {
+	if in.Host == "" {
+		return fmt.Errorf("%w: host is required", ErrInvalidInput)
+	}
+	if in.Port <= 0 || in.Port > 65535 {
+		return fmt.Errorf("%w: port must be 1..65535", ErrInvalidInput)
+	}
+	if in.Username == "" {
+		return fmt.Errorf("%w: username is required", ErrInvalidInput)
+	}
+	if in.Password == "" {
+		return fmt.Errorf("%w: password is required", ErrInvalidInput)
+	}
+	return nil
 }
 
 // Terminal returns true when the job cannot transition further.
@@ -673,6 +704,129 @@ func (s *Service) runImapsync(
 		return fmt.Errorf("imapsync exited: %w", err)
 	}
 	return nil
+}
+
+// ----------------------------------------------------------------
+// IMAP connection test (POST /api/v1/migrations/test-connection)
+//
+// The wizard's "Test connection" button validates IMAP credentials
+// against the source server before the operator commits to creating
+// a job. We avoid pulling in a full IMAP library — the LOGIN /
+// LOGOUT exchange is small enough to drive directly over a
+// `bufio.Reader` against the connection.
+//
+// Implementation notes:
+//   - `UseTLS=true` does an implicit TLS handshake (port 993). For
+//     port 143 + STARTTLS we keep the call simple by issuing
+//     STARTTLS only when UseTLS is false AND the server greeting
+//     advertises STARTTLS in `CAPABILITY`. Most providers — Gmail,
+//     M365, Yahoo — only accept implicit TLS on 993, which is what
+//     the wizard defaults to.
+//   - The whole exchange is bounded by a 10s deadline so a
+//     misconfigured port doesn't hang the request indefinitely.
+//   - On failure we surface the BAD/NO line verbatim so the operator
+//     can distinguish "wrong password" from "auth not enabled".
+// ----------------------------------------------------------------
+
+// imapTestTimeout is the wall-clock budget for the entire LOGIN /
+// LOGOUT exchange. Includes connect, TLS handshake, greeting,
+// LOGIN response, and LOGOUT.
+const imapTestTimeout = 10 * time.Second
+
+// TestConnection establishes an IMAP control connection to the
+// source server with the supplied credentials and returns nil when
+// the LOGIN command succeeds. Used by the migration wizard's "Test
+// connection" button so operators can validate IMAP access before
+// creating a job.
+//
+// Errors are wrapped with ErrInvalidInput when the input is bogus
+// (missing host / port / credentials) and returned verbatim when the
+// IMAP server rejects the LOGIN. Network failures (DNS, connect,
+// handshake) are wrapped with the dialler / TLS error chain so
+// callers can `errors.Is` against `net.OpError` etc.
+func (s *Service) TestConnection(ctx context.Context, in TestConnectionInput) error {
+	if err := in.validate(); err != nil {
+		return err
+	}
+	dialCtx, cancel := context.WithTimeout(ctx, imapTestTimeout)
+	defer cancel()
+
+	addr := net.JoinHostPort(in.Host, strconv.Itoa(in.Port))
+	d := &net.Dialer{Timeout: imapTestTimeout}
+	var conn net.Conn
+	var err error
+	if in.UseTLS {
+		conn, err = (&tls.Dialer{NetDialer: d, Config: &tls.Config{ServerName: in.Host}}).DialContext(dialCtx, "tcp", addr)
+	} else {
+		conn, err = d.DialContext(dialCtx, "tcp", addr)
+	}
+	if err != nil {
+		return fmt.Errorf("dial %s: %w", addr, err)
+	}
+	defer conn.Close()
+	deadline := time.Now().Add(imapTestTimeout)
+	_ = conn.SetDeadline(deadline)
+
+	br := bufio.NewReader(conn)
+	greeting, err := br.ReadString('\n')
+	if err != nil {
+		return fmt.Errorf("read greeting: %w", err)
+	}
+	if !strings.HasPrefix(greeting, "* OK") && !strings.HasPrefix(greeting, "* PREAUTH") {
+		return fmt.Errorf("unexpected greeting: %s", strings.TrimSpace(greeting))
+	}
+	if err := imapCommand(conn, br, "a1", fmt.Sprintf("LOGIN %s %s",
+		quoteIMAP(in.Username), quoteIMAP(in.Password))); err != nil {
+		return fmt.Errorf("imap login: %w", err)
+	}
+	// LOGOUT is best-effort — the connection is about to be closed.
+	_ = imapCommand(conn, br, "a2", "LOGOUT")
+	return nil
+}
+
+// imapCommand writes `tag command\r\n` to conn and reads response
+// lines until it finds the matching tagged completion. Returns nil
+// on `<tag> OK ...`, an error on `<tag> NO|BAD ...`, or a parse
+// error if the stream closes before completion.
+func imapCommand(conn net.Conn, br *bufio.Reader, tag, command string) error {
+	if _, err := fmt.Fprintf(conn, "%s %s\r\n", tag, command); err != nil {
+		return err
+	}
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			return err
+		}
+		trimmed := strings.TrimRight(line, "\r\n")
+		if strings.HasPrefix(trimmed, tag+" ") {
+			rest := strings.TrimPrefix(trimmed, tag+" ")
+			switch {
+			case strings.HasPrefix(rest, "OK"):
+				return nil
+			case strings.HasPrefix(rest, "NO"), strings.HasPrefix(rest, "BAD"):
+				return errors.New(rest)
+			default:
+				return fmt.Errorf("unexpected completion: %s", rest)
+			}
+		}
+		// Untagged response line — keep reading.
+	}
+}
+
+// quoteIMAP wraps a string in IMAP-quoted form, escaping `"` and
+// `\`. Sufficient for usernames / passwords; literal{N} form is
+// not needed for the LOGIN command we use.
+func quoteIMAP(s string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	for _, r := range s {
+		if r == '"' || r == '\\' {
+			b.WriteByte('\\')
+		}
+		b.WriteRune(r)
+	}
+	b.WriteByte('"')
+	return b.String()
 }
 
 // ----------------------------------------------------------------

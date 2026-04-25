@@ -29,7 +29,33 @@ func (h *Handlers) Register(mux *http.ServeMux, authMW *middleware.OIDC) {
 	mux.Handle("GET /api/v1/tenants/{id}/billing", authMW.Wrap(http.HandlerFunc(h.summary)))
 	mux.Handle("GET /api/v1/tenants/{id}/billing/usage", authMW.Wrap(http.HandlerFunc(h.usage)))
 	mux.Handle("PATCH /api/v1/tenants/{id}/billing", authMW.Wrap(http.HandlerFunc(h.updateLimits)))
+	mux.Handle("PATCH /api/v1/tenants/{id}/billing/plan", authMW.Wrap(http.HandlerFunc(h.changePlan)))
 	mux.Handle("POST /api/v1/tenants/{id}/billing/invoice", authMW.Wrap(http.HandlerFunc(h.invoice)))
+}
+
+// ChangePlanInput is the request body for PATCH .../billing/plan.
+type ChangePlanInput struct {
+	Plan string `json:"plan"`
+}
+
+func (h *Handlers) changePlan(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.PathValue("id")
+	if err := checkTenantScope(r, tenantID); err != nil {
+		writeError(w, http.StatusForbidden, err)
+		return
+	}
+	var in ChangePlanInput
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	sum, err := h.svc.ChangePlan(r.Context(), tenantID, in.Plan)
+	if err != nil {
+		h.logger.Printf("billing.changePlan: %v", err)
+		writeError(w, statusFor(err), err)
+		return
+	}
+	writeJSON(w, http.StatusOK, sum)
 }
 
 func (h *Handlers) summary(w http.ResponseWriter, r *http.Request) {

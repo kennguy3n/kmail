@@ -19,6 +19,7 @@ import IpReputationAdmin from "./pages/Admin/IpReputationAdmin";
 import NotificationPrefs from "./pages/Admin/NotificationPrefs";
 import MigrationAdmin from "./pages/Admin/MigrationAdmin";
 import ResourceCalendarAdmin from "./pages/Admin/ResourceCalendarAdmin";
+import PricingAdmin from "./pages/Admin/PricingAdmin";
 
 /**
  * App is the KMail React entrypoint.
@@ -56,6 +57,7 @@ export default function App() {
         <Route path="admin/notifications" element={<NotificationPrefs />} />
         <Route path="admin/migrations" element={<MigrationAdmin />} />
         <Route path="admin/resource-calendars" element={<ResourceCalendarAdmin />} />
+        <Route path="admin/pricing" element={<PricingAdmin />} />
 
         <Route path="*" element={<Navigate to="/mail" replace />} />
       </Route>

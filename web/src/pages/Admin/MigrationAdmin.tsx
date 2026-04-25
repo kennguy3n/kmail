@@ -6,6 +6,7 @@ import {
   listMigrationJobs,
   pauseMigrationJob,
   resumeMigrationJob,
+  testMigrationConnection,
   type CreateMigrationJobInput,
   type MigrationJob,
 } from "../../api/admin";
@@ -36,6 +37,34 @@ export default function MigrationAdmin() {
   });
   const [step, setStep] = useState<1 | 2 | 3>(1);
   const [error, setError] = useState<string | null>(null);
+  const [testResult, setTestResult] = useState<
+    { ok: true } | { ok: false; error: string } | null
+  >(null);
+  const [testing, setTesting] = useState(false);
+
+  const runTestConnection = async () => {
+    if (!selectedTenantId) return;
+    setTesting(true);
+    setTestResult(null);
+    try {
+      const res = await testMigrationConnection(selectedTenantId, {
+        host: draft.source_host,
+        port: draft.source_port ?? 993,
+        username: draft.source_user,
+        password: draft.source_password,
+        use_tls: (draft.source_port ?? 993) === 993,
+      });
+      if (res.ok) {
+        setTestResult({ ok: true });
+      } else {
+        setTestResult({ ok: false, error: res.error ?? "unknown error" });
+      }
+    } catch (e) {
+      setTestResult({ ok: false, error: String(e) });
+    } finally {
+      setTesting(false);
+    }
+  };
 
   const reload = async () => {
     if (!selectedTenantId) return;
@@ -150,6 +179,27 @@ export default function MigrationAdmin() {
             Destination user
             <input value={draft.destination_user_id} onChange={(e) => setDraft({ ...draft, destination_user_id: e.target.value })} />
           </label>
+          <div className="kmail-wizard-actions">
+            <button
+              type="button"
+              onClick={runTestConnection}
+              disabled={
+                testing ||
+                !selectedTenantId ||
+                !draft.source_host ||
+                !draft.source_user ||
+                !draft.source_password
+              }
+            >
+              {testing ? "Testing…" : "Test connection"}
+            </button>
+            {testResult?.ok === true && (
+              <span className="kmail-success">IMAP login succeeded.</span>
+            )}
+            {testResult?.ok === false && (
+              <span className="kmail-error">Connection failed: {testResult.error}</span>
+            )}
+          </div>
           <button type="button" onClick={() => setStep(1)}>← Back</button>
           <button type="button" onClick={() => setStep(3)}>Next →</button>
         </div>

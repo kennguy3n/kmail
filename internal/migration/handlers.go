@@ -32,6 +32,8 @@ func NewHandlers(svc *Service, logger *log.Logger) *Handlers {
 func (h *Handlers) Register(mux *http.ServeMux, authMW *middleware.OIDC) {
 	mux.Handle("POST /api/v1/migrations",
 		authMW.Wrap(http.HandlerFunc(h.createJob)))
+	mux.Handle("POST /api/v1/migrations/test-connection",
+		authMW.Wrap(http.HandlerFunc(h.testConnection)))
 	mux.Handle("GET /api/v1/migrations",
 		authMW.Wrap(http.HandlerFunc(h.listJobs)))
 	mux.Handle("GET /api/v1/migrations/{jobId}",
@@ -138,6 +140,35 @@ func (h *Handlers) getJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, job)
+}
+
+// testConnection runs a lightweight IMAP LOGIN against the supplied
+// host/port/credentials and surfaces the result so the migration
+// wizard can validate input before posting createJob. The handler is
+// tenant-scoped via OIDC but does not record any persistent state —
+// it is a pure side-channel probe.
+func (h *Handlers) testConnection(w http.ResponseWriter, r *http.Request) {
+	tenantID := middleware.TenantIDFrom(r.Context())
+	if tenantID == "" {
+		writeError(w, http.StatusForbidden, errors.New("missing tenant context"))
+		return
+	}
+	var in TestConnectionInput
+	if err := decodeJSON(r, &in); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := h.svc.TestConnection(r.Context(), in); err != nil {
+		// Surface the error message but as a 200 so the UI can
+		// render a red banner without a network-error toast: the
+		// HTTP layer worked fine, the IMAP login did not.
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":    false,
+			"error": err.Error(),
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func (h *Handlers) cancelJob(w http.ResponseWriter, r *http.Request) {

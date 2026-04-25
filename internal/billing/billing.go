@@ -136,6 +136,18 @@ func (s *Service) GetPlanPricing(plan string) (int, error) {
 	}
 }
 
+// ValidatePlan returns nil when the supplied plan ID is one of the
+// canonical billing tiers. Mirrors the CHECK constraint on
+// `tenants.plan` so handlers reject typos before the UPDATE.
+func ValidatePlan(plan string) error {
+	switch plan {
+	case PlanCore, PlanPro, PlanPrivacy:
+		return nil
+	default:
+		return fmt.Errorf("%w: plan must be one of core, pro, privacy", ErrInvalidInput)
+	}
+}
+
 // PerSeatStorageBytes returns the default storage allocation a seat
 // on the given plan is entitled to. Surfaced by the tenant
 // provisioner so newly-created tenants land in `quotas` with a
@@ -577,6 +589,88 @@ func (s *Service) Summary(ctx context.Context, tenantID string) (*BillingSummary
 		StorageLimit:   q.StorageLimitBytes,
 		StoragePercent: pct,
 	}, nil
+}
+
+// ChangePlan validates the new plan, updates `tenants.plan`, syncs
+// the per-seat default storage limit on `quotas.storage_limit_bytes`
+// (only when the existing limit matches the previous plan's default,
+// so admin overrides via UpdateQuotaLimits are preserved), runs
+// EnforcePlanLimits against the resulting quota row, and writes a
+// `plan_changed` event to `billing_events`. Returns the refreshed
+// BillingSummary so the admin console can render the new pricing
+// without a second round trip.
+func (s *Service) ChangePlan(ctx context.Context, tenantID, newPlan string) (*BillingSummary, error) {
+	if tenantID == "" {
+		return nil, fmt.Errorf("%w: tenantID required", ErrInvalidInput)
+	}
+	if err := ValidatePlan(newPlan); err != nil {
+		return nil, err
+	}
+	if s.cfg.Pool == nil {
+		return nil, ErrNotFound
+	}
+	var oldPlan string
+	var newPerSeatBytes int64
+	if v, err := s.PerSeatStorageBytes(newPlan); err == nil {
+		newPerSeatBytes = v
+	}
+	err := pgx.BeginFunc(ctx, s.cfg.Pool, func(tx pgx.Tx) error {
+		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
+			return err
+		}
+		err := tx.QueryRow(ctx, `
+			SELECT plan FROM tenants WHERE id = $1::uuid
+			FOR UPDATE
+		`, tenantID).Scan(&oldPlan)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if oldPlan == newPlan {
+			return nil
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE tenants SET plan = $2 WHERE id = $1::uuid
+		`, tenantID, newPlan); err != nil {
+			return fmt.Errorf("update tenants.plan: %w", err)
+		}
+		// Bump the per-seat storage default only when the existing
+		// quota row still reflects the *old* plan default. This
+		// preserves any explicit `seat_limit` / `storage_limit_bytes`
+		// override an operator made via PATCH .../billing.
+		if newPerSeatBytes > 0 {
+			oldDefault, _ := s.PerSeatStorageBytes(oldPlan)
+			if _, err := tx.Exec(ctx, `
+				UPDATE quotas
+				SET storage_limit_bytes = $2
+				WHERE tenant_id = $1::uuid
+				  AND storage_limit_bytes = $3
+			`, tenantID, newPerSeatBytes, oldDefault); err != nil {
+				return fmt.Errorf("sync quota storage default: %w", err)
+			}
+		}
+		meta := fmt.Sprintf(`{"old_plan":%q,"new_plan":%q}`, oldPlan, newPlan)
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO billing_events (tenant_id, event_type, metadata)
+			VALUES ($1::uuid, 'plan_changed', $2::jsonb)
+		`, tenantID, meta); err != nil {
+			return fmt.Errorf("billing_events plan_changed: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	// EnforcePlanLimits runs *after* the transaction commits so the
+	// quota check sees the updated row. We surface the error as-is
+	// (typically ErrQuotaExceeded → HTTP 402) so admins downgrading
+	// past their current usage learn about it without rolling back.
+	if err := s.EnforcePlanLimits(ctx, tenantID); err != nil && !errors.Is(err, ErrNotFound) {
+		return nil, err
+	}
+	return s.Summary(ctx, tenantID)
 }
 
 // Pool exposes the underlying pgx pool so sibling packages (the

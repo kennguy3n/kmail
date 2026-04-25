@@ -700,6 +700,121 @@ export async function cancelMigrationJob(tenantId: string, jobId: string): Promi
   );
 }
 
+/**
+ * Test the IMAP credentials supplied to the migration wizard before
+ * the operator commits to creating an import job. The backend
+ * always returns 200; success is signalled by `ok: true`. Network
+ * errors (DNS, connect, TLS) and IMAP NO/BAD responses come back as
+ * `{ ok: false, error: "<detail>" }`.
+ */
+export interface TestMigrationConnectionInput {
+  host: string;
+  port: number;
+  username: string;
+  password: string;
+  use_tls: boolean;
+}
+
+export interface TestMigrationConnectionResult {
+  ok: boolean;
+  error?: string;
+}
+
+export async function testMigrationConnection(
+  tenantId: string,
+  input: TestMigrationConnectionInput,
+): Promise<TestMigrationConnectionResult> {
+  return requestJSON<TestMigrationConnectionResult>(
+    `${ADMIN_API_BASE}/migrations/test-connection`,
+    {
+      method: "POST",
+      headers: adminAuthHeaders(tenantId, {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      }),
+      body: JSON.stringify(input),
+    },
+  );
+}
+
+// ---------------------------------------------------------------
+// Pricing / plan management
+// ---------------------------------------------------------------
+
+/** Plan IDs accepted by `PATCH /api/v1/tenants/{id}/billing/plan`. */
+export type BillingPlan = "core" | "pro" | "privacy";
+
+/** Static plan catalog rendered by the pricing admin page. */
+export interface PlanCatalogEntry {
+  id: BillingPlan;
+  name: string;
+  monthlyPriceCents: number;
+  dailySendLimit: number;
+  storagePerSeatGB: number;
+  features: string[];
+}
+
+export const PLAN_CATALOG: PlanCatalogEntry[] = [
+  {
+    id: "core",
+    name: "KChat Core Email",
+    monthlyPriceCents: 300,
+    dailySendLimit: 500,
+    storagePerSeatGB: 5,
+    features: [
+      "Standard Private Mail",
+      "Basic spam filtering",
+      "IMAP / SMTP / JMAP access",
+      "DNS onboarding wizard",
+    ],
+  },
+  {
+    id: "pro",
+    name: "KChat Mail Pro",
+    monthlyPriceCents: 600,
+    dailySendLimit: 2000,
+    storagePerSeatGB: 15,
+    features: [
+      "Everything in Core",
+      "Advanced spam + DNSBL",
+      "CalDAV / CardDAV calendars + contacts",
+      "Shared inboxes (no paid seats)",
+      "Migration automation",
+    ],
+  },
+  {
+    id: "privacy",
+    name: "KChat Privacy",
+    monthlyPriceCents: 900,
+    dailySendLimit: 5000,
+    storagePerSeatGB: 50,
+    features: [
+      "Everything in Pro",
+      "Confidential Send (StrictZK)",
+      "Zero-Access Vault",
+      "Dedicated IP pool",
+      "DMARC reporting",
+    ],
+  },
+];
+
+export async function changePlan(
+  tenantId: string,
+  plan: BillingPlan,
+): Promise<BillingSummary> {
+  return requestJSON<BillingSummary>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/billing/plan`,
+    {
+      method: "PATCH",
+      headers: adminAuthHeaders(tenantId, {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      }),
+      body: JSON.stringify({ plan }),
+    },
+  );
+}
+
 // ---------------------------------------------------------------
 // IP reputation
 // ---------------------------------------------------------------

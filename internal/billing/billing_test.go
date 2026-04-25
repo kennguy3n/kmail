@@ -1,6 +1,7 @@
 package billing
 
 import (
+	"context"
 	"errors"
 	"testing"
 )
@@ -111,6 +112,41 @@ func TestCheckSeatAvailable(t *testing.T) {
 	q = &Quota{SeatCount: 5, SeatLimit: 5}
 	if err := checkSeatAvailable(q); !errors.Is(err, ErrQuotaExceeded) {
 		t.Errorf("slot 6/5 should overflow, got %v", err)
+	}
+}
+
+func TestValidatePlan(t *testing.T) {
+	for _, plan := range []string{PlanCore, PlanPro, PlanPrivacy} {
+		if err := ValidatePlan(plan); err != nil {
+			t.Errorf("ValidatePlan(%q) = %v", plan, err)
+		}
+	}
+	if err := ValidatePlan("ultra"); !errors.Is(err, ErrInvalidInput) {
+		t.Errorf("expected ErrInvalidInput for unknown plan, got %v", err)
+	}
+}
+
+func TestChangePlan_RejectsUnknownPlan(t *testing.T) {
+	s := NewService(Config{})
+	_, err := s.ChangePlan(context.Background(), "tid", "ultra")
+	if !errors.Is(err, ErrInvalidInput) {
+		t.Errorf("expected ErrInvalidInput, got %v", err)
+	}
+}
+
+func TestChangePlan_RejectsEmptyTenant(t *testing.T) {
+	s := NewService(Config{})
+	_, err := s.ChangePlan(context.Background(), "", PlanPro)
+	if !errors.Is(err, ErrInvalidInput) {
+		t.Errorf("expected ErrInvalidInput, got %v", err)
+	}
+}
+
+func TestChangePlan_NilPoolReturnsNotFound(t *testing.T) {
+	s := NewService(Config{})
+	_, err := s.ChangePlan(context.Background(), "tid", PlanPro)
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("expected ErrNotFound, got %v", err)
 	}
 }
 

@@ -32,6 +32,7 @@ export default function Layout() {
           <li><Link to="/admin/notifications">Notifications</Link></li>
           <li><Link to="/admin/migrations">Migrations</Link></li>
           <li><Link to="/admin/resource-calendars">Resource calendars</Link></li>
+          <li><Link to="/admin/pricing">Pricing</Link></li>
         </ul>
       </nav>
       <main className="kmail-main">
