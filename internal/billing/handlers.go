@@ -108,8 +108,13 @@ func (h *Handlers) changePlan(w http.ResponseWriter, r *http.Request) {
 	}
 	// Capture old plan before the mutation so the lifecycle hook
 	// can prorate. ChangePlan is idempotent on (oldPlan == newPlan)
-	// so re-reading the plan column does not race the UPDATE.
-	prev, _ := h.svc.Summary(r.Context(), tenantID)
+	// so re-reading the plan column does not race the UPDATE. We
+	// log a Summary failure so a transient pool error doesn't
+	// silently drop the proration billing event without a trace.
+	prev, prevErr := h.svc.Summary(r.Context(), tenantID)
+	if prevErr != nil {
+		h.logger.Printf("billing.changePlan: read previous plan for proration failed: %v", prevErr)
+	}
 	sum, err := h.svc.ChangePlan(r.Context(), tenantID, in.Plan)
 	if err != nil {
 		h.logger.Printf("billing.changePlan: %v", err)

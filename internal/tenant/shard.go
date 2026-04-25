@@ -427,7 +427,7 @@ func (s *ShardService) GetSecondaryShards(ctx context.Context, tenantID string) 
 		FROM tenant_shard_assignments tsa
 		JOIN shard_failover_config fc ON fc.shard_id = tsa.shard_id
 		JOIN stalwart_shards bsh       ON bsh.id     = fc.backup_shard_id
-		WHERE tsa.tenant_id = $1::uuid AND bsh.healthy = true
+		WHERE tsa.tenant_id = $1::uuid AND bsh.status = 'active'
 		ORDER BY fc.priority ASC, bsh.created_at ASC
 	`, tenantID)
 	if err != nil {
