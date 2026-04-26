@@ -270,6 +270,12 @@ type DNSConfig struct {
 	// ReportingMailbox receives DMARC aggregate and TLS-RPT
 	// reports.
 	ReportingMailbox string
+	// BIMILogoURL is the publicly hosted SVG logo URL surfaced
+	// in the `default._bimi.<domain>` TXT record.
+	BIMILogoURL string
+	// BIMIVMCURL is the publicly hosted Verified Mark Certificate
+	// URL paired with the BIMI logo. Optional.
+	BIMIVMCURL string
 }
 
 // HTTPConfig holds the BFF HTTP listener configuration.
@@ -334,6 +340,8 @@ func Load() (*Config, error) {
 			DKIMPublicKey:    getenv("KMAIL_DNS_DKIM_PUBLIC_KEY", ""),
 			DMARCPolicy:      getenv("KMAIL_DNS_DMARC_POLICY", "none"),
 			ReportingMailbox: getenv("KMAIL_DNS_REPORTING_MAILBOX", "dmarc@kmail.local"),
+			BIMILogoURL:      getenv("KMAIL_DNS_BIMI_LOGO_URL", ""),
+			BIMIVMCURL:       getenv("KMAIL_DNS_BIMI_VMC_URL", ""),
 		},
 		KChatAPIURL:   getenv("KCHAT_API_URL", ""),
 		KChatAPIToken: getenv("KCHAT_API_TOKEN", ""),

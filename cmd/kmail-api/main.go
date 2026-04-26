@@ -10,7 +10,6 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -21,10 +20,12 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/kennguy3n/kmail/internal/adminproxy"
 	"github.com/kennguy3n/kmail/internal/approval"
 	"github.com/kennguy3n/kmail/internal/audit"
 	"github.com/kennguy3n/kmail/internal/billing"
 	"github.com/kennguy3n/kmail/internal/calendarbridge"
+	"github.com/kennguy3n/kmail/internal/contactbridge"
 	"github.com/kennguy3n/kmail/internal/chatbridge"
 	"github.com/kennguy3n/kmail/internal/cmk"
 	"github.com/kennguy3n/kmail/internal/config"
@@ -36,11 +37,14 @@ import (
 	"github.com/kennguy3n/kmail/internal/middleware"
 	"github.com/kennguy3n/kmail/internal/migration"
 	"github.com/kennguy3n/kmail/internal/monitoring"
+	"github.com/kennguy3n/kmail/internal/onboarding"
 	"github.com/kennguy3n/kmail/internal/push"
 	"github.com/kennguy3n/kmail/internal/retention"
+	"github.com/kennguy3n/kmail/internal/scim"
 	"github.com/kennguy3n/kmail/internal/sharedinbox"
 	"github.com/kennguy3n/kmail/internal/tenant"
 	"github.com/kennguy3n/kmail/internal/vault"
+	"github.com/kennguy3n/kmail/internal/webhooks"
 )
 
 func main() {
@@ -169,6 +173,8 @@ func main() {
 		DKIMPublicKey:       cfg.DNS.DKIMPublicKey,
 		DMARCPolicy:         cfg.DNS.DMARCPolicy,
 		ReportingMailbox:    cfg.DNS.ReportingMailbox,
+		BIMILogoURL:         cfg.DNS.BIMILogoURL,
+		BIMIVMCURL:          cfg.DNS.BIMIVMCURL,
 	})
 	tenantHandlers := tenant.NewHandlers(tenantSvc, logger)
 	tenantHandlers.Register(mux, authMW)
@@ -208,11 +214,10 @@ func main() {
 	// tenant to a single configured channel
 	// (`KMAIL_CALENDAR_NOTIFY_CHANNEL`); Phase 5 will route per
 	// resource calendar.
-	calendarNotifier := calendarbridge.NewNotifier(
-		chatbridgeSvc.KChat(),
-		calendarbridge.StaticChannelResolver{ChannelID: os.Getenv("KMAIL_CALENDAR_NOTIFY_CHANNEL")},
-	)
+	calendarChannelResolver := calendarbridge.NewDBChannelResolver(pool, os.Getenv("KMAIL_CALENDAR_NOTIFY_CHANNEL"))
+	calendarNotifier := calendarbridge.NewNotifier(chatbridgeSvc.KChat(), calendarChannelResolver)
 	calendarbridge.NewHandlers(calendarSvc, logger).WithNotifier(calendarNotifier).Register(mux, authMW)
+	calendarbridge.NewChannelHandlers(calendarChannelResolver).Register(mux, authMW)
 	calendarSharingStore := calendarbridge.NewSharingStore(pool)
 	calendarbridge.NewSharingHandlers(calendarSvc, calendarSharingStore).Register(mux, authMW)
 	// Background reminder worker: polls upcoming events every 60s
@@ -342,7 +347,15 @@ func main() {
 
 	retentionSvc := retention.NewService(pool)
 	retention.NewHandlers(retentionSvc, logger).Register(mux, authMW)
-	go retention.NewWorker(retentionSvc, logger).Run(ctx)
+	// Phase 5 closeout: wire the JMAP / fabric-backed enforcer.
+	// Defaults to dry-run unless `KMAIL_RETENTION_DRY_RUN=false`.
+	retentionDryRun := os.Getenv("KMAIL_RETENTION_DRY_RUN") != "false"
+	retentionEnforcer := retention.NewJMAPEnforcer(shardSvc, nil, "",
+		cfg.ZKFabric.ConsoleURL, "", logger)
+	go retention.NewWorker(retentionSvc, logger).
+		WithEnforcer(retentionEnforcer).
+		WithDryRun(retentionDryRun).
+		Run(ctx)
 
 	approvalSvc := approval.NewService(pool)
 	approval.NewHandlers(approvalSvc).Register(mux, authMW)
@@ -368,16 +381,47 @@ func main() {
 	confidentialsend.NewHandlers(confidentialSendSvc, valkeyClient, logger).Register(mux, authMW)
 
 	exportSvc := export.NewService(pool)
-	// Runner is intentionally a stub for Phase 5: it records the
-	// would-be download URL using the tenant's per-bucket
-	// presigning so the admin UI / export job listing has a
-	// realistic shape. Wiring real JMAP/CalDAV/audit fan-out lives
-	// in a follow-up PR per the package doc.
-	exportSvc.WithRunner(func(ctx context.Context, job export.Job) (string, error) {
-		return fmt.Sprintf("https://exports.kmail.example.com/%s/%s.%s", job.TenantID, job.ID, job.Format), nil
+	// Phase 5 closeout: wire the real JMAP / CalDAV / audit
+	// fan-out runner. Each dependency is best-effort so the BFF
+	// keeps booting in dev when one of the downstream services
+	// is unreachable.
+	exportAttachmentSvc := jmap.NewAttachmentService(jmap.AttachmentConfig{
+		Pool:      pool,
+		S3URL:     cfg.ZKFabric.S3URL,
+		AccessKey: cfg.ZKFabric.AccessKey,
+		SecretKey: cfg.ZKFabric.SecretKey,
 	})
+	exportSvc.WithRunner(export.NewRealRunner(export.RealRunnerConfig{
+		JMAP:     export.NewHTTPJMAPClient(cfg.StalwartURL, ""),
+		Calendar: calendarSvc,
+		Audit:    auditSvc,
+		Uploader: exportAttachmentSvc,
+	}))
 	export.NewHandlers(exportSvc).Register(mux, authMW)
 	go export.NewWorker(exportSvc, logger).Run(ctx)
+
+	// Phase 5 closeout — SCIM 2.0 provisioning.
+	scimSvc := scim.NewService(pool, tenantSvc)
+	scim.NewHandlers(scimSvc, logger).Register(mux, authMW)
+
+	// Phase 5 closeout — reverse access proxy for support /
+	// SRE access to tenant data behind the existing approval
+	// workflow.
+	adminProxySvc := adminproxy.NewService(pool, approvalSvc, auditSvc, shardSvc)
+	adminproxy.NewHandlers(adminProxySvc, logger, cfg.StalwartURL).Register(mux, authMW)
+
+	// Phase 5 closeout — CardDAV contact bridge.
+	contactSvc := contactbridge.NewService(contactbridge.Config{StalwartURL: cfg.StalwartURL})
+	contactbridge.NewHandlers(contactSvc, logger).Register(mux, authMW)
+
+	// Phase 5 closeout — Tenant webhook event system.
+	webhookSvc := webhooks.NewService(pool)
+	webhooks.NewHandlers(webhookSvc, logger).Register(mux, authMW)
+	go webhooks.NewWorker(webhookSvc, logger).Run(ctx)
+
+	// Phase 5 closeout — Onboarding checklist.
+	onboardingSvc := onboarding.NewService(pool)
+	onboarding.NewHandlers(onboardingSvc, logger).Register(mux, authMW)
 
 	// Wire metrics and tracing into the outer handler chain.
 	handler := http.Handler(mux)

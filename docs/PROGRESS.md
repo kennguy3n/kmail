@@ -4,6 +4,52 @@
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
 - **Status**: Phase 1 — Foundation (in progress); Phase 2 —
   Prototype (in progress); Phase 3 — Private Beta (in progress)
+- **Last updated**: 2026-04-26 (Phase 5 closeout, batch 4) — Ten-task
+  Phase 5 closeout PR lands the three remaining Phase 5 items
+  (SCIM 2.0 provisioning endpoint at `/scim/v2/{Users,Groups}`
+  backed by `internal/scim/`; reverse access proxy at
+  `/api/v1/admin/proxy/{tenantId}/...` backed by
+  `internal/adminproxy/` and gated by the existing approval
+  workflow; compliance documentation pack under
+  `docs/compliance/` with DPA, SOC 2 control mapping, Article 30
+  records, sub-processor list, and customer-facing security
+  overview), wires real JMAP/CalDAV/audit fan-out into
+  `internal/export/runner.go` (`RealRunner` with `HTTPJMAPClient`,
+  `CalendarClient`, `AuditClient`, and `Uploader` interfaces, with
+  per-job tar.gz packaging and presigned upload via
+  `jmap.AttachmentService`), turns the retention worker into a
+  real enforcer (`internal/retention/worker.go` adds
+  `EmailEnforcer` interface + `JMAPEnforcer` with
+  `Email/query` + `Email/set` destroy fan-out and zk-object-fabric
+  placement-API archive moves, dry-run guarded by
+  `KMAIL_RETENTION_DRY_RUN`; `retention_enforcement_log` migration),
+  routes calendar notifications per-resource via
+  `internal/calendarbridge/channel_resolver.go` with the new
+  `calendar_notification_channels` table and
+  `GET/PUT /api/v1/calendars/{calendarId}/notification-channel` +
+  tenant-default routes, generates BIMI TXT records in the DNS
+  wizard (new `BIMILogoURL`/`BIMIVMCURL` config), adds a CardDAV
+  contact bridge (`internal/contactbridge/`) with vCard 4.0 parser
+  and `/api/v1/contacts/...` CRUD, tenant outbound webhooks
+  (`internal/webhooks/` with HMAC-SHA256 signing, exponential-
+  backoff retry worker, `webhook_endpoints` +
+  `webhook_deliveries` migration, admin UI), and a guided
+  onboarding checklist (`internal/onboarding/` with eight steps
+  computed from existing tables, persistent skip flag in
+  `onboarding_progress`, admin UI). New migrations 028–033
+  (`scim_tokens`, `admin_access_sessions`,
+  `retention_enforcement_log`, `calendar_notification_channels`,
+  `webhooks`, `onboarding_progress`). Frontend adds
+  `web/src/pages/Admin/{ScimAdmin,WebhookAdmin,OnboardingChecklist}.tsx`,
+  `web/src/pages/Mail/ContactsView.tsx`, a
+  `CalendarNotificationSettings` section to
+  `ResourceCalendarAdmin.tsx`, a BIMI step to the DNS wizard, plus
+  typed clients (`web/src/api/contacts.ts` and SCIM / webhook /
+  onboarding / calendar-channel / admin-proxy helpers in
+  `web/src/api/admin.ts`). Routes `/admin/scim`,
+  `/admin/webhooks`, `/admin/onboarding`, `/contacts` wired in
+  `App.tsx` + `Layout.tsx`.
+
 - **Last updated**: 2026-04-25 (later, batch 3) — Phase 5 ten-task
   batch lands the Zero-Access Vault, Customer-managed keys,
   Protected folders, the Confidential Send portal, and the 99.95%
@@ -1257,9 +1303,34 @@ Checklist:
 
 ## Phase 5 — Privacy & Compliance Expansion (Post-Launch)
 
-**Status**: `IN PROGRESS` — six of nine items live, three open
-(Reverse access proxy / SCIM / final compliance pack — none in
-this batch).
+**Status**: `COMPLETE` — all original Phase 5 items live as of
+2026-04-26 (the closeout batch landed SCIM 2.0 provisioning, the
+reverse access proxy, and the compliance documentation pack).
+The same batch added natural follow-ups (real export fan-out,
+retention enforcement, per-resource calendar channel routing,
+BIMI DNS support, CardDAV contact bridge, tenant outbound
+webhooks, and a guided onboarding checklist).
+
+Closeout checklist (added 2026-04-26):
+
+- [x] SCIM 2.0 provisioning endpoint
+      _(`internal/scim/{schema,service,handlers}.go` mounts
+      `/scim/v2/Users` + `/scim/v2/Groups` with
+      `application/scim+json`, ListResponse pagination, RFC 7643
+      schemas; bearer tokens stored as SHA-256 hashes in
+      `scim_tokens` (migration 028) with RLS; admin UI at
+      `web/src/pages/Admin/ScimAdmin.tsx`.)_
+- [x] Reverse access proxy for admin operations
+      _(`internal/adminproxy/{service,handlers}.go` gates SRE
+      reads of tenant data behind the existing approval
+      workflow; routes at
+      `/api/v1/admin/proxy/{tenantId}/...` with session
+      tracking in `admin_access_sessions` (migration 029); every
+      hop is logged through `audit.Service`.)_
+- [x] Compliance documentation pack
+      _(`docs/compliance/` adds DPA, SOC 2 control mapping,
+      Article 30 records, sub-processor list, and the customer-
+      facing security overview.)_
 
 **Goal**: advanced privacy features, compliance controls, and
 enterprise readiness.
@@ -1431,6 +1502,48 @@ Checklist:
       region selector, a per-region availability table with a
       global rollup row, and renders the 99.95% target
       alongside the 99.9% legacy line.)_
+
+---
+
+## Phase 6 — Enterprise Readiness
+
+**Status**: `PLANNED` — opens after the Phase 5 closeout batch
+ships (2026-04-26). Phase 6 picks up the natural follow-ups
+identified during the closeout and the longer-running enterprise
+work that was deferred from earlier phases.
+
+Checklist:
+
+- [ ] Real MLS group integration for Confidential Send
+      (currently link-based; replace with native MLS rekey on
+      participant change).
+- [ ] BYOC HSM for customer-managed keys (KMIP / PKCS#11 envelope
+      backed by tenant-provided HSM rather than only PEM upload).
+- [ ] Exchange interop **research only** — produce a
+      compatibility matrix and decide whether to invest. Per the
+      do-not-do list, do **not** start an Exchange interop build
+      without an explicit phase decision.
+- [ ] SCIM provisioning conformance test suite (run the SCIM 2.0
+      reference test runner against `/scim/v2/...` and publish
+      the results).
+- [ ] Webhook HMAC v2 signing scheme that includes a replay-
+      protection nonce and a versioned secret.
+- [ ] Retention enforcement worker default flip (after a quarter
+      of dry-run telemetry, default `KMAIL_RETENTION_DRY_RUN` to
+      `false` and document the operator opt-out flag).
+- [ ] CardDAV directory bridge to surface a tenant-wide global
+      address list (currently per-account address books only).
+- [ ] BIMI VMC issuance helper / vendor partnership so tenants
+      can buy a Verified Mark Certificate inside the admin
+      console.
+- [ ] Onboarding checklist auto-completion via webhook events
+      (e.g. mark "send test email" complete the moment the
+      `email.received` event for the tenant's first inbound
+      message lands).
+- [ ] Reverse access proxy session expiry watcher (Phase 5 ships
+      explicit revoke + TTL; Phase 6 adds a worker that emits a
+      `session_expired` audit row when the TTL elapses without a
+      revoke).
 
 ---
 

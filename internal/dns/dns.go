@@ -56,6 +56,13 @@ type Service struct {
 	// ReportingMailbox receives aggregate DMARC and TLS-RPT
 	// reports (e.g. `dmarc@kmail.example`).
 	ReportingMailbox string
+	// BIMILogoURL is the publicly hosted SVG logo for BIMI
+	// (https://bimigroup.org/). Empty disables the BIMI record.
+	BIMILogoURL string
+	// BIMIVMCURL is the publicly hosted Verified Mark Certificate
+	// (PEM, served as application/pkcs7-mime). Optional: BIMI
+	// renders without a VMC for compatible mail clients.
+	BIMIVMCURL string
 }
 
 // Config wires NewService.
@@ -68,6 +75,8 @@ type Config struct {
 	DKIMPublicKey       string
 	DMARCPolicy         string
 	ReportingMailbox    string
+	BIMILogoURL         string
+	BIMIVMCURL          string
 }
 
 // NewService returns a Service with the provided configuration. A
@@ -95,6 +104,8 @@ func NewService(cfg Config) *Service {
 		DKIMPublicKey:       cfg.DKIMPublicKey,
 		DMARCPolicy:         policy,
 		ReportingMailbox:    cfg.ReportingMailbox,
+		BIMILogoURL:         cfg.BIMILogoURL,
+		BIMIVMCURL:          cfg.BIMIVMCURL,
 	}
 }
 
@@ -496,6 +507,20 @@ func (s *Service) GenerateRecords(domain string) DomainRecords {
 			Value: ensureTrailingDot("autodiscover." + s.MailHost),
 			TTL:   3600,
 			Notes: "Apple Mail / Outlook autodiscover.",
+		})
+	}
+
+	if s.BIMILogoURL != "" {
+		value := fmt.Sprintf("v=BIMI1; l=%s", s.BIMILogoURL)
+		if s.BIMIVMCURL != "" {
+			value = fmt.Sprintf("v=BIMI1; l=%s; a=%s", s.BIMILogoURL, s.BIMIVMCURL)
+		}
+		out.Records = append(out.Records, DomainRecord{
+			Type:  "TXT",
+			Name:  "default._bimi." + domain,
+			Value: value,
+			TTL:   3600,
+			Notes: "BIMI brand indicator. Requires DMARC p=quarantine or p=reject.",
 		})
 	}
 

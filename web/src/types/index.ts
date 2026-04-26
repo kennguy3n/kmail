@@ -386,3 +386,41 @@ export interface EventDateRange {
   start: string;
   end: string;
 }
+
+/**
+ * CardDAV address book metadata returned by the contact bridge.
+ */
+export interface AddressBook {
+  id: string;
+  name: string;
+  description?: string;
+  isDefault: boolean;
+}
+
+/**
+ * Slim view of a vCard surfaced by the BFF. The full vCard
+ * payload is preserved in `vcardRaw` so unknown properties round
+ * trip on update.
+ */
+export interface Contact {
+  uid: string;
+  fn: string;
+  emails?: string[];
+  phones?: string[];
+  org?: string;
+  note?: string;
+  vcardRaw?: string;
+}
+
+/**
+ * Input shape for create / update contact. UID is optional on
+ * create — the BFF will assign one.
+ */
+export interface ContactDraft {
+  uid?: string;
+  fn: string;
+  emails?: string[];
+  phones?: string[];
+  org?: string;
+  note?: string;
+}
