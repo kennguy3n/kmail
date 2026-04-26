@@ -323,7 +323,11 @@ func BuildVCard(d ContactDraft) string {
 		fmt.Fprintf(&b, "PHOTO:%s\r\n", escapeVCardValue(d.PhotoURL))
 	}
 	if len(d.Groups) > 0 {
-		fmt.Fprintf(&b, "CATEGORIES:%s\r\n", escapeVCardValue(strings.Join(d.Groups, ",")))
+		escaped := make([]string, len(d.Groups))
+		for i, g := range d.Groups {
+			escaped[i] = escapeVCardValue(g)
+		}
+		fmt.Fprintf(&b, "CATEGORIES:%s\r\n", strings.Join(escaped, ","))
 	}
 	b.WriteString("END:VCARD\r\n")
 	return b.String()

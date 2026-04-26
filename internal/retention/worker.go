@@ -147,23 +147,29 @@ func (w *Worker) DryRun() bool { return w.dryRun }
 // worker. Counters are cumulative (not per-tick) so the admin UI
 // can render "X emails deleted since boot".
 func (w *Worker) Snapshot() WorkerSnapshot {
-	return WorkerSnapshot{
+	snap := WorkerSnapshot{
 		DryRun:         w.dryRun,
-		LastEvaluated:  time.Unix(w.lastEvaluatedAt.Load(), 0).UTC(),
 		EmailsDeleted:  w.lastDeletedTotal.Load(),
 		EmailsArchived: w.lastArchivedTotal.Load(),
 		Errors:         w.lastErrorsTotal.Load(),
 	}
+	if ts := w.lastEvaluatedAt.Load(); ts > 0 {
+		t := time.Unix(ts, 0).UTC()
+		snap.LastEvaluated = &t
+	}
+	return snap
 }
 
 // WorkerSnapshot is the lightweight read returned by the admin
-// status card endpoint.
+// status card endpoint. `LastEvaluated` is nil until the first
+// tick completes so the admin UI can render "never" instead of
+// the Unix epoch.
 type WorkerSnapshot struct {
-	DryRun         bool      `json:"dry_run"`
-	LastEvaluated  time.Time `json:"last_evaluated_at"`
-	EmailsDeleted  int64     `json:"emails_deleted"`
-	EmailsArchived int64     `json:"emails_archived"`
-	Errors         int64     `json:"errors"`
+	DryRun         bool       `json:"dry_run"`
+	LastEvaluated  *time.Time `json:"last_evaluated_at"`
+	EmailsDeleted  int64      `json:"emails_deleted"`
+	EmailsArchived int64      `json:"emails_archived"`
+	Errors         int64      `json:"errors"`
 }
 
 // Run loops until ctx is cancelled.
