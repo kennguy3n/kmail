@@ -271,23 +271,23 @@ func ParseVCard(raw string) *Contact {
 		case "UID":
 			c.UID = value
 		case "FN":
-			c.FN = value
+			c.FN = unescapeVCardValue(value)
 		case "EMAIL":
-			if value != "" {
-				c.Emails = append(c.Emails, value)
+			if v := unescapeVCardValue(value); v != "" {
+				c.Emails = append(c.Emails, v)
 			}
 		case "TEL":
-			if value != "" {
-				c.Phones = append(c.Phones, value)
+			if v := unescapeVCardValue(value); v != "" {
+				c.Phones = append(c.Phones, v)
 			}
 		case "ORG":
-			c.Org = value
+			c.Org = unescapeVCardValue(value)
 		case "NOTE":
-			c.Note = value
+			c.Note = unescapeVCardValue(value)
 		case "PHOTO":
-			c.PhotoURL = value
+			c.PhotoURL = unescapeVCardValue(value)
 		case "CATEGORIES":
-			for _, g := range strings.Split(value, ",") {
+			for _, g := range splitVCardList(value) {
 				if g = strings.TrimSpace(g); g != "" {
 					c.Groups = append(c.Groups, g)
 				}
@@ -339,6 +339,62 @@ func escapeVCardValue(s string) string {
 	s = strings.ReplaceAll(s, ",", "\\,")
 	s = strings.ReplaceAll(s, ";", "\\;")
 	return s
+}
+
+// unescapeVCardValue is the inverse of escapeVCardValue per RFC
+// 6350 §3.4: `\\`, `\n` / `\N`, `\,`, `\;` decode to their literal
+// counterparts.
+func unescapeVCardValue(s string) string {
+	if !strings.ContainsRune(s, '\\') {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+1 < len(s) {
+			switch s[i+1] {
+			case '\\':
+				b.WriteByte('\\')
+			case 'n', 'N':
+				b.WriteByte('\n')
+			case ',':
+				b.WriteByte(',')
+			case ';':
+				b.WriteByte(';')
+			default:
+				b.WriteByte(s[i+1])
+			}
+			i++
+			continue
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}
+
+// splitVCardList splits a comma-separated vCard list value (e.g.
+// CATEGORIES) into its constituent items, respecting backslash-
+// escaped commas. Each returned item is unescaped.
+func splitVCardList(s string) []string {
+	var out []string
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+1 < len(s) {
+			b.WriteByte(s[i])
+			b.WriteByte(s[i+1])
+			i++
+			continue
+		}
+		if s[i] == ',' {
+			out = append(out, unescapeVCardValue(b.String()))
+			b.Reset()
+			continue
+		}
+		b.WriteByte(s[i])
+	}
+	out = append(out, unescapeVCardValue(b.String()))
+	return out
 }
 
 func splitLines(s string) []string {
