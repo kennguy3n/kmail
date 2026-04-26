@@ -27,6 +27,16 @@ func (h *Handlers) Register(mux *http.ServeMux, authMW *middleware.OIDC) {
 	mux.Handle("GET /api/v1/tenants/{id}/onboarding", authMW.Wrap(http.HandlerFunc(h.get)))
 	mux.Handle("POST /api/v1/tenants/{id}/onboarding/{stepId}/skip", authMW.Wrap(http.HandlerFunc(h.skip)))
 	mux.Handle("POST /api/v1/tenants/{id}/onboarding/{stepId}/unskip", authMW.Wrap(http.HandlerFunc(h.unskip)))
+	mux.Handle("POST /api/v1/tenants/{id}/onboarding/reset", authMW.Wrap(http.HandlerFunc(h.reset)))
+}
+
+func (h *Handlers) reset(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.PathValue("id")
+	if err := h.svc.ResetChecklist(r.Context(), tenantID); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *Handlers) get(w http.ResponseWriter, r *http.Request) {

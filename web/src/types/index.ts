@@ -409,6 +409,8 @@ export interface Contact {
   phones?: string[];
   org?: string;
   note?: string;
+  photoUrl?: string;
+  groups?: string[];
   vcardRaw?: string;
 }
 
@@ -423,4 +425,21 @@ export interface ContactDraft {
   phones?: string[];
   org?: string;
   note?: string;
+  photoUrl?: string;
+  groups?: string[];
+}
+
+/**
+ * Tenant-wide directory entry surfaced by the Global Address List
+ * (`internal/contactbridge/gal.go`). Read-only and deduplicated by
+ * email within a tenant.
+ */
+export interface GalEntry {
+  email: string;
+  display_name?: string;
+  org?: string;
+  phone?: string;
+  source_uid?: string;
+  source_account?: string;
+  last_synced_at?: string;
 }

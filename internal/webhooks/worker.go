@@ -79,14 +79,14 @@ func (w *Worker) deliverNext(ctx context.Context) (bool, error) {
 		return false, nil
 	}
 	var (
-		id, endpointID, tenantID, eventType, url, secretHash string
-		payload                                              []byte
-		attempts                                             int
+		id, endpointID, tenantID, eventType, url, secretHash, signingVersion string
+		payload                                                              []byte
+		attempts                                                             int
 	)
 	err := pgx.BeginFunc(ctx, w.svc.pool, func(tx pgx.Tx) error {
 		row := tx.QueryRow(ctx, `
 			SELECT d.id::text, d.endpoint_id::text, d.tenant_id::text, d.event_type, d.payload::text, d.attempts,
-			       e.url, e.secret_hash
+			       e.url, e.secret_hash, e.signing_version
 			FROM webhook_deliveries d
 			JOIN webhook_endpoints e ON e.id = d.endpoint_id
 			WHERE d.status = 'pending' AND d.next_retry_at <= now()
@@ -95,7 +95,7 @@ func (w *Worker) deliverNext(ctx context.Context) (bool, error) {
 			LIMIT 1
 		`)
 		var payloadStr string
-		err := row.Scan(&id, &endpointID, &tenantID, &eventType, &payloadStr, &attempts, &url, &secretHash)
+		err := row.Scan(&id, &endpointID, &tenantID, &eventType, &payloadStr, &attempts, &url, &secretHash, &signingVersion)
 		if err != nil {
 			return err
 		}
@@ -110,7 +110,7 @@ func (w *Worker) deliverNext(ctx context.Context) (bool, error) {
 		return false, err
 	}
 
-	status, sendErr := w.send(ctx, url, secretHash, eventType, payload)
+	status, sendErr := w.send(ctx, url, secretHash, signingVersion, eventType, payload)
 	final := status >= 200 && status < 300
 	switch {
 	case final:
@@ -152,21 +152,32 @@ func (w *Worker) deliverNext(ctx context.Context) (bool, error) {
 	return true, nil
 }
 
-func (w *Worker) send(ctx context.Context, url, secretHash, eventType string, payload []byte) (int, error) {
+func (w *Worker) send(ctx context.Context, url, secretHash, signingVersion, eventType string, payload []byte) (int, error) {
 	// We do not have the plaintext secret on the worker side. The
 	// endpoint expects the same hash for verification, so we sign
 	// with the hash itself — this mirrors how Stripe's "endpoint
 	// secret" is the only shared value. Tenants verify by
-	// recomputing hex-encoded HMAC-SHA256 over `<unix>.<body>`.
+	// recomputing hex-encoded HMAC-SHA256 over the canonical
+	// signing string for the configured version.
 	ts := time.Now().UTC()
-	sig := SignPayload(secretHash, ts, payload)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
 	if err != nil {
 		return 0, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-KMail-Event", eventType)
-	req.Header.Set("X-KMail-Signature", sig)
+	switch signingVersion {
+	case SigningV2:
+		nonce, err := NewNonce()
+		if err != nil {
+			return 0, err
+		}
+		req.Header.Set("X-KMail-Webhook-Timestamp", fmt.Sprintf("%d", ts.Unix()))
+		req.Header.Set("X-KMail-Webhook-Nonce", nonce)
+		req.Header.Set("X-KMail-Signature", SignPayloadV2(secretHash, ts, nonce, payload))
+	default:
+		req.Header.Set("X-KMail-Signature", SignPayload(secretHash, ts, payload))
+	}
 	resp, err := w.http.Do(req)
 	if err != nil {
 		return 0, err

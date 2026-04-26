@@ -35,6 +35,58 @@ func (h *Handlers) Register(mux *http.ServeMux, authMW *middleware.OIDC) {
 	mux.Handle("PUT /api/v1/tenants/{id}/cmk/{keyId}/rotate", authMW.Wrap(http.HandlerFunc(h.rotate)))
 	mux.Handle("DELETE /api/v1/tenants/{id}/cmk/{keyId}/revoke", authMW.Wrap(http.HandlerFunc(h.revoke)))
 	mux.Handle("GET /api/v1/tenants/{id}/cmk/active", authMW.Wrap(http.HandlerFunc(h.active)))
+	// Phase 6: BYOC HSM.
+	mux.Handle("GET /api/v1/tenants/{id}/cmk/hsm", authMW.Wrap(http.HandlerFunc(h.listHSM)))
+	mux.Handle("POST /api/v1/tenants/{id}/cmk/hsm", authMW.Wrap(http.HandlerFunc(h.registerHSM)))
+	mux.Handle("POST /api/v1/tenants/{id}/cmk/hsm/{configId}/test", authMW.Wrap(http.HandlerFunc(h.testHSM)))
+}
+
+func (h *Handlers) listHSM(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.PathValue("id")
+	out, err := h.svc.ListHSMConfigs(r.Context(), tenantID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if out == nil {
+		out = []HSMConfig{}
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (h *Handlers) registerHSM(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.PathValue("id")
+	plan, err := h.lookupPlan(r, tenantID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	var in HSMRegistration
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	out, err := h.svc.RegisterHSMKey(r.Context(), tenantID, plan, in)
+	if err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, ErrPlanNotEligible) {
+			status = http.StatusForbidden
+		}
+		writeError(w, status, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, out)
+}
+
+func (h *Handlers) testHSM(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.PathValue("id")
+	configID := r.PathValue("configId")
+	out, err := h.svc.TestHSMConnection(r.Context(), tenantID, configID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (h *Handlers) list(w http.ResponseWriter, r *http.Request) {

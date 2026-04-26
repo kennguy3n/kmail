@@ -1,4 +1,4 @@
-.PHONY: build test lint fmt vet tidy docker-build clean help migrate bench e2e
+.PHONY: build test lint fmt vet tidy docker-build clean help migrate bench e2e scim-test
 
 # ---------------------------------------------------------------
 # KMail Go control plane — developer Makefile.
@@ -70,3 +70,9 @@ bench:
 KMAIL_API_URL ?= http://localhost:8080
 e2e:
 	KMAIL_API_URL=$(KMAIL_API_URL) ./scripts/test-e2e.sh
+
+# scim-test runs the SCIM 2.0 conformance harness against a
+# running BFF. Override KMAIL_API_URL to point at a remote
+# instance. Results are documented in docs/SCIM_CONFORMANCE.md.
+scim-test:
+	KMAIL_API_URL=$(KMAIL_API_URL) ./scripts/test-scim.sh

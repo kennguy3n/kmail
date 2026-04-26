@@ -49,6 +49,58 @@ func (h *Handlers) Register(mux *http.ServeMux, authMW *middleware.OIDC) {
 	// Public portal — no auth.
 	mux.HandleFunc("GET /api/v1/secure/{token}", h.portal)
 	mux.HandleFunc("POST /api/v1/secure/{token}", h.portal)
+	// Phase 6: MLS key-derivation endpoints. The Compose flow
+	// calls /mls/status to decide between MLS and link-based send,
+	// then /mls/wrap to obtain a per-recipient wrapping key.
+	mux.Handle("GET /api/v1/tenants/{id}/confidential-send/mls/status", authMW.Wrap(http.HandlerFunc(h.mlsStatus)))
+	mux.Handle("POST /api/v1/tenants/{id}/confidential-send/mls/wrap", authMW.Wrap(http.HandlerFunc(h.mlsWrap)))
+	mux.Handle("POST /api/v1/tenants/{id}/confidential-send/{linkId}/mls/rekey", authMW.Wrap(http.HandlerFunc(h.mlsRekey)))
+}
+
+func (h *Handlers) mlsStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]bool{"enabled": h.svc.MLSEnabled()})
+}
+
+func (h *Handlers) mlsWrap(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		SenderLeafKey       string `json:"sender_leaf_key"`
+		RecipientCredential string `json:"recipient_credential"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	key, err := h.svc.DeriveMLSWrappingKey(r.Context(), in.SenderLeafKey, in.RecipientCredential)
+	if errors.Is(err, ErrMLSDisabled) {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"wrapping_key": key})
+}
+
+func (h *Handlers) mlsRekey(w http.ResponseWriter, r *http.Request) {
+	linkID := r.PathValue("linkId")
+	var in struct {
+		Participants []string `json:"participants"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	key, err := h.svc.RekeyConfidentialMessage(r.Context(), linkID, in.Participants)
+	if errors.Is(err, ErrMLSDisabled) {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"wrapping_key": key})
 }
 
 func (h *Handlers) create(w http.ResponseWriter, r *http.Request) {

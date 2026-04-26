@@ -16,30 +16,54 @@ import { useCallback, useEffect, useState } from "react";
 import {
   type CmkKey,
   getActiveCmkKey,
+  type HsmConfig,
+  type HsmRegistration,
   listCmkKeys,
+  listHsmConfigs,
   registerCmkKey,
+  registerHsmKey,
   revokeCmkKey,
   rotateCmkKey,
+  testHsmConnection,
 } from "../../api/admin";
 import { useTenantSelection } from "./useTenantSelection";
+
+type Tab = "pem" | "hsm";
 
 export default function CmkAdmin() {
   const { tenants, selectedTenantId, selectedTenant, selectTenant } =
     useTenantSelection();
+  const [tab, setTab] = useState<Tab>("pem");
   const [keys, setKeys] = useState<CmkKey[]>([]);
   const [active, setActive] = useState<CmkKey | null>(null);
   const [pem, setPem] = useState("");
   const [revoking, setRevoking] = useState<CmkKey | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [info, setInfo] = useState<string | null>(null);
+  const [hsmConfigs, setHsmConfigs] = useState<HsmConfig[]>([]);
+  const [hsmDraft, setHsmDraft] = useState<HsmRegistration>({
+    provider_type: "kmip",
+    endpoint: "",
+    slot_id: "",
+    credentials: "",
+  });
 
   const eligible = selectedTenant?.plan === "privacy";
 
-  const reload = useCallback((tid: string) => {
-    listKeys(tid).then(setKeys).catch((e: unknown) => setError(String(e)));
-    getActiveCmkKey(tid)
-      .then(setActive)
-      .catch((e: unknown) => setError(String(e)));
-  }, []);
+  const reload = useCallback(
+    (tid: string) => {
+      listKeys(tid).then(setKeys).catch((e: unknown) => setError(String(e)));
+      getActiveCmkKey(tid)
+        .then(setActive)
+        .catch((e: unknown) => setError(String(e)));
+      if (eligible) {
+        listHsmConfigs(tid)
+          .then(setHsmConfigs)
+          .catch((e: unknown) => setError(String(e)));
+      }
+    },
+    [eligible],
+  );
 
   useEffect(() => {
     if (selectedTenantId) reload(selectedTenantId);
@@ -121,6 +145,140 @@ export default function CmkAdmin() {
       )}
 
       {selectedTenantId && eligible && (
+        <div role="tablist" style={{ display: "flex", gap: "0.5rem", marginBottom: "1rem" }}>
+          <button role="tab" aria-selected={tab === "pem"} onClick={() => setTab("pem")}>
+            PEM key
+          </button>
+          <button role="tab" aria-selected={tab === "hsm"} onClick={() => setTab("hsm")}>
+            HSM (KMIP / PKCS#11)
+          </button>
+        </div>
+      )}
+
+      {info && (
+        <p className="kmail-info" role="status">
+          {info} <button onClick={() => setInfo(null)}>dismiss</button>
+        </p>
+      )}
+
+      {selectedTenantId && eligible && tab === "hsm" && (
+        <>
+          <h3>HSM configurations</h3>
+          {hsmConfigs.length === 0 ? (
+            <p>No HSM configurations registered yet.</p>
+          ) : (
+            <table className="kmail-cmk-list">
+              <thead>
+                <tr>
+                  <th>Provider</th>
+                  <th>Endpoint</th>
+                  <th>Slot</th>
+                  <th>Status</th>
+                  <th>Last test</th>
+                  <th />
+                </tr>
+              </thead>
+              <tbody>
+                {hsmConfigs.map((c) => (
+                  <tr key={c.id}>
+                    <td>{c.provider_type}</td>
+                    <td><code>{c.endpoint}</code></td>
+                    <td>{c.slot_id ?? ""}</td>
+                    <td>{c.status}{c.last_test_error ? ` (${c.last_test_error})` : ""}</td>
+                    <td>{c.last_test_at ? new Date(c.last_test_at).toLocaleString() : "—"}</td>
+                    <td>
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          if (!selectedTenantId) return;
+                          try {
+                            await testHsmConnection(selectedTenantId, c.id);
+                            setInfo("Test handshake started.");
+                            reload(selectedTenantId);
+                          } catch (err) {
+                            setError(String(err));
+                          }
+                        }}
+                      >
+                        Test
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+
+          <h3>Register HSM</h3>
+          <form
+            className="kmail-cmk-form"
+            onSubmit={async (e) => {
+              e.preventDefault();
+              if (!selectedTenantId) return;
+              try {
+                await registerHsmKey(selectedTenantId, hsmDraft);
+                setHsmDraft({ provider_type: "kmip", endpoint: "", slot_id: "", credentials: "" });
+                setInfo("HSM configuration registered.");
+                reload(selectedTenantId);
+              } catch (err) {
+                setError(String(err));
+              }
+            }}
+          >
+            <label>
+              Provider
+              <select
+                value={hsmDraft.provider_type}
+                onChange={(e) =>
+                  setHsmDraft({ ...hsmDraft, provider_type: e.target.value as "kmip" | "pkcs11" })
+                }
+              >
+                <option value="kmip">KMIP-over-TLS</option>
+                <option value="pkcs11">PKCS#11 module</option>
+              </select>
+            </label>
+            <label>
+              Endpoint
+              <input
+                type="text"
+                required
+                placeholder={
+                  hsmDraft.provider_type === "kmip"
+                    ? "kmips://hsm.corp.example:5696"
+                    : "/usr/lib/softhsm/libsofthsm2.so"
+                }
+                value={hsmDraft.endpoint}
+                onChange={(e) => setHsmDraft({ ...hsmDraft, endpoint: e.target.value })}
+              />
+            </label>
+            <label>
+              Slot ID {hsmDraft.provider_type === "kmip" ? "(optional)" : "(required)"}
+              <input
+                type="text"
+                value={hsmDraft.slot_id ?? ""}
+                onChange={(e) => setHsmDraft({ ...hsmDraft, slot_id: e.target.value })}
+              />
+            </label>
+            <label>
+              Credentials
+              <textarea
+                rows={3}
+                required
+                placeholder={
+                  hsmDraft.provider_type === "kmip"
+                    ? "PEM-encoded mTLS client cert + key"
+                    : "PIN"
+                }
+                value={hsmDraft.credentials}
+                onChange={(e) => setHsmDraft({ ...hsmDraft, credentials: e.target.value })}
+              />
+            </label>
+            <button type="submit">Register</button>
+          </form>
+        </>
+      )}
+
+      {selectedTenantId && eligible && tab === "pem" && (
         <>
           <h3>Active key</h3>
           {active ? (

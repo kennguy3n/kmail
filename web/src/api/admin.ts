@@ -1068,6 +1068,34 @@ export async function deleteRetentionPolicy(tenantId: string, id: string): Promi
   );
 }
 
+export interface RetentionEnforcementRun {
+  id?: string;
+  policy_id?: string;
+  notes?: string;
+  rows_scanned?: number;
+  rows_processed?: number;
+  rows_archived?: number;
+  rows_deleted?: number;
+  started_at?: string;
+  completed_at?: string;
+}
+
+export interface RetentionStatus {
+  dry_run: boolean;
+  last_evaluated_at?: string;
+  emails_deleted: number;
+  emails_archived: number;
+  errors: number;
+  recent_runs: RetentionEnforcementRun[];
+}
+
+export async function getRetentionStatus(tenantId: string): Promise<RetentionStatus> {
+  return requestJSON<RetentionStatus>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/retention/status`,
+    { headers: adminAuthHeaders(tenantId, { Accept: "application/json" }) },
+  );
+}
+
 // =====================================================================
 // Phase 5 — Approval workflow
 // =====================================================================
@@ -1362,6 +1390,62 @@ export async function getActiveCmkKey(
   return out as CmkKey;
 }
 
+// HSM (Phase 6) — KMIP / PKCS#11 backing for CMK.
+
+export interface HsmConfig {
+  id: string;
+  tenant_id: string;
+  provider_type: "kmip" | "pkcs11";
+  endpoint: string;
+  slot_id?: string;
+  status: "pending" | "active" | "failed" | "revoked";
+  last_test_at?: string;
+  last_test_error?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface HsmRegistration {
+  provider_type: "kmip" | "pkcs11";
+  endpoint: string;
+  slot_id?: string;
+  credentials: string;
+}
+
+export async function listHsmConfigs(tenantId: string): Promise<HsmConfig[]> {
+  return requestJSON<HsmConfig[]>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/cmk/hsm`,
+    { headers: adminAuthHeaders(tenantId, { Accept: "application/json" }) },
+  );
+}
+
+export async function registerHsmKey(
+  tenantId: string,
+  reg: HsmRegistration,
+): Promise<HsmConfig> {
+  return requestJSON<HsmConfig>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/cmk/hsm`,
+    {
+      method: "POST",
+      headers: adminAuthHeaders(tenantId, {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      }),
+      body: JSON.stringify(reg),
+    },
+  );
+}
+
+export async function testHsmConnection(
+  tenantId: string,
+  configId: string,
+): Promise<HsmConfig> {
+  return requestJSON<HsmConfig>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/cmk/hsm/${encodeURIComponent(configId)}/test`,
+    { method: "POST", headers: adminAuthHeaders(tenantId, { Accept: "application/json" }) },
+  );
+}
+
 // =====================================================================
 // Phase 5 — Protected folders
 // =====================================================================
@@ -1572,6 +1656,7 @@ export interface WebhookEndpoint {
   url: string;
   events: string[];
   active: boolean;
+  signing_version: "v1" | "v2";
   created_at: string;
   updated_at: string;
 }
@@ -1606,6 +1691,7 @@ export async function registerWebhook(
   tenantId: string,
   url: string,
   events: string[],
+  signingVersion: "v1" | "v2" = "v1",
 ): Promise<WebhookRegisterResponse> {
   return requestJSON<WebhookRegisterResponse>(
     `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/webhooks`,
@@ -1615,8 +1701,33 @@ export async function registerWebhook(
         "Content-Type": "application/json",
         Accept: "application/json",
       }),
-      body: JSON.stringify({ url, events }),
+      body: JSON.stringify({ url, events, signing_version: signingVersion }),
     },
+  );
+}
+
+export async function updateWebhookSigningVersion(
+  tenantId: string,
+  webhookId: string,
+  signingVersion: "v1" | "v2",
+): Promise<void> {
+  await fetch(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/webhooks/${encodeURIComponent(webhookId)}`,
+    {
+      method: "PATCH",
+      headers: adminAuthHeaders(tenantId, { "Content-Type": "application/json" }),
+      body: JSON.stringify({ signing_version: signingVersion }),
+    },
+  );
+}
+
+export async function testFireWebhook(
+  tenantId: string,
+  webhookId: string,
+): Promise<void> {
+  await fetch(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/webhooks/${encodeURIComponent(webhookId)}/test`,
+    { method: "POST", headers: adminAuthHeaders(tenantId) },
   );
 }
 
@@ -1648,6 +1759,8 @@ export interface OnboardingStep {
   status: "pending" | "complete" | "skipped";
   optional: boolean;
   link?: string;
+  auto_completed?: boolean;
+  completed_at?: string;
 }
 
 export interface OnboardingChecklist {
@@ -1681,6 +1794,13 @@ export async function unskipOnboardingStep(
 ): Promise<void> {
   await fetch(
     `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/onboarding/${encodeURIComponent(stepId)}/unskip`,
+    { method: "POST", headers: adminAuthHeaders(tenantId) },
+  );
+}
+
+export async function resetOnboardingChecklist(tenantId: string): Promise<void> {
+  await fetch(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/onboarding/reset`,
     { method: "POST", headers: adminAuthHeaders(tenantId) },
   );
 }

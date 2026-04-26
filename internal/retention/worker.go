@@ -10,12 +10,51 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/kennguy3n/kmail/internal/middleware"
 )
+
+// Metrics is the Prometheus metric set for the retention worker.
+// Exposed so callers can register the collectors with the same
+// registry the BFF exposes on `/metrics`.
+type Metrics struct {
+	Evaluations    prometheus.Counter
+	EmailsDeleted  prometheus.Counter
+	EmailsArchived prometheus.Counter
+	Errors         prometheus.Counter
+}
+
+// NewMetrics builds a Metrics set and registers it with `reg`.
+// Pass `nil` to skip registration (tests).
+func NewMetrics(reg prometheus.Registerer) *Metrics {
+	m := &Metrics{
+		Evaluations: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "kmail_retention_evaluations_total",
+			Help: "Number of retention policy evaluations performed by the worker.",
+		}),
+		EmailsDeleted: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "kmail_retention_emails_deleted_total",
+			Help: "Total emails destroyed by retention policies (live mode only).",
+		}),
+		EmailsArchived: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "kmail_retention_emails_archived_total",
+			Help: "Total emails archived by retention policies (live mode only).",
+		}),
+		Errors: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "kmail_retention_errors_total",
+			Help: "Errors raised by the retention worker (any phase).",
+		}),
+	}
+	if reg != nil {
+		reg.MustRegister(m.Evaluations, m.EmailsDeleted, m.EmailsArchived, m.Errors)
+	}
+	return m
+}
 
 // EmailEnforcer is the abstraction over Stalwart JMAP that the
 // worker calls to enumerate + destroy / archive emails. The
@@ -53,9 +92,18 @@ type Worker struct {
 	interval time.Duration
 	enforcer EmailEnforcer
 	dryRun   bool
+	metrics  *Metrics
+
+	// Last enforcement snapshot for the admin UI status card.
+	// Read-only outside the worker; updated atomically each tick.
+	lastEvaluatedAt  atomic.Int64
+	lastDeletedTotal atomic.Int64
+	lastArchivedTotal atomic.Int64
+	lastErrorsTotal  atomic.Int64
 }
 
-// NewWorker constructs a Worker.
+// NewWorker constructs a Worker. Defaults to dry-run; production
+// callers flip `WithDryRun(false)` to enforce.
 func NewWorker(svc *Service, logger *log.Logger) *Worker {
 	if logger == nil {
 		logger = log.Default()
@@ -76,10 +124,52 @@ func (w *Worker) WithEnforcer(e EmailEnforcer) *Worker {
 }
 
 // WithDryRun toggles dry-run mode. Defaults to true so the first
-// release does not actually destroy mail.
+// release does not actually destroy mail. Phase 6 flips the
+// production default to live; operators opt out via
+// `KMAIL_RETENTION_DRY_RUN=true`.
 func (w *Worker) WithDryRun(b bool) *Worker {
 	w.dryRun = b
 	return w
+}
+
+// WithMetrics wires a Prometheus metric set into the worker. Pass
+// nil to disable metrics emission.
+func (w *Worker) WithMetrics(m *Metrics) *Worker {
+	w.metrics = m
+	return w
+}
+
+// DryRun reports whether the worker is in dry-run mode. Used by
+// the admin status card.
+func (w *Worker) DryRun() bool { return w.dryRun }
+
+// Snapshot returns the most-recent enforcement totals seen by the
+// worker. Counters are cumulative (not per-tick) so the admin UI
+// can render "X emails deleted since boot".
+func (w *Worker) Snapshot() WorkerSnapshot {
+	snap := WorkerSnapshot{
+		DryRun:         w.dryRun,
+		EmailsDeleted:  w.lastDeletedTotal.Load(),
+		EmailsArchived: w.lastArchivedTotal.Load(),
+		Errors:         w.lastErrorsTotal.Load(),
+	}
+	if ts := w.lastEvaluatedAt.Load(); ts > 0 {
+		t := time.Unix(ts, 0).UTC()
+		snap.LastEvaluated = &t
+	}
+	return snap
+}
+
+// WorkerSnapshot is the lightweight read returned by the admin
+// status card endpoint. `LastEvaluated` is nil until the first
+// tick completes so the admin UI can render "never" instead of
+// the Unix epoch.
+type WorkerSnapshot struct {
+	DryRun         bool       `json:"dry_run"`
+	LastEvaluated  *time.Time `json:"last_evaluated_at"`
+	EmailsDeleted  int64      `json:"emails_deleted"`
+	EmailsArchived int64      `json:"emails_archived"`
+	Errors         int64      `json:"errors"`
 }
 
 // Run loops until ctx is cancelled.
@@ -129,6 +219,8 @@ func (w *Worker) enforcePolicy(ctx context.Context, tenantID string, p Policy) e
 	if err != nil {
 		w.logger.Printf("retention.worker: startLog: %v", err)
 	}
+	w.lastEvaluatedAt.Store(time.Now().Unix())
+	w.incEvaluations()
 	before := time.Now().AddDate(0, 0, -p.RetentionDays)
 
 	if w.enforcer == nil {
@@ -141,6 +233,7 @@ func (w *Worker) enforcePolicy(ctx context.Context, tenantID string, p Policy) e
 
 	ids, err := w.enforcer.QueryOlderThan(ctx, tenantID, p.AppliesTo, p.TargetRef, before)
 	if err != nil {
+		w.incErrors()
 		_ = w.completeLog(ctx, logID, 0, 0, 0, err.Error(), "")
 		return err
 	}
@@ -162,11 +255,47 @@ func (w *Worker) enforcePolicy(ctx context.Context, tenantID string, p Policy) e
 		err = fmt.Errorf("retention: unsupported policy_type %q", p.PolicyType)
 	}
 	if err != nil {
+		w.incErrors()
 		_ = w.completeLog(ctx, logID, processed, deleted, archived, err.Error(), "")
 		return err
 	}
+	w.incDeleted(deleted)
+	w.incArchived(archived)
 	_ = w.completeLog(ctx, logID, processed, deleted, archived, "", "")
 	return nil
+}
+
+func (w *Worker) incEvaluations() {
+	if w.metrics != nil {
+		w.metrics.Evaluations.Inc()
+	}
+}
+
+func (w *Worker) incErrors() {
+	w.lastErrorsTotal.Add(1)
+	if w.metrics != nil {
+		w.metrics.Errors.Inc()
+	}
+}
+
+func (w *Worker) incDeleted(n int) {
+	if n <= 0 {
+		return
+	}
+	w.lastDeletedTotal.Add(int64(n))
+	if w.metrics != nil {
+		w.metrics.EmailsDeleted.Add(float64(n))
+	}
+}
+
+func (w *Worker) incArchived(n int) {
+	if n <= 0 {
+		return
+	}
+	w.lastArchivedTotal.Add(int64(n))
+	if w.metrics != nil {
+		w.metrics.EmailsArchived.Add(float64(n))
+	}
 }
 
 func noopNote(dryRun bool) string {

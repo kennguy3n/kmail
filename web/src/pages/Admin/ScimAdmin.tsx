@@ -19,10 +19,18 @@ export default function ScimAdmin() {
   const [tokens, setTokens] = useState<ScimToken[]>([]);
   const [description, setDescription] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [info, setInfo] = useState<string | null>(null);
   const [newToken, setNewToken] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [pendingRevoke, setPendingRevoke] = useState<ScimToken | null>(null);
+  const [generating, setGenerating] = useState(false);
 
   const reload = useCallback((tid: string) => {
-    listScimTokens(tid).then(setTokens).catch((e: unknown) => setError(String(e)));
+    setLoading(true);
+    listScimTokens(tid)
+      .then(setTokens)
+      .catch((e: unknown) => setError(String(e)))
+      .finally(() => setLoading(false));
   }, []);
 
   useEffect(() => {
@@ -32,23 +40,40 @@ export default function ScimAdmin() {
   const onGenerate = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!selectedTenantId) return;
+    setGenerating(true);
     try {
       const token = await generateScimToken(selectedTenantId, description);
       setNewToken(token.token ?? null);
       setDescription("");
+      setInfo("Token generated. Copy it now — it cannot be shown again.");
+      reload(selectedTenantId);
+    } catch (e: unknown) {
+      setError(String(e));
+    } finally {
+      setGenerating(false);
+    }
+  };
+
+  const confirmRevoke = (t: ScimToken) => setPendingRevoke(t);
+  const onRevokeConfirmed = async () => {
+    if (!selectedTenantId || !pendingRevoke) return;
+    try {
+      await revokeScimToken(selectedTenantId, pendingRevoke.id);
+      setInfo("Token revoked.");
+      setPendingRevoke(null);
       reload(selectedTenantId);
     } catch (e: unknown) {
       setError(String(e));
     }
   };
 
-  const onRevoke = async (id: string) => {
-    if (!selectedTenantId) return;
+  const copyToken = async () => {
+    if (!newToken) return;
     try {
-      await revokeScimToken(selectedTenantId, id);
-      reload(selectedTenantId);
-    } catch (e: unknown) {
-      setError(String(e));
+      await navigator.clipboard.writeText(newToken);
+      setInfo("Token copied to clipboard.");
+    } catch {
+      setError("Clipboard write failed; copy the token manually.");
     }
   };
 
@@ -74,7 +99,16 @@ export default function ScimAdmin() {
         </label>
       </div>
 
-      {error && <p className="kmail-error">{error}</p>}
+      {error && (
+        <p className="kmail-error" role="alert">
+          {error} <button onClick={() => setError(null)}>dismiss</button>
+        </p>
+      )}
+      {info && (
+        <p className="kmail-info" role="status">
+          {info} <button onClick={() => setInfo(null)}>dismiss</button>
+        </p>
+      )}
 
       {selectedTenantId && (
         <>
@@ -89,17 +123,24 @@ export default function ScimAdmin() {
                 onChange={(e) => setDescription(e.target.value)}
               />
             </label>
-            <button type="submit">Generate</button>
+            <button type="submit" disabled={generating}>
+              {generating ? "Generating…" : "Generate"}
+            </button>
           </form>
 
           {newToken && (
-            <div className="kmail-admin-card">
+            <div className="kmail-admin-card" role="region" aria-label="New SCIM token">
               <h4>New token (copy now — it will not be shown again)</h4>
-              <code style={{ wordBreak: "break-all" }}>{newToken}</code>
+              <code style={{ wordBreak: "break-all", display: "block" }}>{newToken}</code>
+              <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.5rem" }}>
+                <button onClick={copyToken}>Copy token</button>
+                <button onClick={() => setNewToken(null)}>Hide</button>
+              </div>
             </div>
           )}
 
           <h3>Active tokens</h3>
+          {loading && <p>Loading…</p>}
           <table className="kmail-admin-table">
             <thead>
               <tr>
@@ -117,17 +158,32 @@ export default function ScimAdmin() {
                   <td>{t.revoked_at ? "revoked" : "active"}</td>
                   <td>
                     {!t.revoked_at && (
-                      <button onClick={() => onRevoke(t.id)}>Revoke</button>
+                      <button onClick={() => confirmRevoke(t)}>Revoke</button>
                     )}
                   </td>
                 </tr>
               ))}
-              {tokens.length === 0 && (
-                <tr><td colSpan={4}>No tokens yet.</td></tr>
+              {!loading && tokens.length === 0 && (
+                <tr><td colSpan={4}>No tokens yet — generate one above.</td></tr>
               )}
             </tbody>
           </table>
         </>
+      )}
+
+      {pendingRevoke && (
+        <div role="dialog" aria-modal="true" className="kmail-modal">
+          <div className="kmail-modal-body">
+            <p>
+              Revoke token <strong>{pendingRevoke.description || pendingRevoke.id}</strong>?
+              Provisioning calls using this token will fail immediately.
+            </p>
+            <div style={{ display: "flex", gap: "0.5rem" }}>
+              <button onClick={onRevokeConfirmed}>Revoke</button>
+              <button onClick={() => setPendingRevoke(null)}>Cancel</button>
+            </div>
+          </div>
+        </div>
       )}
     </section>
   );
