@@ -531,7 +531,7 @@ export async function uploadDmarcReport(
 
 /** One step in the DNS wizard walkthrough. */
 export interface DnsWizardStep {
-  key: "mx" | "spf" | "dkim" | "dmarc" | "mta_sts" | "tls_rpt" | "autoconfig";
+  key: "mx" | "spf" | "dkim" | "dmarc" | "mta_sts" | "tls_rpt" | "autoconfig" | "bimi";
   label: string;
   record: DomainRecord | null;
   verified: boolean;
@@ -553,6 +553,7 @@ const WIZARD_STEP_LABELS: Record<DnsWizardStep["key"], string> = {
   mta_sts: "MTA-STS",
   tls_rpt: "TLS-RPT",
   autoconfig: "Autoconfig",
+  bimi: "BIMI (Brand Indicators)",
 };
 
 function pickRecord(
@@ -574,6 +575,8 @@ function pickRecord(
       return records.find((r) => r.name.startsWith("_smtp._tls.")) ?? null;
     case "autoconfig":
       return records.find((r) => r.name.startsWith("autoconfig.") || r.name.startsWith("autodiscover.")) ?? null;
+    case "bimi":
+      return records.find((r) => r.name.startsWith("default._bimi.")) ?? null;
   }
 }
 
@@ -600,6 +603,7 @@ export async function getDnsWizardStatus(
     mta_sts: false,
     tls_rpt: false,
     autoconfig: false,
+    bimi: false,
   };
   const steps: DnsWizardStep[] = (Object.keys(WIZARD_STEP_LABELS) as DnsWizardStep["key"][]).map(
     (key) => ({
@@ -1509,5 +1513,291 @@ export async function getSloRegions(): Promise<MultiRegionResult> {
   return requestJSON<MultiRegionResult>(
     `${ADMIN_API_BASE}/admin/slo/regions`,
     { headers: adminAuthHeaders(undefined, { Accept: "application/json" }) },
+  );
+}
+
+// =====================================================================
+// Phase 5 closeout — SCIM 2.0 token management
+// =====================================================================
+
+export interface ScimToken {
+  id: string;
+  description: string;
+  created_at: string;
+  revoked_at: string | null;
+  token?: string;
+}
+
+export async function listScimTokens(tenantId: string): Promise<ScimToken[]> {
+  return requestJSON<ScimToken[]>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/scim/tokens`,
+    { headers: adminAuthHeaders(tenantId, { Accept: "application/json" }) },
+  );
+}
+
+export async function generateScimToken(
+  tenantId: string,
+  description: string,
+): Promise<ScimToken> {
+  return requestJSON<ScimToken>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/scim/tokens`,
+    {
+      method: "POST",
+      headers: adminAuthHeaders(tenantId, {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      }),
+      body: JSON.stringify({ description }),
+    },
+  );
+}
+
+export async function revokeScimToken(
+  tenantId: string,
+  tokenId: string,
+): Promise<void> {
+  await fetch(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/scim/tokens/${encodeURIComponent(tokenId)}`,
+    { method: "DELETE", headers: adminAuthHeaders(tenantId) },
+  );
+}
+
+// =====================================================================
+// Phase 5 closeout — Tenant webhooks
+// =====================================================================
+
+export interface WebhookEndpoint {
+  id: string;
+  tenant_id: string;
+  url: string;
+  events: string[];
+  active: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface WebhookDelivery {
+  id: string;
+  tenant_id: string;
+  endpoint_id: string;
+  event_type: string;
+  status: "pending" | "delivered" | "failed";
+  attempts: number;
+  last_error?: string;
+  last_status?: number;
+  next_retry_at: string;
+  created_at: string;
+  delivered_at?: string;
+}
+
+export interface WebhookRegisterResponse {
+  endpoint: WebhookEndpoint;
+  secret: string;
+}
+
+export async function listWebhooks(tenantId: string): Promise<WebhookEndpoint[]> {
+  return requestJSON<WebhookEndpoint[]>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/webhooks`,
+    { headers: adminAuthHeaders(tenantId, { Accept: "application/json" }) },
+  );
+}
+
+export async function registerWebhook(
+  tenantId: string,
+  url: string,
+  events: string[],
+): Promise<WebhookRegisterResponse> {
+  return requestJSON<WebhookRegisterResponse>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/webhooks`,
+    {
+      method: "POST",
+      headers: adminAuthHeaders(tenantId, {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      }),
+      body: JSON.stringify({ url, events }),
+    },
+  );
+}
+
+export async function deleteWebhook(tenantId: string, webhookId: string): Promise<void> {
+  await fetch(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/webhooks/${encodeURIComponent(webhookId)}`,
+    { method: "DELETE", headers: adminAuthHeaders(tenantId) },
+  );
+}
+
+export async function listWebhookDeliveries(
+  tenantId: string,
+  limit = 100,
+): Promise<WebhookDelivery[]> {
+  return requestJSON<WebhookDelivery[]>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/webhook-deliveries?limit=${limit}`,
+    { headers: adminAuthHeaders(tenantId, { Accept: "application/json" }) },
+  );
+}
+
+// =====================================================================
+// Phase 5 closeout — Onboarding checklist
+// =====================================================================
+
+export interface OnboardingStep {
+  id: string;
+  title: string;
+  description: string;
+  status: "pending" | "complete" | "skipped";
+  optional: boolean;
+  link?: string;
+}
+
+export interface OnboardingChecklist {
+  tenant_id: string;
+  steps: OnboardingStep[];
+  updated_at: string;
+}
+
+export async function getOnboardingChecklist(
+  tenantId: string,
+): Promise<OnboardingChecklist> {
+  return requestJSON<OnboardingChecklist>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/onboarding`,
+    { headers: adminAuthHeaders(tenantId, { Accept: "application/json" }) },
+  );
+}
+
+export async function skipOnboardingStep(
+  tenantId: string,
+  stepId: string,
+): Promise<void> {
+  await fetch(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/onboarding/${encodeURIComponent(stepId)}/skip`,
+    { method: "POST", headers: adminAuthHeaders(tenantId) },
+  );
+}
+
+export async function unskipOnboardingStep(
+  tenantId: string,
+  stepId: string,
+): Promise<void> {
+  await fetch(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/onboarding/${encodeURIComponent(stepId)}/unskip`,
+    { method: "POST", headers: adminAuthHeaders(tenantId) },
+  );
+}
+
+// =====================================================================
+// Phase 5 closeout — Calendar notification channel routing
+// =====================================================================
+
+export interface CalendarChannelMapping {
+  tenant_id: string;
+  calendar_id?: string;
+  channel_id: string;
+  configured?: boolean;
+}
+
+export async function getCalendarDefaultChannel(
+  tenantId: string,
+): Promise<CalendarChannelMapping> {
+  return requestJSON<CalendarChannelMapping>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/calendar-default-channel`,
+    { headers: adminAuthHeaders(tenantId, { Accept: "application/json" }) },
+  );
+}
+
+export async function setCalendarDefaultChannel(
+  tenantId: string,
+  channelId: string,
+): Promise<CalendarChannelMapping> {
+  return requestJSON<CalendarChannelMapping>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/calendar-default-channel`,
+    {
+      method: "PUT",
+      headers: adminAuthHeaders(tenantId, {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      }),
+      body: JSON.stringify({ channel_id: channelId }),
+    },
+  );
+}
+
+export async function getCalendarChannelMapping(
+  tenantId: string,
+  calendarId: string,
+): Promise<CalendarChannelMapping> {
+  return requestJSON<CalendarChannelMapping>(
+    `${ADMIN_API_BASE}/calendars/${encodeURIComponent(calendarId)}/notification-channel`,
+    { headers: adminAuthHeaders(tenantId, { Accept: "application/json" }) },
+  );
+}
+
+export async function setCalendarChannelMapping(
+  tenantId: string,
+  calendarId: string,
+  channelId: string,
+): Promise<CalendarChannelMapping> {
+  return requestJSON<CalendarChannelMapping>(
+    `${ADMIN_API_BASE}/calendars/${encodeURIComponent(calendarId)}/notification-channel`,
+    {
+      method: "PUT",
+      headers: adminAuthHeaders(tenantId, {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      }),
+      body: JSON.stringify({ channel_id: channelId }),
+    },
+  );
+}
+
+// =====================================================================
+// Phase 5 closeout — Reverse access proxy
+// =====================================================================
+
+export interface AdminProxySession {
+  id: string;
+  tenant_id: string;
+  approval_request_id: string;
+  admin_user_id: string;
+  scope: string;
+  started_at: string;
+  expires_at: string;
+  revoked_at?: string;
+}
+
+export async function listAdminProxySessions(
+  tenantId: string,
+): Promise<AdminProxySession[]> {
+  return requestJSON<AdminProxySession[]>(
+    `${ADMIN_API_BASE}/admin/proxy/${encodeURIComponent(tenantId)}/sessions`,
+    { headers: adminAuthHeaders(tenantId, { Accept: "application/json" }) },
+  );
+}
+
+export async function requestAdminProxyAccess(
+  tenantId: string,
+  reason: string,
+  scope: string,
+): Promise<{ id: string; status: string; expires_at: string }> {
+  return requestJSON(
+    `${ADMIN_API_BASE}/admin/proxy/${encodeURIComponent(tenantId)}/access`,
+    {
+      method: "POST",
+      headers: adminAuthHeaders(tenantId, {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      }),
+      body: JSON.stringify({ reason, scope }),
+    },
+  );
+}
+
+export async function revokeAdminProxySession(
+  tenantId: string,
+  sessionId: string,
+): Promise<void> {
+  await fetch(
+    `${ADMIN_API_BASE}/admin/proxy/${encodeURIComponent(tenantId)}/sessions/${encodeURIComponent(sessionId)}/revoke`,
+    { method: "POST", headers: adminAuthHeaders(tenantId) },
   );
 }

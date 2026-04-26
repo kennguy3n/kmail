@@ -42,6 +42,10 @@ export default function Layout() {
           <li><Link to="/admin/approvals">Approvals</Link></li>
           <li><Link to="/admin/exports">Exports</Link></li>
           <li><Link to="/admin/cmk">Customer-managed keys</Link></li>
+          <li><Link to="/admin/scim">SCIM provisioning</Link></li>
+          <li><Link to="/admin/webhooks">Webhooks</Link></li>
+          <li><Link to="/admin/onboarding">Onboarding</Link></li>
+          <li><Link to="/contacts">Contacts</Link></li>
         </ul>
       </nav>
       <main className="kmail-main">

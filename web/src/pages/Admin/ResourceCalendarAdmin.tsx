@@ -124,6 +124,8 @@ export default function ResourceCalendarAdmin() {
         <button type="submit">Create</button>
       </form>
 
+      <CalendarNotificationSettings rows={rows} />
+
       {booking && (
         <div className="kmail-booking-dialog">
           <h3>Book {booking.id}</h3>
@@ -143,6 +145,91 @@ export default function ResourceCalendarAdmin() {
           <button type="button" onClick={() => setBooking(null)}>Cancel</button>
         </div>
       )}
+    </section>
+  );
+}
+
+/**
+ * CalendarNotificationSettings — Phase 5 closeout: lets a tenant
+ * admin pick a default KChat channel for calendar notifications,
+ * and override the channel on a per-resource basis.
+ */
+function CalendarNotificationSettings({ rows }: { rows: ResourceCalendar[] }) {
+  const [tenantId, setTenantId] = useState<string>("");
+  const [defaultChannel, setDefaultChannel] = useState<string>("");
+  const [perCalendarChannel, setPerCalendarChannel] = useState<Record<string, string>>({});
+  const [status, setStatus] = useState<string | null>(null);
+
+  return (
+    <section style={{ marginTop: "2rem" }}>
+      <h3>Calendar notification routing</h3>
+      <p>
+        Pick the KChat channel events publish to. Per-resource overrides
+        take priority over the tenant default; if neither is set, the
+        environment-default channel applies.
+      </p>
+
+      <label>
+        Tenant ID
+        <input value={tenantId} onChange={(e) => setTenantId(e.target.value)} />
+      </label>
+      <label>
+        Default channel ID
+        <input value={defaultChannel} onChange={(e) => setDefaultChannel(e.target.value)} />
+      </label>
+      <button
+        onClick={async () => {
+          if (!tenantId || !defaultChannel) return;
+          const { setCalendarDefaultChannel } = await import("../../api/admin");
+          try {
+            await setCalendarDefaultChannel(tenantId, defaultChannel);
+            setStatus("Saved tenant default.");
+          } catch (e: unknown) {
+            setStatus(String(e));
+          }
+        }}
+      >
+        Save default
+      </button>
+
+      <h4>Per-resource channels</h4>
+      <table className="kmail-admin-table">
+        <thead>
+          <tr><th>Resource</th><th>Channel ID</th><th></th></tr>
+        </thead>
+        <tbody>
+          {rows.map((r) => (
+            <tr key={r.id}>
+              <td>{r.name ?? r.id}</td>
+              <td>
+                <input
+                  value={perCalendarChannel[r.id] ?? ""}
+                  onChange={(e) => setPerCalendarChannel((prev) => ({ ...prev, [r.id]: e.target.value }))}
+                />
+              </td>
+              <td>
+                <button
+                  onClick={async () => {
+                    if (!tenantId) return;
+                    const channelId = perCalendarChannel[r.id] ?? "";
+                    if (!channelId) return;
+                    const { setCalendarChannelMapping } = await import("../../api/admin");
+                    try {
+                      await setCalendarChannelMapping(tenantId, r.id, channelId);
+                      setStatus(`Saved override for ${r.name ?? r.id}.`);
+                    } catch (e: unknown) {
+                      setStatus(String(e));
+                    }
+                  }}
+                >
+                  Save
+                </button>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {status && <p>{status}</p>}
     </section>
   );
 }

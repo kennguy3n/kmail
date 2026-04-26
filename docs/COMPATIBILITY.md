@@ -280,3 +280,24 @@ What it checks:
 4. `PUT` writes a minimal VEVENT; the script re-reads it via
    `GET` and verifies the `SUMMARY` round-tripped intact.
 5. `DELETE` removes the test event cleanly (204).
+
+## BIMI (Brand Indicators for Message Identification)
+
+Phase 5 closeout adds BIMI record generation to the DNS wizard.
+When `KMAIL_DNS_BIMI_LOGO_URL` is set on the BFF, the wizard
+emits a `default._bimi.<domain>` TXT record with the form:
+
+```
+v=BIMI1; l=<logo_url>; a=<vmc_url>
+```
+
+`a=<vmc_url>` is optional but recommended — Verified Mark
+Certificates (VMCs) unlock Gmail / Apple Mail brand-indicator
+rendering. BIMI requires the publishing domain to enforce DMARC
+with `p=quarantine` or `p=reject`; the wizard surfaces this
+prerequisite alongside the BIMI step.
+
+The logo must be served as **SVG Tiny PS** (`image/svg+xml`)
+from a URL that is publicly reachable without authentication.
+The VMC must be a PEM-encoded PKCS#7 chain hosted at the URL
+specified in `KMAIL_DNS_BIMI_VMC_URL`.

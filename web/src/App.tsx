@@ -30,6 +30,10 @@ import RetentionAdmin from "./pages/Admin/RetentionAdmin";
 import ApprovalAdmin from "./pages/Admin/ApprovalAdmin";
 import ExportAdmin from "./pages/Admin/ExportAdmin";
 import CmkAdmin from "./pages/Admin/CmkAdmin";
+import ScimAdmin from "./pages/Admin/ScimAdmin";
+import WebhookAdmin from "./pages/Admin/WebhookAdmin";
+import OnboardingChecklist from "./pages/Admin/OnboardingChecklist";
+import ContactsView from "./pages/Mail/ContactsView";
 
 /**
  * App is the KMail React entrypoint.
@@ -82,6 +86,10 @@ export default function App() {
         <Route path="admin/approvals" element={<ApprovalAdmin />} />
         <Route path="admin/exports" element={<ExportAdmin />} />
         <Route path="admin/cmk" element={<CmkAdmin />} />
+        <Route path="admin/scim" element={<ScimAdmin />} />
+        <Route path="admin/webhooks" element={<WebhookAdmin />} />
+        <Route path="admin/onboarding" element={<OnboardingChecklist />} />
+        <Route path="contacts" element={<ContactsView />} />
 
         <Route path="*" element={<Navigate to="/mail" replace />} />
       </Route>
