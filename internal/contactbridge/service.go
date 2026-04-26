@@ -58,6 +58,8 @@ type Contact struct {
 	Phones   []string `json:"phones,omitempty"`
 	Org      string   `json:"org,omitempty"`
 	Note     string   `json:"note,omitempty"`
+	PhotoURL string   `json:"photoUrl,omitempty"`
+	Groups   []string `json:"groups,omitempty"`
 	VCardRaw string   `json:"vcardRaw,omitempty"`
 }
 
@@ -65,11 +67,13 @@ type Contact struct {
 // service builds a vCard 4.0 payload from these fields.
 type ContactDraft struct {
 	UID    string   `json:"uid,omitempty"`
-	FN     string   `json:"fn"`
-	Emails []string `json:"emails,omitempty"`
-	Phones []string `json:"phones,omitempty"`
-	Org    string   `json:"org,omitempty"`
-	Note   string   `json:"note,omitempty"`
+	FN       string   `json:"fn"`
+	Emails   []string `json:"emails,omitempty"`
+	Phones   []string `json:"phones,omitempty"`
+	Org      string   `json:"org,omitempty"`
+	Note     string   `json:"note,omitempty"`
+	PhotoURL string   `json:"photoUrl,omitempty"`
+	Groups   []string `json:"groups,omitempty"`
 }
 
 // ErrInvalidInput / ErrNotFound mirror the calendarbridge package.
@@ -280,6 +284,14 @@ func ParseVCard(raw string) *Contact {
 			c.Org = value
 		case "NOTE":
 			c.Note = value
+		case "PHOTO":
+			c.PhotoURL = value
+		case "CATEGORIES":
+			for _, g := range strings.Split(value, ",") {
+				if g = strings.TrimSpace(g); g != "" {
+					c.Groups = append(c.Groups, g)
+				}
+			}
 		}
 	}
 	return c
@@ -306,6 +318,12 @@ func BuildVCard(d ContactDraft) string {
 	}
 	if d.Note != "" {
 		fmt.Fprintf(&b, "NOTE:%s\r\n", escapeVCardValue(d.Note))
+	}
+	if d.PhotoURL != "" {
+		fmt.Fprintf(&b, "PHOTO:%s\r\n", escapeVCardValue(d.PhotoURL))
+	}
+	if len(d.Groups) > 0 {
+		fmt.Fprintf(&b, "CATEGORIES:%s\r\n", escapeVCardValue(strings.Join(d.Groups, ",")))
 	}
 	b.WriteString("END:VCARD\r\n")
 	return b.String()

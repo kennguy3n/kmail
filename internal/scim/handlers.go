@@ -40,6 +40,13 @@ func NewHandlers(svc *Service, logger *log.Logger) *Handlers {
 
 // Register installs all SCIM routes on the mux.
 func (h *Handlers) Register(mux *http.ServeMux, authMW *middleware.OIDC) {
+	// SCIM 2.0 discovery (RFC 7644 §4) — public, unauthenticated.
+	mux.HandleFunc("GET /scim/v2/ServiceProviderConfig", HandleServiceProviderConfig)
+	mux.HandleFunc("GET /scim/v2/ResourceTypes", HandleResourceTypes)
+	mux.HandleFunc("GET /scim/v2/ResourceTypes/{id}", handleResourceType)
+	mux.HandleFunc("GET /scim/v2/Schemas", HandleSchemas)
+	mux.HandleFunc("GET /scim/v2/Schemas/{id}", handleSchema)
+
 	// SCIM-bearer-token-authenticated provisioning surface.
 	mux.Handle("GET /scim/v2/Users", h.scimAuth(http.HandlerFunc(h.listUsers)))
 	mux.Handle("POST /scim/v2/Users", h.scimAuth(http.HandlerFunc(h.createUser)))

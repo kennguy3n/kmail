@@ -24,7 +24,23 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/kennguy3n/kmail/internal/middleware"
 )
+
+// EnforcementRun is one row of `retention_enforcement_log`
+// projected for the admin status card.
+type EnforcementRun struct {
+	ID              string     `json:"id"`
+	PolicyID        string     `json:"policy_id"`
+	EmailsProcessed int        `json:"emails_processed"`
+	EmailsDeleted   int        `json:"emails_deleted"`
+	EmailsArchived  int        `json:"emails_archived"`
+	StartedAt       time.Time  `json:"started_at"`
+	CompletedAt     *time.Time `json:"completed_at,omitempty"`
+	Error           string     `json:"error,omitempty"`
+	Notes           string     `json:"notes,omitempty"`
+}
 
 // Policy is the public shape of a retention policy.
 type Policy struct {
@@ -183,6 +199,45 @@ func validatePolicy(p Policy) error {
 		return errors.New("retention: applies_to must be all|mailbox|label")
 	}
 	return nil
+}
+
+// RecentEnforcementRuns returns the most recent enforcement log
+// rows for a tenant, ordered newest-first.
+func (s *Service) RecentEnforcementRuns(ctx context.Context, tenantID string, limit int) ([]EnforcementRun, error) {
+	if s.pool == nil || tenantID == "" {
+		return nil, nil
+	}
+	if limit <= 0 || limit > 200 {
+		limit = 20
+	}
+	var out []EnforcementRun
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
+			return err
+		}
+		rows, err := tx.Query(ctx, `
+			SELECT id::text, policy_id::text, emails_processed, emails_deleted,
+			       emails_archived, started_at, completed_at, error, notes
+			FROM retention_enforcement_log
+			WHERE tenant_id = $1::uuid
+			ORDER BY started_at DESC
+			LIMIT $2
+		`, tenantID, limit)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var r EnforcementRun
+			if err := rows.Scan(&r.ID, &r.PolicyID, &r.EmailsProcessed, &r.EmailsDeleted,
+				&r.EmailsArchived, &r.StartedAt, &r.CompletedAt, &r.Error, &r.Notes); err != nil {
+				return err
+			}
+			out = append(out, r)
+		}
+		return rows.Err()
+	})
+	return out, err
 }
 
 // ErrNotFound is exported for handler 404 mapping.

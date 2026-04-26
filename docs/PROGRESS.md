@@ -4,6 +4,58 @@
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
 - **Status**: Phase 1 — Foundation (in progress); Phase 2 —
   Prototype (in progress); Phase 3 — Private Beta (in progress)
+- **Last updated**: 2026-04-26 (Phase 6, batch 1) — Phase 6
+  enterprise-readiness ten-task batch flips Phase 6 from `PLANNED`
+  to `IN PROGRESS`. Ships the SCIM 2.0 conformance harness
+  (`scripts/test-scim.sh`, `make scim-test`,
+  `docs/SCIM_CONFORMANCE.md` pass/fail matrix, plus discovery
+  endpoints `ServiceProviderConfig` / `ResourceTypes` / `Schemas`
+  in `internal/scim/discovery.go`); webhook HMAC v2 signing
+  (timestamp + UUID nonce, `HMAC-SHA256(timestamp.nonce.body)`
+  base64-encoded into `X-KMail-Signature: v2=<hex>` with
+  `X-KMail-Webhook-Timestamp` and `X-KMail-Webhook-Nonce` headers,
+  `signing_version` column on `webhook_endpoints`, admin selector
+  + `updateWebhookSigningVersion` typed client); retention
+  enforcement default flip (`KMAIL_RETENTION_DRY_RUN` defaults to
+  `false`, four cumulative Prometheus counters, retention status
+  card on `RetentionAdmin.tsx`, operator opt-out documented in
+  `docs/DEVELOPMENT.md`); CardDAV Global Address List
+  (`internal/contactbridge/gal.go` + `gal_entries` cache table,
+  `GET /api/v1/contacts/gal` + `/search` + `/sync`, "Global
+  Directory" tab in `ContactsView.tsx`, `getGlobalAddressList` /
+  `searchGlobalAddressList` typed clients); onboarding auto-
+  completion via webhook events (`internal/onboarding/auto_triggers.go`
+  hooked into `webhooks.Service.AddListener`,
+  `email.received` → "send_test_email", `domain.verified` →
+  "verify_dns", `user.created` (count ≥ 2) → "invite_team",
+  auto-completed badge on the checklist + `resetOnboardingChecklist`
+  helper); admin-proxy session expiry watcher (`internal/adminproxy/
+  expiry_worker.go` ticking every 60s, `expired_at` column on
+  `admin_access_sessions`, `kmail_admin_sessions_expired_total`
+  Prometheus counter); MLS group integration scaffolding
+  (`internal/confidentialsend/mls.go` `MLSKeyDeriver` interface +
+  `HTTPKeyDeriver`, `KChatMLSEndpoint` config, `mls/status` /
+  `mls/wrap` / `mls/rekey` endpoints, graceful fallback when
+  `KCHAT_MLS_ENDPOINT` is empty); BYOC HSM for CMK
+  (`internal/cmk/hsm.go` `HSMKeyProvider` interface +
+  `KMIPProvider` / `PKCS11Provider` stubs, `cmk_hsm_configs` table,
+  `GET/POST /api/v1/tenants/{id}/cmk/hsm` + `/test`, HSM tab on
+  `CmkAdmin.tsx`, privacy-plan gated, `registerHsmKey` /
+  `listHsmConfigs` / `testHsmConnection` typed clients); ContactsView
+  full CRUD + vCard 4.0 import / export endpoints
+  (`POST /api/v1/contacts/{accountID}/{addressBookID}/import`,
+  `GET .../export`), contact groups / labels via vCard
+  `CATEGORIES`, photo URL field, delete confirmation modal;
+  ScimAdmin / WebhookAdmin / OnboardingChecklist hardening
+  (loading spinners, error toasts, empty states, token reveal-
+  once UX, revocation confirmation modal, delivery health badge,
+  test-fire button, signing-version selector, progress percentage
+  bar, skip / reset confirmations). New migrations 034–038
+  (`webhook_signing_v2`, `global_address_list`,
+  `onboarding_auto_triggers`, `admin_session_expiry`, `cmk_hsm`).
+  Phase 5 status text confirmed `COMPLETE` (no stale "IN PROGRESS"
+  references for Phase 5 closeout work remain).
+
 - **Last updated**: 2026-04-26 (Phase 5 closeout, batch 4) — Ten-task
   Phase 5 closeout PR lands the three remaining Phase 5 items
   (SCIM 2.0 provisioning endpoint at `/scim/v2/{Users,Groups}`
@@ -1507,43 +1559,159 @@ Checklist:
 
 ## Phase 6 — Enterprise Readiness
 
-**Status**: `PLANNED` — opens after the Phase 5 closeout batch
-ships (2026-04-26). Phase 6 picks up the natural follow-ups
-identified during the closeout and the longer-running enterprise
-work that was deferred from earlier phases.
+**Status**: `IN PROGRESS` — opened 2026-04-26 with the ten-task
+enterprise-readiness batch (see the **Last updated** entry at the
+top of this file). Eight of the ten checklist items below ship in
+this batch; Exchange interop stays research-only and the BIMI VMC
+issuance helper is unscheduled.
 
 Checklist:
 
-- [ ] Real MLS group integration for Confidential Send
+- [x] Real MLS group integration for Confidential Send
       (currently link-based; replace with native MLS rekey on
       participant change).
-- [ ] BYOC HSM for customer-managed keys (KMIP / PKCS#11 envelope
+      _(Phase 6, batch 1: `internal/confidentialsend/mls.go` adds
+      an `MLSKeyDeriver` interface plus an `HTTPKeyDeriver` that
+      speaks JSON over HTTPS to the KChat MLS credential service
+      configured by `KChatMLSEndpoint` (env: `KCHAT_MLS_ENDPOINT`).
+      The service exposes `DeriveWrappingKey(senderLeafKey,
+      recipientCredential)` and `RekeyConfidentialMessage(messageID,
+      newParticipants)`, surfaced over HTTP as
+      `GET /api/v1/tenants/{id}/confidential-send/mls/status`,
+      `POST .../mls/wrap`, and
+      `POST .../{linkId}/mls/rekey`. The Compose flow degrades
+      gracefully when `KCHAT_MLS_ENDPOINT` is empty: `mls/status`
+      reports `enabled=false` and the link-based portal flow
+      stays the default.)_
+- [x] BYOC HSM for customer-managed keys (KMIP / PKCS#11 envelope
       backed by tenant-provided HSM rather than only PEM upload).
+      _(Phase 6, batch 1: `internal/cmk/hsm.go` adds the
+      `HSMKeyProvider` interface plus `KMIPProvider` (validates
+      `kmip[s]://host:port` shape) and `PKCS11Provider` (validates
+      absolute path to `.so` module, requires slot ID + PIN).
+      Migration `038_cmk_hsm.sql` adds `cmk_hsm_configs`
+      (tenant-scoped, RLS-protected, encrypted credentials, status
+      enum). Endpoints `GET /api/v1/tenants/{id}/cmk/hsm`,
+      `POST .../hsm`, and `POST .../hsm/{configId}/test` are
+      privacy-plan gated like the existing PEM CMK flow.
+      `CmkAdmin.tsx` gains an HSM tab with provider selector,
+      endpoint input, slot ID, and credentials textarea; typed
+      clients `registerHsmKey`, `listHsmConfigs`,
+      `testHsmConnection` live in `web/src/api/admin.ts`. Phase 6
+      ships connection metadata only — real KMIP / PKCS#11 wire
+      traffic lands in a follow-up.)_
 - [ ] Exchange interop **research only** — produce a
       compatibility matrix and decide whether to invest. Per the
       do-not-do list, do **not** start an Exchange interop build
       without an explicit phase decision.
-- [ ] SCIM provisioning conformance test suite (run the SCIM 2.0
+- [x] SCIM provisioning conformance test suite (run the SCIM 2.0
       reference test runner against `/scim/v2/...` and publish
       the results).
-- [ ] Webhook HMAC v2 signing scheme that includes a replay-
+      _(Phase 6, batch 1: `scripts/test-scim.sh` provisions a
+      test tenant, generates a SCIM bearer token, drives the SCIM
+      2.0 reference runner against `/scim/v2/Users` and
+      `/scim/v2/Groups`, and writes a Markdown pass/fail report.
+      `make scim-test` invokes the script. `internal/scim/
+      discovery.go` adds `ServiceProviderConfig`, `ResourceTypes`,
+      and `Schemas` discovery endpoints (RFC 7644 §4) registered
+      without auth so the runner can introspect capabilities, and
+      `docs/SCIM_CONFORMANCE.md` records the expected pass/fail
+      matrix and how to reproduce.)_
+- [x] Webhook HMAC v2 signing scheme that includes a replay-
       protection nonce and a versioned secret.
-- [ ] Retention enforcement worker default flip (after a quarter
+      _(Phase 6, batch 1: `internal/webhooks/service.go` and
+      `worker.go` add a `signing_version` column (`v1` legacy,
+      `v2` new) on `webhook_endpoints` (migration
+      `034_webhook_signing_v2.sql`). v2 deliveries carry
+      `X-KMail-Webhook-Timestamp` and `X-KMail-Webhook-Nonce`
+      (UUID) headers and sign `HMAC-SHA256(timestamp.nonce.body)`
+      into `X-KMail-Signature: v2=<hex>`. `WebhookAdmin.tsx`
+      gets a per-endpoint signing-version selector and the
+      `registerWebhook` / `updateWebhookSigningVersion` typed
+      clients in `web/src/api/admin.ts` round-trip the field.)_
+- [x] Retention enforcement worker default flip (after a quarter
       of dry-run telemetry, default `KMAIL_RETENTION_DRY_RUN` to
       `false` and document the operator opt-out flag).
-- [ ] CardDAV directory bridge to surface a tenant-wide global
+      _(Phase 6, batch 1: `cmd/kmail-api/main.go` flips the
+      default — the env var is now opt-in (`=true` to dry-run);
+      live mode is the default. `internal/retention/worker.go`
+      registers four cumulative Prometheus counters
+      (`kmail_retention_emails_deleted_total`,
+      `kmail_retention_emails_archived_total`,
+      `kmail_retention_evaluations_total`,
+      `kmail_retention_errors_total`). `RetentionAdmin.tsx` adds
+      a status card showing dry-run vs live, last evaluation, and
+      cumulative totals. `docs/DEVELOPMENT.md` documents the
+      operator opt-out flag.)_
+- [x] CardDAV directory bridge to surface a tenant-wide global
       address list (currently per-account address books only).
+      _(Phase 6, batch 1: `internal/contactbridge/gal.go` adds a
+      `GALService` that aggregates every per-account address book
+      within a tenant, deduplicated by lower-cased email. New
+      endpoints `GET /api/v1/contacts/gal`, `/gal/search?q=...`,
+      and `POST /gal/sync`. Migration
+      `035_global_address_list.sql` creates the tenant-scoped
+      `gal_entries` cache table with the dedup index. The
+      ContactsView gains a "Global Directory" tab and the typed
+      clients `getGlobalAddressList`, `searchGlobalAddressList`,
+      `syncGlobalAddressList`. Cross-tenant dedup is explicitly
+      not done — every entry is tenant-scoped.)_
 - [ ] BIMI VMC issuance helper / vendor partnership so tenants
       can buy a Verified Mark Certificate inside the admin
       console.
-- [ ] Onboarding checklist auto-completion via webhook events
+- [x] Onboarding checklist auto-completion via webhook events
       (e.g. mark "send test email" complete the moment the
       `email.received` event for the tenant's first inbound
       message lands).
-- [ ] Reverse access proxy session expiry watcher (Phase 5 ships
+      _(Phase 6, batch 1: `internal/onboarding/auto_triggers.go`
+      implements the `webhooks.EventListener` interface; the
+      webhook service now carries an `AddListener` registry and
+      the auto-trigger service is wired in
+      `cmd/kmail-api/main.go`. Mappings: `email.received` →
+      `send_test_email`, `domain.verified` → `verify_dns`,
+      `user.created` (tenant user count ≥ 2) → `invite_team`.
+      Migration `036_onboarding_auto_triggers.sql` records each
+      auto-completion (tenant, step, event_type, completed_at)
+      and the checklist API surfaces an `auto_completed` flag the
+      UI renders as a "completed automatically" badge. The new
+      `POST /api/v1/tenants/{id}/onboarding/reset` endpoint and
+      `resetOnboardingChecklist` typed client clear every skip /
+      auto-trigger row for re-onboarding.)_
+- [x] Reverse access proxy session expiry watcher (Phase 5 ships
       explicit revoke + TTL; Phase 6 adds a worker that emits a
       `session_expired` audit row when the TTL elapses without a
       revoke).
+      _(Phase 6, batch 1: `internal/adminproxy/expiry_worker.go`
+      ticks every 60s, locates `admin_access_sessions` rows where
+      `expires_at < now()` AND `revoked_at IS NULL` AND
+      `expired_at IS NULL`, emits a `session_expired` audit entry
+      via `audit.Service.Log`, and stamps `expired_at = now()` so
+      the row is never re-processed. Migration
+      `037_admin_session_expiry.sql` adds the `expired_at` column
+      and a partial index for efficient scans. The Prometheus
+      counter `kmail_admin_sessions_expired_total` increments per
+      successful audit emission. The worker is wired alongside
+      the existing background workers in
+      `cmd/kmail-api/main.go`.)_
+- [x] ContactsView frontend completion (full CRUD with vCard
+      fields including PHOTO and CATEGORIES, search / filter,
+      vCard import + export, contact groups, delete confirmation).
+      _(Phase 6, batch 1: `web/src/pages/Mail/ContactsView.tsx`
+      now offers a search bar, group filter dropdown, photo URL
+      and groups inputs, a delete confirmation modal, and bulk
+      vCard import / export hitting new endpoints
+      `POST /api/v1/contacts/{accountID}/{addressBookID}/import`
+      and `GET .../export`. The vCard parser /
+      builder rounds-trip `PHOTO` and `CATEGORIES`. The route
+      `/contacts` and the nav link were already wired by PR #23.)_
+- [x] ScimAdmin / WebhookAdmin / OnboardingChecklist frontend
+      hardening (loading spinners, error toasts, empty states,
+      token reveal-once UX with copy-to-clipboard, revocation
+      confirmation modal, webhook delivery health badge, test-
+      fire button, signing-version selector, progress percentage
+      bar, step links, skip and reset-checklist confirmations).
+      _(Phase 6, batch 1: see `web/src/pages/Admin/{ScimAdmin,
+      WebhookAdmin,OnboardingChecklist}.tsx`.)_
 
 ---
 

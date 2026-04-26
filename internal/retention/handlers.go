@@ -12,6 +12,7 @@ import (
 type Handlers struct {
 	svc    *Service
 	logger *log.Logger
+	worker *Worker
 }
 
 // NewHandlers returns Handlers.
@@ -22,12 +23,44 @@ func NewHandlers(svc *Service, logger *log.Logger) *Handlers {
 	return &Handlers{svc: svc, logger: logger}
 }
 
+// WithWorker wires the running worker so the status endpoint can
+// report dry-run mode and the enforcement snapshot.
+func (h *Handlers) WithWorker(w *Worker) *Handlers {
+	h.worker = w
+	return h
+}
+
 // Register installs the routes.
 func (h *Handlers) Register(mux *http.ServeMux, authMW *middleware.OIDC) {
 	mux.Handle("GET /api/v1/tenants/{id}/retention", authMW.Wrap(http.HandlerFunc(h.list)))
 	mux.Handle("POST /api/v1/tenants/{id}/retention", authMW.Wrap(http.HandlerFunc(h.create)))
 	mux.Handle("PUT /api/v1/tenants/{id}/retention/{policyId}", authMW.Wrap(http.HandlerFunc(h.update)))
 	mux.Handle("DELETE /api/v1/tenants/{id}/retention/{policyId}", authMW.Wrap(http.HandlerFunc(h.delete)))
+	mux.Handle("GET /api/v1/tenants/{id}/retention/status", authMW.Wrap(http.HandlerFunc(h.status)))
+}
+
+func (h *Handlers) status(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.PathValue("id")
+	out := map[string]any{
+		"dry_run":         true,
+		"recent_runs":     []any{},
+		"emails_deleted":  int64(0),
+		"emails_archived": int64(0),
+		"errors":          int64(0),
+	}
+	if h.worker != nil {
+		snap := h.worker.Snapshot()
+		out["dry_run"] = snap.DryRun
+		out["last_evaluated_at"] = snap.LastEvaluated
+		out["emails_deleted"] = snap.EmailsDeleted
+		out["emails_archived"] = snap.EmailsArchived
+		out["errors"] = snap.Errors
+	}
+	runs, err := h.svc.RecentEnforcementRuns(r.Context(), tenantID, 20)
+	if err == nil {
+		out["recent_runs"] = runs
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (h *Handlers) list(w http.ResponseWriter, r *http.Request) {

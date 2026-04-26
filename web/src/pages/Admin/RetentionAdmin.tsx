@@ -8,14 +8,17 @@ import { useCallback, useEffect, useState } from "react";
 import {
   createRetentionPolicy,
   deleteRetentionPolicy,
+  getRetentionStatus,
   listRetentionPolicies,
   type RetentionPolicy,
+  type RetentionStatus,
 } from "../../api/admin";
 import { useTenantSelection } from "./useTenantSelection";
 
 export default function RetentionAdmin() {
   const { tenants, selectedTenantId, selectTenant } = useTenantSelection();
   const [policies, setPolicies] = useState<RetentionPolicy[]>([]);
+  const [status, setStatus] = useState<RetentionStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [draft, setDraft] = useState<Partial<RetentionPolicy>>({
     policy_type: "archive",
@@ -26,6 +29,7 @@ export default function RetentionAdmin() {
 
   const reload = useCallback((tid: string) => {
     listRetentionPolicies(tid).then(setPolicies).catch((e: unknown) => setError(String(e)));
+    getRetentionStatus(tid).then(setStatus).catch((e: unknown) => setError(String(e)));
   }, []);
 
   useEffect(() => {
@@ -69,6 +73,41 @@ export default function RetentionAdmin() {
       </div>
 
       {error && <p className="kmail-error">{error}</p>}
+
+      {selectedTenantId && status && (
+        <div
+          className="kmail-admin-card"
+          style={{
+            borderLeft: `4px solid ${status.dry_run ? "#d97706" : "#16a34a"}`,
+          }}
+        >
+          <h3>Enforcement status</h3>
+          <p>
+            <strong>Mode:</strong>{" "}
+            <span style={{ color: status.dry_run ? "#d97706" : "#16a34a" }}>
+              {status.dry_run ? "DRY RUN (no rows mutated)" : "LIVE (deleting / archiving)"}
+            </span>
+          </p>
+          <p>
+            <strong>Last evaluated:</strong>{" "}
+            {status.last_evaluated_at
+              ? new Date(status.last_evaluated_at).toLocaleString()
+              : "never"}
+          </p>
+          <p>
+            <strong>Cumulative since boot:</strong>{" "}
+            {status.emails_deleted} deleted · {status.emails_archived} archived ·{" "}
+            {status.errors} errors
+          </p>
+          {status.dry_run && (
+            <p style={{ fontSize: 13, color: "#92400e" }}>
+              The worker is in dry-run mode (<code>KMAIL_RETENTION_DRY_RUN=true</code>).
+              Live enforcement is the Phase 6 default — set the env var to <code>false</code>{" "}
+              or unset it to switch on.
+            </p>
+          )}
+        </div>
+      )}
 
       {selectedTenantId && (
         <>

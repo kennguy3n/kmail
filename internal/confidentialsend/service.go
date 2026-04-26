@@ -54,13 +54,54 @@ type CreateRequest struct {
 
 // Service is the implementation.
 type Service struct {
-	pool *pgxpool.Pool
-	now  func() time.Time
+	pool   *pgxpool.Pool
+	now    func() time.Time
+	mls    MLSKeyDeriver
 }
 
 // NewService returns a service.
 func NewService(pool *pgxpool.Pool) *Service {
 	return &Service{pool: pool, now: time.Now}
+}
+
+// WithMLS plugs an MLS key deriver into the service. Pass nil to
+// disable MLS — the surrounding flow falls back to the link-based
+// portal flow (current behaviour).
+func (s *Service) WithMLS(d MLSKeyDeriver) *Service {
+	s.mls = d
+	return s
+}
+
+// MLSEnabled reports whether the wired MLS deriver is configured.
+// Frontend code calls a small endpoint to flip the Compose UI
+// between MLS and link flows; see handlers.go.
+func (s *Service) MLSEnabled() bool {
+	if s.mls == nil {
+		return false
+	}
+	if d, ok := s.mls.(*HTTPKeyDeriver); ok {
+		return d.Enabled()
+	}
+	return true
+}
+
+// DeriveMLSWrappingKey delegates to the wired deriver. Callers
+// receive `ErrMLSDisabled` when MLS is not configured and should
+// fall back to CreateSecureMessage.
+func (s *Service) DeriveMLSWrappingKey(ctx context.Context, senderLeafKey, recipientCredential string) (string, error) {
+	if !s.MLSEnabled() {
+		return "", ErrMLSDisabled
+	}
+	return s.mls.DeriveWrappingKey(ctx, senderLeafKey, recipientCredential)
+}
+
+// RekeyConfidentialMessage triggers an MLS rekey when the
+// participant set on a confidential thread changes.
+func (s *Service) RekeyConfidentialMessage(ctx context.Context, messageID string, newParticipants []string) (string, error) {
+	if !s.MLSEnabled() {
+		return "", ErrMLSDisabled
+	}
+	return s.mls.RekeyConfidentialMessage(ctx, messageID, newParticipants)
 }
 
 // CreateSecureMessage mints a token, hashes the password (if

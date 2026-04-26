@@ -29,12 +29,13 @@ const (
 
 // Step is the public per-step view.
 type Step struct {
-	ID          string     `json:"id"`
-	Title       string     `json:"title"`
-	Description string     `json:"description"`
-	Status      StepStatus `json:"status"`
-	Optional    bool       `json:"optional"`
-	Link        string     `json:"link,omitempty"`
+	ID            string     `json:"id"`
+	Title         string     `json:"title"`
+	Description   string     `json:"description"`
+	Status        StepStatus `json:"status"`
+	Optional      bool       `json:"optional"`
+	Link          string     `json:"link,omitempty"`
+	AutoCompleted bool       `json:"auto_completed,omitempty"`
 }
 
 // Checklist is the response shape.
@@ -67,33 +68,74 @@ func (s *Service) GetChecklist(ctx context.Context, tenantID string) (*Checklist
 	if err != nil {
 		return nil, err
 	}
+	auto, _ := s.queryAutoTriggers(ctx, tenantID)
 	out.Steps = []Step{
 		stepFromBool("add_domain", "Add custom domain",
 			"Connect your sending domain to KMail.", false,
-			"/admin/domains", stats.HasDomain, skipped),
+			"/admin/domains", stats.HasDomain, skipped, auto),
 		stepFromBool("verify_dns", "Verify DNS records",
 			"Publish MX, SPF, DKIM, and DMARC records.", false,
-			"/admin/domains", stats.AllDNSVerified, skipped),
+			"/admin/domains", stats.AllDNSVerified, skipped, auto),
 		stepFromBool("create_user", "Create first user",
 			"Add at least one user to your tenant.", false,
-			"/admin/users", stats.HasUser, skipped),
+			"/admin/users", stats.HasUser, skipped, auto),
 		stepFromBool("send_test_email", "Send a test email",
 			"Verify deliverability by sending one message.", false,
-			"/admin/deliverability", stats.HasSend, skipped),
+			"/admin/deliverability", stats.HasSend, skipped, auto),
 		stepFromBool("shared_inbox", "Set up shared inbox",
 			"Optional: create a team mailbox.", true,
-			"/admin/shared-inboxes", stats.HasSharedInbox, skipped),
+			"/admin/shared-inboxes", stats.HasSharedInbox, skipped, auto),
 		stepFromBool("billing_plan", "Configure billing plan",
 			"Pick Core, Pro, or Privacy.", false,
-			"/admin/billing", stats.HasPlan, skipped),
+			"/admin/billing", stats.HasPlan, skipped, auto),
 		stepFromBool("start_migration", "Start migration",
 			"Optional: import mail from your existing provider.", true,
-			"/admin/migrations", stats.HasMigration, skipped),
+			"/admin/migrations", stats.HasMigration, skipped, auto),
 		stepFromBool("invite_team", "Invite team members",
 			"Optional: bring your team to KMail.", true,
-			"/admin/users", stats.UserCount > 1, skipped),
+			"/admin/users", stats.UserCount > 1, skipped, auto),
 	}
 	return &out, nil
+}
+
+func (s *Service) queryAutoTriggers(ctx context.Context, tenantID string) (map[string]bool, error) {
+	out := map[string]bool{}
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
+			return err
+		}
+		rows, err := tx.Query(ctx, `SELECT step_key FROM onboarding_auto_triggers WHERE tenant_id = $1::uuid`, tenantID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var k string
+			if err := rows.Scan(&k); err != nil {
+				return err
+			}
+			out[k] = true
+		}
+		return rows.Err()
+	})
+	return out, err
+}
+
+// ResetChecklist clears every skip / auto-trigger flag for a tenant.
+func (s *Service) ResetChecklist(ctx context.Context, tenantID string) error {
+	if s == nil || s.pool == nil || tenantID == "" {
+		return errors.New("onboarding: tenant required")
+	}
+	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `DELETE FROM onboarding_progress WHERE tenant_id = $1::uuid`, tenantID); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `DELETE FROM onboarding_auto_triggers WHERE tenant_id = $1::uuid`, tenantID)
+		return err
+	})
 }
 
 // SkipStep marks an optional step as skipped.
@@ -202,7 +244,7 @@ func (s *Service) queryStats(ctx context.Context, tenantID string) (stats, map[s
 	return st, skipped, err
 }
 
-func stepFromBool(id, title, description string, optional bool, link string, complete bool, skipped map[string]bool) Step {
+func stepFromBool(id, title, description string, optional bool, link string, complete bool, skipped, auto map[string]bool) Step {
 	st := StatusPending
 	if complete {
 		st = StatusComplete
@@ -210,11 +252,12 @@ func stepFromBool(id, title, description string, optional bool, link string, com
 		st = StatusSkipped
 	}
 	return Step{
-		ID:          id,
-		Title:       title,
-		Description: description,
-		Status:      st,
-		Optional:    optional,
-		Link:        link,
+		ID:            id,
+		Title:         title,
+		Description:   description,
+		Status:        st,
+		Optional:      optional,
+		Link:          link,
+		AutoCompleted: auto[id],
 	}
 }

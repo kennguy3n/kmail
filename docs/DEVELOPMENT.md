@@ -302,3 +302,29 @@ docker compose up -d
 
 This re-runs `postgres-init-stalwart.sql` and drops you back onto the
 fresh wizard with `admin / kmail-dev`.
+
+## 8. Retention enforcement opt-out
+
+The retention worker (`internal/retention/worker.go`) ticks daily and
+applies every tenant's policies. As of Phase 6 it runs in **live
+mode by default** — emails older than a policy's retention horizon
+are destroyed (or archived) for real.
+
+Operators can switch the worker back to dry-run for a deployment by
+setting:
+
+```bash
+KMAIL_RETENTION_DRY_RUN=true
+```
+
+In dry-run mode the worker still walks every policy and writes a row
+to `retention_enforcement_log` with `notes = 'dry_run=true'`, but it
+does not call `Email/set destroy` or move blobs. The admin UI status
+card on **Retention → Enforcement** reads the same flag and renders
+a banner so operators always know which mode is active. The
+Prometheus counters (`kmail_retention_emails_deleted_total`,
+`kmail_retention_emails_archived_total`,
+`kmail_retention_evaluations_total`,
+`kmail_retention_errors_total`) tick in both modes — `*_deleted_*` /
+`*_archived_*` stay at zero in dry-run, which is the canonical
+"safety check" before flipping back to live.

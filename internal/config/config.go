@@ -91,6 +91,13 @@ type Config struct {
 	// bridge presents to the KChat API.
 	KChatAPIToken string
 
+	// KChatMLSEndpoint is the URL of the KChat MLS credential
+	// service. Confidential Send uses it to derive per-recipient
+	// wrapping keys when the recipient is a KChat user. Empty
+	// values disable MLS and fall back to the link-based portal
+	// flow.
+	KChatMLSEndpoint string
+
 	// ChatBridge controls the standalone `cmd/kmail-chat-bridge`
 	// listener. The in-process BFF integration ignores this.
 	ChatBridge ChatBridgeConfig
@@ -343,8 +350,9 @@ func Load() (*Config, error) {
 			BIMILogoURL:      getenv("KMAIL_DNS_BIMI_LOGO_URL", ""),
 			BIMIVMCURL:       getenv("KMAIL_DNS_BIMI_VMC_URL", ""),
 		},
-		KChatAPIURL:   getenv("KCHAT_API_URL", ""),
-		KChatAPIToken: getenv("KCHAT_API_TOKEN", ""),
+		KChatAPIURL:      getenv("KCHAT_API_URL", ""),
+		KChatAPIToken:    getenv("KCHAT_API_TOKEN", ""),
+		KChatMLSEndpoint: getenv("KCHAT_MLS_ENDPOINT", ""),
 		ChatBridge: ChatBridgeConfig{
 			Addr: getenv("KMAIL_CHAT_BRIDGE_ADDR", ":8091"),
 		},

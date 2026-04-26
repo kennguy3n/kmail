@@ -346,16 +346,19 @@ func main() {
 	tenant.NewPlacementHandlers(placementSvc, pool).Register(mux, authMW)
 
 	retentionSvc := retention.NewService(pool)
-	retention.NewHandlers(retentionSvc, logger).Register(mux, authMW)
-	// Phase 5 closeout: wire the JMAP / fabric-backed enforcer.
-	// Defaults to dry-run unless `KMAIL_RETENTION_DRY_RUN=false`.
-	retentionDryRun := os.Getenv("KMAIL_RETENTION_DRY_RUN") != "false"
+	// Phase 6: live mode is now the default. Operators opt out
+	// per-deployment via `KMAIL_RETENTION_DRY_RUN=true`. Documented
+	// in `docs/DEVELOPMENT.md`.
+	retentionDryRun := os.Getenv("KMAIL_RETENTION_DRY_RUN") == "true"
 	retentionEnforcer := retention.NewJMAPEnforcer(shardSvc, nil, "",
 		cfg.ZKFabric.ConsoleURL, "", logger)
-	go retention.NewWorker(retentionSvc, logger).
+	retentionMetrics := retention.NewMetrics(metrics.Registry)
+	retentionWorker := retention.NewWorker(retentionSvc, logger).
 		WithEnforcer(retentionEnforcer).
 		WithDryRun(retentionDryRun).
-		Run(ctx)
+		WithMetrics(retentionMetrics)
+	retention.NewHandlers(retentionSvc, logger).WithWorker(retentionWorker).Register(mux, authMW)
+	go retentionWorker.Run(ctx)
 
 	approvalSvc := approval.NewService(pool)
 	approval.NewHandlers(approvalSvc).Register(mux, authMW)
@@ -377,7 +380,8 @@ func main() {
 	// (`GET /api/v1/secure/{token}`) is registered *without* the
 	// auth middleware by the handler; tenant-scoped admin routes
 	// stay behind authMW.
-	confidentialSendSvc := confidentialsend.NewService(pool)
+	confidentialSendSvc := confidentialsend.NewService(pool).
+		WithMLS(confidentialsend.NewHTTPKeyDeriver(cfg.KChatMLSEndpoint, cfg.KChatAPIToken))
 	confidentialsend.NewHandlers(confidentialSendSvc, valkeyClient, logger).Register(mux, authMW)
 
 	exportSvc := export.NewService(pool)
@@ -409,10 +413,16 @@ func main() {
 	// workflow.
 	adminProxySvc := adminproxy.NewService(pool, approvalSvc, auditSvc, shardSvc)
 	adminproxy.NewHandlers(adminProxySvc, logger, cfg.StalwartURL).Register(mux, authMW)
+	// Phase 6: background watcher emits `session_expired` audit
+	// rows once `expires_at` passes.
+	go adminproxy.NewExpiryWorker(pool, auditSvc, logger).
+		WithMetric(metrics.Registry).
+		Run(ctx)
 
 	// Phase 5 closeout — CardDAV contact bridge.
 	contactSvc := contactbridge.NewService(contactbridge.Config{StalwartURL: cfg.StalwartURL})
-	contactbridge.NewHandlers(contactSvc, logger).Register(mux, authMW)
+	galSvc := contactbridge.NewGALService(pool, contactSvc)
+	contactbridge.NewHandlers(contactSvc, logger).WithGAL(galSvc).Register(mux, authMW)
 
 	// Phase 5 closeout — Tenant webhook event system.
 	webhookSvc := webhooks.NewService(pool)
@@ -422,6 +432,9 @@ func main() {
 	// Phase 5 closeout — Onboarding checklist.
 	onboardingSvc := onboarding.NewService(pool)
 	onboarding.NewHandlers(onboardingSvc, logger).Register(mux, authMW)
+	// Phase 6: auto-complete onboarding steps from internal events.
+	autoTriggerSvc := onboarding.NewAutoTriggerService(pool)
+	webhookSvc.AddListener(autoTriggerSvc)
 
 	// Wire metrics and tracing into the outer handler chain.
 	handler := http.Handler(mux)
