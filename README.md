@@ -261,6 +261,19 @@ end-user surfaces.
 
 See [docs/PROGRESS.md](docs/PROGRESS.md) for the phase-gated tracker.
 
+## Screenshots
+
+| | | |
+|---|---|---|
+| ![Inbox](docs/screenshots/01-mail-inbox.png) | ![Compose](docs/screenshots/02-compose.png) | ![Calendar](docs/screenshots/06-calendar.png) |
+| Mail Inbox | Compose | Calendar |
+| ![DNS Wizard](docs/screenshots/12-dns-wizard.png) | ![Pricing](docs/screenshots/14-pricing-admin.png) | ![Security](docs/screenshots/18-security-settings.png) |
+| DNS Wizard | Pricing ($3/$6/$9) | Security (WebAuthn + TOTP) |
+| ![Secure Portal](docs/screenshots/10-secure-portal.png) | ![SLO](docs/screenshots/20-slo-admin.png) | ![Onboarding](docs/screenshots/21-onboarding.png) |
+| Confidential Send Portal | SLO Dashboard | Onboarding Checklist |
+
+See [`docs/screenshots/`](docs/screenshots/) for the full set.
+
 ## Links
 
 - [docs/PROPOSAL.md](docs/PROPOSAL.md) — detailed technical proposal.
