@@ -167,12 +167,17 @@ func (a Adapter) AdaptErrorEnvelope(raw map[string]any) map[string]any {
 }
 
 // VersionDetector resolves and caches the Stalwart version for a
-// given JMAP session URL. Detection is best-effort: if the
-// upstream cannot be reached the cached value is returned and the
-// detector retries on the next call.
+// given JMAP session URL. Detection is best-effort: successful
+// probes are cached for TTL (default 5 min) so the BFF doesn't
+// flood the session endpoint, while failed probes are cached
+// only briefly (ErrorTTL, default 30s) so a transient outage
+// doesn't pin the BFF in v0 fallback long after the shard
+// recovers — the runbook in docs/STALWART_UPGRADE.md depends on
+// hot rollbacks completing within the next probe.
 type VersionDetector struct {
-	Client *http.Client
-	TTL    time.Duration
+	Client   *http.Client
+	TTL      time.Duration
+	ErrorTTL time.Duration
 
 	mu    sync.Mutex
 	cache map[string]versionCacheEntry
@@ -181,16 +186,23 @@ type VersionDetector struct {
 type versionCacheEntry struct {
 	value     StalwartVersion
 	cachedAt  time.Time
+	ttl       time.Duration
 	probedErr error
 }
 
-// NewVersionDetector returns a detector with a 5-minute cache TTL
-// and a 5-second HTTP timeout. Tests can override Client and TTL.
+func (e versionCacheEntry) fresh(now time.Time) bool {
+	return now.Sub(e.cachedAt) < e.ttl
+}
+
+// NewVersionDetector returns a detector with a 5-minute success
+// TTL, a 30-second error TTL, and a 5-second HTTP timeout. Tests
+// can override Client / TTL / ErrorTTL.
 func NewVersionDetector() *VersionDetector {
 	return &VersionDetector{
-		Client: &http.Client{Timeout: 5 * time.Second},
-		TTL:    5 * time.Minute,
-		cache:  map[string]versionCacheEntry{},
+		Client:   &http.Client{Timeout: 5 * time.Second},
+		TTL:      5 * time.Minute,
+		ErrorTTL: 30 * time.Second,
+		cache:    map[string]versionCacheEntry{},
 	}
 }
 
@@ -201,11 +213,12 @@ func NewVersionDetector() *VersionDetector {
 // Stalwart builds omit `stalwartVersion` and we fall back to the
 // `Server: Stalwart/v0.16.0` response header.
 func (d *VersionDetector) Detect(ctx context.Context, sessionURL string) (StalwartVersion, error) {
+	now := time.Now()
 	d.mu.Lock()
 	if d.cache == nil {
 		d.cache = map[string]versionCacheEntry{}
 	}
-	if entry, ok := d.cache[sessionURL]; ok && time.Since(entry.cachedAt) < d.TTL {
+	if entry, ok := d.cache[sessionURL]; ok && entry.fresh(now) {
 		d.mu.Unlock()
 		if entry.probedErr != nil {
 			return entry.value, entry.probedErr
@@ -246,16 +259,30 @@ func (d *VersionDetector) Detect(ctx context.Context, sessionURL string) (Stalwa
 		return d.cacheError(sessionURL, err)
 	}
 	d.mu.Lock()
-	d.cache[sessionURL] = versionCacheEntry{value: v, cachedAt: time.Now()}
+	d.cache[sessionURL] = versionCacheEntry{value: v, cachedAt: time.Now(), ttl: d.successTTL()}
 	d.mu.Unlock()
 	return v, nil
 }
 
 func (d *VersionDetector) cacheError(sessionURL string, err error) (StalwartVersion, error) {
 	d.mu.Lock()
-	d.cache[sessionURL] = versionCacheEntry{cachedAt: time.Now(), probedErr: err}
+	d.cache[sessionURL] = versionCacheEntry{cachedAt: time.Now(), ttl: d.errorTTL(), probedErr: err}
 	d.mu.Unlock()
 	return StalwartVersion{}, err
+}
+
+func (d *VersionDetector) successTTL() time.Duration {
+	if d.TTL > 0 {
+		return d.TTL
+	}
+	return 5 * time.Minute
+}
+
+func (d *VersionDetector) errorTTL() time.Duration {
+	if d.ErrorTTL > 0 {
+		return d.ErrorTTL
+	}
+	return 30 * time.Second
 }
 
 // parseServerHeader extracts a version out of strings shaped like
