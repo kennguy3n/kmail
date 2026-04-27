@@ -103,23 +103,32 @@ func (s *DunningService) Handle(ctx context.Context, evt DunningEvent) error {
 	if evt.OccurredAt.IsZero() {
 		evt.OccurredAt = s.cfg.Now()
 	}
-	failures, err := s.recordAndCount(ctx, evt)
+	failures, isNew, err := s.recordAndCount(ctx, evt)
 	if err != nil {
 		return err
 	}
-	if s.cfg.Notifier != nil {
-		if err := s.cfg.Notifier.NotifyPaymentFailed(ctx, evt.TenantID, evt.StripeInvoiceID, evt.AmountDue, evt.Currency); err != nil {
-			s.cfg.Logger.Printf("dunning: notify failed for tenant=%s: %v", evt.TenantID, err)
+	// Stripe redelivers webhooks aggressively (every retry of the
+	// same invoice.payment_failed event arrives with the same
+	// stripe_invoice_id). recordAndCount dedupes the row via ON
+	// CONFLICT DO NOTHING; gate the side-effecting calls on isNew
+	// so retries don't spam the tenant's KChat workspace or the
+	// audit log. The suspension check still uses the real failure
+	// count, which is unaffected by retries.
+	if isNew {
+		if s.cfg.Notifier != nil {
+			if err := s.cfg.Notifier.NotifyPaymentFailed(ctx, evt.TenantID, evt.StripeInvoiceID, evt.AmountDue, evt.Currency); err != nil {
+				s.cfg.Logger.Printf("dunning: notify failed for tenant=%s: %v", evt.TenantID, err)
+			}
+		}
+		if s.cfg.Auditor != nil {
+			_ = s.cfg.Auditor.Log(ctx, evt.TenantID, "system:billing", "billing.payment_failed", evt.StripeInvoiceID, map[string]any{
+				"failures_30d": failures,
+				"amount_due":   evt.AmountDue,
+				"currency":     evt.Currency,
+			})
 		}
 	}
-	if s.cfg.Auditor != nil {
-		_ = s.cfg.Auditor.Log(ctx, evt.TenantID, "system:billing", "billing.payment_failed", evt.StripeInvoiceID, map[string]any{
-			"failures_30d": failures,
-			"amount_due":   evt.AmountDue,
-			"currency":     evt.Currency,
-		})
-	}
-	if failures >= dunningSuspendThreshold {
+	if isNew && failures >= dunningSuspendThreshold {
 		if err := s.suspend(ctx, evt.TenantID); err != nil {
 			return err
 		}
@@ -133,25 +142,33 @@ func (s *DunningService) Handle(ctx context.Context, evt DunningEvent) error {
 }
 
 // recordAndCount inserts the failure into billing_dunning_events
-// and returns the count of failures inside the rolling window.
-// Pool may be nil in tests; in that case we return 1.
-func (s *DunningService) recordAndCount(ctx context.Context, evt DunningEvent) (int, error) {
+// and returns the rolling-window failure count plus a flag
+// indicating whether the row was actually inserted (true) or
+// deduplicated by ON CONFLICT (false, which means this is a
+// Stripe webhook retry of an event we've already processed).
+// Pool may be nil in tests; in that case we return (1, true).
+func (s *DunningService) recordAndCount(ctx context.Context, evt DunningEvent) (int, bool, error) {
 	if s.cfg.Pool == nil {
-		return 1, nil
+		return 1, true, nil
 	}
 	cutoff := evt.OccurredAt.Add(-dunningWindow)
-	var count int
+	var (
+		count int
+		isNew bool
+	)
 	err := pgx.BeginFunc(ctx, s.cfg.Pool, func(tx pgx.Tx) error {
 		if err := middleware.SetTenantGUC(ctx, tx, evt.TenantID); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx, `
+		tag, err := tx.Exec(ctx, `
 			INSERT INTO billing_dunning_events (tenant_id, stripe_invoice_id, stripe_customer_id, amount_due, currency, occurred_at)
 			VALUES ($1::uuid, $2, $3, $4, $5, $6)
 			ON CONFLICT (stripe_invoice_id) DO NOTHING`,
-			evt.TenantID, evt.StripeInvoiceID, evt.StripeCustomerID, evt.AmountDue, evt.Currency, evt.OccurredAt); err != nil {
+			evt.TenantID, evt.StripeInvoiceID, evt.StripeCustomerID, evt.AmountDue, evt.Currency, evt.OccurredAt)
+		if err != nil {
 			return err
 		}
+		isNew = tag.RowsAffected() > 0
 		row := tx.QueryRow(ctx, `
 			SELECT COUNT(*) FROM billing_dunning_events
 			 WHERE tenant_id = $1::uuid AND occurred_at >= $2`,
@@ -159,9 +176,9 @@ func (s *DunningService) recordAndCount(ctx context.Context, evt DunningEvent) (
 		return row.Scan(&count)
 	})
 	if err != nil {
-		return 0, fmt.Errorf("dunning record: %w", err)
+		return 0, false, fmt.Errorf("dunning record: %w", err)
 	}
-	return count, nil
+	return count, isNew, nil
 }
 
 // suspend flips the tenant's status to `suspended`. Idempotent:
