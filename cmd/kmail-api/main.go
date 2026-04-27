@@ -278,17 +278,16 @@ func main() {
 	// configured via env so dev compose stays lean.
 	var searchBackends []search.SearchBackend
 	if url := os.Getenv("KMAIL_MEILISEARCH_URL"); url != "" {
-		searchBackends = append(searchBackends, &search.MeilisearchBackend{
-			BaseURL: url,
-			APIKey:  os.Getenv("KMAIL_MEILISEARCH_API_KEY"),
-		})
+		searchBackends = append(searchBackends, search.NewMeilisearchBackend(
+			url, os.Getenv("KMAIL_MEILISEARCH_API_KEY"),
+		))
 	}
 	if url := os.Getenv("KMAIL_OPENSEARCH_URL"); url != "" {
-		searchBackends = append(searchBackends, &search.OpenSearchBackend{
-			BaseURL:  url,
-			Username: os.Getenv("KMAIL_OPENSEARCH_USER"),
-			Password: os.Getenv("KMAIL_OPENSEARCH_PASS"),
-		})
+		searchBackends = append(searchBackends, search.NewOpenSearchBackend(
+			url,
+			os.Getenv("KMAIL_OPENSEARCH_USER"),
+			os.Getenv("KMAIL_OPENSEARCH_PASS"),
+		))
 	}
 	searchSvc := search.NewService(search.Config{
 		Pool:     pool,
