@@ -179,7 +179,7 @@ func (h *WebAuthnHandlers) registerBegin(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	challenge := mintChallenge()
-	if err := h.cfg.Challenger.StoreChallenge(r.Context(), "register:"+userID, challenge, 5*time.Minute); err != nil {
+	if err := h.cfg.Challenger.StoreChallenge(r.Context(), webauthnChallengeKey("register", tenantID, userID), challenge, 5*time.Minute); err != nil {
 		writeWebAuthnError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -249,7 +249,7 @@ func (h *WebAuthnHandlers) registerFinish(w http.ResponseWriter, r *http.Request
 		writeWebAuthnError(w, http.StatusBadRequest, "missing credential id or public key")
 		return
 	}
-	challenge, err := h.cfg.Challenger.LoadChallenge(r.Context(), "register:"+userID)
+	challenge, err := h.cfg.Challenger.LoadChallenge(r.Context(), webauthnChallengeKey("register", tenantID, userID))
 	if err != nil {
 		writeWebAuthnError(w, http.StatusBadRequest, "challenge expired")
 		return
@@ -258,7 +258,7 @@ func (h *WebAuthnHandlers) registerFinish(w http.ResponseWriter, r *http.Request
 		writeWebAuthnError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	_ = h.cfg.Challenger.DeleteChallenge(r.Context(), "register:"+userID)
+	_ = h.cfg.Challenger.DeleteChallenge(r.Context(), webauthnChallengeKey("register", tenantID, userID))
 	cred := WebAuthnCredential{
 		TenantID:     tenantID,
 		UserID:       userID,
@@ -293,7 +293,7 @@ func (h *WebAuthnHandlers) loginBegin(w http.ResponseWriter, r *http.Request) {
 		descs = append(descs, credentialDescriptor{Type: "public-key", ID: c.CredentialID})
 	}
 	challenge := mintChallenge()
-	if err := h.cfg.Challenger.StoreChallenge(r.Context(), "login:"+req.Username, challenge, 5*time.Minute); err != nil {
+	if err := h.cfg.Challenger.StoreChallenge(r.Context(), webauthnChallengeKey("login", req.TenantID, req.Username), challenge, 5*time.Minute); err != nil {
 		writeWebAuthnError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -329,7 +329,7 @@ func (h *WebAuthnHandlers) loginFinish(w http.ResponseWriter, r *http.Request) {
 		writeWebAuthnError(w, http.StatusBadRequest, "username, tenant_id, and rawId required")
 		return
 	}
-	challenge, err := h.cfg.Challenger.LoadChallenge(r.Context(), "login:"+req.Username)
+	challenge, err := h.cfg.Challenger.LoadChallenge(r.Context(), webauthnChallengeKey("login", req.TenantID, req.Username))
 	if err != nil {
 		writeWebAuthnError(w, http.StatusBadRequest, "challenge expired")
 		return
@@ -370,7 +370,7 @@ func (h *WebAuthnHandlers) loginFinish(w http.ResponseWriter, r *http.Request) {
 	if err := h.store.SetSignCount(r.Context(), req.TenantID, req.RawID, int64(newSignCount), h.cfg.Now()); err != nil {
 		h.cfg.Logger.Printf("webauthn: set sign_count: %v", err)
 	}
-	_ = h.cfg.Challenger.DeleteChallenge(r.Context(), "login:"+req.Username)
+	_ = h.cfg.Challenger.DeleteChallenge(r.Context(), webauthnChallengeKey("login", req.TenantID, req.Username))
 	writeWebAuthnJSON(w, http.StatusOK, map[string]any{
 		"ok":         true,
 		"user_id":    cred.UserID,
@@ -415,6 +415,14 @@ func (h *WebAuthnHandlers) delete(w http.ResponseWriter, r *http.Request) {
 }
 
 // mintChallenge returns 32 cryptographically random bytes.
+// webauthnChallengeKey composes the Challenger key used for both
+// registration and authentication ceremonies. It must include the
+// tenant ID so two users with the same username in different
+// tenants don't overwrite each other's challenge.
+func webauthnChallengeKey(kind, tenantID, principal string) string {
+	return kind + ":" + tenantID + ":" + principal
+}
+
 func mintChallenge() []byte {
 	b := make([]byte, 32)
 	_, _ = rand.Read(b)

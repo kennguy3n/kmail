@@ -141,8 +141,10 @@ func (s *DKIMRotationService) WithEnvelope(env cmk.SecretsEnvelope) *DKIMRotatio
 // GenerateKeyPair returns a fresh 2048-bit RSA key pair encoded
 // in the format Stalwart expects: PKCS#8 PEM for the private key,
 // base64-DER for the public key. The selector is derived from the
-// current UTC date (e.g. "20260427") so concurrent rotations get
-// distinct selectors.
+// current UTC timestamp (e.g. "20260427T153012") so two rotations
+// of the same domain on the same day produce distinct selectors —
+// the `dkim_keys` table has a UNIQUE (domain_id, selector) constraint
+// that would otherwise reject the second rotation.
 func (s *DKIMRotationService) GenerateKeyPair() (DKIMKeyPair, error) {
 	priv, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -158,7 +160,7 @@ func (s *DKIMRotationService) GenerateKeyPair() (DKIMKeyPair, error) {
 		return DKIMKeyPair{}, fmt.Errorf("marshal pub: %w", err)
 	}
 	return DKIMKeyPair{
-		Selector:   time.Now().UTC().Format("20060102"),
+		Selector:   time.Now().UTC().Format("20060102T150405"),
 		PublicKey:  base64.StdEncoding.EncodeToString(pubDER),
 		PrivateKey: string(privPEM),
 	}, nil
