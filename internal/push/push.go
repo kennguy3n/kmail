@@ -367,3 +367,14 @@ func (t loggingTransport) Send(_ context.Context, sub Subscription, n Notificati
 	t.logger.Printf("push: subscription=%s device=%s payload=%s", sub.ID, sub.DeviceType, payload)
 	return nil
 }
+
+// NewLoggingTransport returns the no-op transport that logs each
+// notification instead of sending it. Useful as a Default on the
+// TransportRouter so missing platform-specific transports degrade
+// to logging rather than failing.
+func NewLoggingTransport(logger *log.Logger) Transport {
+	if logger == nil {
+		logger = log.Default()
+	}
+	return loggingTransport{logger: logger}
+}

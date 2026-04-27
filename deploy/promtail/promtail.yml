@@ -21,21 +21,40 @@ clients:
   - url: ${LOKI_URL:-http://loki:3100/loki/api/v1/push}
 
 scrape_configs:
-  # Container-stdout scraping. Compose mounts /var/lib/docker/containers
-  # so Promtail can tail every kmail-* service. The labels limit
-  # high cardinality: tenant_id and route come from the structured
-  # JSON, status_class comes from the same line. user_id and
-  # trace_id are kept on the line but NOT lifted into labels —
-  # they're queryable through Loki's JSON parser instead.
+  # Container-stdout scraping via Docker service discovery. The
+  # compose stack mounts /var/run/docker.sock (read-only) so
+  # Promtail can ask Docker which containers exist and tail their
+  # JSON log files directly. We then keep only containers whose
+  # name starts with "kmail-" — this matches the compose project's
+  # container_name convention without depending on a fragile glob
+  # against Docker's content-addressed log directory layout.
+  #
+  # The labels limit high cardinality: tenant_id and route come
+  # from the structured JSON, status_class comes from the same
+  # line. user_id and trace_id are kept on the line but NOT lifted
+  # into labels — they're queryable through Loki's JSON parser
+  # instead.
   - job_name: kmail-bff
-    static_configs:
-      - targets: [localhost]
-        labels:
-          job: kmail-api
-          env: ${KMAIL_ENV:-dev}
-          __path__: /var/log/containers/kmail-*.log
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 5s
+    relabel_configs:
+      # Drop everything that isn't a kmail-* container.
+      - source_labels: ["__meta_docker_container_name"]
+        regex: "/kmail-.*"
+        action: keep
+      # Surface the container name (sans leading slash) as a label
+      # so Loki streams are split per service (kmail-api,
+      # kmail-stalwart, etc.) without exploding cardinality.
+      - source_labels: ["__meta_docker_container_name"]
+        regex: "/(.*)"
+        target_label: container
+      - target_label: job
+        replacement: kmail-api
+      - target_label: env
+        replacement: ${KMAIL_ENV:-dev}
     pipeline_stages:
-      - cri: {}
+      - docker: {}
       - json:
           expressions:
             tenant_id: tenant_id

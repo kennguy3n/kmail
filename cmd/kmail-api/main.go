@@ -605,9 +605,18 @@ func getenvDuration(key string, fallback time.Duration) time.Duration {
 // buildPushTransport assembles the per-platform push transports
 // (APNs / FCM / web) from env vars and wires them through a
 // TransportRouter. Missing credentials downgrade to the no-op
-// logging transport, which is what we want in dev.
+// logging transport via the router's Default, which is what we
+// want in dev — the router otherwise returns an error for any
+// device type that has no transport configured.
 func buildPushTransport(logger *log.Logger) push.Transport {
 	router := push.NewTransportRouter(logger)
+	// Default transport is the logging transport: any device type
+	// (web, plus iOS/Android in dev) without a platform-specific
+	// transport falls through to it. Web push has no real backend
+	// yet — when one ships it will be assigned to router.Web and
+	// only unrecognized device types will hit Default.
+	router.Default = push.NewLoggingTransport(logger)
+	router.Web = router.Default
 	if keyID := os.Getenv("KMAIL_APNS_KEY_ID"); keyID != "" {
 		apns, err := push.NewAPNsTransport(push.APNsConfig{
 			KeyID:    keyID,
