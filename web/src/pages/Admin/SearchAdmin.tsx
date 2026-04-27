@@ -36,7 +36,11 @@ export default function SearchAdmin() {
     try {
       const updated = await setSearchBackend(selectedTenantId, backend);
       setConfig(updated);
-      setInfo(`Backend set to ${backend}. Reindex queued.`);
+      // setSearchBackend only flips tenants.search_backend; it does
+      // NOT enqueue a reindex. Make that explicit so operators don't
+      // assume their data is being migrated and end up with empty
+      // results on the new backend.
+      setInfo(`Backend set to ${backend}. Click "Reindex now" to migrate existing data — the new backend will return empty results until a reindex completes.`);
     } catch (e: unknown) {
       setError(String(e));
     } finally {
