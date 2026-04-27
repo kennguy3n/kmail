@@ -1,0 +1,134 @@
+{
+  "annotations": {"list": []},
+  "description": "KMail BFF overview — request rate, latency percentiles, tenants/seats, JMAP proxy latency, retention counters, and the SLO availability gauge. Phase 8 GA-readiness dashboard.",
+  "editable": false,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "uid": "kmail-overview",
+  "title": "KMail — Overview",
+  "tags": ["kmail", "overview", "phase8"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": {"from": "now-6h", "to": "now"},
+  "templating": {"list": []},
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "HTTP request rate (req/s)",
+      "id": 1,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "sum by (status) (rate(kmail_http_requests_total[5m]))", "legendFormat": "{{status}}"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "reqps"}}
+    },
+    {
+      "type": "timeseries",
+      "title": "HTTP request latency (P50 / P95 / P99)",
+      "id": 2,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "histogram_quantile(0.50, sum by (le) (rate(kmail_http_request_duration_seconds_bucket[5m])))", "legendFormat": "P50"},
+        {"refId": "B", "expr": "histogram_quantile(0.95, sum by (le) (rate(kmail_http_request_duration_seconds_bucket[5m])))", "legendFormat": "P95"},
+        {"refId": "C", "expr": "histogram_quantile(0.99, sum by (le) (rate(kmail_http_request_duration_seconds_bucket[5m])))", "legendFormat": "P99"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "s"}}
+    },
+    {
+      "type": "stat",
+      "title": "Active tenants",
+      "id": 3,
+      "gridPos": {"h": 6, "w": 6, "x": 0, "y": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "kmail_active_tenants"}
+      ],
+      "options": {"colorMode": "value", "reduceOptions": {"calcs": ["lastNotNull"]}}
+    },
+    {
+      "type": "stat",
+      "title": "Seats total (by plan)",
+      "id": 4,
+      "gridPos": {"h": 6, "w": 6, "x": 6, "y": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "sum by (plan) (kmail_seats_total)", "legendFormat": "{{plan}}"}
+      ]
+    },
+    {
+      "type": "gauge",
+      "title": "Availability SLO (rolling 30d)",
+      "id": 5,
+      "gridPos": {"h": 6, "w": 6, "x": 12, "y": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "1 - (sum(rate(kmail_http_requests_total{status=~\"5..\"}[30d])) / sum(rate(kmail_http_requests_total[30d])))"}
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0.99,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"value": null, "color": "red"},
+              {"value": 0.999, "color": "yellow"},
+              {"value": 0.9995, "color": "green"}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Admin sessions expired (cumulative)",
+      "id": 6,
+      "gridPos": {"h": 6, "w": 6, "x": 18, "y": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "kmail_admin_sessions_expired_total"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "JMAP proxy latency (P50 / P95 / P99)",
+      "id": 7,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 14},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "histogram_quantile(0.50, sum by (le) (rate(kmail_jmap_proxy_duration_seconds_bucket[5m])))", "legendFormat": "P50"},
+        {"refId": "B", "expr": "histogram_quantile(0.95, sum by (le) (rate(kmail_jmap_proxy_duration_seconds_bucket[5m])))", "legendFormat": "P95"},
+        {"refId": "C", "expr": "histogram_quantile(0.99, sum by (le) (rate(kmail_jmap_proxy_duration_seconds_bucket[5m])))", "legendFormat": "P99"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "s"}}
+    },
+    {
+      "type": "timeseries",
+      "title": "Retention worker (deletes / archives / errors)",
+      "id": 8,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 14},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "rate(kmail_retention_emails_deleted_total[5m])", "legendFormat": "deleted/s"},
+        {"refId": "B", "expr": "rate(kmail_retention_emails_archived_total[5m])", "legendFormat": "archived/s"},
+        {"refId": "C", "expr": "rate(kmail_retention_errors_total[5m])", "legendFormat": "errors/s"}
+      ]
+    },
+    {
+      "type": "logs",
+      "title": "Recent kmail-api errors (Loki)",
+      "id": 9,
+      "gridPos": {"h": 10, "w": 24, "x": 0, "y": 22},
+      "datasource": {"type": "loki", "uid": "loki"},
+      "targets": [
+        {"refId": "A", "expr": "{job=\"kmail-api\"} |~ \"(?i)error|panic|fatal\""}
+      ]
+    }
+  ]
+}

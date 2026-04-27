@@ -227,25 +227,37 @@ client compatibility but are not the main UX path.
 
 ## Project status
 
-**Phase 1 — Foundation (in progress). Phase 2 — Prototype (in
-progress).** Phase 1 architecture is ratified and the scaffolds,
-schema, JMAP contract, and license evaluation are all landed — only
-the external MLS-key-derivation review remains before the gate
-closes. Phase 2 prototype work is underway: Tenant CRUD, the DNS
-Onboarding Service, and the automated Stalwart v0.16.0 bootstrap are
-live, `docker compose up` brings the whole stack up hands-off,
-zk-object-fabric blob round-trips are verified end-to-end through
-Stalwart's JMAP blob API, and the React KChat **Mail UI** (inbox,
-compose, read, full-text search, read/unread + move/delete),
-**Calendar UI** (day / week / month views, event create / edit,
-RSVP, calendar-visibility sidebar, deep-link to event detail), and
-**Admin UI** (Domain admin with MX / SPF / DKIM / DMARC flags +
-Verify + Show DNS records, User admin with inline Edit + confirmed
-Delete) are functional against the Go BFF. Stalwart's built-in
-spam / phishing classifier (thresholds + DNSBL + Bayesian
-auto-learn + Sieve Junk rule) is wired through the JMAP admin
-registry, and the Gmail / IMAP migration orchestrator is live under
-`/api/v1/migrations`.
+**Phases 1–5 — complete. Phase 6 — Enterprise Readiness (in
+progress, with Microsoft Exchange interop research and the BIMI
+VMC issuance helper deferred per the do-not-do list). Phase 7 —
+Production Hardening — complete. Phase 8 — GA Readiness — in
+progress.** The schema now spans 45 migrations covering tenants,
+Stalwart JMAP integration, retention, suppression and bounce
+ledgers, ledger-driven audit, BYOK / per-tenant CMK + HSM with
+real KMIP TTLV wire traffic, MLS-backed Confidential Send, the
+Tenant Service, DNS Onboarding (auto-generated MX / SPF / DKIM /
+DMARC / BIMI / autoconfig records), Stripe billing lifecycle on
+tenant signup / plan change / delete (`stripe_customer_id` /
+`stripe_subscription_id` columns), Sieve rules, WebAuthn / FIDO2
++ TOTP fallback, DKIM key rotation, search backend selection
+(Meilisearch / OpenSearch), CardDAV global address list,
+admin-proxy session expiry, free/busy publishing, and shared-
+inbox MLS group key rotation. The platform stack ships with a
+Helm chart for the kmail-api Deployment + Stalwart StatefulSet,
+Loki / Promtail log shipping plus pre-built Grafana dashboards
+(KMail Overview + Deliverability), a load-testing and chaos
+harness (`make loadtest` / `make chaos`), an optional ClamAV
+malware-scanning adapter wired as a JMAP submit-time pre-
+delivery hook, RFC 8030 Web Push with VAPID, autoconfig /
+autodiscover XML endpoints (Thunderbird + Outlook), SCIM 2.0
+provisioning (with discovery + conformance harness), the
+reverse access proxy with full audit, and a Stalwart v0 ↔ v1
+compatibility shim (KMail still runs against v0.16.0 today;
+v1.0.0 is expected H1 2026 and the shim makes the transition a
+config flag). The React UI ships a complete admin surface
+(domain, user, security, billing, retention, search, Sieve,
+DKIM, webhooks, onboarding) plus the Mail / Calendar / Contacts
+end-user surfaces.
 
 See [docs/PROGRESS.md](docs/PROGRESS.md) for the phase-gated tracker.
 

@@ -89,6 +89,32 @@ type PortalSessionResult struct {
 	URL string `json:"url"`
 }
 
+// CustomerResult is the trimmed shape from /v1/customers.
+type CustomerResult struct {
+	ID    string `json:"id"`
+	Email string `json:"email"`
+}
+
+// CreateCustomer POSTs to /v1/customers. Used by Lifecycle on
+// tenant signup so the subscription has somebody to attach to.
+func (c *StripeClient) CreateCustomer(ctx context.Context, email string, metadata map[string]string) (*CustomerResult, error) {
+	if !c.Configured() {
+		return nil, ErrStripeUnconfigured
+	}
+	form := url.Values{}
+	if email != "" {
+		form.Set("email", email)
+	}
+	for k, v := range metadata {
+		form.Set("metadata["+k+"]", v)
+	}
+	var out CustomerResult
+	if err := c.do(ctx, http.MethodPost, "/v1/customers", form, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // CreateSubscription POSTs to /v1/subscriptions.
 func (c *StripeClient) CreateSubscription(ctx context.Context, req SubscriptionRequest) (*SubscriptionResult, error) {
 	if !c.Configured() {

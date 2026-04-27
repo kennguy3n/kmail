@@ -45,6 +45,29 @@ func (h *Handlers) Register(mux *http.ServeMux, auth Registrar) {
 		auth.Wrap(http.HandlerFunc(h.listNotes)))
 	mux.Handle("POST /api/v1/shared-inboxes/{inboxId}/emails/{emailId}/notes",
 		auth.Wrap(http.HandlerFunc(h.addNote)))
+	mux.Handle("GET /api/v1/shared-inboxes/{inboxId}/mls/status",
+		auth.Wrap(http.HandlerFunc(h.mlsStatus)))
+}
+
+// mlsStatus surfaces the MLS group epoch + member count to the
+// admin UI. Returns {enabled: false} when the workflow service
+// is not wired to a manager (KCHAT_MLS_ENDPOINT empty).
+func (h *Handlers) mlsStatus(w http.ResponseWriter, r *http.Request) {
+	if _, err := tenantFromReq(r); err != nil {
+		writeErr(w, http.StatusForbidden, err)
+		return
+	}
+	inboxID := r.PathValue("inboxId")
+	if h.svc == nil || h.svc.MLS == nil {
+		writeJSON(w, http.StatusOK, &MLSGroupStatus{InboxID: inboxID, Enabled: false})
+		return
+	}
+	status, err := h.svc.MLS.Status(r.Context(), inboxID)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, status)
 }
 
 type assignRequest struct {

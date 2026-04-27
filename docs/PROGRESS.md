@@ -2,8 +2,55 @@
 
 - **Project**: KMail — Privacy Email & Calendar for KChat B2B
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
-- **Status**: Phase 1 — Foundation (in progress); Phase 2 —
-  Prototype (in progress); Phase 3 — Private Beta (in progress)
+- **Status**: Phases 1–5 complete; Phase 6 in progress (Exchange
+  interop research + BIMI VMC issuance helper still deferred);
+  Phase 7 complete; Phase 8 GA Readiness in progress.
+- **Last updated**: 2026-04-27 (Phase 8, batch 1) — Phase 8 GA-
+  readiness ten-task batch flips Phase 8 from `PLANNED` to
+  `IN PROGRESS`. Closes Phase 6 / 7 stubs, fills PROPOSAL.md
+  roadmap gaps, and corrects long-standing documentation drift.
+  Ships real KMIP TTLV wire traffic for HSM CMK envelope ops
+  (`internal/cmk/{kmip,pkcs11}.go`, `EncryptDEK` / `DecryptDEK`,
+  `last_used_at` column in migration 043, PKCS#11 path gated
+  behind a `pkcs11` build tag); RFC 8030 Web Push transport with
+  VAPID JWT signing (`internal/push/webpush.go`,
+  `KMAIL_VAPID_PUBLIC_KEY` / `KMAIL_VAPID_PRIVATE_KEY` /
+  `KMAIL_VAPID_SUBJECT`, browser registration helper at
+  `web/src/api/push.ts`); TOTP fallback for WebAuthn
+  (`internal/middleware/{totp,totp_store}.go`, RFC 6238 HMAC-SHA1,
+  recovery codes, migration 044 `totp_credentials` with RLS, TOTP
+  tab on `SecuritySettings.tsx`); ClamAV malware scanning adapter
+  (`internal/malware/{scanner,clamav,handlers}.go`, INSTREAM over
+  TCP, JMAP submit-time pre-delivery hook, `KMAIL_CLAMAV_ADDR`,
+  optional `clamav` compose profile); free/busy publishing
+  (`internal/calendarbridge/{freebusy,freebusy_handlers}.go`,
+  `GET /.well-known/caldav` discovery, CalDAV `REPORT` with
+  RFC 5545 VFREEBUSY, JSON `/api/v1/calendars/{accountID}/{calendarID}/freebusy`,
+  "Check availability" UI in `EventCreate.tsx`); autoconfig /
+  autodiscover XML endpoints
+  (`internal/dns/{autoconfig,autoconfig_handlers}.go`, Thunderbird
+  `mail/config-v1.1.xml`, Outlook `autodiscover.xml`,
+  `.well-known/autoconfig/mail/config-v1.1.xml`, tenant-aware via
+  the email's domain); Stripe subscription lifecycle wired on
+  tenant signup / plan change / tenant delete
+  (`internal/billing/{stripe,lifecycle}.go`,
+  `KMAIL_STRIPE_SECRET_KEY` + `KMAIL_STRIPE_PRICE_*` plan→price
+  map, `stripe_customer_id` / `stripe_subscription_id` columns in
+  migration 045); shared-inbox MLS group key rotation
+  (`internal/sharedinbox/mls.go` `MLSGroupManager` interface +
+  `HTTPMLSGroupManager`, post-`AddSharedInboxMember` /
+  `RemoveSharedInboxMember` rotation hook routed via
+  `tenant.Service.WithSharedInboxMembershipHook`,
+  `GET /api/v1/shared-inboxes/{inboxId}/mls/status`); Grafana
+  dashboard provisioning
+  (`deploy/grafana/dashboards/{kmail-overview,kmail-deliverability}.json`,
+  `deploy/grafana/provisioning/dashboards.yml`, auto-loaded by
+  `docker compose --profile loki up`, documented in
+  `docs/DEVELOPMENT.md`); and a documentation reconciliation pass
+  flipping Phase 4 to `COMPLETE`, Phase 7 to `COMPLETE`, and
+  refreshing the README §Project Status block. New migrations
+  043–045.
+
 - **Last updated**: 2026-04-27 (Phase 7, batch 1) — Phase 7
   production-hardening ten-task batch flips Phase 7 from `PLANNED`
   to `IN PROGRESS`. Ships real APNs / FCM push transports with a
@@ -1189,7 +1236,9 @@ Checklist:
 
 ## Phase 4 — Production SME Launch (Weeks 19–28)
 
-**Status**: `NOT STARTED`
+**Status**: `COMPLETE` — every checklist item below ships in main.
+The status text was drift-stale; Phase 8's documentation
+reconciliation pass corrects it.
 
 **Goal**: production launch with published pricing tiers, full
 deliverability infrastructure, and migration automation.
@@ -1756,10 +1805,10 @@ Checklist:
 
 ## Phase 7 — Production Hardening
 
-**Status**: `IN PROGRESS` — opened 2026-04-27 with the ten-task
-production-hardening batch (see the **Last updated** entry at the
-top of this file). All ten checklist items below ship in this
-batch.
+**Status**: `COMPLETE` — all ten checklist items below shipped in
+the 2026-04-27 production-hardening batch (PR #25). Phase 8's
+reconciliation pass flips the status from `IN PROGRESS` to
+`COMPLETE`.
 
 Checklist:
 
@@ -1810,6 +1859,126 @@ Checklist:
       `chaos-valkey.sh`, `make loadtest` and `make chaos`
       targets, and `docs/LOADTEST.md` documenting baselines and
       interpretation.
+
+---
+
+## Phase 8 — GA Readiness
+
+**Status**: `IN PROGRESS` — opened 2026-04-27 with the ten-task
+GA-readiness batch (see the **Last updated** entry at the top of
+this file). All ten checklist items below ship in this batch.
+
+Checklist:
+
+- [x] Real KMIP / PKCS#11 wire traffic for HSM CMK envelope
+      operations. Pure-Go KMIP 1.4 TTLV encoder/decoder + TLS
+      transport in `internal/cmk/kmip.go` covering `Locate`,
+      `Encrypt`, and `Decrypt` operations. PKCS#11 path lives in
+      `internal/cmk/pkcs11.go` behind a `pkcs11` build tag —
+      operators rebuild the API binary with
+      `go build -tags pkcs11 ./cmd/kmail-api` to enable
+      `C_Initialize` / `C_OpenSession` / `C_Encrypt` /
+      `C_Decrypt`. `CMKService.EncryptDEK` / `DecryptDEK`
+      dispatch by provider type and bump the new
+      `cmk_hsm_configs.last_used_at` column (migration 043) on
+      success.
+- [x] Web Push (RFC 8030) real transport. `internal/push/webpush.go`
+      signs VAPID JWTs (P-256, ES256) with `KMAIL_VAPID_PUBLIC_KEY`
+      / `KMAIL_VAPID_PRIVATE_KEY` / `KMAIL_VAPID_SUBJECT`,
+      builds `aes128gcm` push payloads per RFC 8291, and is
+      wired into `buildPushTransport` as `router.Web` (replacing
+      the `loggingTransport` no-op). Browser-side helper at
+      `web/src/api/push.ts` registers a `PushSubscription` via
+      `/api/v1/push/subscribe`. Unit-tested with a mock push
+      service.
+- [x] TOTP fallback for WebAuthn. `internal/middleware/totp.go`
+      implements RFC 6238 HMAC-SHA1 verification, secret
+      generation, `otpauth://` URI rendering, and recovery codes.
+      `internal/middleware/totp_store.go` wraps the secret with
+      the existing `KMAIL_SECRETS_KEY` envelope before insert.
+      Migration 044 ships the `totp_credentials` table with
+      RLS. The "TOTP" tab on `web/src/pages/Admin/SecuritySettings.tsx`
+      drives the setup wizard (QR code, verification, recovery
+      code download).
+- [x] Malware scanning adapter. `internal/malware/scanner.go`
+      defines a `Scanner` interface with `NoopScanner` (default)
+      and `clamavScanner` (`internal/malware/clamav.go`) that
+      speaks INSTREAM over TCP. `internal/malware/handlers.go`
+      registers `POST /api/v1/malware/scan` and exposes a
+      `PreDeliverHook` that the JMAP proxy
+      (`internal/jmap/proxy.go` `ProxyConfig.PreDeliverHook`)
+      invokes on every submit body, short-circuiting infected
+      messages with a JMAP `rejectedByPolicy` 422. Gated behind
+      `KMAIL_CLAMAV_ADDR`; `docker-compose.yml` exposes a
+      `clamav` profile (`docker compose --profile clamav up`).
+- [x] Free/busy publishing to external domains.
+      `internal/calendarbridge/freebusy.go` aggregates Stalwart
+      CalDAV events into merged busy intervals and renders an
+      RFC 5545 VFREEBUSY component.
+      `freebusy_handlers.go` registers `GET /.well-known/caldav`
+      (RFC 6764 discovery), CalDAV `REPORT
+      /api/v1/calendars/{accountID}/{calendarID}` parsing
+      `calendar-freebusy` time-range queries, and JSON
+      `GET /api/v1/calendars/{accountID}/{calendarID}/freebusy?start=&end=`
+      for the React UI. The "Check availability" panel on
+      `web/src/pages/Calendar/EventCreate.tsx` queries the
+      participant calendar before scheduling.
+- [x] Autoconfig / autodiscover XML endpoints.
+      `internal/dns/autoconfig.go` renders Thunderbird-style
+      autoconfig and Outlook autodiscover XML against the
+      tenant's `tenant_domain` / `tenant_dns_records` rows
+      (resolving the tenant from the incoming email's domain).
+      `autoconfig_handlers.go` registers `GET /mail/config-v1.1.xml`,
+      `POST /autodiscover/autodiscover.xml`, and
+      `GET /.well-known/autoconfig/mail/config-v1.1.xml` without
+      auth (these are public discovery endpoints).
+- [x] Stripe subscription creation on tenant signup.
+      `internal/billing/stripe.go` adds `CreateCustomer` and
+      keeps existing `CreateSubscription` /
+      `UpdateSubscription` / `CancelSubscription` honest with a
+      mock-server unit test. `internal/billing/lifecycle.go`
+      wires `WithStripe(stripeClient, planPrices)` so
+      `OnTenantCreated` mints a Stripe customer + subscription
+      (when `KMAIL_STRIPE_SECRET_KEY` is set), `OnPlanChanged`
+      pushes plan-change metadata, and `OnTenantDeleted`
+      cancels the subscription. Migration 045 adds
+      `stripe_customer_id` and `stripe_subscription_id` columns
+      to `billing_subscriptions` (nullable so pre-Phase-8
+      tenants are unchanged).
+- [x] Shared-inbox MLS group key rotation.
+      `internal/sharedinbox/mls.go` introduces an
+      `MLSGroupManager` interface plus `HTTPMLSGroupManager`
+      pointing at `KCHAT_MLS_ENDPOINT`. The tenant Service's
+      `AddSharedInboxMember` / `RemoveSharedInboxMember` paths
+      fire a `WithSharedInboxMembershipHook` callback that
+      routes into `WorkflowService.HandleMembershipChange`,
+      which in turn calls `MLSGroupManager.RotateGroup` so the
+      next message bound for the inbox is encrypted to the
+      current member set. Graceful no-op + warning log when the
+      endpoint is empty. New
+      `GET /api/v1/shared-inboxes/{inboxId}/mls/status`
+      surfaces epoch + member count to the admin UI.
+- [x] Grafana dashboard provisioning.
+      `deploy/grafana/dashboards/kmail-overview.json` and
+      `deploy/grafana/dashboards/kmail-deliverability.json` ship
+      pre-built panels for HTTP RED metrics, JMAP proxy
+      latency, active tenants / seats, retention counters, SLO
+      availability, bounce / complaint rates, suppression list
+      size, IP pool health, warmup progress, DMARC pass rate,
+      and abuse score distribution.
+      `deploy/grafana/provisioning/dashboards.yml` makes them
+      auto-load when `docker compose --profile loki up` is
+      running. Documented in `docs/DEVELOPMENT.md`.
+- [x] Phase status reconciliation + README refresh.
+      Phase 4 status corrected `NOT STARTED` → `COMPLETE`;
+      Phase 7 status flipped `IN PROGRESS` → `COMPLETE`; Phase
+      8 section added with this checklist; top-of-file status
+      line refreshed; `README.md` §Project Status block
+      rewritten to describe the current state (Phase 7 done,
+      Phase 8 in progress, 45 migrations, Helm chart, Stripe
+      lifecycle, WebAuthn + TOTP, Sieve, load testing, Stalwart
+      v1 compat shim, Grafana dashboards, ClamAV scanner, free/
+      busy, autoconfig, KMIP wire traffic).
 
 ---
 

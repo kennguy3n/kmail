@@ -359,3 +359,26 @@ JSON log line emitted by `internal/middleware/logger.go`. Set
 stack) so the lines have the right shape; the request logger
 falls back to text format otherwise and Promtail will refuse the
 records.
+
+### Pre-built Grafana dashboards (Phase 8)
+
+The `loki` profile now boots a Grafana 11 container at
+http://localhost:3000 (anonymous Viewer enabled, admin
+credentials `admin` / `kmail-dev`). Two pre-built dashboards
+live under `deploy/grafana/dashboards/` and are loaded
+automatically by the provisioner at
+`deploy/grafana/provisioning/dashboards.yml`:
+
+- **KMail — Overview** (`kmail-overview`): request rate / P50–P99
+  latency, active tenants, seats by plan, JMAP proxy latency,
+  retention worker counters, the rolling 30-day availability SLO
+  gauge, and a Loki panel for recent kmail-api errors.
+- **KMail — Deliverability** (`kmail-deliverability`): bounce
+  rate (hard / soft), complaint rate per IP pool, suppression
+  list size, DMARC pass rate, IP pool reputation, warmup
+  progress, abuse score distribution, and a Loki panel for
+  bounce / complaint events.
+
+To edit a dashboard locally, change the JSON on disk; the
+provisioner re-reads `/var/lib/grafana/dashboards` every 30
+seconds, so the change shows up without restarting Grafana.

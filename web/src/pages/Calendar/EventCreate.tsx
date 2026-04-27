@@ -281,6 +281,11 @@ export default function EventCreate() {
             placeholder="name@example.com, Other Person <other@example.com>"
           />
         </div>
+        <FreeBusyCheck
+          calendarId={calendarId}
+          startLocal={startLocal}
+          endLocal={endLocal}
+        />
         <div style={styles.row}>
           <label style={styles.label}>RSVP</label>
           <label style={styles.inlineCheckbox}>
@@ -591,3 +596,83 @@ const styles: Record<string, React.CSSProperties> = {
     cursor: "pointer",
   },
 };
+
+interface FreeBusyResp {
+  busy?: { start: string; end: string }[];
+}
+
+/**
+ * FreeBusyCheck (Phase 8) renders a "Check availability" button.
+ * The current account ID is read from the existing JMAP session;
+ * we issue a GET against the BFF's free/busy publisher and render
+ * the resulting busy intervals inline.
+ */
+function FreeBusyCheck({
+  calendarId,
+  startLocal,
+  endLocal,
+}: {
+  calendarId: string;
+  startLocal: string;
+  endLocal: string;
+}) {
+  const [busy, setBusy] = useState<{ start: string; end: string }[] | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const onClick = async () => {
+    setError(null);
+    setBusy(null);
+    if (!calendarId || !startLocal || !endLocal) {
+      setError("Calendar, start and end are required");
+      return;
+    }
+    setLoading(true);
+    try {
+      const startIso = encodeURIComponent(new Date(startLocal).toISOString());
+      const endIso = encodeURIComponent(new Date(endLocal).toISOString());
+      const accountId = "default"; // resolved server-side from auth context
+      const res = await fetch(
+        `/api/v1/calendars/${encodeURIComponent(accountId)}/${encodeURIComponent(
+          calendarId,
+        )}/freebusy?start=${startIso}&end=${endIso}`,
+        { credentials: "include", headers: { Accept: "application/json" } },
+      );
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`);
+      }
+      const body = (await res.json()) as FreeBusyResp;
+      setBusy(body.busy ?? []);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div style={styles.row}>
+      <label style={styles.label}>Availability</label>
+      <div>
+        <button type="button" onClick={onClick} disabled={loading}>
+          {loading ? "Checking…" : "Check availability"}
+        </button>
+        {error && <span style={{ color: "#b91c1c", marginLeft: "0.5rem" }}>{error}</span>}
+        {busy && busy.length === 0 && (
+          <span style={{ color: "#16a34a", marginLeft: "0.5rem" }}>
+            All clear in this window.
+          </span>
+        )}
+        {busy && busy.length > 0 && (
+          <ul style={{ marginTop: "0.5rem" }}>
+            {busy.map((b, i) => (
+              <li key={i} style={{ color: "#b45309" }}>
+                Busy: {new Date(b.start).toLocaleString()} – {new Date(b.end).toLocaleString()}
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </div>
+  );
+}

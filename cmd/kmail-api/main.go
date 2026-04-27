@@ -34,6 +34,7 @@ import (
 	"github.com/kennguy3n/kmail/internal/dns"
 	"github.com/kennguy3n/kmail/internal/export"
 	"github.com/kennguy3n/kmail/internal/jmap"
+	"github.com/kennguy3n/kmail/internal/malware"
 	"github.com/kennguy3n/kmail/internal/middleware"
 	"github.com/kennguy3n/kmail/internal/migration"
 	"github.com/kennguy3n/kmail/internal/monitoring"
@@ -115,11 +116,37 @@ func main() {
 	// the JMAP proxy can resolve per-tenant primary + secondary
 	// Stalwart URLs on every request.
 	shardSvc := tenant.NewShardService(pool, logger)
+
+	// Optional malware scanner (Phase 8). When KMAIL_CLAMAV_ADDR is
+	// unset we install a no-op scanner so the JMAP submit path
+	// stays unchanged.
+	var malwareHook func(ctx context.Context, body []byte) error
+	if addr := os.Getenv("KMAIL_CLAMAV_ADDR"); addr != "" {
+		clamScanner, scanErr := malware.NewClamAVScanner(malware.ClamAVConfig{
+			Addr:    addr,
+			Timeout: getenvDuration("KMAIL_CLAMAV_TIMEOUT", 10*time.Second),
+		})
+		if scanErr != nil {
+			logger.Printf("malware: ClamAV adapter disabled: %v", scanErr)
+		} else {
+			handlers := malware.NewHandlers(clamScanner, logger)
+			handlers.Register(mux, authMW.Wrap)
+			malwareHook = handlers.PreDeliverHook
+			logger.Printf("malware: ClamAV adapter enabled at %s", addr)
+		}
+	} else {
+		// Always expose the scan endpoint so the React UI can
+		// shape its compose-time call against a real handler;
+		// the no-op scanner returns clean for everything.
+		malware.NewHandlers(malware.NewNoopScanner(), logger).Register(mux, authMW.Wrap)
+	}
+
 	proxy, err := jmap.NewProxy(jmap.ProxyConfig{
-		StalwartURL: cfg.StalwartURL,
-		Pool:        pool,
-		Logger:      logger,
-		Shards:      shardSvc,
+		StalwartURL:    cfg.StalwartURL,
+		Pool:           pool,
+		Logger:         logger,
+		Shards:         shardSvc,
+		PreDeliverHook: malwareHook,
 	})
 	if err != nil {
 		logger.Fatalf("jmap.NewProxy: %v", err)
@@ -144,6 +171,18 @@ func main() {
 		PrivacyPerSeatBytes: cfg.Billing.PrivacyPerSeatBytes,
 	})
 	billingLifecycleEarly := billing.NewLifecycle(billingSvc, logger)
+	// Phase 8: outbound Stripe wiring. Disabled when
+	// KMAIL_STRIPE_SECRET_KEY is empty (the corresponding methods
+	// short-circuit on `Configured()`).
+	if k := os.Getenv("KMAIL_STRIPE_SECRET_KEY"); k != "" {
+		stripeClient := billing.NewStripeClient(k)
+		planPrices := map[string]string{
+			"core":    os.Getenv("KMAIL_STRIPE_PRICE_CORE"),
+			"pro":     os.Getenv("KMAIL_STRIPE_PRICE_PRO"),
+			"privacy": os.Getenv("KMAIL_STRIPE_PRICE_PRIVACY"),
+		}
+		billingLifecycleEarly.WithStripe(stripeClient, planPrices)
+	}
 	billing.NewHandlers(billingSvc, logger).WithLifecycle(billingLifecycleEarly).Register(mux, authMW)
 	billing.NewWebhookHandler(billing.WebhookConfig{
 		Lifecycle:           billingLifecycleEarly,
@@ -163,10 +202,18 @@ func main() {
 		AdminSecretKey: cfg.ZKFabric.SecretKey,
 		Logger:         logger,
 	})
+	// Phase 8 — build the shared-inbox workflow service early so
+	// the tenant service can wire its `WithSharedInboxMembershipHook`
+	// to fire MLS-group rotations when membership changes.
+	sharedInboxWorkflowEarly := sharedinbox.NewService(pool, logger).
+		WithMLS(sharedinbox.NewHTTPMLSGroupManager(cfg.KChatMLSEndpoint, cfg.KChatAPIToken))
 	tenantSvc := tenant.NewService(pool).
 		WithSeatAccounter(billingSvc).
 		WithStorageProvisioner(zkProvisioner).
-		WithBillingLifecycle(billingLifecycleEarly)
+		WithBillingLifecycle(billingLifecycleEarly).
+		WithSharedInboxMembershipHook(func(ctx context.Context, _ /*tenantID*/, inboxID string, members []string, reason string) {
+			sharedInboxWorkflowEarly.HandleMembershipChange(ctx, inboxID, members, reason)
+		})
 	dnsSvc := dns.NewService(dns.Config{
 		Pool:                pool,
 		MailHost:            cfg.DNS.MailHost,
@@ -182,6 +229,25 @@ func main() {
 	tenantHandlers.Register(mux, authMW)
 	dnsHandlers := dns.NewHandlers(dnsSvc, logger)
 	dnsHandlers.Register(mux, authMW)
+
+	// Public autoconfig / autodiscover endpoints (Phase 8). Mozilla
+	// Thunderbird hits `/mail/config-v1.1.xml`; Outlook hits
+	// `/autodiscover/autodiscover.xml`. These are intentionally
+	// unauthenticated — IMAP / SMTP / CalDAV bootstrap happens
+	// pre-login. Tenant settings come from `KMAIL_AUTOCONFIG_*`
+	// env vars and the per-domain row in `domains`.
+	autoconfigSvc := dns.NewAutoconfigService(dns.AutoconfigConfig{
+		Pool:       pool,
+		IMAPHost:   os.Getenv("KMAIL_AUTOCONFIG_IMAP_HOST"),
+		IMAPPort:   config.GetenvInt("KMAIL_AUTOCONFIG_IMAP_PORT", 993),
+		SMTPHost:   os.Getenv("KMAIL_AUTOCONFIG_SMTP_HOST"),
+		SMTPPort:   config.GetenvInt("KMAIL_AUTOCONFIG_SMTP_PORT", 587),
+		CalDAVHost: os.Getenv("KMAIL_AUTOCONFIG_CALDAV_HOST"),
+		CalDAVPort: config.GetenvInt("KMAIL_AUTOCONFIG_CALDAV_PORT", 443),
+		BaseURL:    os.Getenv("KMAIL_PUBLIC_BASE_URL"),
+		BrandName:  os.Getenv("KMAIL_AUTOCONFIG_BRAND_NAME"),
+	})
+	dns.NewAutoconfigHandlers(autoconfigSvc, logger).Register(mux)
 
 	migrationSvc := migration.NewService(migration.Config{
 		Pool:             pool,
@@ -220,6 +286,16 @@ func main() {
 	calendarNotifier := calendarbridge.NewNotifier(chatbridgeSvc.KChat(), calendarChannelResolver)
 	calendarbridge.NewHandlers(calendarSvc, logger).WithNotifier(calendarNotifier).Register(mux, authMW)
 	calendarbridge.NewChannelHandlers(calendarChannelResolver).Register(mux, authMW)
+
+	// Free/busy publisher (Phase 8). Exposes
+	// `/api/v1/calendars/{accountID}/{calendarID}/freebusy` for the
+	// React UI plus the public `/.well-known/caldav` discovery
+	// document and the CalDAV REPORT route external clients use.
+	calendarbridge.NewFreeBusyHandlers(
+		calendarbridge.NewFreeBusyService(calendarSvc),
+		os.Getenv("KMAIL_PUBLIC_BASE_URL"),
+		logger,
+	).Register(mux, authMW)
 	calendarSharingStore := calendarbridge.NewSharingStore(pool)
 	calendarbridge.NewSharingHandlers(calendarSvc, calendarSharingStore).Register(mux, authMW)
 	// Background reminder worker: polls upcoming events every 60s
@@ -317,9 +393,27 @@ func main() {
 	})
 	webauthnHandlers.Register(mux, authMW)
 
-	// Shared-inbox workflow state machine.
-	sharedInboxWorkflow := sharedinbox.NewService(pool, logger)
-	sharedinbox.NewHandlers(sharedInboxWorkflow, logger).Register(mux, authMW)
+	// TOTP fallback (Phase 8). PROPOSAL.md §10.1 specifies TOTP as
+	// a fallback to FIDO2 — same identity surface, weaker assurance,
+	// usable from any authenticator app. The shared secret is
+	// wrapped by the kmail-secrets envelope; recovery codes are
+	// SHA-256 hashed.
+	envelope, err := cmk.LoadEnvelope()
+	if err != nil {
+		logger.Printf("totp: KMAIL_SECRETS_KEY not set — TOTP secrets stored unwrapped (DEV ONLY): %v", err)
+		envelope = nil
+	}
+	middleware.NewTOTPHandlers(middleware.TOTPConfig{
+		Pool:     pool,
+		Logger:   logger,
+		Issuer:   "KMail",
+		Envelope: envelope,
+	}).Register(mux, authMW)
+
+	// Shared-inbox workflow state machine. The service was built
+	// up above (alongside the tenant Service) so the tenant
+	// `WithSharedInboxMembershipHook` could route to it.
+	sharedinbox.NewHandlers(sharedInboxWorkflowEarly, logger).Register(mux, authMW)
 
 	tenant.NewShardHandlers(shardSvc).Register(mux, authMW)
 
@@ -616,6 +710,14 @@ func buildPushTransport(logger *log.Logger) push.Transport {
 	// only unrecognized device types will hit Default.
 	router.Default = push.NewLoggingTransport(logger)
 	router.Web = router.Default
+	if pub, priv := os.Getenv("KMAIL_VAPID_PUBLIC_KEY"), os.Getenv("KMAIL_VAPID_PRIVATE_KEY"); pub != "" && priv != "" {
+		webpush, err := push.NewWebPushFromKeys(pub, priv, os.Getenv("KMAIL_VAPID_SUBJECT"), logger)
+		if err != nil {
+			logger.Printf("web push transport disabled: %v", err)
+		} else {
+			router.Web = webpush
+		}
+	}
 	if keyID := os.Getenv("KMAIL_APNS_KEY_ID"); keyID != "" {
 		apns, err := push.NewAPNsTransport(push.APNsConfig{
 			KeyID:    keyID,

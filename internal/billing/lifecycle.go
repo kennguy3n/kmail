@@ -39,6 +39,19 @@ type Lifecycle struct {
 	svc    *Service
 	logger *log.Logger
 	now    func() time.Time
+
+	// stripe is the optional outbound Stripe client. When
+	// configured (non-empty `KMAIL_STRIPE_SECRET_KEY`), Lifecycle
+	// methods drive the corresponding Stripe REST calls so the
+	// billing relationship in Stripe stays in sync with KMail's
+	// tenant lifecycle. When unconfigured, lifecycle stays purely
+	// local (matching the pre-Phase-8 behaviour).
+	stripe *StripeClient
+	// pricing maps plan slug → Stripe price ID. Set per
+	// deployment via `KMAIL_STRIPE_PRICE_*` env vars; an empty
+	// map means "Stripe wired, but no plans known", in which
+	// case Lifecycle skips the Stripe call.
+	pricing map[string]string
 }
 
 // NewLifecycle returns a Lifecycle bound to the given Service.
@@ -47,6 +60,18 @@ func NewLifecycle(svc *Service, logger *log.Logger) *Lifecycle {
 		logger = log.Default()
 	}
 	return &Lifecycle{svc: svc, logger: logger, now: time.Now}
+}
+
+// WithStripe attaches the outbound Stripe client + plan→priceID
+// mapping. Returning the Lifecycle keeps the call chainable in
+// `cmd/kmail-api/main.go`.
+func (l *Lifecycle) WithStripe(client *StripeClient, planPrices map[string]string) *Lifecycle {
+	if l == nil {
+		return l
+	}
+	l.stripe = client
+	l.pricing = planPrices
+	return l
 }
 
 // SubscriptionStatus mirrors `billing_subscriptions.status`.
@@ -91,7 +116,31 @@ func (l *Lifecycle) OnTenantCreated(ctx context.Context, tenantID, plan string) 
 		return fmt.Errorf("upsert quota: %w", err)
 	}
 	now := l.now().UTC()
-	if err := l.upsertSubscription(ctx, tenantID, plan, SubscriptionActive, "", now, now.AddDate(0, 1, 0)); err != nil {
+	customerID, subscriptionID := "", ""
+	if l.stripe != nil && l.stripe.Configured() {
+		cust, err := l.stripe.CreateCustomer(ctx, "", map[string]string{"kmail_tenant_id": tenantID})
+		if err != nil {
+			l.logger.Printf("billing.OnTenantCreated: Stripe CreateCustomer failed (non-fatal): %v", err)
+		} else if cust != nil {
+			customerID = cust.ID
+			if priceID := l.pricing[plan]; priceID != "" {
+				sub, err := l.stripe.CreateSubscription(ctx, SubscriptionRequest{
+					Customer: customerID,
+					PriceID:  priceID,
+					Quantity: 1,
+					Metadata: map[string]string{"kmail_tenant_id": tenantID, "kmail_plan": plan},
+				})
+				if err != nil {
+					l.logger.Printf("billing.OnTenantCreated: Stripe CreateSubscription failed (non-fatal): %v", err)
+				} else if sub != nil {
+					subscriptionID = sub.ID
+				}
+			} else {
+				l.logger.Printf("billing.OnTenantCreated: no Stripe price ID for plan %q — skipping subscription create", plan)
+			}
+		}
+	}
+	if err := l.upsertSubscriptionWithStripe(ctx, tenantID, plan, SubscriptionActive, subscriptionID, customerID, now, now.AddDate(0, 1, 0)); err != nil {
 		return fmt.Errorf("upsert subscription: %w", err)
 	}
 	return nil
@@ -106,6 +155,13 @@ func (l *Lifecycle) OnTenantDeleted(ctx context.Context, tenantID string) error 
 	}
 	if _, err := l.svc.CalculateInvoice(ctx, tenantID); err != nil && !errors.Is(err, ErrNotFound) {
 		l.logger.Printf("billing.OnTenantDeleted: final invoice: %v", err)
+	}
+	if l.stripe != nil && l.stripe.Configured() {
+		if sub, err := l.GetSubscription(ctx, tenantID); err == nil && sub != nil && sub.StripeSubscriptionID != "" {
+			if _, err := l.stripe.CancelSubscription(ctx, sub.StripeSubscriptionID); err != nil {
+				l.logger.Printf("billing.OnTenantDeleted: Stripe CancelSubscription failed (non-fatal): %v", err)
+			}
+		}
 	}
 	if err := l.markSubscriptionCancelled(ctx, tenantID); err != nil {
 		return fmt.Errorf("mark cancelled: %w", err)
@@ -138,6 +194,21 @@ func (l *Lifecycle) OnPlanChanged(ctx context.Context, tenantID, oldPlan, newPla
 	prorated, err := l.computeProration(ctx, tenantID, oldPlan, newPlan, sub.CurrentPeriodStart, sub.CurrentPeriodEnd, now)
 	if err != nil {
 		l.logger.Printf("billing.OnPlanChanged: proration: %v", err)
+	}
+	if l.stripe != nil && l.stripe.Configured() && sub.StripeSubscriptionID != "" {
+		if priceID := l.pricing[newPlan]; priceID != "" {
+			// We don't currently persist Stripe item IDs (one-item
+			// subscriptions only); emit a metadata-only update so
+			// the subscription's metadata reflects the plan change.
+			// Operators using Stripe's price-update path should run
+			// the dedicated reconciliation tool documented in
+			// docs/SECURITY.md §billing.
+			if _, err := l.stripe.UpdateSubscription(ctx, sub.StripeSubscriptionID, SubscriptionRequest{
+				Metadata: map[string]string{"kmail_plan": newPlan, "kmail_price_id": priceID},
+			}); err != nil {
+				l.logger.Printf("billing.OnPlanChanged: Stripe UpdateSubscription metadata failed (non-fatal): %v", err)
+			}
+		}
 	}
 	if err := l.upsertSubscription(ctx, tenantID, newPlan, sub.Status, sub.StripeSubscriptionID, sub.CurrentPeriodStart, sub.CurrentPeriodEnd); err != nil {
 		return err
@@ -270,12 +341,22 @@ type BillingHistoryEntry struct {
 
 // upsertSubscription writes the `billing_subscriptions` row.
 func (l *Lifecycle) upsertSubscription(ctx context.Context, tenantID, plan string, status SubscriptionStatus, stripeID string, periodStart, periodEnd time.Time) error {
+	return l.upsertSubscriptionWithStripe(ctx, tenantID, plan, status, stripeID, "", periodStart, periodEnd)
+}
+
+// upsertSubscriptionWithStripe is the variant that also persists
+// the Stripe customer ID (Phase 8 migration 045). Empty strings
+// are treated as "do not update" via COALESCE.
+func (l *Lifecycle) upsertSubscriptionWithStripe(ctx context.Context, tenantID, plan string, status SubscriptionStatus, stripeID, stripeCustomerID string, periodStart, periodEnd time.Time) error {
 	if l.svc.cfg.Pool == nil {
 		return nil
 	}
-	var stripe any
+	var stripeSub, stripeCust any
 	if stripeID != "" {
-		stripe = stripeID
+		stripeSub = stripeID
+	}
+	if stripeCustomerID != "" {
+		stripeCust = stripeCustomerID
 	}
 	return pgx.BeginFunc(ctx, l.svc.cfg.Pool, func(tx pgx.Tx) error {
 		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
@@ -283,16 +364,17 @@ func (l *Lifecycle) upsertSubscription(ctx context.Context, tenantID, plan strin
 		}
 		_, err := tx.Exec(ctx, `
 			INSERT INTO billing_subscriptions (
-				tenant_id, plan, status, stripe_subscription_id,
+				tenant_id, plan, status, stripe_subscription_id, stripe_customer_id,
 				current_period_start, current_period_end
-			) VALUES ($1::uuid, $2, $3, $4, $5, $6)
+			) VALUES ($1::uuid, $2, $3, $4, $5, $6, $7)
 			ON CONFLICT (tenant_id) DO UPDATE
 			SET plan = EXCLUDED.plan,
 			    status = EXCLUDED.status,
 			    stripe_subscription_id = COALESCE(EXCLUDED.stripe_subscription_id, billing_subscriptions.stripe_subscription_id),
+			    stripe_customer_id     = COALESCE(EXCLUDED.stripe_customer_id, billing_subscriptions.stripe_customer_id),
 			    current_period_start = EXCLUDED.current_period_start,
 			    current_period_end = EXCLUDED.current_period_end
-		`, tenantID, plan, string(status), stripe, periodStart, periodEnd)
+		`, tenantID, plan, string(status), stripeSub, stripeCust, periodStart, periodEnd)
 		return err
 	})
 }

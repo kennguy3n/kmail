@@ -74,3 +74,64 @@ export async function updatePreferences(
     body: JSON.stringify(prefs),
   });
 }
+
+/**
+ * Register the browser's Push API subscription with KMail's Web
+ * Push transport (Phase 8 GA-readiness).
+ *
+ * The caller supplies the active service worker registration and
+ * the application server's VAPID public key (typically delivered
+ * to the page through a server-rendered config or the `/api/v1/auth/me`
+ * envelope). The helper:
+ *
+ *   1. Asks the browser for permission to display notifications.
+ *   2. Subscribes to the platform push service via
+ *      `pushManager.subscribe({ userVisibleOnly: true, applicationServerKey })`.
+ *   3. Posts the resulting endpoint + p256dh + auth keys to
+ *      `/api/v1/push/subscribe`.
+ *
+ * Returns the persisted KMail subscription row.
+ */
+export async function registerWebPush(
+  registration: ServiceWorkerRegistration,
+  vapidPublicKey: string,
+): Promise<PushSubscription> {
+  if (typeof Notification === "undefined") {
+    throw new Error("Notifications API unavailable in this browser");
+  }
+  const permission = await Notification.requestPermission();
+  if (permission !== "granted") {
+    throw new Error("Notification permission denied");
+  }
+  // The lib.dom.d.ts type for `applicationServerKey` is
+  // `BufferSource`, which the TS compiler narrows to require an
+  // ArrayBuffer (not a SharedArrayBuffer-backed view). Construct
+  // the buffer view explicitly so the type-narrowing succeeds.
+  const keyBytes = urlBase64ToUint8Array(vapidPublicKey);
+  const keyBuf = new ArrayBuffer(keyBytes.byteLength);
+  new Uint8Array(keyBuf).set(keyBytes);
+  const browserSub = await registration.pushManager.subscribe({
+    userVisibleOnly: true,
+    applicationServerKey: keyBuf,
+  });
+  const json = browserSub.toJSON();
+  return subscribe({
+    device_type: "web",
+    push_endpoint: json.endpoint ?? browserSub.endpoint,
+    p256dh_key: json.keys?.p256dh,
+    auth_key: json.keys?.auth,
+  });
+}
+
+/**
+ * Decode a base64url-encoded VAPID public key into the Uint8Array
+ * shape `pushManager.subscribe` expects.
+ */
+function urlBase64ToUint8Array(base64String: string): Uint8Array {
+  const padding = "=".repeat((4 - (base64String.length % 4)) % 4);
+  const base64 = (base64String + padding).replace(/-/g, "+").replace(/_/g, "/");
+  const rawData = atob(base64);
+  const output = new Uint8Array(rawData.length);
+  for (let i = 0; i < rawData.length; i++) output[i] = rawData.charCodeAt(i);
+  return output;
+}

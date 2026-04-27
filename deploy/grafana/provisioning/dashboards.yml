@@ -1,0 +1,22 @@
+# KMail — Grafana dashboard provisioning.
+#
+# Mounted at `/etc/grafana/provisioning/dashboards/dashboards.yml`
+# alongside `datasources.yml`. Tells Grafana to scan
+# `/var/lib/grafana/dashboards` (a directory we mount the JSON files
+# into) for pre-built dashboards and load them every 30 seconds so
+# operators can edit the JSON on disk and see changes without
+# restarting Grafana.
+
+apiVersion: 1
+
+providers:
+  - name: KMail
+    orgId: 1
+    folder: "KMail"
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false
