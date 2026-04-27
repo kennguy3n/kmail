@@ -335,6 +335,55 @@ services:
       - "-config.file=/etc/promtail/promtail.yml"
     restart: unless-stopped
 
+  # Grafana shares the `loki` profile with Loki + Promtail. The
+  # datasource + dashboard provisioning files under `deploy/grafana/`
+  # are mounted at the standard Grafana provisioning paths so the
+  # KMail Overview and Deliverability dashboards (Phase 8 GA-readiness
+  # batch) load on first boot without operator interaction.
+  grafana:
+    image: grafana/grafana:11.1.0
+    profiles: ["loki"]
+    container_name: kmail-grafana
+    depends_on:
+      loki:
+        condition: service_started
+      prometheus:
+        condition: service_started
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: kmail-dev
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./deploy/grafana/datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml:ro
+      - ./deploy/grafana/provisioning/dashboards.yml:/etc/grafana/provisioning/dashboards/dashboards.yml:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    restart: unless-stopped
+
+  # ClamAV malware scanner (Phase 8 GA-readiness). Behind the
+  # `clamav` compose profile so the default `docker compose up`
+  # stack stays small. When enabled, point the API at it with
+  # `KMAIL_CLAMAV_ADDR=clamav:3310` — the JMAP submit hook then
+  # streams every outbound message through INSTREAM (RFC 2045
+  # body, capped at 26 MiB).
+  clamav:
+    image: clamav/clamav:1.2
+    profiles: ["clamav"]
+    container_name: kmail-clamav
+    ports:
+      - "3310:3310"
+    volumes:
+      - clamav_data:/var/lib/clamav
+    healthcheck:
+      test: ["CMD", "clamdcheck.sh"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
 volumes:
   postgres_data:
   meilisearch_data:
@@ -342,4 +391,6 @@ volumes:
   zk_data:
   stalwart_data:
   prometheus_data:
+  grafana_data:
   loki_data:
+  clamav_data:

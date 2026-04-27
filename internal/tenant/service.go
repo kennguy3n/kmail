@@ -33,11 +33,19 @@ type SeatAccounter interface {
 // tenant / user / alias / shared-inbox lifecycle methods consumed by
 // the HTTP handlers in this package.
 type Service struct {
-	pool        *pgxpool.Pool
-	seats       SeatAccounter
-	provisioner StorageProvisioner
-	billing     BillingLifecycleHook
+	pool          *pgxpool.Pool
+	seats         SeatAccounter
+	provisioner   StorageProvisioner
+	billing       BillingLifecycleHook
+	sharedInboxFn SharedInboxMembershipHook
 }
+
+// SharedInboxMembershipHook is invoked after a successful
+// `AddSharedInboxMember` / `RemoveSharedInboxMember` write so the
+// sharedinbox.WorkflowService can rotate the inbox's MLS group.
+// Defined as a closure (not an interface) to keep the call site
+// trivially stub-able in tests.
+type SharedInboxMembershipHook func(ctx context.Context, tenantID, inboxID string, members []string, reason string)
 
 // StorageProvisioner is the narrow slice of `ZKFabricProvisioner`
 // the Tenant Service consumes on CreateTenant. Defined here so
@@ -86,6 +94,14 @@ func (s *Service) WithStorageProvisioner(p StorageProvisioner) *Service {
 func (s *Service) WithBillingLifecycle(b BillingLifecycleHook) *Service {
 	cp := *s
 	cp.billing = b
+	return &cp
+}
+
+// WithSharedInboxMembershipHook wires the post-mutation MLS-group
+// rotation callback. Returning a copy keeps Service immutable.
+func (s *Service) WithSharedInboxMembershipHook(fn SharedInboxMembershipHook) *Service {
+	cp := *s
+	cp.sharedInboxFn = fn
 	return &cp
 }
 
@@ -804,7 +820,41 @@ func (s *Service) AddSharedInboxMember(ctx context.Context, tenantID, inboxID, u
 	if err != nil {
 		return nil, fmt.Errorf("insert shared inbox member: %w", err)
 	}
+	if s.sharedInboxFn != nil {
+		members, _ := s.listSharedInboxMemberIDs(ctx, tenantID, inboxID)
+		s.sharedInboxFn(ctx, tenantID, inboxID, members, "member_added")
+	}
 	return &m, nil
+}
+
+// listSharedInboxMemberIDs returns the current member set after a
+// mutation, used to feed MLS rotation. Best-effort — failures are
+// logged at the call-site.
+func (s *Service) listSharedInboxMemberIDs(ctx context.Context, tenantID, inboxID string) ([]string, error) {
+	var ids []string
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
+			return err
+		}
+		rows, err := tx.Query(ctx, `
+			SELECT user_id::text FROM shared_inbox_members
+			WHERE tenant_id = $1::uuid AND shared_inbox_id = $2::uuid
+			ORDER BY user_id
+		`, tenantID, inboxID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				return err
+			}
+			ids = append(ids, id)
+		}
+		return rows.Err()
+	})
+	return ids, err
 }
 
 // RemoveSharedInboxMember removes a user from a shared inbox. It
@@ -836,6 +886,10 @@ func (s *Service) RemoveSharedInboxMember(ctx context.Context, tenantID, inboxID
 	}
 	if affected == 0 {
 		return ErrNotFound
+	}
+	if s.sharedInboxFn != nil {
+		members, _ := s.listSharedInboxMemberIDs(ctx, tenantID, inboxID)
+		s.sharedInboxFn(ctx, tenantID, inboxID, members, "member_removed")
 	}
 	return nil
 }

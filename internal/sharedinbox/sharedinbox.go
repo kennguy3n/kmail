@@ -81,6 +81,13 @@ type ListAssignmentsOptions struct {
 type WorkflowService struct {
 	Pool   *pgxpool.Pool
 	Logger *log.Logger
+
+	// MLS is the optional shared-inbox MLS group manager. When
+	// non-nil and `Enabled()`, member-add / member-remove paths
+	// dispatch to its `RotateGroup` to mint a fresh epoch so the
+	// next message bound for this inbox is encrypted to the
+	// updated member set. (Phase 8 wiring; see mls.go.)
+	MLS MLSGroupManager
 }
 
 // NewService constructs a WorkflowService.
@@ -89,6 +96,35 @@ func NewService(pool *pgxpool.Pool, logger *log.Logger) *WorkflowService {
 		logger = log.Default()
 	}
 	return &WorkflowService{Pool: pool, Logger: logger}
+}
+
+// WithMLS attaches an MLSGroupManager. Returning the receiver
+// keeps the call chainable in main.go.
+func (s *WorkflowService) WithMLS(m MLSGroupManager) *WorkflowService {
+	if s == nil {
+		return s
+	}
+	s.MLS = m
+	return s
+}
+
+// HandleMembershipChange invokes the MLS group manager when the
+// underlying tenant Service has just mutated `shared_inbox_members`.
+// Errors are logged but never returned: rotation is best-effort
+// because failing the membership change because KChat is down is
+// worse than briefly running on the previous epoch (the next
+// rotation will re-converge).
+func (s *WorkflowService) HandleMembershipChange(ctx context.Context, inboxID string, members []string, reason string) {
+	if s == nil || s.MLS == nil {
+		return
+	}
+	if !s.MLS.Enabled() {
+		s.Logger.Printf("sharedinbox MLS: KCHAT_MLS_ENDPOINT empty — skipping rotation for inbox %s (%s)", inboxID, reason)
+		return
+	}
+	if _, err := s.MLS.RotateGroup(ctx, inboxID, members, reason); err != nil {
+		s.Logger.Printf("sharedinbox MLS: rotate inbox=%s reason=%s err=%v", inboxID, reason, err)
+	}
 }
 
 // AssignEmail assigns (or reassigns) an email to a user. Creates

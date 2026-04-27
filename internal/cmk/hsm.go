@@ -35,6 +35,7 @@ type HSMConfig struct {
 	Status        string          `json:"status"`
 	LastTestAt    *time.Time      `json:"last_test_at,omitempty"`
 	LastTestError string          `json:"last_test_error,omitempty"`
+	LastUsedAt    *time.Time      `json:"last_used_at,omitempty"`
 	CreatedAt     time.Time       `json:"created_at"`
 	UpdatedAt     time.Time       `json:"updated_at"`
 }
@@ -197,6 +198,108 @@ func (s *CMKService) ListHSMConfigs(ctx context.Context, tenantID string) ([]HSM
 		return rows.Err()
 	})
 	return out, err
+}
+
+// EncryptDEK runs the operation-specific KMIP / PKCS#11 wire
+// path (Phase 8) for the configured HSM. The KMIP path connects
+// over TLS and exchanges Encrypt; the PKCS#11 path requires the
+// `pkcs11` build tag (see pkcs11.go for the build-tag matrix).
+// Updates `last_used_at` on success.
+func (s *CMKService) EncryptDEK(ctx context.Context, tenantID, configID, keyLabel string, plaintext []byte) (ciphertext, iv []byte, err error) {
+	cfg, creds, err := s.loadHSMConfig(ctx, tenantID, configID)
+	if err != nil {
+		return nil, nil, err
+	}
+	switch cfg.Provider {
+	case HSMKMIP:
+		client := NewKMIPClient(strings.TrimPrefix(strings.TrimPrefix(cfg.Endpoint, "kmips://"), "kmip://"), nil)
+		client.Username = ""
+		client.Password = string(creds)
+		ciphertext, iv, err = client.Encrypt(keyLabel, plaintext)
+	case HSMPKCS11:
+		ciphertext, iv, err = pkcs11Encrypt(ctx, *cfg, keyLabel, plaintext)
+	default:
+		return nil, nil, fmt.Errorf("cmk: unsupported provider_type %q", cfg.Provider)
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	if updErr := s.markHSMUsed(ctx, tenantID, configID); updErr != nil {
+		// Non-fatal: the envelope succeeded.
+		_ = updErr
+	}
+	return ciphertext, iv, nil
+}
+
+// DecryptDEK is the symmetric counterpart of EncryptDEK.
+func (s *CMKService) DecryptDEK(ctx context.Context, tenantID, configID, keyLabel string, ciphertext, iv []byte) ([]byte, error) {
+	cfg, creds, err := s.loadHSMConfig(ctx, tenantID, configID)
+	if err != nil {
+		return nil, err
+	}
+	var out []byte
+	switch cfg.Provider {
+	case HSMKMIP:
+		client := NewKMIPClient(strings.TrimPrefix(strings.TrimPrefix(cfg.Endpoint, "kmips://"), "kmip://"), nil)
+		client.Password = string(creds)
+		out, err = client.Decrypt(keyLabel, ciphertext, iv)
+	case HSMPKCS11:
+		out, err = pkcs11Decrypt(ctx, *cfg, keyLabel, ciphertext, iv)
+	default:
+		return nil, fmt.Errorf("cmk: unsupported provider_type %q", cfg.Provider)
+	}
+	if err != nil {
+		return nil, err
+	}
+	_ = s.markHSMUsed(ctx, tenantID, configID)
+	return out, nil
+}
+
+// loadHSMConfig pulls the row + decrypted credentials for use by
+// EncryptDEK / DecryptDEK.
+func (s *CMKService) loadHSMConfig(ctx context.Context, tenantID, configID string) (*HSMConfig, []byte, error) {
+	if s.pool == nil {
+		return nil, nil, errors.New("cmk: pool not configured")
+	}
+	var cfg HSMConfig
+	var creds []byte
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `
+			SELECT id::text, tenant_id::text, provider_type, endpoint, slot_id,
+			       credentials_encrypted, status, last_test_at, last_test_error,
+			       created_at, updated_at
+			FROM cmk_hsm_configs
+			WHERE id = $1::uuid AND tenant_id = $2::uuid
+		`, configID, tenantID).Scan(
+			&cfg.ID, &cfg.TenantID, &cfg.Provider, &cfg.Endpoint, &cfg.SlotID,
+			&creds, &cfg.Status, &cfg.LastTestAt, &cfg.LastTestError,
+			&cfg.CreatedAt, &cfg.UpdatedAt,
+		)
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return &cfg, creds, nil
+}
+
+// markHSMUsed bumps `last_used_at` to now() (Phase 8 column).
+func (s *CMKService) markHSMUsed(ctx context.Context, tenantID, configID string) error {
+	if s.pool == nil {
+		return nil
+	}
+	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `
+			UPDATE cmk_hsm_configs SET last_used_at = now()
+			WHERE id = $1::uuid AND tenant_id = $2::uuid
+		`, configID, tenantID)
+		return err
+	})
 }
 
 // TestHSMConnection re-runs the provider's Validate against a

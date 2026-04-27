@@ -63,6 +63,18 @@ type ProxyConfig struct {
 	// failure count after which the proxy marks a shard URL
 	// unhealthy and routes to the next backup. Defaults to 3.
 	CircuitBreakThreshold int
+
+	// PreDeliverHook (Phase 8) is invoked over the submit body
+	// before forwarding it to Stalwart. Returning a non-nil
+	// error short-circuits the request with 422 (and a JMAP
+	// `urn:ietf:params:jmap:error:rejectedByPolicy` payload). nil
+	// means "no pre-delivery checks", which is the default.
+	//
+	// In production this is wired to `malware.Handlers.PreDeliverHook`
+	// from `internal/malware`, behind the `KMAIL_CLAMAV_ADDR` env
+	// var. The hook only runs on writes (POST/PUT) — JMAP is a
+	// JSON-RPC-style protocol so the body is small and re-readable.
+	PreDeliverHook func(ctx context.Context, body []byte) error
 }
 
 // Proxy forwards authenticated JMAP requests from the React client
@@ -307,6 +319,29 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx := middleware.WithStalwartAccountID(r.Context(), accountID)
 	if urls := p.resolveShardURLs(ctx, tenantID); len(urls) > 0 {
 		ctx = withShardURLs(ctx, urls)
+	}
+	// Pre-delivery scan hook (Phase 8). Only runs on submit
+	// methods (POST / PUT) and only when a hook is wired. The body
+	// is buffered and replaced on the request so the downstream
+	// reverse proxy still streams the same payload to Stalwart.
+	if p.cfg.PreDeliverHook != nil && (r.Method == http.MethodPost || r.Method == http.MethodPut) && r.Body != nil {
+		const maxScanBytes = 32 * 1024 * 1024
+		body, err := io.ReadAll(io.LimitReader(r.Body, maxScanBytes))
+		_ = r.Body.Close()
+		if err != nil {
+			p.logger.Printf("jmap proxy: read body for malware scan: %v", err)
+			http.Error(w, `{"type":"urn:ietf:params:jmap:error:serverFail","title":"read body"}`, http.StatusBadGateway)
+			return
+		}
+		if err := p.cfg.PreDeliverHook(ctx, body); err != nil {
+			p.logger.Printf("jmap proxy: pre-deliver hook rejected tenant=%s err=%v", tenantID, err)
+			w.Header().Set("Content-Type", "application/problem+json")
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			_, _ = w.Write([]byte(`{"type":"urn:ietf:params:jmap:error:rejectedByPolicy","title":"message rejected by malware scanner"}` + "\n"))
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		r.ContentLength = int64(len(body))
 	}
 	p.rp.ServeHTTP(w, r.WithContext(ctx))
 }
