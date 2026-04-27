@@ -178,7 +178,8 @@ func (s *CMKService) ListHSMConfigs(ctx context.Context, tenantID string) ([]HSM
 		}
 		rows, err := tx.Query(ctx, `
 			SELECT id::text, tenant_id::text, provider_type, endpoint, slot_id,
-			       status, last_test_at, last_test_error, created_at, updated_at
+			       status, last_test_at, last_test_error, last_used_at,
+			       created_at, updated_at
 			FROM cmk_hsm_configs
 			WHERE tenant_id = $1::uuid
 			ORDER BY created_at DESC
@@ -190,7 +191,8 @@ func (s *CMKService) ListHSMConfigs(ctx context.Context, tenantID string) ([]HSM
 		for rows.Next() {
 			var c HSMConfig
 			if err := rows.Scan(&c.ID, &c.TenantID, &c.Provider, &c.Endpoint, &c.SlotID,
-				&c.Status, &c.LastTestAt, &c.LastTestError, &c.CreatedAt, &c.UpdatedAt); err != nil {
+				&c.Status, &c.LastTestAt, &c.LastTestError, &c.LastUsedAt,
+				&c.CreatedAt, &c.UpdatedAt); err != nil {
 				return err
 			}
 			out = append(out, c)
@@ -270,13 +272,13 @@ func (s *CMKService) loadHSMConfig(ctx context.Context, tenantID, configID strin
 		return tx.QueryRow(ctx, `
 			SELECT id::text, tenant_id::text, provider_type, endpoint, slot_id,
 			       credentials_encrypted, status, last_test_at, last_test_error,
-			       created_at, updated_at
+			       last_used_at, created_at, updated_at
 			FROM cmk_hsm_configs
 			WHERE id = $1::uuid AND tenant_id = $2::uuid
 		`, configID, tenantID).Scan(
 			&cfg.ID, &cfg.TenantID, &cfg.Provider, &cfg.Endpoint, &cfg.SlotID,
 			&creds, &cfg.Status, &cfg.LastTestAt, &cfg.LastTestError,
-			&cfg.CreatedAt, &cfg.UpdatedAt,
+			&cfg.LastUsedAt, &cfg.CreatedAt, &cfg.UpdatedAt,
 		)
 	})
 	if err != nil {
@@ -318,13 +320,13 @@ func (s *CMKService) TestHSMConnection(ctx context.Context, tenantID, configID s
 		err := tx.QueryRow(ctx, `
 			SELECT id::text, tenant_id::text, provider_type, endpoint, slot_id,
 			       credentials_encrypted, status, last_test_at, last_test_error,
-			       created_at, updated_at
+			       last_used_at, created_at, updated_at
 			FROM cmk_hsm_configs
 			WHERE id = $1::uuid AND tenant_id = $2::uuid
 		`, configID, tenantID).Scan(
 			&out.ID, &out.TenantID, &out.Provider, &out.Endpoint, &out.SlotID,
 			&creds, &out.Status, &out.LastTestAt, &out.LastTestError,
-			&out.CreatedAt, &out.UpdatedAt,
+			&out.LastUsedAt, &out.CreatedAt, &out.UpdatedAt,
 		)
 		if err != nil {
 			return err

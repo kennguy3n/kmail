@@ -320,11 +320,20 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if urls := p.resolveShardURLs(ctx, tenantID); len(urls) > 0 {
 		ctx = withShardURLs(ctx, urls)
 	}
-	// Pre-delivery scan hook (Phase 8). Only runs on submit
-	// methods (POST / PUT) and only when a hook is wired. The body
-	// is buffered and replaced on the request so the downstream
-	// reverse proxy still streams the same payload to Stalwart.
-	if p.cfg.PreDeliverHook != nil && (r.Method == http.MethodPost || r.Method == http.MethodPut) && r.Body != nil {
+	// Pre-delivery scan hook (Phase 8). JMAP (RFC 8620) uses POST
+	// for both reads (`Email/get`, `Mailbox/get`, `Email/query`,
+	// `Thread/get`) and writes; scanning every POST would put a
+	// ClamAV TCP round-trip in front of read-heavy traffic. We
+	// therefore only invoke the hook on the two paths where actual
+	// message content flows:
+	//
+	//   • The blob upload path (typically `/jmap/upload/...`),
+	//     which is how MIME bodies and attachments enter Stalwart.
+	//   • The JMAP request endpoint when the body advertises an
+	//     `Email/set` or `EmailSubmission/set` invocation, which
+	//     are the only methods that submit (or stage for
+	//     submission) a message.
+	if p.cfg.PreDeliverHook != nil && (r.Method == http.MethodPost || r.Method == http.MethodPut) && r.Body != nil && requestCarriesMessageContent(r) {
 		const maxScanBytes = 32 * 1024 * 1024
 		body, err := io.ReadAll(io.LimitReader(r.Body, maxScanBytes))
 		_ = r.Body.Close()
@@ -333,17 +342,69 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"type":"urn:ietf:params:jmap:error:serverFail","title":"read body"}`, http.StatusBadGateway)
 			return
 		}
-		if err := p.cfg.PreDeliverHook(ctx, body); err != nil {
-			p.logger.Printf("jmap proxy: pre-deliver hook rejected tenant=%s err=%v", tenantID, err)
-			w.Header().Set("Content-Type", "application/problem+json")
-			w.WriteHeader(http.StatusUnprocessableEntity)
-			_, _ = w.Write([]byte(`{"type":"urn:ietf:params:jmap:error:rejectedByPolicy","title":"message rejected by malware scanner"}` + "\n"))
-			return
+		if shouldScanBody(r, body) {
+			if err := p.cfg.PreDeliverHook(ctx, body); err != nil {
+				p.logger.Printf("jmap proxy: pre-deliver hook rejected tenant=%s err=%v", tenantID, err)
+				w.Header().Set("Content-Type", "application/problem+json")
+				w.WriteHeader(http.StatusUnprocessableEntity)
+				_, _ = w.Write([]byte(`{"type":"urn:ietf:params:jmap:error:rejectedByPolicy","title":"message rejected by malware scanner"}` + "\n"))
+				return
+			}
 		}
 		r.Body = io.NopCloser(bytes.NewReader(body))
 		r.ContentLength = int64(len(body))
 	}
 	p.rp.ServeHTTP(w, r.WithContext(ctx))
+}
+
+// requestCarriesMessageContent is the cheap path-only filter for
+// the malware pre-delivery hook. Returning false short-circuits
+// the body buffering for read-only JMAP traffic.
+func requestCarriesMessageContent(r *http.Request) bool {
+	p := r.URL.Path
+	// Blob-upload paths always carry MIME / attachment bytes.
+	if strings.Contains(p, "/jmap/upload") || strings.HasSuffix(p, "/upload") {
+		return true
+	}
+	// The JMAP request endpoint itself can carry an Email/set or
+	// EmailSubmission/set invocation; we still buffer there but
+	// `shouldScanBody` decides whether to actually invoke the
+	// scanner based on the JSON-RPC method names. Match either
+	// `/jmap` (or `/jmap/`) at the end of the path, but require
+	// it to be a path component — `/.well-known/jmap` is a
+	// discovery doc, not a method call.
+	if strings.HasSuffix(p, "/jmap") || strings.HasSuffix(p, "/jmap/") {
+		return !strings.Contains(p, "/.well-known/")
+	}
+	return false
+}
+
+// jmapSubmitMethods is the subset of JMAP method names whose
+// invocations stage or submit user-supplied message content.
+// Everything else is a read or metadata mutation we can safely
+// skip.
+var jmapSubmitMethods = []string{
+	`"Email/set"`,
+	`"EmailSubmission/set"`,
+	`"EmailSubmission/create"`,
+}
+
+// shouldScanBody decides whether the buffered body should be
+// passed to the malware scanner. Upload paths always scan; the
+// JMAP request endpoint only scans when its body references one
+// of `jmapSubmitMethods`. The check is a cheap byte-level scan
+// so we avoid a full JSON parse on the hot path.
+func shouldScanBody(r *http.Request, body []byte) bool {
+	p := r.URL.Path
+	if strings.Contains(p, "/jmap/upload") || strings.HasSuffix(p, "/upload") {
+		return true
+	}
+	for _, m := range jmapSubmitMethods {
+		if bytes.Contains(body, []byte(m)) {
+			return true
+		}
+	}
+	return false
 }
 
 // resolveShardURLs returns the ordered candidate Stalwart URLs for
