@@ -81,9 +81,16 @@ type FCMTransport struct {
 	account fcmServiceAccount
 	signKey *rsa.PrivateKey
 
+	// mu guards the cached access token / expiry. It is held
+	// only while reading or writing those two fields — never
+	// during the OAuth2 HTTP round trip.
 	mu          sync.Mutex
 	accessToken string
 	expiresAt   time.Time
+	// refreshMu serialises concurrent token refreshes so only
+	// one OAuth2 call is in flight at a time. Send() callers
+	// that find an unexpired cached token never touch it.
+	refreshMu sync.Mutex
 }
 
 // fcmScope is the OAuth2 scope FCM HTTP v1 requires.
@@ -218,13 +225,29 @@ func (t *FCMTransport) Send(ctx context.Context, sub Subscription, n Notificatio
 
 // accessTokenLocked returns a cached OAuth2 access token, or
 // fetches a fresh one if the cached value is missing / expired.
+//
+// The token cache is guarded by t.mu, which is held only while
+// reading / writing the two cache fields. The OAuth2 HTTP
+// exchange runs OUTSIDE t.mu under a separate t.refreshMu so a
+// slow refresh does not serialise concurrent Send() callers that
+// only need to read an already-valid token. refreshMu also
+// coalesces concurrent refreshes — only one round trip is in
+// flight at a time, even when many goroutines simultaneously
+// observe an expired token.
 func (t *FCMTransport) accessTokenLocked(ctx context.Context) (string, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	now := t.cfg.Now()
-	if t.accessToken != "" && now.Before(t.expiresAt) {
-		return t.accessToken, nil
+	// Fast path: cached token still valid.
+	if tok, ok := t.cachedToken(); ok {
+		return tok, nil
 	}
+	// Slow path: serialise refreshes.
+	t.refreshMu.Lock()
+	defer t.refreshMu.Unlock()
+	// Re-check the cache: another goroutine may have refreshed
+	// while we were waiting for refreshMu.
+	if tok, ok := t.cachedToken(); ok {
+		return tok, nil
+	}
+	now := t.cfg.Now()
 	jwtStr, err := t.signServiceJWT(now)
 	if err != nil {
 		return "", err
@@ -256,14 +279,28 @@ func (t *FCMTransport) accessTokenLocked(ctx context.Context) (string, error) {
 	if tokenResp.AccessToken == "" {
 		return "", errors.New("fcm: empty access_token")
 	}
-	t.accessToken = tokenResp.AccessToken
 	ttl := time.Duration(tokenResp.ExpiresIn) * time.Second
 	if ttl <= 0 {
 		ttl = time.Hour
 	}
 	// Refresh 60s before expiry to absorb clock skew.
+	t.mu.Lock()
+	t.accessToken = tokenResp.AccessToken
 	t.expiresAt = now.Add(ttl - 60*time.Second)
-	return t.accessToken, nil
+	token := t.accessToken
+	t.mu.Unlock()
+	return token, nil
+}
+
+// cachedToken returns the cached access token if it is still
+// valid for the current clock. The caller must NOT hold t.mu.
+func (t *FCMTransport) cachedToken() (string, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.accessToken != "" && t.cfg.Now().Before(t.expiresAt) {
+		return t.accessToken, true
+	}
+	return "", false
 }
 
 // signServiceJWT signs the JWT assertion exchanged at the OAuth2

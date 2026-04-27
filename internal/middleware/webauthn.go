@@ -344,6 +344,16 @@ func (h *WebAuthnHandlers) loginFinish(w http.ResponseWriter, r *http.Request) {
 		writeWebAuthnError(w, http.StatusUnauthorized, "credential not found")
 		return
 	}
+	// Bind the credential to the claimed username before consuming
+	// the challenge: the challenge is keyed off (tenant, username),
+	// so a different user signing it with their own credential could
+	// otherwise burn the victim's challenge slot (a DoS, since the
+	// victim has to re-initiate). Verify ownership first; the
+	// challenge stays in storage so the legitimate user can retry.
+	if cred.UserID != req.Username {
+		writeWebAuthnError(w, http.StatusUnauthorized, "credential does not belong to the claimed user")
+		return
+	}
 	newSignCount, err := verifyAssertionSignature(
 		cred.PublicKey,
 		req.Response.AuthenticatorData,
