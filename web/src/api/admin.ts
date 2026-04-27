@@ -1921,3 +1921,192 @@ export async function revokeAdminProxySession(
     { method: "POST", headers: adminAuthHeaders(tenantId) },
   );
 }
+
+// ─── Phase 7 Production hardening ─────────────────────────────────
+
+export interface SearchBackendConfig {
+  backend: "meilisearch" | "opensearch";
+}
+
+export async function getSearchBackend(tenantId: string): Promise<SearchBackendConfig> {
+  return requestJSON<SearchBackendConfig>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/search/backend`,
+    { method: "GET", headers: adminAuthHeaders(tenantId, { Accept: "application/json" }) },
+  );
+}
+
+export async function setSearchBackend(
+  tenantId: string,
+  backend: SearchBackendConfig["backend"],
+): Promise<SearchBackendConfig> {
+  return requestJSON<SearchBackendConfig>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/search/backend`,
+    {
+      method: "PUT",
+      headers: adminAuthHeaders(tenantId, {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      }),
+      body: JSON.stringify({ backend }),
+    },
+  );
+}
+
+export async function reindexSearch(tenantId: string): Promise<void> {
+  await requestJSON<void>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/search/reindex`,
+    { method: "POST", headers: adminAuthHeaders(tenantId) },
+    { expectJson: false },
+  );
+}
+
+export interface DkimKey {
+  id: string;
+  selector: string;
+  public_key: string;
+  status: "active" | "deprecated" | "revoked";
+  created_at: string;
+  activated_at?: string | null;
+  expires_at?: string | null;
+  revoked_at?: string | null;
+}
+
+export async function listDkimKeys(tenantId: string, domainId: string): Promise<{ keys: DkimKey[] }> {
+  return requestJSON<{ keys: DkimKey[] }>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/domains/${encodeURIComponent(domainId)}/dkim`,
+    { method: "GET", headers: adminAuthHeaders(tenantId, { Accept: "application/json" }) },
+  );
+}
+
+export async function rotateDkimKey(tenantId: string, domainId: string): Promise<DkimKey> {
+  return requestJSON<DkimKey>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/domains/${encodeURIComponent(domainId)}/dkim`,
+    {
+      method: "POST",
+      headers: adminAuthHeaders(tenantId, { Accept: "application/json" }),
+    },
+  );
+}
+
+export interface SieveRule {
+  id: string;
+  tenant_id: string;
+  user_id?: string | null;
+  name: string;
+  script: string;
+  priority: number;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export async function listSieveRules(tenantId: string): Promise<{ rules: SieveRule[] }> {
+  return requestJSON<{ rules: SieveRule[] }>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/sieve-rules`,
+    { method: "GET", headers: adminAuthHeaders(tenantId, { Accept: "application/json" }) },
+  );
+}
+
+export async function createSieveRule(
+  tenantId: string,
+  rule: Omit<SieveRule, "id" | "tenant_id" | "created_at" | "updated_at">,
+): Promise<SieveRule> {
+  return requestJSON<SieveRule>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/sieve-rules`,
+    {
+      method: "POST",
+      headers: adminAuthHeaders(tenantId, {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      }),
+      body: JSON.stringify(rule),
+    },
+  );
+}
+
+export async function updateSieveRule(tenantId: string, rule: SieveRule): Promise<SieveRule> {
+  return requestJSON<SieveRule>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/sieve-rules/${encodeURIComponent(rule.id)}`,
+    {
+      method: "PUT",
+      headers: adminAuthHeaders(tenantId, {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      }),
+      body: JSON.stringify(rule),
+    },
+  );
+}
+
+export async function deleteSieveRule(tenantId: string, ruleId: string): Promise<void> {
+  await requestJSON<void>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/sieve-rules/${encodeURIComponent(ruleId)}`,
+    { method: "DELETE", headers: adminAuthHeaders(tenantId) },
+    { expectJson: false },
+  );
+}
+
+export async function validateSieveScript(
+  tenantId: string,
+  script: string,
+): Promise<{ valid: boolean; error?: string }> {
+  return requestJSON<{ valid: boolean; error?: string }>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/sieve-rules/validate`,
+    {
+      method: "POST",
+      headers: adminAuthHeaders(tenantId, {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      }),
+      body: JSON.stringify({ script }),
+    },
+  );
+}
+
+export async function deploySieveRules(tenantId: string): Promise<void> {
+  await requestJSON<void>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/sieve-rules/deploy`,
+    { method: "POST", headers: adminAuthHeaders(tenantId) },
+    { expectJson: false },
+  );
+}
+
+export interface WebAuthnCredential {
+  id: string;
+  credential_id: string;
+  name: string;
+  created_at: string;
+  last_used_at?: string | null;
+}
+
+export async function listWebAuthnCredentials(): Promise<{ credentials: WebAuthnCredential[] }> {
+  return requestJSON<{ credentials: WebAuthnCredential[] }>(
+    `${ADMIN_API_BASE}/auth/webauthn/credentials`,
+    { method: "GET", headers: adminAuthHeaders(undefined, { Accept: "application/json" }) },
+  );
+}
+
+export async function deleteWebAuthnCredential(id: string): Promise<void> {
+  await requestJSON<void>(
+    `${ADMIN_API_BASE}/auth/webauthn/credentials/${encodeURIComponent(id)}`,
+    { method: "DELETE", headers: adminAuthHeaders() },
+    { expectJson: false },
+  );
+}
+
+export async function openBillingPortal(
+  tenantId: string,
+  returnURL: string,
+): Promise<{ id: string; url: string }> {
+  return requestJSON<{ id: string; url: string }>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/billing/portal`,
+    {
+      method: "POST",
+      headers: adminAuthHeaders(tenantId, {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      }),
+      body: JSON.stringify({ return_url: returnURL }),
+    },
+  );
+}

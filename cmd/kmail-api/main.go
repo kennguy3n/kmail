@@ -41,6 +41,8 @@ import (
 	"github.com/kennguy3n/kmail/internal/push"
 	"github.com/kennguy3n/kmail/internal/retention"
 	"github.com/kennguy3n/kmail/internal/scim"
+	"github.com/kennguy3n/kmail/internal/search"
+	"github.com/kennguy3n/kmail/internal/sieve"
 	"github.com/kennguy3n/kmail/internal/sharedinbox"
 	"github.com/kennguy3n/kmail/internal/tenant"
 	"github.com/kennguy3n/kmail/internal/vault"
@@ -246,12 +248,67 @@ func main() {
 	deliverabilityHandlers.RegisterPhase3(mux, authMW)
 
 	// Push notifications (web / iOS / Android fan-out).
+	pushTransport := buildPushTransport(logger)
 	pushSvc := push.NewService(push.Config{
 		Pool:        pool,
 		StalwartURL: cfg.StalwartURL,
 		Logger:      logger,
+		Transport:   pushTransport,
 	})
 	push.NewHandlers(pushSvc, logger).Register(mux, authMW)
+
+	// DKIM rotation surface (Phase 7). Lives next to the DNS
+	// wizard so the wizard UI can show "rotation pending" rows
+	// when an admin has rolled a new selector but DNS hasn't
+	// caught up yet.
+	dkimSvc := dns.NewDKIMRotationService(pool, logger)
+	dns.NewDKIMHandlers(dkimSvc, logger).Register(mux, authMW)
+
+	// Search backend abstraction (Phase 7). Meilisearch is the
+	// default; OpenSearch is opt-in per-tenant via the admin
+	// surface. The backend registry only contains the backends
+	// configured via env so dev compose stays lean.
+	var searchBackends []search.SearchBackend
+	if url := os.Getenv("KMAIL_MEILISEARCH_URL"); url != "" {
+		searchBackends = append(searchBackends, &search.MeilisearchBackend{
+			BaseURL: url,
+			APIKey:  os.Getenv("KMAIL_MEILISEARCH_API_KEY"),
+		})
+	}
+	if url := os.Getenv("KMAIL_OPENSEARCH_URL"); url != "" {
+		searchBackends = append(searchBackends, &search.OpenSearchBackend{
+			BaseURL:  url,
+			Username: os.Getenv("KMAIL_OPENSEARCH_USER"),
+			Password: os.Getenv("KMAIL_OPENSEARCH_PASS"),
+		})
+	}
+	searchSvc := search.NewService(search.Config{
+		Pool:     pool,
+		Logger:   logger,
+		Backends: searchBackends,
+	})
+	search.NewHandlers(searchSvc, logger).Register(mux, authMW)
+
+	// Sieve rule management (Phase 7).
+	sieveSvc := sieve.NewService(sieve.Config{Pool: pool, Logger: logger})
+	sieve.NewHandlers(sieveSvc, logger).Register(mux, authMW)
+
+	// Stripe billing portal (Phase 7). The portal endpoint is a
+	// no-op in dev (when KMAIL_STRIPE_SECRET_KEY is unset) — the
+	// handler returns 503 with `ErrStripeUnconfigured` so the UI
+	// can fall through to the existing stub-mode billing surface.
+	stripeClient := billing.NewStripeClient(os.Getenv("KMAIL_STRIPE_SECRET_KEY"))
+	billing.NewPortalHandlers(pool, stripeClient, logger).Register(mux, authMW)
+
+	// WebAuthn / FIDO2 surface (Phase 7).
+	webauthnHandlers := middleware.NewWebAuthnHandlers(middleware.WebAuthnConfig{
+		Pool:     pool,
+		Logger:   logger,
+		RPID:     os.Getenv("KMAIL_WEBAUTHN_RPID"),
+		RPName:   "KMail",
+		RPOrigin: os.Getenv("KMAIL_WEBAUTHN_ORIGIN"),
+	})
+	webauthnHandlers.Register(mux, authMW)
 
 	// Shared-inbox workflow state machine.
 	sharedInboxWorkflow := sharedinbox.NewService(pool, logger)
@@ -535,4 +592,40 @@ func getenvDuration(key string, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	return d
+}
+
+// buildPushTransport assembles the per-platform push transports
+// (APNs / FCM / web) from env vars and wires them through a
+// TransportRouter. Missing credentials downgrade to the no-op
+// logging transport, which is what we want in dev.
+func buildPushTransport(logger *log.Logger) push.Transport {
+	router := push.NewTransportRouter(logger)
+	if keyID := os.Getenv("KMAIL_APNS_KEY_ID"); keyID != "" {
+		apns, err := push.NewAPNsTransport(push.APNsConfig{
+			KeyID:    keyID,
+			TeamID:   os.Getenv("KMAIL_APNS_TEAM_ID"),
+			KeyPath:  os.Getenv("KMAIL_APNS_KEY_PATH"),
+			Topic:    os.Getenv("KMAIL_APNS_TOPIC"),
+			Endpoint: os.Getenv("KMAIL_APNS_ENDPOINT"),
+			Logger:   logger,
+		})
+		if err != nil {
+			logger.Printf("apns transport disabled: %v", err)
+		} else {
+			router.IOS = apns
+		}
+	}
+	if path := os.Getenv("KMAIL_FCM_CREDENTIALS_PATH"); path != "" {
+		fcm, err := push.NewFCMTransport(push.FCMConfig{
+			CredentialsPath: path,
+			Endpoint:        os.Getenv("KMAIL_FCM_ENDPOINT"),
+			Logger:          logger,
+		})
+		if err != nil {
+			logger.Printf("fcm transport disabled: %v", err)
+		} else {
+			router.Android = fcm
+		}
+	}
+	return router
 }

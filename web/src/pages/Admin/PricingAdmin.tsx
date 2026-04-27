@@ -4,6 +4,7 @@ import {
   AdminApiError,
   changePlan,
   getBillingSummary,
+  openBillingPortal,
   PLAN_CATALOG,
   type BillingPlan,
   type BillingSummary,
@@ -107,6 +108,32 @@ export default function PricingAdmin() {
 
       {error && <p className="kmail-error">{error}</p>}
       {info && <p className="kmail-info">{info}</p>}
+
+      {selectedTenantId && (
+        <p className="kmail-actions">
+          <button
+            type="button"
+            onClick={async () => {
+              if (!selectedTenantId) return;
+              try {
+                const session = await openBillingPortal(
+                  selectedTenantId,
+                  window.location.href,
+                );
+                window.location.href = session.url;
+              } catch (e: unknown) {
+                if (e instanceof AdminApiError && e.status === 503) {
+                  setInfo("Billing portal not configured (KMAIL_STRIPE_SECRET_KEY missing).");
+                } else {
+                  setError(String(e));
+                }
+              }
+            }}
+          >
+            Manage subscription
+          </button>
+        </p>
+      )}
 
       {summary && (
         <p className="kmail-pricing-summary">

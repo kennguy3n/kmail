@@ -295,6 +295,46 @@ services:
       - "--storage.tsdb.retention.time=15d"
     restart: unless-stopped
 
+  # Loki + Promtail are gated behind the `loki` compose profile
+  # so a vanilla `docker compose up` (which is what the e2e
+  # harness, the developer onboarding doc, and CI all use) keeps
+  # working without the extra services. Operators that want the
+  # log-shipping stack invoke `docker compose --profile loki up`.
+  # Promtail tails the kmail-api JSON request log and ships it to
+  # Loki; the Grafana datasource at
+  # `deploy/grafana/datasources.yml` wires both Loki and
+  # Prometheus into a freshly provisioned Grafana image.
+  loki:
+    image: grafana/loki:3.0.0
+    profiles: ["loki"]
+    container_name: kmail-loki
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./deploy/loki/loki.yml:/etc/loki/local-config.yaml:ro
+      - loki_data:/tmp/loki
+    command:
+      - "-config.file=/etc/loki/local-config.yaml"
+    restart: unless-stopped
+
+  promtail:
+    image: grafana/promtail:3.0.0
+    profiles: ["loki"]
+    container_name: kmail-promtail
+    depends_on:
+      loki:
+        condition: service_started
+    environment:
+      LOKI_URL: http://loki:3100/loki/api/v1/push
+      KMAIL_ENV: dev
+    volumes:
+      - ./deploy/promtail/promtail.yml:/etc/promtail/promtail.yml:ro
+      - /var/lib/docker/containers:/var/log/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    command:
+      - "-config.file=/etc/promtail/promtail.yml"
+    restart: unless-stopped
+
 volumes:
   postgres_data:
   meilisearch_data:
@@ -302,3 +342,4 @@ volumes:
   zk_data:
   stalwart_data:
   prometheus_data:
+  loki_data:

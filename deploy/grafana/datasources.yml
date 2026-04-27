@@ -1,0 +1,25 @@
+# KMail — Grafana datasource provisioning.
+#
+# Wires the Loki and Prometheus instances created by the compose
+# stack as default datasources so a fresh Grafana image picks them
+# up automatically (mount this file at
+# `/etc/grafana/provisioning/datasources/datasources.yml`).
+
+apiVersion: 1
+
+datasources:
+  - name: Loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    jsonData:
+      maxLines: 5000
+    isDefault: true
+    editable: false
+
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: false
+    editable: false

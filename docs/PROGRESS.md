@@ -4,6 +4,45 @@
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
 - **Status**: Phase 1 — Foundation (in progress); Phase 2 —
   Prototype (in progress); Phase 3 — Private Beta (in progress)
+- **Last updated**: 2026-04-27 (Phase 7, batch 1) — Phase 7
+  production-hardening ten-task batch flips Phase 7 from `PLANNED`
+  to `IN PROGRESS`. Ships real APNs / FCM push transports with a
+  TransportRouter that dispatches by `push_subscriptions.platform`
+  (`internal/push/{apns,fcm,router,transport_test}.go`,
+  `KMAIL_APNS_KEY_ID` / `KMAIL_APNS_TEAM_ID` /
+  `KMAIL_APNS_KEY_PATH` / `KMAIL_FCM_CREDENTIALS_PATH`); a
+  Stalwart v0 ↔ v1 compatibility shim
+  (`internal/jmap/compat.go`, `scripts/stalwart-init-v1.sh`,
+  `scripts/test-stalwart-upgrade.sh`, `docs/STALWART_UPGRADE.md`);
+  per-tenant search backend abstraction
+  (`internal/search/{service,meilisearch,opensearch,handlers}.go`,
+  `migrations/039_search_backend.sql`, `SearchAdmin.tsx`); Loki +
+  Promtail log shipping behind a compose profile
+  (`internal/middleware/loki.go`, `deploy/loki/loki.yml`,
+  `deploy/promtail/promtail.yml`, `deploy/grafana/datasources.yml`,
+  `docker compose --profile loki up`,
+  `docs/DEVELOPMENT.md` Loki section); DKIM key rotation
+  automation (`internal/dns/{dkim_rotation,dkim_handlers}.go`,
+  `migrations/040_dkim_keys.sql`, `DkimAdmin.tsx`); Helm chart for
+  the kmail-api Deployment + Stalwart StatefulSet
+  (`deploy/helm/kmail/{Chart,values,templates}.yaml`,
+  `deploy/helm/README.md`, `make helm-lint`); Stripe REST client
+  + dunning service + customer portal endpoint
+  (`internal/billing/{stripe,dunning,portal_handler}.go`,
+  `billing_dunning_events` table in migration 040, "Manage
+  subscription" button on `PricingAdmin.tsx`); WebAuthn / FIDO2
+  credential management (`internal/middleware/{webauthn,
+  webauthn_store}.go`, `migrations/041_webauthn_credentials.sql`,
+  `SecuritySettings.tsx`); per-tenant Sieve rule management
+  (`internal/sieve/{service,handlers}.go`,
+  `migrations/042_sieve_rules.sql`, `SieveAdmin.tsx`); load
+  testing + chaos harness (`scripts/loadtest/load-jmap.go`,
+  `load-smtp.sh`, `chaos-shard.sh`, `chaos-postgres.sh`,
+  `chaos-valkey.sh`, `make loadtest` / `make chaos`,
+  `docs/LOADTEST.md`). New migrations 039–042. Phase 6 status
+  remains `IN PROGRESS` — the two deferred items (Exchange
+  interop research, BIMI VMC) stay open per the do-not-do list.
+
 - **Last updated**: 2026-04-26 (Phase 6, batch 1) — Phase 6
   enterprise-readiness ten-task batch flips Phase 6 from `PLANNED`
   to `IN PROGRESS`. Ships the SCIM 2.0 conformance harness
@@ -1712,6 +1751,65 @@ Checklist:
       bar, step links, skip and reset-checklist confirmations).
       _(Phase 6, batch 1: see `web/src/pages/Admin/{ScimAdmin,
       WebhookAdmin,OnboardingChecklist}.tsx`.)_
+
+---
+
+## Phase 7 — Production Hardening
+
+**Status**: `IN PROGRESS` — opened 2026-04-27 with the ten-task
+production-hardening batch (see the **Last updated** entry at the
+top of this file). All ten checklist items below ship in this
+batch.
+
+Checklist:
+
+- [x] Real APNs / FCM push transports with platform-aware
+      `TransportRouter` (web → web push, ios → APNs HTTP/2,
+      android → FCM HTTP v1) and dev fall-through to the
+      `loggingTransport` when credentials are absent.
+- [x] Stalwart v0 ↔ v1 compatibility shim with version detection
+      and adapter pattern, parallel `scripts/stalwart-init-v1.sh`,
+      `scripts/test-stalwart-upgrade.sh` upgrade harness, and
+      `docs/STALWART_UPGRADE.md` runbook.
+- [x] OpenSearch migration path: per-tenant `search_backend`
+      column (migration 039), `SearchBackend` interface with
+      Meilisearch and OpenSearch implementations, admin GET / PUT
+      endpoints, and `SearchAdmin.tsx` selector + reindex
+      trigger.
+- [x] Loki + Promtail log shipping behind a `loki` compose
+      profile, JSON request log enrichment in
+      `internal/middleware/loki.go`, Grafana datasource
+      provisioning, and `docs/DEVELOPMENT.md` Loki section.
+- [x] DKIM key rotation automation: `dkim_keys` table (migration
+      040), `DKIMRotationService` with generate / rotate / list /
+      revoke, REST endpoints, and `DkimAdmin.tsx` history view +
+      manual rotate button.
+- [x] Kubernetes Helm chart for the kmail-api Deployment + Service
+      + Ingress + ConfigMap + Secret + HPA + PodDisruptionBudget,
+      plus a Stalwart StatefulSet with stable per-pod hostnames.
+      `make helm-lint` target wired.
+- [x] Stripe billing integration completion: REST `StripeClient`
+      with create / cancel / update / portal session, dunning
+      service that suspends after three failures inside 30 days
+      (`billing_dunning_events` table folded into migration 040),
+      and a "Manage subscription" button on `PricingAdmin.tsx`.
+      Gated behind `KMAIL_STRIPE_SECRET_KEY` so dev keeps working.
+- [x] WebAuthn / FIDO2 credential management: registration +
+      authentication flows, `webauthn_credentials` table
+      (migration 041), and `SecuritySettings.tsx` showing
+      registered keys with add / remove actions.
+- [x] Per-tenant Sieve rule management: `sieve_rules` table
+      (migration 042) with RLS, `SieveService` CRUD + validate +
+      deploy, and `SieveAdmin.tsx` editor with validate button
+      and deploy toggle.
+- [x] Load testing and chaos engineering harness:
+      `scripts/loadtest/load-jmap.go` (configurable concurrency +
+      ramp-up / steady / cool-down phases),
+      `scripts/loadtest/load-smtp.sh` (sustained TPS),
+      `chaos-shard.sh` / `chaos-postgres.sh` /
+      `chaos-valkey.sh`, `make loadtest` and `make chaos`
+      targets, and `docs/LOADTEST.md` documenting baselines and
+      interpretation.
 
 ---
 

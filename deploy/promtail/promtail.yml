@@ -1,0 +1,52 @@
+# KMail — Promtail configuration.
+#
+# Promtail tails the BFF's structured-JSON log (one record per
+# request, emitted by `internal/middleware/logger.go` when
+# `KMAIL_LOG_FORMAT=json`) and ships the records to Loki. The
+# pipeline lifts a small set of low-cardinality labels out of the
+# JSON body so Loki streams stay manageable.
+#
+# In the compose stack Promtail runs alongside Loki; in production
+# Promtail is intended to run as a sidecar / DaemonSet next to the
+# kmail-api Deployment defined in `deploy/helm/kmail/`.
+
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+
+positions:
+  filename: /tmp/promtail-positions.yaml
+
+clients:
+  - url: ${LOKI_URL:-http://loki:3100/loki/api/v1/push}
+
+scrape_configs:
+  # Container-stdout scraping. Compose mounts /var/lib/docker/containers
+  # so Promtail can tail every kmail-* service. The labels limit
+  # high cardinality: tenant_id and route come from the structured
+  # JSON, status_class comes from the same line. user_id and
+  # trace_id are kept on the line but NOT lifted into labels —
+  # they're queryable through Loki's JSON parser instead.
+  - job_name: kmail-bff
+    static_configs:
+      - targets: [localhost]
+        labels:
+          job: kmail-api
+          env: ${KMAIL_ENV:-dev}
+          __path__: /var/log/containers/kmail-*.log
+    pipeline_stages:
+      - cri: {}
+      - json:
+          expressions:
+            tenant_id: tenant_id
+            route: route
+            status_class: status_class
+            method: method
+      - labels:
+          tenant_id:
+          route:
+          status_class:
+          method:
+      - timestamp:
+          source: ts
+          format: RFC3339Nano

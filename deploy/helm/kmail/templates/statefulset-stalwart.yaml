@@ -1,0 +1,71 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.stalwart.service.headlessName }}
+  labels:
+    {{- include "kmail.labels" . | nindent 4 }}
+    app.kubernetes.io/component: stalwart
+spec:
+  clusterIP: None
+  selector:
+    {{- include "kmail.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: stalwart
+  ports:
+    - name: jmap
+      port: 8080
+    - name: smtp
+      port: 25
+    - name: imap
+      port: 143
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "kmail.fullname" . }}-stalwart
+  labels:
+    {{- include "kmail.labels" . | nindent 4 }}
+    app.kubernetes.io/component: stalwart
+spec:
+  serviceName: {{ .Values.stalwart.service.headlessName }}
+  replicas: {{ .Values.stalwart.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "kmail.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: stalwart
+  template:
+    metadata:
+      labels:
+        {{- include "kmail.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: stalwart
+    spec:
+      # `subdomain` pairs with the headless service name above so
+      # each pod gets a stable DNS entry of the form
+      # <pod-name>.<service>.<namespace>.svc.cluster.local. The
+      # BFF resolves a tenant's primary shard to that hostname.
+      subdomain: {{ .Values.stalwart.service.headlessName }}
+      containers:
+        - name: stalwart
+          image: "{{ .Values.stalwart.image.repository }}:{{ .Values.stalwart.image.tag }}"
+          ports:
+            - name: jmap
+              containerPort: 8080
+            - name: smtp
+              containerPort: 25
+            - name: imap
+              containerPort: 143
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            {{- toYaml .Values.stalwart.resources | nindent 12 }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.stalwart.storage.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.stalwart.storage.size }}

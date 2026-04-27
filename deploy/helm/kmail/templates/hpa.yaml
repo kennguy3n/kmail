@@ -1,0 +1,22 @@
+{{- if .Values.kmailApi.hpa.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "kmail.fullname" . }}-api
+  labels:
+    {{- include "kmail.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "kmail.fullname" . }}-api
+  minReplicas: {{ .Values.kmailApi.hpa.minReplicas }}
+  maxReplicas: {{ .Values.kmailApi.hpa.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.kmailApi.hpa.targetCPUUtilizationPercentage }}
+{{- end }}
