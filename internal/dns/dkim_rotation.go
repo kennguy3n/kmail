@@ -41,6 +41,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/kennguy3n/kmail/internal/cmk"
 	"github.com/kennguy3n/kmail/internal/middleware"
 )
 
@@ -101,6 +102,11 @@ type DKIMRotationService struct {
 	// touches the local database (the operator publishes the new
 	// selector manually).
 	Pusher StalwartDKIMPusher
+	// envelope wraps the private key before INSERT and unwraps
+	// it before handing back to Pusher / external callers. When
+	// nil, the service writes plaintext PEM (dev only) and logs
+	// a warning at rotate time.
+	envelope cmk.SecretsEnvelope
 }
 
 // StalwartDKIMPusher is the slice of Stalwart's JMAP admin API
@@ -121,6 +127,14 @@ func NewDKIMRotationService(pool *pgxpool.Pool, logger *log.Logger) *DKIMRotatio
 // WithPusher attaches a Stalwart JMAP admin pusher.
 func (s *DKIMRotationService) WithPusher(p StalwartDKIMPusher) *DKIMRotationService {
 	s.Pusher = p
+	return s
+}
+
+// WithEnvelope attaches the kmail-secrets AEAD envelope used to
+// wrap private keys at rest. Production callers MUST inject one;
+// without it, the service logs a loud warning and stores raw PEM.
+func (s *DKIMRotationService) WithEnvelope(env cmk.SecretsEnvelope) *DKIMRotationService {
+	s.envelope = env
 	return s
 }
 
@@ -203,6 +217,10 @@ func (s *DKIMRotationService) RotateKey(ctx context.Context, tenantID, domainID 
 	if err != nil {
 		return DKIMKey{}, err
 	}
+	wrappedPriv, err := s.wrapPrivateKey(pair.PrivateKey)
+	if err != nil {
+		return DKIMKey{}, fmt.Errorf("wrap private key: %w", err)
+	}
 	var domainName string
 	var newKey DKIMKey
 	if s.pool != nil {
@@ -229,7 +247,7 @@ func (s *DKIMRotationService) RotateKey(ctx context.Context, tenantID, domainID 
 					$1::uuid, $2::uuid, $3, $4, $5::bytea, 'active', now()
 				)
 				RETURNING id::text, created_at, activated_at`,
-				tenantID, domainID, pair.Selector, pair.PublicKey, []byte(pair.PrivateKey))
+				tenantID, domainID, pair.Selector, pair.PublicKey, wrappedPriv)
 			return row.Scan(&newKey.ID, &newKey.CreatedAt, &newKey.ActivatedAt)
 		})
 		if err != nil {
@@ -303,4 +321,51 @@ func (s *DKIMRotationService) PendingRotation(ctx context.Context, tenantID, dom
 		return &PendingRotation{Selector: "kmail", Record: defaultRecord}, nil
 	}
 	return nil, errors.New("no rotations pending")
+}
+
+// wrapPrivateKey runs the configured envelope over the raw PEM
+// bytes. When no envelope is configured, it logs a loud warning
+// and returns the plaintext — production callers MUST inject
+// `WithEnvelope(...)` to avoid the warning.
+func (s *DKIMRotationService) wrapPrivateKey(privPEM string) ([]byte, error) {
+	if s.envelope == nil {
+		s.logger.Printf("dkim: WARNING: no SecretsEnvelope configured; storing PRIVATE KEY as plaintext (set KMAIL_SECRETS_KEY)")
+		return []byte(privPEM), nil
+	}
+	return s.envelope.Wrap([]byte(privPEM))
+}
+
+// LoadPrivateKey fetches the encrypted private key for a given
+// (tenant, domain, keyID) and unwraps it through the configured
+// envelope. Used by callers that need to push the key out of
+// band (e.g. backfill against a fresh Stalwart instance).
+func (s *DKIMRotationService) LoadPrivateKey(ctx context.Context, tenantID, domainID, keyID string) (string, error) {
+	if tenantID == "" || domainID == "" || keyID == "" {
+		return "", fmt.Errorf("%w: tenantID, domainID, keyID required", ErrInvalidInput)
+	}
+	if s.pool == nil {
+		return "", errors.New("dkim: pool not configured")
+	}
+	var blob []byte
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `
+			SELECT private_key_encrypted
+			  FROM dkim_keys
+			 WHERE tenant_id = $1::uuid AND domain_id = $2::uuid AND id = $3::uuid`,
+			tenantID, domainID, keyID).Scan(&blob)
+	})
+	if err != nil {
+		return "", err
+	}
+	if s.envelope == nil {
+		return string(blob), nil
+	}
+	pt, _, err := s.envelope.Unwrap(blob)
+	if err != nil {
+		return "", err
+	}
+	return string(pt), nil
 }

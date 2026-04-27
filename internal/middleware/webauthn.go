@@ -40,12 +40,21 @@ package middleware
 
 import (
 	"context"
+	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/subtle"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"log"
+	"math/big"
 	"net/http"
 	"time"
 
@@ -325,7 +334,8 @@ func (h *WebAuthnHandlers) loginFinish(w http.ResponseWriter, r *http.Request) {
 		writeWebAuthnError(w, http.StatusBadRequest, "challenge expired")
 		return
 	}
-	if err := verifyClientDataChallenge(req.Response.ClientDataJSON, challenge); err != nil {
+	clientDataRaw, err := verifyClientDataAssertion(req.Response.ClientDataJSON, challenge, h.cfg.RPOrigin)
+	if err != nil {
 		writeWebAuthnError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -334,15 +344,39 @@ func (h *WebAuthnHandlers) loginFinish(w http.ResponseWriter, r *http.Request) {
 		writeWebAuthnError(w, http.StatusUnauthorized, "credential not found")
 		return
 	}
-	if err := h.store.BumpSignCount(r.Context(), req.TenantID, req.RawID, h.cfg.Now()); err != nil {
-		h.cfg.Logger.Printf("webauthn: bump sign_count: %v", err)
+	newSignCount, err := verifyAssertionSignature(
+		cred.PublicKey,
+		req.Response.AuthenticatorData,
+		req.Response.Signature,
+		clientDataRaw,
+		h.cfg.RPID,
+		false, // requireUV — UV is "preferred" in loginBegin; opt-in callers can flip this.
+	)
+	if err != nil {
+		h.cfg.Logger.Printf("webauthn: assertion verify: %v", err)
+		writeWebAuthnError(w, http.StatusUnauthorized, "assertion verification failed")
+		return
+	}
+	// Cloned-key detection: per WebAuthn §7.2 step 21, if either
+	// the new sign count or the stored count is non-zero, the new
+	// count MUST be greater than the stored count. Authenticators
+	// that always emit zero (allowed by the spec) skip this check.
+	if newSignCount != 0 || cred.SignCount != 0 {
+		if int64(newSignCount) <= cred.SignCount {
+			writeWebAuthnError(w, http.StatusUnauthorized, "signCount did not increase — possible cloned authenticator")
+			return
+		}
+	}
+	if err := h.store.SetSignCount(r.Context(), req.TenantID, req.RawID, int64(newSignCount), h.cfg.Now()); err != nil {
+		h.cfg.Logger.Printf("webauthn: set sign_count: %v", err)
 	}
 	_ = h.cfg.Challenger.DeleteChallenge(r.Context(), "login:"+req.Username)
 	writeWebAuthnJSON(w, http.StatusOK, map[string]any{
-		"ok":       true,
-		"user_id":  cred.UserID,
-		"cred_id":  cred.CredentialID,
-		"verified": true,
+		"ok":         true,
+		"user_id":    cred.UserID,
+		"cred_id":    cred.CredentialID,
+		"sign_count": newSignCount,
+		"verified":   true,
 	})
 }
 
@@ -388,48 +422,158 @@ func mintChallenge() []byte {
 }
 
 // verifyClientDataChallenge confirms the browser-supplied client
-// data echoes the challenge we minted. The full WebAuthn spec
-// also checks `origin` and `type`; we intentionally keep the
-// signature surface narrow here and rely on the higher-level
-// session check (the registration flow runs inside an
-// OIDC-authenticated request).
+// data echoes the challenge we minted. The registration flow runs
+// inside an OIDC-authenticated request, so we keep the type/origin
+// checks soft there; the assertion (login) flow calls
+// verifyClientDataAssertion below, which enforces type=="webauthn.get"
+// and origin matching the configured RPOrigin.
 func verifyClientDataChallenge(clientDataB64 string, expected []byte) error {
+	_, err := decodeClientData(clientDataB64, expected, "", "")
+	return err
+}
+
+// verifyClientDataAssertion is the assertion-side counterpart that
+// also enforces the spec-mandated type and origin checks.
+func verifyClientDataAssertion(clientDataB64 string, expected []byte, allowedOrigin string) ([]byte, error) {
+	return decodeClientData(clientDataB64, expected, "webauthn.get", allowedOrigin)
+}
+
+// decodeClientData is the shared parser used by both the
+// registration and assertion paths. It returns the raw
+// clientDataJSON bytes (used to compute clientDataHash on the
+// assertion path) once all checks pass.
+func decodeClientData(clientDataB64 string, expected []byte, expectedType, allowedOrigin string) ([]byte, error) {
 	raw, err := base64.RawURLEncoding.DecodeString(clientDataB64)
 	if err != nil {
 		// Some browsers emit standard base64 padding; accept
 		// either encoding.
 		raw, err = base64.StdEncoding.DecodeString(clientDataB64)
 		if err != nil {
-			return fmt.Errorf("clientDataJSON: %w", err)
+			return nil, fmt.Errorf("clientDataJSON: %w", err)
 		}
 	}
 	var cd struct {
 		Type      string `json:"type"`
 		Challenge string `json:"challenge"`
+		Origin    string `json:"origin"`
 	}
 	if err := json.Unmarshal(raw, &cd); err != nil {
-		return fmt.Errorf("clientDataJSON: %w", err)
+		return nil, fmt.Errorf("clientDataJSON: %w", err)
+	}
+	if expectedType != "" && cd.Type != expectedType {
+		return nil, fmt.Errorf("clientDataJSON.type: expected %q, got %q", expectedType, cd.Type)
+	}
+	if allowedOrigin != "" && cd.Origin != allowedOrigin {
+		return nil, fmt.Errorf("clientDataJSON.origin: not allowed")
 	}
 	got, err := base64.RawURLEncoding.DecodeString(cd.Challenge)
 	if err != nil {
-		return fmt.Errorf("clientDataJSON.challenge: %w", err)
+		return nil, fmt.Errorf("clientDataJSON.challenge: %w", err)
 	}
-	if !bytesEqual(got, expected) {
-		return errors.New("challenge mismatch")
+	if subtle.ConstantTimeCompare(got, expected) != 1 {
+		return nil, errors.New("challenge mismatch")
 	}
-	return nil
+	return raw, nil
 }
 
-func bytesEqual(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
+// verifyAssertionSignature validates a WebAuthn assertion against
+// the credential public key stored at registration time. The stored
+// PublicKey is expected to be a base64-encoded SubjectPublicKeyInfo
+// (matching what `PublicKeyCredential.response.getPublicKey()`
+// returns in modern browsers). We support ES256 (P-256 ECDSA) and
+// RS256 (RSA-PKCS1v15-SHA256). The function also enforces the
+// authenticatorData rpIdHash, the User Present flag, and (when the
+// caller passes requireUV) the User Verified flag, and parses the
+// embedded signCount which the caller must check for monotonic
+// increase to detect cloned authenticators.
+func verifyAssertionSignature(publicKeyB64, authenticatorDataB64, signatureB64 string, clientDataJSONRaw []byte, rpID string, requireUV bool) (signCount uint32, err error) {
+	pubKeyDER, err := decodeBase64Loose(publicKeyB64)
+	if err != nil {
+		return 0, fmt.Errorf("publicKey: %w", err)
 	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
+	pub, err := x509.ParsePKIXPublicKey(pubKeyDER)
+	if err != nil {
+		// Fall back to PEM-encoded SPKI for tests/dev tooling.
+		if block, _ := pem.Decode(pubKeyDER); block != nil {
+			pub, err = x509.ParsePKIXPublicKey(block.Bytes)
+		}
+		if err != nil {
+			return 0, fmt.Errorf("parse public key: %w", err)
 		}
 	}
-	return true
+	authData, err := decodeBase64Loose(authenticatorDataB64)
+	if err != nil {
+		return 0, fmt.Errorf("authenticatorData: %w", err)
+	}
+	if len(authData) < 37 {
+		return 0, errors.New("authenticatorData too short")
+	}
+	rpIDHash := sha256.Sum256([]byte(rpID))
+	if subtle.ConstantTimeCompare(authData[:32], rpIDHash[:]) != 1 {
+		return 0, errors.New("rpIdHash mismatch")
+	}
+	flags := authData[32]
+	const (
+		flagUP = 0x01
+		flagUV = 0x04
+	)
+	if flags&flagUP == 0 {
+		return 0, errors.New("user-present flag not set")
+	}
+	if requireUV && flags&flagUV == 0 {
+		return 0, errors.New("user-verified flag required but not set")
+	}
+	signCount = uint32(authData[33])<<24 | uint32(authData[34])<<16 | uint32(authData[35])<<8 | uint32(authData[36])
+
+	sig, err := decodeBase64Loose(signatureB64)
+	if err != nil {
+		return 0, fmt.Errorf("signature: %w", err)
+	}
+	clientDataHash := sha256.Sum256(clientDataJSONRaw)
+	signed := append([]byte{}, authData...)
+	signed = append(signed, clientDataHash[:]...)
+
+	switch k := pub.(type) {
+	case *ecdsa.PublicKey:
+		if k.Curve != elliptic.P256() {
+			return 0, fmt.Errorf("unsupported ECDSA curve %s", k.Curve.Params().Name)
+		}
+		digest := sha256.Sum256(signed)
+		if !ecdsa.VerifyASN1(k, digest[:], sig) {
+			// Some authenticators emit raw r||s instead of ASN.1.
+			if len(sig) == 64 {
+				r := new(big.Int).SetBytes(sig[:32])
+				s := new(big.Int).SetBytes(sig[32:])
+				if !ecdsa.Verify(k, digest[:], r, s) {
+					return 0, errors.New("ecdsa signature invalid")
+				}
+			} else {
+				return 0, errors.New("ecdsa signature invalid")
+			}
+		}
+	case *rsa.PublicKey:
+		digest := sha256.Sum256(signed)
+		if err := rsa.VerifyPKCS1v15(k, crypto.SHA256, digest[:], sig); err != nil {
+			return 0, fmt.Errorf("rsa signature invalid: %w", err)
+		}
+	default:
+		return 0, fmt.Errorf("unsupported public key type %T", pub)
+	}
+	return signCount, nil
+}
+
+// decodeBase64Loose accepts both raw URL and standard base64.
+func decodeBase64Loose(s string) ([]byte, error) {
+	if b, err := base64.RawURLEncoding.DecodeString(s); err == nil {
+		return b, nil
+	}
+	if b, err := base64.URLEncoding.DecodeString(s); err == nil {
+		return b, nil
+	}
+	if b, err := base64.RawStdEncoding.DecodeString(s); err == nil {
+		return b, nil
+	}
+	return base64.StdEncoding.DecodeString(s)
 }
 
 func orDefault(s, fallback string) string {

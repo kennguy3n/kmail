@@ -148,6 +148,30 @@ func (s *WebAuthnStore) BumpSignCount(ctx context.Context, tenantID, credentialI
 	})
 }
 
+// SetSignCount writes the authenticator-supplied counter directly,
+// only if the new value is strictly greater than the stored value
+// (defence-in-depth against TOCTOU on the handler-side check). The
+// caller is responsible for the broader cloned-authenticator
+// rejection.
+func (s *WebAuthnStore) SetSignCount(ctx context.Context, tenantID, credentialID string, value int64, when time.Time) error {
+	if s.pool == nil {
+		return nil
+	}
+	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := SetTenantGUC(ctx, tx, tenantID); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `
+			UPDATE webauthn_credentials
+			   SET sign_count = $3,
+			       last_used_at = $4
+			 WHERE tenant_id = $1::uuid AND credential_id = $2
+			   AND ($3 > sign_count OR ($3 = 0 AND sign_count = 0))`,
+			tenantID, credentialID, value, when)
+		return err
+	})
+}
+
 // Delete removes a credential by id, scoped to (tenant, user).
 func (s *WebAuthnStore) Delete(ctx context.Context, tenantID, userID, id string) error {
 	if s.pool == nil {

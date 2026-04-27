@@ -260,8 +260,16 @@ func main() {
 	// DKIM rotation surface (Phase 7). Lives next to the DNS
 	// wizard so the wizard UI can show "rotation pending" rows
 	// when an admin has rolled a new selector but DNS hasn't
-	// caught up yet.
+	// caught up yet. The kmail-secrets envelope wraps freshly
+	// generated private keys before they hit dkim_keys; in dev
+	// (no KMAIL_SECRETS_KEY) the service logs a loud warning and
+	// stores plaintext PEM.
 	dkimSvc := dns.NewDKIMRotationService(pool, logger)
+	if env, err := cmk.LoadEnvelope(); err == nil {
+		dkimSvc = dkimSvc.WithEnvelope(env)
+	} else {
+		logger.Printf("dkim: KMAIL_SECRETS_KEY unset (%v) — DKIM private keys will be stored as plaintext PEM", err)
+	}
 	dns.NewDKIMHandlers(dkimSvc, logger).Register(mux, authMW)
 
 	// Search backend abstraction (Phase 7). Meilisearch is the
