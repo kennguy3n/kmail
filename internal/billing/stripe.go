@@ -58,10 +58,19 @@ func (c *StripeClient) Configured() bool { return c != nil && c.APIKey != "" }
 
 // SubscriptionRequest is the input shape for CreateSubscription /
 // UpdateSubscription. Only the fields KMail uses are surfaced.
+//
+// ItemID is the existing subscription item identifier (Stripe's
+// `si_...`). It MUST be set when calling UpdateSubscription on an
+// existing subscription whose items the caller wants to modify
+// in place — otherwise Stripe interprets the items[0] entry as a
+// new line item, leaving the old price item attached and
+// double-charging the tenant. CreateSubscription ignores ItemID
+// since items don't exist yet on creation.
 type SubscriptionRequest struct {
 	Customer string
 	PriceID  string
 	Quantity int
+	ItemID   string
 	Metadata map[string]string
 }
 
@@ -102,7 +111,11 @@ func (c *StripeClient) CreateSubscription(ctx context.Context, req SubscriptionR
 }
 
 // UpdateSubscription POSTs to /v1/subscriptions/:id with the
-// fields it can find in req.
+// fields it can find in req. When changing the price or quantity
+// of an existing subscription item the caller MUST set
+// req.ItemID; without it Stripe treats the items[0] entry as a
+// brand-new line item and the previous one stays attached,
+// resulting in duplicate charges.
 func (c *StripeClient) UpdateSubscription(ctx context.Context, id string, req SubscriptionRequest) (*SubscriptionResult, error) {
 	if !c.Configured() {
 		return nil, ErrStripeUnconfigured
@@ -111,6 +124,13 @@ func (c *StripeClient) UpdateSubscription(ctx context.Context, id string, req Su
 		return nil, errors.New("stripe: subscription id required")
 	}
 	form := url.Values{}
+	haveItemFields := req.PriceID != "" || req.Quantity > 0
+	if haveItemFields && req.ItemID == "" {
+		return nil, errors.New("stripe: ItemID is required when modifying an existing subscription item (Stripe would otherwise add a new line item and leave the old one attached)")
+	}
+	if req.ItemID != "" {
+		form.Set("items[0][id]", req.ItemID)
+	}
 	if req.PriceID != "" {
 		form.Set("items[0][price]", req.PriceID)
 	}
