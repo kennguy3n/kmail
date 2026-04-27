@@ -2079,17 +2079,22 @@ export interface WebAuthnCredential {
   last_used_at?: string | null;
 }
 
-export async function listWebAuthnCredentials(): Promise<{ credentials: WebAuthnCredential[] }> {
+export async function listWebAuthnCredentials(
+  tenantId: string,
+): Promise<{ credentials: WebAuthnCredential[] }> {
   return requestJSON<{ credentials: WebAuthnCredential[] }>(
     `${ADMIN_API_BASE}/auth/webauthn/credentials`,
-    { method: "GET", headers: adminAuthHeaders(undefined, { Accept: "application/json" }) },
+    { method: "GET", headers: adminAuthHeaders(tenantId, { Accept: "application/json" }) },
   );
 }
 
-export async function deleteWebAuthnCredential(id: string): Promise<void> {
+export async function deleteWebAuthnCredential(
+  tenantId: string,
+  id: string,
+): Promise<void> {
   await requestJSON<void>(
     `${ADMIN_API_BASE}/auth/webauthn/credentials/${encodeURIComponent(id)}`,
-    { method: "DELETE", headers: adminAuthHeaders() },
+    { method: "DELETE", headers: adminAuthHeaders(tenantId) },
     { expectJson: false },
   );
 }
