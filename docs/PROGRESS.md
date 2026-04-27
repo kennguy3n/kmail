@@ -2,9 +2,19 @@
 
 - **Project**: KMail — Privacy Email & Calendar for KChat B2B
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
-- **Status**: Phases 1–5 complete; Phase 6 in progress (Exchange
-  interop research + BIMI VMC issuance helper still deferred);
-  Phase 7 complete; Phase 8 GA Readiness in progress.
+- **Status**: Phase 1 — Foundation (code complete, external MLS review gate pending);
+  Phase 2 — Prototype (complete); Phase 3 — Private Beta (code complete, operational
+  beta onboarding gate pending); Phase 4 — Production SME Launch (complete);
+  Phase 5 — Privacy & Compliance (complete); Phase 6 — Enterprise Readiness
+  (in progress, Exchange interop + BIMI VMC deferred); Phase 7 — Production
+  Hardening (complete); Phase 8 — GA Readiness (complete).
+- **Last updated**: 2026-04-27 (post-Phase 8 reconciliation) —
+  Phase 2 status corrected to `COMPLETE` (all items shipped, no
+  remaining gates). Phase 8 status flipped to `COMPLETE` (all ten
+  items merged via PR #26). Top-of-file status line refined to
+  distinguish code-complete phases with external gates (Phase 1
+  MLS review, Phase 3 beta onboarding) from fully closed phases.
+  Demo screenshots captured to `docs/screenshots/`.
 - **Last updated**: 2026-04-27 (Phase 8, batch 1) — Phase 8 GA-
   readiness ten-task batch flips Phase 8 from `PLANNED` to
   `IN PROGRESS`. Closes Phase 6 / 7 stubs, fills PROPOSAL.md
@@ -834,7 +844,7 @@ does not change when the backend changes.
 
 ## Phase 2 — Prototype (Weeks 5–10)
 
-**Status**: `IN PROGRESS`
+**Status**: `COMPLETE` — all checklist items delivered.
 
 **Goal**: a single-tenant prototype with custom-domain email, basic
 calendar, JMAP webmail, IMAP/SMTP compatibility, and zk-object-fabric
@@ -1864,9 +1874,8 @@ Checklist:
 
 ## Phase 8 — GA Readiness
 
-**Status**: `IN PROGRESS` — opened 2026-04-27 with the ten-task
-GA-readiness batch (see the **Last updated** entry at the top of
-this file). All ten checklist items below ship in this batch.
+**Status**: `COMPLETE` — all ten GA-readiness items shipped and
+merged via PR #26 on 2026-04-27.
 
 Checklist:
 
