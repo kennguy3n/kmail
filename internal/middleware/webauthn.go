@@ -92,6 +92,11 @@ type WebAuthnHandlers struct {
 // store. The OIDC middleware is required for the authenticated
 // register / list / delete paths; the login flow is intentionally
 // unauthenticated since it predates the OIDC session.
+//
+// RPOrigin must be set when RPID is set: the assertion path
+// (loginFinish) refuses to run without it, so we warn loudly at
+// startup so the misconfiguration surfaces in a smoke test rather
+// than at first user login.
 func NewWebAuthnHandlers(cfg WebAuthnConfig) *WebAuthnHandlers {
 	if cfg.Logger == nil {
 		cfg.Logger = log.Default()
@@ -101,6 +106,9 @@ func NewWebAuthnHandlers(cfg WebAuthnConfig) *WebAuthnHandlers {
 	}
 	if cfg.Challenger == nil {
 		cfg.Challenger = NewMemoryChallenger()
+	}
+	if cfg.RPID != "" && cfg.RPOrigin == "" {
+		cfg.Logger.Printf("webauthn: WARNING RPID=%q is set but RPOrigin is empty — the unauthenticated /login/finish endpoint will refuse all assertions until KMAIL_WEBAUTHN_ORIGIN is configured", cfg.RPID)
 	}
 	store := NewWebAuthnStore(cfg.Pool)
 	return &WebAuthnHandlers{cfg: cfg, store: store}
@@ -451,8 +459,15 @@ func verifyClientDataChallenge(clientDataB64 string, expected []byte) error {
 }
 
 // verifyClientDataAssertion is the assertion-side counterpart that
-// also enforces the spec-mandated type and origin checks.
+// also enforces the spec-mandated type and origin checks. An empty
+// allowedOrigin is treated as a hard failure: per WebAuthn §7.2
+// step 13 the Relying Party MUST verify origin, and skipping that
+// check on the unauthenticated login path would let any same-RPID
+// page (e.g. an attacker-controlled subdomain) replay assertions.
 func verifyClientDataAssertion(clientDataB64 string, expected []byte, allowedOrigin string) ([]byte, error) {
+	if allowedOrigin == "" {
+		return nil, errors.New("webauthn: RPOrigin is not configured — refusing to verify assertion (set KMAIL_WEBAUTHN_ORIGIN)")
+	}
 	return decodeClientData(clientDataB64, expected, "webauthn.get", allowedOrigin)
 }
 
