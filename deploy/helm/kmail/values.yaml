@@ -1,0 +1,100 @@
+# KMail — default Helm values.
+#
+# Two top-level deployables: the Go BFF (`kmail-api`) as a
+# horizontally scaled Deployment, and Stalwart as a StatefulSet
+# with stable per-pod hostnames (mail nodes are not autoscaled —
+# see the do-not-do list).
+#
+# Every `internal/config` env var is exposed under
+# `kmailApi.config.*`. Values that should not live in plaintext
+# (DB URL, OIDC client secret, Stripe key, etc.) come from the
+# referenced Secret instead — see `secret.yaml`.
+
+image:
+  repository: ghcr.io/kennguy3n/kmail-api
+  tag: phase-7
+  pullPolicy: IfNotPresent
+
+# kmail-api — stateless BFF / control plane.
+kmailApi:
+  replicaCount: 3
+  service:
+    type: ClusterIP
+    port: 80
+    targetPort: 8080
+  ingress:
+    enabled: true
+    className: nginx
+    annotations: {}
+    hosts:
+      - host: mail.kmail.example.com
+        paths:
+          - path: /
+            pathType: Prefix
+    tls: []
+  resources:
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+    requests:
+      cpu: 250m
+      memory: 256Mi
+  hpa:
+    enabled: true
+    minReplicas: 3
+    maxReplicas: 12
+    targetCPUUtilizationPercentage: 70
+  pdb:
+    enabled: true
+    minAvailable: 1
+  config:
+    KMAIL_LOG_FORMAT: "json"
+    KMAIL_STALWART_URL: "http://kmail-stalwart-0.kmail-stalwart.svc:8080"
+    KMAIL_RETENTION_DRY_RUN: "false"
+    KMAIL_TRACING_OTLP_ENDPOINT: ""
+    KMAIL_KCHAT_OIDC_ISSUER: "https://kchat.example.com"
+    KMAIL_KCHAT_OIDC_AUDIENCE: "kmail"
+    KMAIL_LOKI_ENV: "prod"
+
+# Stalwart — mail core, deployed as a StatefulSet with stable
+# per-pod IPs via spec.subdomain. Mail nodes are explicitly NOT
+# autoscaled (see `do-not-do.md`); resize replicaCount manually.
+stalwart:
+  replicaCount: 2
+  image:
+    repository: stalwartlabs/stalwart
+    tag: v0.16.0
+  service:
+    headlessName: kmail-stalwart
+  storage:
+    storageClass: ""
+    size: 50Gi
+  resources:
+    limits:
+      cpu: 2000m
+      memory: 4Gi
+    requests:
+      cpu: 500m
+      memory: 1Gi
+
+# Secret references. The chart creates a Secret from these values
+# only if `secret.create=true`; production deployments should set
+# `secret.create=false` and provide an existing Secret (see
+# `secret.existingName`) so credentials live in your secret store.
+secret:
+  create: true
+  existingName: ""
+  data:
+    KMAIL_DATABASE_URL: "postgres://kmail:kmail@postgres:5432/kmail"
+    KMAIL_VALKEY_URL: "redis://valkey:6379"
+    KMAIL_KCHAT_OIDC_CLIENT_ID: "kmail"
+    KMAIL_KCHAT_OIDC_CLIENT_SECRET: ""
+    KMAIL_ZK_FABRIC_S3_URL: "http://zk-fabric:8080"
+    KMAIL_ZK_FABRIC_ACCESS_KEY: ""
+    KMAIL_ZK_FABRIC_SECRET_KEY: ""
+    KMAIL_STRIPE_SECRET_KEY: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""

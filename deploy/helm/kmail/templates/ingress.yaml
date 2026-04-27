@@ -1,0 +1,35 @@
+{{- if .Values.kmailApi.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "kmail.fullname" . }}-api
+  labels:
+    {{- include "kmail.labels" . | nindent 4 }}
+  {{- with .Values.kmailApi.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.kmailApi.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- with .Values.kmailApi.ingress.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    {{- range .Values.kmailApi.ingress.hosts }}
+    - host: {{ .host | quote }}
+      http:
+        paths:
+          {{- range .paths }}
+          - path: {{ .path }}
+            pathType: {{ .pathType }}
+            backend:
+              service:
+                name: {{ include "kmail.fullname" $ }}-api
+                port:
+                  number: {{ $.Values.kmailApi.service.port }}
+          {{- end }}
+    {{- end }}
+{{- end }}

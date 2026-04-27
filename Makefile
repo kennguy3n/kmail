@@ -1,4 +1,4 @@
-.PHONY: build test lint fmt vet tidy docker-build clean help migrate bench e2e scim-test
+.PHONY: build test lint fmt vet tidy docker-build clean help migrate bench e2e scim-test helm-lint loadtest chaos
 
 # ---------------------------------------------------------------
 # KMail Go control plane — developer Makefile.
@@ -76,3 +76,27 @@ e2e:
 # instance. Results are documented in docs/SCIM_CONFORMANCE.md.
 scim-test:
 	KMAIL_API_URL=$(KMAIL_API_URL) ./scripts/test-scim.sh
+
+# helm-lint runs `helm lint` against the deploy/helm/kmail chart.
+# Requires Helm 3.x to be on PATH; in CI set HELM=/path/to/helm.
+HELM ?= helm
+helm-lint:
+	$(HELM) lint deploy/helm/kmail
+
+# loadtest runs the Phase 7 JMAP / SMTP load harness from
+# scripts/loadtest/. Override LOADTEST_ITER / LOADTEST_TPS to
+# change the workload shape.
+LOADTEST_ITER ?= 1000
+LOADTEST_TPS ?= 25
+loadtest:
+	$(GO) run ./scripts/loadtest/load-jmap.go --iterations $(LOADTEST_ITER)
+	./scripts/loadtest/load-smtp.sh $(LOADTEST_TPS)
+
+# chaos runs the Phase 7 chaos-engineering harness against the
+# local compose stack. Each script kills / pauses one dependency
+# in turn and verifies the BFF degrades gracefully. Run targets
+# individually if you only want to exercise one failure mode.
+chaos:
+	./scripts/loadtest/chaos-shard.sh
+	./scripts/loadtest/chaos-postgres.sh
+	./scripts/loadtest/chaos-valkey.sh

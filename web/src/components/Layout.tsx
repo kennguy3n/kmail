@@ -45,6 +45,10 @@ export default function Layout() {
           <li><Link to="/admin/scim">SCIM provisioning</Link></li>
           <li><Link to="/admin/webhooks">Webhooks</Link></li>
           <li><Link to="/admin/onboarding">Onboarding</Link></li>
+          <li><Link to="/admin/search">Search backend</Link></li>
+          <li><Link to="/admin/dkim">DKIM keys</Link></li>
+          <li><Link to="/admin/sieve">Sieve rules</Link></li>
+          <li><Link to="/admin/security">Security keys</Link></li>
           <li><Link to="/contacts">Contacts</Link></li>
         </ul>
       </nav>

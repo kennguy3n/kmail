@@ -33,6 +33,10 @@ import CmkAdmin from "./pages/Admin/CmkAdmin";
 import ScimAdmin from "./pages/Admin/ScimAdmin";
 import WebhookAdmin from "./pages/Admin/WebhookAdmin";
 import OnboardingChecklist from "./pages/Admin/OnboardingChecklist";
+import SearchAdmin from "./pages/Admin/SearchAdmin";
+import DkimAdmin from "./pages/Admin/DkimAdmin";
+import SieveAdmin from "./pages/Admin/SieveAdmin";
+import SecuritySettings from "./pages/Admin/SecuritySettings";
 import ContactsView from "./pages/Mail/ContactsView";
 
 /**
@@ -89,6 +93,10 @@ export default function App() {
         <Route path="admin/scim" element={<ScimAdmin />} />
         <Route path="admin/webhooks" element={<WebhookAdmin />} />
         <Route path="admin/onboarding" element={<OnboardingChecklist />} />
+        <Route path="admin/search" element={<SearchAdmin />} />
+        <Route path="admin/dkim" element={<DkimAdmin />} />
+        <Route path="admin/sieve" element={<SieveAdmin />} />
+        <Route path="admin/security" element={<SecuritySettings />} />
         <Route path="contacts" element={<ContactsView />} />
 
         <Route path="*" element={<Navigate to="/mail" replace />} />

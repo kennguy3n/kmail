@@ -1,0 +1,14 @@
+{{- if .Values.kmailApi.pdb.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "kmail.fullname" . }}-api
+  labels:
+    {{- include "kmail.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.kmailApi.pdb.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "kmail.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: api
+{{- end }}

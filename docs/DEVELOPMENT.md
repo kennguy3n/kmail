@@ -328,3 +328,34 @@ Prometheus counters (`kmail_retention_emails_deleted_total`,
 `kmail_retention_errors_total`) tick in both modes — `*_deleted_*` /
 `*_archived_*` stay at zero in dry-run, which is the canonical
 "safety check" before flipping back to live.
+
+## 9. Loki + Promtail log shipping
+
+Phase 7 adds an optional Loki + Promtail stack so operators can
+query the BFF's structured-JSON request log alongside the
+existing Prometheus metrics. Everything lives behind the `loki`
+compose profile — `docker compose up` keeps working without
+shipping any logs:
+
+```bash
+# Start KMail with the Loki stack attached.
+docker compose --profile loki up -d
+
+# Tail the Promtail and Loki containers to confirm ingest.
+docker compose logs -f loki promtail
+```
+
+Loki listens on port `3100`. The bundled Grafana datasource
+config (`deploy/grafana/datasources.yml`) provisions Loki +
+Prometheus into a freshly mounted Grafana image so an operator
+running `grafana/grafana:11` against
+`/etc/grafana/provisioning/datasources/datasources.yml` gets
+both datasources without clicking through the UI.
+
+Promtail's pipeline (`deploy/promtail/promtail.yml`) pulls
+`tenant_id`, `route`, `status_class`, and `method` out of every
+JSON log line emitted by `internal/middleware/logger.go`. Set
+`KMAIL_LOG_FORMAT=json` on the BFF (the default in the compose
+stack) so the lines have the right shape; the request logger
+falls back to text format otherwise and Promtail will refuse the
+records.

@@ -1,0 +1,14 @@
+apiVersion: v2
+name: kmail
+description: KMail — privacy-centric email & calendar for KChat B2B
+type: application
+version: 0.1.0
+appVersion: "phase-7"
+home: https://github.com/kennguy3n/kmail
+keywords:
+  - email
+  - jmap
+  - stalwart
+  - kchat
+maintainers:
+  - name: KMail platform
