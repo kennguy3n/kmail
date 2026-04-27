@@ -47,7 +47,7 @@ func (o *OpenSearchBackend) Name() string { return BackendOpenSearch }
 // IndexMessage calls `PUT /:index/_doc/:id` so re-indexing a
 // document is idempotent on (tenant, message_id).
 func (o *OpenSearchBackend) IndexMessage(ctx context.Context, msg Message) error {
-	endpoint := o.BaseURL + "/" + indexNameFor(msg.TenantID) + "/_doc/" + queryEscape(msg.MessageID)
+	endpoint := o.BaseURL + "/" + indexNameFor(msg.TenantID) + "/_doc/" + pathEscape(msg.MessageID)
 	return o.do(ctx, http.MethodPut, endpoint, msg, nil)
 }
 

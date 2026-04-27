@@ -281,7 +281,9 @@ func indexNameFor(tenantID string) string {
 	return "kmail_" + clean
 }
 
-// queryEscape is exported through `url.QueryEscape` but pulled
-// into the package so the backend drivers depend on a single
-// helper.
-var queryEscape = url.QueryEscape
+// pathEscape is `url.PathEscape` exposed through the package so
+// the backend drivers depend on a single helper. Path escaping is
+// required (rather than QueryEscape) because the only caller uses
+// it for a path segment (`/_doc/{id}`) where a literal space must
+// be `%20`, not `+`.
+var pathEscape = url.PathEscape
