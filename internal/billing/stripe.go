@@ -164,13 +164,14 @@ func (c *StripeClient) CreatePortalSession(ctx context.Context, customer, return
 }
 
 // do executes a single request against the Stripe API. For POST /
-// DELETE with form data we use `application/x-www-form-urlencoded`
-// matching Stripe's idiomatic shape. GETs pass form as a query
-// string.
+// PUT / DELETE with form data we use `application/x-www-form-urlencoded`
+// matching Stripe's idiomatic shape (Stripe accepts a body on
+// DELETE for fields like `cancel_at_period_end`). GETs pass form
+// as a query string.
 func (c *StripeClient) do(ctx context.Context, method, path string, form url.Values, out any) error {
 	endpoint := strings.TrimRight(c.BaseURL, "/") + path
 	var body io.Reader
-	if form != nil && (method == http.MethodPost || method == http.MethodPut) {
+	if form != nil && (method == http.MethodPost || method == http.MethodPut || method == http.MethodDelete) {
 		body = strings.NewReader(form.Encode())
 	} else if form != nil {
 		endpoint += "?" + form.Encode()

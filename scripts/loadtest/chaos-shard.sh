@@ -10,7 +10,10 @@
 #   4. Restarts the shard container and confirms readyz returns
 #      to OK.
 #
-# Pass criterion (default): error rate <= 0.05% (== 1 in 200).
+# Pass criterion (default): error rate <= 0.05% — the 99.95% SLO
+# budget. With ITERATIONS=200 that means 0 failures (1 in 200 is
+# already 0.5%, ten times over budget); raise ITERATIONS to absorb
+# rare flakes, or override KMAIL_CHAOS_SLO_PCT for looser targets.
 set -euo pipefail
 
 PROJECT="${KMAIL_COMPOSE_PROJECT:-kmail}"
