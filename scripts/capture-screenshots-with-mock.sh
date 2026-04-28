@@ -53,7 +53,10 @@ for i in $(seq 1 60); do
 done
 
 echo "Capturing screenshots…"
-(cd "${REPO_ROOT}" && node scripts/capture-screenshots.mjs)
+# Forward the resolved Vite URL so a non-default KMAIL_VITE_PORT
+# also reaches the Node script — otherwise it falls back to the
+# hardcoded :5173 default and Playwright would screenshot nothing.
+(cd "${REPO_ROOT}" && KMAIL_DEV_URL="${URL}" node scripts/capture-screenshots.mjs)
 
 echo "Verifying expected PNGs in ${OUT_DIR}…"
 EXPECTED=(
