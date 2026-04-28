@@ -1,13 +1,36 @@
 // Capture demo screenshots for KMail React routes.
-// Run with: node scripts/capture-screenshots.mjs
-// Requires the Vite dev server to be running on http://localhost:5173.
+//
+// The Vite dev server must be running with mocked APIs so every
+// page renders sample data instead of "Failed to fetch" banners:
+//
+//   cd web && VITE_MOCK_API=true npx vite --port 5173
+//
+// The `scripts/capture-screenshots-with-mock.sh` wrapper handles
+// starting / waiting on Vite for you. To run this script directly:
+//
+//   node scripts/capture-screenshots.mjs
+//
+// The generated screenshots land in `docs/screenshots/`.
 
-import { chromium } from "playwright";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const BASE = process.env.KMAIL_DEV_URL || "http://localhost:5173";
-const OUT = path.resolve("docs/screenshots");
+// Anchor the output directory to the repo root regardless of where
+// node is invoked from.
+const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = path.resolve(SCRIPT_DIR, "..");
+const OUT = path.resolve(REPO_ROOT, "docs", "screenshots");
+
+// `playwright` is a dev dependency of the React app (web/) so we
+// only need it installed in one place. ESM resolution is anchored
+// to the importing file, so a bare `import "playwright"` here
+// would fail — we resolve the package by absolute URL instead.
+const playwrightUrl = pathToFileURL(
+  path.join(REPO_ROOT, "web", "node_modules", "playwright", "index.mjs"),
+).href;
+const { chromium } = await import(playwrightUrl);
 
 const routes = [
   { path: "/mail", name: "01-mail-inbox" },
@@ -40,6 +63,19 @@ const routes = [
   { path: "/admin/exports", name: "28-export-admin" },
 ];
 
+// Substrings that, when present in the visible body text, indicate
+// the page is showing an error banner instead of the polished mock
+// state. The screenshot will still be captured, but a warning is
+// logged so the maintainer can investigate.
+const ERROR_NEEDLES = [
+  "Failed to fetch",
+  "internal error",
+  "Internal error",
+  "TypeError",
+  "AdminApiError",
+  "kmail-web:",
+];
+
 async function main() {
   await mkdir(OUT, { recursive: true });
   const browser = await chromium.launch();
@@ -47,6 +83,7 @@ async function main() {
     viewport: { width: 1440, height: 900 },
   });
   const page = await context.newPage();
+  const warnings = [];
 
   for (const r of routes) {
     const url = `${BASE}${r.path}`;
@@ -56,14 +93,45 @@ async function main() {
     } catch {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 15000 });
     }
-    // Give React a moment to render placeholder data.
-    await page.waitForTimeout(900);
+    // Give MSW responses time to be processed and React time to
+    // render the resulting state. 1500ms is empirically enough for
+    // the heaviest admin pages.
+    await page.waitForTimeout(1500);
     const out = path.join(OUT, `${r.name}.png`);
     await page.screenshot({ path: out, fullPage: true });
-    process.stdout.write("ok\n");
+
+    // Best-effort error-banner detection. We grep the rendered
+    // body text rather than DOM selectors because every page
+    // surfaces errors differently (banner div, inline `<p>`, alert
+    // role, etc.).
+    let bodyText = "";
+    try {
+      bodyText = await page.evaluate(() => document.body.innerText);
+    } catch {
+      // ignore — page might be navigating away
+    }
+    const hit = ERROR_NEEDLES.find((needle) => bodyText.includes(needle));
+    if (hit) {
+      warnings.push({ name: r.name, path: r.path, hit });
+      process.stdout.write(`ok (warning: "${hit}")\n`);
+    } else {
+      process.stdout.write("ok\n");
+    }
   }
 
   await browser.close();
+
+  if (warnings.length > 0) {
+    console.warn(
+      `\n${warnings.length} route(s) rendered an error-looking string:`,
+    );
+    for (const w of warnings) {
+      console.warn(`  - ${w.name} (${w.path}): "${w.hit}"`);
+    }
+    console.warn(
+      "Inspect those PNGs and add or fix MSW handlers in web/src/mocks/handlers.ts.",
+    );
+  }
 }
 
 main().catch((err) => {

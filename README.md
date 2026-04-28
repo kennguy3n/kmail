@@ -274,6 +274,11 @@ See [docs/PROGRESS.md](docs/PROGRESS.md) for the phase-gated tracker.
 
 See [`docs/screenshots/`](docs/screenshots/) for the full set.
 
+To regenerate the demo screenshots locally, run `make screenshots`.
+That target boots a Vite dev server with `VITE_MOCK_API=true` so the
+React UI renders against MSW handlers (no Go BFF required), then
+captures each route into `docs/screenshots/`.
+
 ## Links
 
 - [docs/PROPOSAL.md](docs/PROPOSAL.md) — detailed technical proposal.

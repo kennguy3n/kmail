@@ -1,4 +1,4 @@
-.PHONY: build test lint fmt vet tidy docker-build clean help migrate bench e2e scim-test helm-lint loadtest chaos
+.PHONY: build test lint fmt vet tidy docker-build clean help migrate bench e2e scim-test helm-lint loadtest chaos screenshots
 
 # ---------------------------------------------------------------
 # KMail Go control plane — developer Makefile.
@@ -25,6 +25,7 @@ help:
 	@echo "  migrate        Apply migrations/*.sql to \$$DATABASE_URL (idempotent)"
 	@echo "  docker-build   Build the multi-stage Docker image"
 	@echo "  e2e            Run the scripts/test-e2e.sh smoke harness"
+	@echo "  screenshots    Capture demo PNGs for docs/screenshots/ (Vite + MSW)"
 	@echo "  clean          Remove built binaries"
 
 build:
@@ -100,3 +101,10 @@ chaos:
 	./scripts/loadtest/chaos-shard.sh
 	./scripts/loadtest/chaos-postgres.sh
 	./scripts/loadtest/chaos-valkey.sh
+
+# screenshots starts the React dev server with the MSW mock layer
+# (VITE_MOCK_API=true) and runs scripts/capture-screenshots.mjs to
+# regenerate every PNG in docs/screenshots/. The wrapper script
+# manages the Vite lifecycle and verifies the expected output.
+screenshots:
+	./scripts/capture-screenshots-with-mock.sh
