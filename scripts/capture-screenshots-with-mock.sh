@@ -10,6 +10,12 @@
 # Run from the repo root: `./scripts/capture-screenshots-with-mock.sh`
 # or via `make screenshots`.
 set -euo pipefail
+# `set -m` enables job control so backgrounded jobs run in their
+# own process group. That lets cleanup() send signals to the
+# entire group (`kill -- -PGID`) and reliably stop the chain of
+# `npm exec` → `sh -c vite` → `node` instead of orphaning Vite
+# children when the script exits.
+set -m
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WEB_DIR="${REPO_ROOT}/web"
@@ -20,7 +26,16 @@ URL="http://localhost:${PORT}"
 cleanup() {
   if [[ -n "${VITE_PID:-}" ]] && kill -0 "${VITE_PID}" 2>/dev/null; then
     echo "Stopping Vite (pid ${VITE_PID})…"
-    kill "${VITE_PID}" 2>/dev/null || true
+    # With `set -m`, VITE_PID is the leader of its own process
+    # group, so `kill -- -PID` reaches every descendant
+    # (npx → sh → node). Fall back to KILL after a brief grace
+    # period for anything that ignored SIGTERM.
+    kill -TERM -- "-${VITE_PID}" 2>/dev/null || true
+    for _ in 1 2 3 4 5; do
+      kill -0 "${VITE_PID}" 2>/dev/null || break
+      sleep 0.5
+    done
+    kill -KILL -- "-${VITE_PID}" 2>/dev/null || true
     wait "${VITE_PID}" 2>/dev/null || true
   fi
 }
@@ -29,7 +44,8 @@ trap cleanup EXIT
 echo "Starting Vite with VITE_MOCK_API=true on port ${PORT}…"
 (
   cd "${WEB_DIR}"
-  VITE_MOCK_API=true npx vite --port "${PORT}" --strictPort >/tmp/kmail-vite.log 2>&1
+  exec env VITE_MOCK_API=true npx vite --port "${PORT}" --strictPort \
+    >/tmp/kmail-vite.log 2>&1
 ) &
 VITE_PID=$!
 
