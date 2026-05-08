@@ -2,10 +2,11 @@
 
 **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
 
-> Status: Phase 1 — Foundation (in progress). This document defines the
-> target architecture, not the current implementation. See
-> [PROGRESS.md](PROGRESS.md) for build status. For strategy, pricing,
-> and phased plan, see [PROPOSAL.md](PROPOSAL.md).
+> Status: Phases 1–5, 7–8 complete. Phase 6 — Enterprise Readiness
+> (in progress; Exchange interop research and BIMI VMC issuance deferred).
+> See [PROGRESS.md](PROGRESS.md) for the phase-gated tracker and
+> [PHASES.md](PHASES.md) for the phase overview. For strategy,
+> pricing, and the phased plan, see [PROPOSAL.md](PROPOSAL.md).
 
 This document is the single source of truth for KMail's architecture.
 It covers the system topology, three-layer integration model, data
@@ -426,6 +427,107 @@ Summary:
   Postmaster APIs.
 - **Audit / Compliance API** → PostgreSQL.
 
+### 7.1 Extended Service Map
+
+The diagram above shows the original Phase 1–2 service set. Phases
+3–8 added a second layer of focused control-plane packages that
+share the same BFF process and Postgres instance. Each package owns
+a single concern, has its own RLS-scoped tables (where applicable),
+and registers its routes under `/api/v1/...`.
+
+The full list of Go packages under `internal/` (28 total):
+
+| Package              | Concern                                                                    | Backed by                                          |
+| -------------------- | -------------------------------------------------------------------------- | -------------------------------------------------- |
+| `adminproxy/`        | Reverse access proxy for SRE reads of tenant data (approval-gated, audited)| `admin_access_sessions` (mig 029), `audit`         |
+| `approval/`          | Admin access approval workflow (per-action gating, executor registry)      | `approval_requests`, `approval_config` (mig 022)   |
+| `audit/`             | Hash-chained audit log + verify + JSON/CSV export                          | `audit_log` (mig 004)                              |
+| `billing/`           | Quota / seat accounting, plan enforcement, Stripe lifecycle, dunning       | `billing_*`, `quotas`, `billing_subscriptions`     |
+| `calendarbridge/`    | CalDAV bridge, KChat scheduling, reminders, free/busy, sharing             | Stalwart CalDAV + KChat API + Valkey               |
+| `chatbridge/`        | KChat ↔ email bridge (notifications, routing, threading)                   | Stalwart + KChat API + `chat_bridge_routes`        |
+| `cmk/`               | Customer-managed keys (PEM upload, KMIP / PKCS#11 HSM envelope ops)        | `customer_managed_keys`, `cmk_hsm_configs`         |
+| `confidentialsend/`  | Confidential Send portal + MLS-derived envelope keys                       | `confidential_send_links` (mig 027) + KChat MLS    |
+| `contactbridge/`     | CardDAV bridge + tenant-wide global address list                           | Stalwart CardDAV + `gal_entries` (mig 035)         |
+| `deliverability/`    | IP pools, warmup, suppression, bounce, DMARC, FBL, abuse, alerts           | `ip_pools`, `suppression_list`, `dmarc_reports`, … |
+| `dns/`               | DNS onboarding, autoconfig / autodiscover, DKIM rotation                   | `tenant_domains`, `tenant_dns_records`, `dkim_keys`|
+| `export/`            | Worker-pool eDiscovery export jobs (mbox / eml / pst stub)                 | `export_jobs` (mig 023)                            |
+| `jmap/`              | JMAP proxy, shard-aware routing, attachment-to-link, malware pre-hook      | Stalwart JMAP + `attachment_links`                 |
+| `malware/`           | Malware scanning adapter (NoopScanner default, ClamAV INSTREAM)            | optional ClamAV TCP endpoint                       |
+| `middleware/`        | OIDC, RLS GUC, metrics, tracing, Loki log shipping, WebAuthn / TOTP        | Postgres + OTEL + Valkey                           |
+| `migration/`         | IMAP / Gmail / M365 migration orchestrator + staged sync + test-connection | `migration_jobs` (mig 002) + imapsync              |
+| `monitoring/`        | SLO tracker + multi-region aggregator + degradation middleware             | Valkey-backed sorted sets                          |
+| `onboarding/`        | Guided onboarding checklist + auto-triggers from webhook events            | `onboarding_steps`, `onboarding_auto_triggers`     |
+| `push/`              | Push notifications (TransportRouter → APNs / FCM / Web Push / dev log)     | `push_subscriptions`, `notification_preferences`   |
+| `retention/`         | Retention / archive policy CRUD + 24 h evaluation worker                   | `retention_policies` (mig 021)                     |
+| `scim/`              | SCIM 2.0 provisioning (`/scim/v2/Users` + `/scim/v2/Groups`) + discovery   | `scim_tokens` (mig 028)                            |
+| `search/`            | Per-tenant search backend abstraction (Meilisearch / OpenSearch) + reindex | `search_backend` column (mig 039)                  |
+| `sharedinbox/`       | Shared-inbox workflows (assign / note / status) + MLS group key rotation   | `shared_inbox_*` tables + KChat MLS                |
+| `sieve/`             | Per-tenant Sieve rule CRUD + validate + deploy                             | `sieve_rules` (mig 042)                            |
+| `tenant/`            | Tenant lifecycle, shards, storage placement, billing lifecycle hooks       | `tenants`, `users`, `tenant_storage_credentials`   |
+| `vault/`             | Zero-Access Vault folders + Protected folders + access log                 | `vault_folders`, `protected_folders` (mig 024–026) |
+| `webhooks/`          | Tenant outbound webhooks with HMAC v1 + v2 signing (timestamp + nonce)     | `webhook_endpoints`, `webhook_deliveries` (mig 032)|
+
+`/jmap` and `/scim/v2/...` are the only routes outside the
+`/api/v1/...` REST namespace; both are required by their respective
+RFCs.
+
+```mermaid
+flowchart LR
+    BFF["API Gateway / BFF"]
+    AdminProxy["adminproxy"]
+    Approval["approval"]
+    CMK["cmk + HSM"]
+    ConfidentialSend["confidentialsend"]
+    ContactBridge["contactbridge"]
+    Export["export"]
+    Malware["malware (ClamAV)"]
+    Monitoring["monitoring"]
+    Onboarding["onboarding"]
+    Push["push (APNs / FCM / Web Push)"]
+    Retention["retention"]
+    SCIM["scim"]
+    Search["search (Meili / OpenSearch)"]
+    SharedInbox["sharedinbox + MLS rotate"]
+    Sieve["sieve"]
+    Vault["vault + Protected folders"]
+    Webhooks["webhooks (HMAC v2)"]
+
+    Postgres["PostgreSQL"]
+    Valkey["Valkey"]
+    Stalwart["Stalwart"]
+    KChatMLS["KChat MLS"]
+    HSM["KMIP / PKCS#11 HSM"]
+    ClamAV["ClamAV"]
+    SearchEngine["Meilisearch / OpenSearch"]
+    PushProviders["APNs / FCM / Web Push"]
+
+    BFF --> AdminProxy --> Postgres
+    BFF --> Approval --> Postgres
+    BFF --> CMK --> HSM
+    BFF --> ConfidentialSend --> KChatMLS
+    BFF --> ContactBridge --> Stalwart
+    BFF --> Export --> Postgres
+    BFF --> Malware --> ClamAV
+    BFF --> Monitoring --> Valkey
+    BFF --> Onboarding --> Postgres
+    BFF --> Push --> PushProviders
+    BFF --> Retention --> Postgres
+    BFF --> SCIM --> Postgres
+    BFF --> Search --> SearchEngine
+    BFF --> SharedInbox --> KChatMLS
+    BFF --> Sieve --> Stalwart
+    BFF --> Vault --> Postgres
+    BFF --> Webhooks --> Postgres
+```
+
+The mermaid diagram is intentionally abbreviated — every package
+also reads/writes Postgres for its own tables and emits events via
+`audit.Service` where applicable. The originals (BFF, Tenant,
+DNS, Migration, ChatBridge, CalendarBridge, Billing, Deliverability,
+Audit) remain the trunk; the extended map above are leaves on that
+trunk that share the same Postgres connection pool, Valkey client,
+and OIDC/RLS middleware stack.
+
 ---
 
 ## 8. Protocol Matrix
@@ -468,6 +570,94 @@ mismatch.
   servers**. The control plane autoscales and rolls out from a
   GitOps pipeline; Stalwart runs on long-lived hosts with explicit
   IP reputation, SPF alignment, and planned maintenance windows.
+- **Helm chart at `deploy/helm/kmail/`**. Ships a `kmail-api`
+  Deployment + Service + Ingress + ConfigMap + Secret + HPA + PDB
+  for the Go BFF, and a Stalwart StatefulSet (with stable per-pod
+  hostnames so SMTP PTR records line up). `make helm-lint`
+  validates the chart in CI; the chart is the production deploy
+  target — `docker compose up` is for local dev only.
+- **Observability stack — Loki + Promtail + Grafana**, behind the
+  `loki` compose profile (`docker compose --profile loki up`).
+  Promtail tails the Stalwart and BFF JSON request logs and ships
+  them into Loki; Grafana auto-loads the
+  `deploy/grafana/datasources.yml` Loki datasource and the
+  `deploy/grafana/dashboards/{kmail-overview,kmail-deliverability}.json`
+  dashboards on first boot.
+- **Prometheus scrape config at `deploy/prometheus/prometheus.yml`**
+  scrapes `/metrics` on the BFF (request latency, error rate, JMAP
+  / SCIM / SMTP rates, deliverability counters, SLO gauges, dunning
+  events, retention runs, malware-scan outcomes). The
+  `KMail Overview` dashboard renders the SLO targets from
+  PROPOSAL.md against this scrape.
+- **ClamAV malware scanning** ships behind the `clamav` compose
+  profile (`docker compose --profile clamav up`). The
+  `internal/malware` adapter speaks INSTREAM over TCP and is wired
+  as a JMAP submit-time pre-delivery hook in `internal/jmap`. When
+  the profile is off the scanner falls through to a `NoopScanner`
+  so dev stacks don't hard-depend on ClamAV.
+- **Pre-built Grafana dashboards** at
+  `deploy/grafana/dashboards/`:
+    - `kmail-overview.json` — SLO compliance, request latency,
+      error rate, shard health, queue depths.
+    - `kmail-deliverability.json` — IP reputation, bounce / FBL /
+      DMARC pass rates, suppression growth, abuse-score outliers.
+- **Secrets / env**. The BFF reads its config from environment
+  variables (database URL, OIDC issuer, KChat API token,
+  zk-object-fabric credentials, Stripe keys, VAPID keys, ClamAV
+  address, optional CMK / KMIP / PKCS#11 paths). The Helm chart
+  surfaces these via `values.yaml` keys + a Kubernetes Secret; the
+  compose stack reads them from `.env`.
+- **CI / CD**. `.github/workflows/ci.yml` runs Go 1.25 `make tidy
+  / vet / build / test` (with `-race`) on every push and PR, and
+  `npm ci && npm run build` for the React app. The Helm chart is
+  validated in the same job via `make helm-lint`.
+
+---
+
+## 9.1 Repository Layout
+
+The repo is laid out so each top-level directory maps to exactly
+one architectural concern from the section above:
+
+```
+kmail/
+├── api/              # API documentation (openapi / spec)
+├── cmd/              # Go entrypoint binaries (9 services)
+├── configs/          # Stalwart bootstrap config
+├── deploy/           # Helm, Grafana, Loki, Promtail, Prometheus, Stalwart HA
+├── docs/             # All project documentation
+├── internal/         # Go packages (28 packages — see §7.1)
+├── migrations/       # PostgreSQL migrations (001–045)
+├── scripts/          # Init, test, bench, load, chaos scripts
+├── web/              # React frontend (TypeScript + Vite)
+├── docker-compose.yml
+├── Dockerfile
+├── Makefile
+└── go.mod
+```
+
+- `cmd/` — small entrypoints that wire `internal/` packages into a
+  long-running binary. The primary one is `cmd/kmail-api/`; the
+  others (worker / migrations / dev tooling) follow the same
+  pattern.
+- `configs/` — Stalwart's TOML config, generated migrations for
+  the dev tenant, and the per-shard bootstrap files.
+- `deploy/` — `helm/kmail/` (chart + values + templates),
+  `grafana/dashboards/` + `grafana/provisioning/`, `loki/`,
+  `promtail/`, `prometheus/`, `stalwart-ha/` (per-shard HA template).
+- `migrations/` — additive-only, numbered, RLS-scoped Postgres
+  migrations. Runs in lexicographic order via `scripts/migrate.sh`
+  on first boot of `cmd/kmail-api/`.
+- `scripts/` — `test-e2e.sh`, `test-scim.sh`, `test-imap-smtp.sh`,
+  `test-caldav.sh`, `test-stalwart-upgrade.sh`,
+  `loadtest/load-jmap.go`, `load-smtp.sh`, `chaos-shard.sh`,
+  `chaos-postgres.sh`, `chaos-valkey.sh`, `bench/`,
+  `capture-screenshots.mjs`, `init-zk-bucket.sh`,
+  `stalwart-init*.sh`. All wrapped by Makefile targets.
+- `web/` — Vite + TypeScript + React Router. `src/api/` mirrors
+  the BFF's REST surface; `src/pages/` hosts the Mail / Calendar
+  / Contacts / Admin views; `src/types/` carries the shared types
+  generated from JMAP shapes.
 
 ---
 

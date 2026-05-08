@@ -17,6 +17,87 @@ calendar as a **KChat workflow** — custom-domain email, shared
 inboxes, calendar, and migration for SMEs, delivered inside the same
 workspace where teams already chat.
 
+## Quick start
+
+### Prerequisites
+
+- Docker and Docker Compose
+- Go 1.25+ (for local development)
+- Node.js 20+ (for frontend development)
+
+### Run the full stack
+
+```bash
+git clone https://github.com/kennguy3n/kmail.git
+cd kmail
+docker compose up
+```
+
+This boots PostgreSQL, Meilisearch, Valkey, zk-object-fabric,
+Stalwart, and Prometheus. The Stalwart init container configures
+blob storage, search, and the dev tenant automatically.
+
+### Run the Go BFF
+
+```bash
+make build
+./bin/kmail-api
+```
+
+### Run the React frontend
+
+```bash
+cd web
+npm install
+npm run dev
+```
+
+### Optional profiles
+
+```bash
+docker compose --profile loki up    # Loki + Promtail + Grafana
+docker compose --profile clamav up  # ClamAV malware scanning
+```
+
+## Project structure
+
+```
+kmail/
+├── api/              # API documentation
+├── cmd/              # Go entrypoint binaries (9 services)
+├── configs/          # Stalwart bootstrap config
+├── deploy/           # Helm, Grafana, Loki, Promtail, Prometheus, Stalwart HA
+├── docs/             # All project documentation
+├── internal/         # Go packages (28 packages — see docs/ARCHITECTURE.md §7.1)
+├── migrations/       # PostgreSQL migrations (001–045)
+├── scripts/          # Init, test, bench, load, chaos scripts
+├── web/              # React frontend (TypeScript + Vite)
+├── docker-compose.yml
+├── Dockerfile
+├── Makefile
+└── go.mod
+```
+
+## Testing
+
+```bash
+make test          # Go unit tests with -race
+make e2e           # End-to-end smoke harness (10 workflows)
+make bench         # JMAP / SMTP / CalDAV benchmarks
+make scim-test     # SCIM 2.0 conformance harness
+make loadtest      # Load testing (JMAP + SMTP)
+make chaos         # Chaos engineering (shard / postgres / valkey failures)
+make helm-lint     # Helm chart validation
+```
+
+The React frontend uses Vitest:
+
+```bash
+cd web
+npm test           # Vitest watch mode
+npm run test:run   # One-shot run (used in CI)
+```
+
 The positioning is deliberate: KMail is **"private business
 communication inside KChat"**, not **"cheaper Gmail"**. Email and
 calendar are a retention and ARPU expansion layer inside the KChat
@@ -227,17 +308,20 @@ client compatibility but are not the main UX path.
 
 ## Project status
 
-**Phases 1–5 — complete. Phase 6 — Enterprise Readiness (in
-progress, with Microsoft Exchange interop research and the BIMI
-VMC issuance helper deferred per the do-not-do list). Phase 7 —
-Production Hardening — complete. Phase 8 — GA Readiness — in
-progress.** The schema now spans 45 migrations covering tenants,
-Stalwart JMAP integration, retention, suppression and bounce
-ledgers, ledger-driven audit, BYOK / per-tenant CMK + HSM with
-real KMIP TTLV wire traffic, MLS-backed Confidential Send, the
-Tenant Service, DNS Onboarding (auto-generated MX / SPF / DKIM /
-DMARC / BIMI / autoconfig records), Stripe billing lifecycle on
-tenant signup / plan change / delete (`stripe_customer_id` /
+**~95% complete. Phases 1–5, 7–8 — complete. Phase 6 — Enterprise
+Readiness — in progress** (with Microsoft Exchange interop research
+and the BIMI VMC issuance helper deferred per the do-not-do list).
+The two remaining open items outside Phase 6 (Phase 1 MLS
+architecture review, Phase 3 private-beta onboarding) are external
+operational gates rather than code work.
+
+The schema now spans 45 migrations covering tenants, Stalwart
+JMAP integration, retention, suppression and bounce ledgers,
+ledger-driven audit, BYOK / per-tenant CMK + HSM with real KMIP
+TTLV wire traffic, MLS-backed Confidential Send, the Tenant
+Service, DNS Onboarding (auto-generated MX / SPF / DKIM / DMARC /
+BIMI / autoconfig records), Stripe billing lifecycle on tenant
+signup / plan change / delete (`stripe_customer_id` /
 `stripe_subscription_id` columns), Sieve rules, WebAuthn / FIDO2
 + TOTP fallback, DKIM key rotation, search backend selection
 (Meilisearch / OpenSearch), CardDAV global address list,
@@ -259,7 +343,9 @@ config flag). The React UI ships a complete admin surface
 DKIM, webhooks, onboarding) plus the Mail / Calendar / Contacts
 end-user surfaces.
 
-See [docs/PROGRESS.md](docs/PROGRESS.md) for the phase-gated tracker.
+See [docs/PHASES.md](docs/PHASES.md) for the scannable phase
+overview and [docs/PROGRESS.md](docs/PROGRESS.md) for the
+phase-gated tracker.
 
 ## Screenshots
 
@@ -281,14 +367,49 @@ captures each route into `docs/screenshots/`.
 
 ## Links
 
-- [docs/PROPOSAL.md](docs/PROPOSAL.md) — detailed technical proposal.
+### Project documentation
+
+- [docs/PHASES.md](docs/PHASES.md) — scannable phase overview
+  (goal, status, deliverables, decision gate per phase).
+- [docs/PROPOSAL.md](docs/PROPOSAL.md) — detailed technical proposal
+  (strategy, pricing, full phased plan).
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — focused architecture
-  document (data flow, encryption, multi-tenancy, deployment).
-- [docs/PROGRESS.md](docs/PROGRESS.md) — phase-gated progress tracker.
+  document (data flow, encryption, multi-tenancy, deployment, full
+  service topology).
+- [docs/PROGRESS.md](docs/PROGRESS.md) — phase-gated progress tracker
+  with the verbose changelog.
+
+### Engineering / operations
+
+- [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) — local development setup,
+  compose profiles, dev-bypass auth.
+- [docs/BENCHMARKS.md](docs/BENCHMARKS.md) — JMAP / SMTP / CalDAV
+  benchmark methodology and results.
+- [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md) — third-party client
+  compatibility matrix (Thunderbird, Apple Mail, Outlook).
+- [docs/LOADTEST.md](docs/LOADTEST.md) — load-testing harness and
+  baselines (`make loadtest`, `make chaos`).
+- [docs/STALWART_UPGRADE.md](docs/STALWART_UPGRADE.md) — Stalwart
+  v0 → v1 upgrade runbook.
+- [docs/SCIM_CONFORMANCE.md](docs/SCIM_CONFORMANCE.md) — SCIM 2.0
+  conformance harness (`make scim-test`) and results.
+
+### Compliance
+
+- [docs/compliance/](docs/compliance/) — DPA, SOC 2 control mapping,
+  Article 30 records, sub-processor list, customer-facing security
+  overview.
+
+### External
+
 - [ZK Object Fabric](https://github.com/kennguy3n/zk-object-fabric) —
   the underlying blob storage fabric.
 - [Stalwart](https://github.com/stalwartlabs/mail-server) — the
   upstream mail / collaboration core.
+- [JMAP](https://jmap.io/) — primary client protocol.
+- [MLS RFC 9420](https://www.rfc-editor.org/rfc/rfc9420.html) — KChat's
+  group messaging encryption (KMail derives email encryption keys
+  from this hierarchy).
 
 ## License
 

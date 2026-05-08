@@ -2,12 +2,15 @@
 
 - **Project**: KMail — Privacy Email & Calendar for KChat B2B
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
-- **Status**: Phase 1 — Foundation (code complete, external MLS review gate pending);
-  Phase 2 — Prototype (complete); Phase 3 — Private Beta (code complete, operational
-  beta onboarding gate pending); Phase 4 — Production SME Launch (complete);
-  Phase 5 — Privacy & Compliance (complete); Phase 6 — Enterprise Readiness
-  (in progress, Exchange interop + BIMI VMC deferred); Phase 7 — Production
-  Hardening (complete); Phase 8 — GA Readiness (complete).
+- **Status**: In progress | ~95% — Phase 1 — Foundation (code complete, external
+  MLS review gate pending); Phase 2 — Prototype (complete); Phase 3 — Private
+  Beta (code complete, operational beta onboarding gate pending); Phase 4 —
+  Production SME Launch (complete); Phase 5 — Privacy & Compliance (complete);
+  Phase 6 — Enterprise Readiness (in progress, Exchange interop + BIMI VMC
+  deferred); Phase 7 — Production Hardening (complete); Phase 8 — GA
+  Readiness (complete). 6 of 8 phases fully closed; the two remaining open
+  items (Phase 1 MLS architecture review and Phase 3 private-beta onboarding)
+  are external operational gates rather than code work.
 - **Last updated**: 2026-04-27 (post-Phase 8 reconciliation) —
   Phase 2 status corrected to `COMPLETE` (all items shipped, no
   remaining gates). Phase 8 status flipped to `COMPLETE` (all ten

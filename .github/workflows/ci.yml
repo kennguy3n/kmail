@@ -62,3 +62,8 @@ jobs:
         if: steps.check.outputs.present == 'true'
         working-directory: web
         run: npm run build
+
+      - name: npm run test:run
+        if: steps.check.outputs.present == 'true'
+        working-directory: web
+        run: npm run test:run
