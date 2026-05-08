@@ -2,9 +2,10 @@
 
 **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
 
-> Status: Phase 1 — Foundation (in progress). This document defines the
-> target architecture, not the current implementation. See
-> [PROGRESS.md](PROGRESS.md) for build status.
+> Status: Phases 1–5, 7–8 complete. Phase 6 — Enterprise Readiness
+> (in progress; Exchange interop research and BIMI VMC issuance deferred).
+> See [PROGRESS.md](PROGRESS.md) for the phase-gated tracker and
+> [PHASES.md](PHASES.md) for the phase overview.
 
 ---
 
