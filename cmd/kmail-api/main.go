@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -77,6 +78,7 @@ func main() {
 		Issuer:         cfg.KChatOIDCIssuer,
 		Audience:       cfg.KChatOIDCAudience,
 		DevBypassToken: cfg.DevBypassToken,
+		Env:            cfg.Env,
 		Pool:           pool,
 		Logger:         logger,
 	})
@@ -141,12 +143,30 @@ func main() {
 		malware.NewHandlers(malware.NewNoopScanner(), logger).Register(mux, authMW.Wrap)
 	}
 
+	var stalwartTLS *jmap.ClientTLSConfig
+	if cfg.StalwartMTLS.Enabled() {
+		stalwartTLS = &jmap.ClientTLSConfig{
+			CertFile:   cfg.StalwartMTLS.CertFile,
+			KeyFile:    cfg.StalwartMTLS.KeyFile,
+			CAFile:     cfg.StalwartMTLS.CAFile,
+			ServerName: cfg.StalwartMTLS.ServerName,
+		}
+		logger.Printf("jmap proxy: mTLS to Stalwart enabled (cert=%s ca=%s server=%s)",
+			cfg.StalwartMTLS.CertFile, cfg.StalwartMTLS.CAFile, cfg.StalwartMTLS.ServerName)
+	} else if strings.HasPrefix(cfg.StalwartURL, "https://") {
+		// HTTPS without a client cert is a production-config bug.
+		// The proxy itself also logs a warning, but surfacing it
+		// here makes the misconfiguration obvious at boot.
+		logger.Printf("jmap proxy: WARNING StalwartURL is HTTPS but KMAIL_STALWART_TLS_CERT/KEY are unset \u2014 BFF will not authenticate to Stalwart")
+	}
+
 	proxy, err := jmap.NewProxy(jmap.ProxyConfig{
 		StalwartURL:    cfg.StalwartURL,
 		Pool:           pool,
 		Logger:         logger,
 		Shards:         shardSvc,
 		PreDeliverHook: malwareHook,
+		TLS:            stalwartTLS,
 	})
 	if err != nil {
 		logger.Fatalf("jmap.NewProxy: %v", err)
@@ -531,7 +551,14 @@ func main() {
 
 	// Phase 5 — Customer-managed keys (privacy plan only; the
 	// handler enforces the plan gate via a per-request lookup).
-	cmkSvc := cmk.NewCMKService(pool)
+	// The kmail-secrets envelope wraps HSM connection credentials
+	// (KMIP password, PKCS#11 PIN) at rest. We reuse the same
+	// envelope instance already loaded for TOTP — KMAIL_SECRETS_KEY
+	// is the single master key for every BFF-side secret.
+	cmkSvc := cmk.NewCMKServiceWithEnvelope(pool, envelope)
+	if envelope == nil {
+		logger.Printf("cmk: KMAIL_SECRETS_KEY not set — HSM credential registration will be refused (set the env var to enable BYOC HSM)")
+	}
 	cmk.NewHandlers(cmkSvc, pool, logger).Register(mux, authMW)
 
 	// Phase 5 — Confidential Send portal. The public portal route

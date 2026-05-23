@@ -34,8 +34,16 @@ type Config struct {
 
 	// StalwartURL is the internal Stalwart JMAP endpoint the BFF
 	// proxies to. In compose this is `http://stalwart:8080`; in
-	// production it is an internal service URL behind the mesh.
+	// production it is an internal HTTPS service URL the BFF
+	// reaches over mutual TLS (see `StalwartMTLS`).
 	StalwartURL string
+
+	// StalwartMTLS holds the mTLS client material the BFF
+	// presents to Stalwart. In production cert-manager mounts a
+	// per-pod keypair under `/etc/kmail/tls`. Empty values
+	// disable client-cert auth — only acceptable in local
+	// compose dev where the upstream listens on plain HTTP.
+	StalwartMTLS StalwartMTLSConfig
 
 	// ValkeyURL is the Redis-compatible Valkey connection string
 	// used for session caches, rate-limit buckets, and the
@@ -59,8 +67,18 @@ type Config struct {
 	// DevBypassToken is a static bearer token that the auth
 	// middleware accepts when running in dev mode. Never set this in
 	// production; the value is a convenience for local development
-	// only. Empty disables the bypass.
+	// only. Empty disables the bypass. The middleware refuses to
+	// boot if this is non-empty while `Env != "development"`.
 	DevBypassToken string
+
+	// Env names the deployment posture: "development", "staging",
+	// "production", etc. The string is opaque to most of the BFF,
+	// but the OIDC middleware uses it to gate developer-only auth
+	// shortcuts — the dev-bypass token and the unverified-JWT
+	// fallback are only honoured when `Env == "development"`.
+	// Empty defaults to "production" so a misconfigured deployment
+	// fails closed instead of silently exposing dev paths.
+	Env string
 
 	// RateLimit controls the Valkey-backed rate limiter mounted in
 	// front of the JMAP proxy and tenant handlers (per
@@ -249,6 +267,36 @@ type RateLimitConfig struct {
 	Window time.Duration
 }
 
+// StalwartMTLSConfig wires the BFF→Stalwart mutual-TLS handshake.
+//
+// Production deployments are expected to set every field via
+// cert-manager (see `deploy/helm/kmail/templates/stalwart-client-cert.yaml`).
+// The defaults are all empty so a misconfigured environment fails
+// closed: the proxy logs a warning when StalwartURL is HTTPS but
+// no client certificate is configured. Setting only some of the
+// fields is rejected by `internal/jmap.ClientTLSConfig.validate`.
+type StalwartMTLSConfig struct {
+	// CertFile is the path to the PEM-encoded client certificate.
+	CertFile string
+	// KeyFile is the path to the matching PEM-encoded private key.
+	KeyFile string
+	// CAFile, when non-empty, is the PEM bundle pinning which CAs
+	// Stalwart's server certificate must chain to. Empty uses
+	// the host's default trust store.
+	CAFile string
+	// ServerName overrides the SNI / certificate-name field on
+	// the TLS handshake. Empty falls back to the host portion of
+	// StalwartURL.
+	ServerName string
+}
+
+// Enabled reports whether the proxy should construct a TLS
+// transport. Both CertFile and KeyFile must be set; the proxy
+// itself catches partial configuration with a clearer error.
+func (c StalwartMTLSConfig) Enabled() bool {
+	return strings.TrimSpace(c.CertFile) != "" && strings.TrimSpace(c.KeyFile) != ""
+}
+
 // DNSConfig wires the DNS Onboarding Service. The defaults target
 // KMail's dev infrastructure (`kmail.local`) so `go run
 // ./cmd/kmail-api` and `go run ./cmd/kmail-dns` work out of the
@@ -317,11 +365,18 @@ func Load() (*Config, error) {
 		// (`go run ./cmd/kmail-api`) can reach it without colliding
 		// with the BFF's own :8080 listener. Inside compose, override
 		// this with `STALWART_URL=http://stalwart:8080`.
-		StalwartURL:     getenv("STALWART_URL", "http://localhost:18080"),
+		StalwartURL: getenv("STALWART_URL", "http://localhost:18080"),
+		StalwartMTLS: StalwartMTLSConfig{
+			CertFile:   getenv("KMAIL_STALWART_TLS_CERT", ""),
+			KeyFile:    getenv("KMAIL_STALWART_TLS_KEY", ""),
+			CAFile:     getenv("KMAIL_STALWART_TLS_CA", ""),
+			ServerName: getenv("KMAIL_STALWART_TLS_SERVER_NAME", ""),
+		},
 		ValkeyURL:       getenv("VALKEY_URL", "valkey:6379"),
 		KChatOIDCIssuer:   getenv("KCHAT_OIDC_ISSUER", ""),
 		KChatOIDCAudience: getenv("KCHAT_OIDC_AUDIENCE", ""),
 		DevBypassToken:    getenv("KMAIL_DEV_BYPASS_TOKEN", ""),
+		Env:               getenv("KMAIL_ENV", "production"),
 		RateLimit: RateLimitConfig{
 			Enabled:   getenvBool("KMAIL_RATELIMIT_ENABLED", false),
 			TenantRPM: GetenvInt("KMAIL_RATELIMIT_TENANT_RPM", 1000),

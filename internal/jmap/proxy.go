@@ -11,13 +11,17 @@ package jmap
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -39,14 +43,25 @@ type ShardResolver interface {
 
 // ProxyConfig wires the JMAP reverse proxy. `StalwartURL` is the
 // internal Stalwart JMAP endpoint (e.g., `http://stalwart:8080` in
-// the local compose stack). `Pool` is used to resolve the acting
-// user's Stalwart account ID per
+// the local compose stack, `https://kmail-stalwart-0.kmail-stalwart.svc:8443`
+// in production where mTLS is mandatory). `Pool` is used to
+// resolve the acting user's Stalwart account ID per
 // `docs/JMAP-CONTRACT.md` §3.3. `Logger` is optional; if nil, a
 // logger writing to the default output is used.
 type ProxyConfig struct {
 	StalwartURL string
 	Pool        *pgxpool.Pool
 	Logger      *log.Logger
+
+	// TLS, when non-nil, configures the BFF→Stalwart transport for
+	// mutual TLS authentication. In production the BFF presents a
+	// per-pod client certificate issued by cert-manager so
+	// Stalwart can authenticate the caller cryptographically
+	// rather than relying on a trusted-network posture
+	// (`docs/ARCHITECTURE.md` §7). When nil, the transport falls
+	// back to whatever scheme `StalwartURL` declares — plain HTTP
+	// in compose dev, HTTPS without a client cert in staging.
+	TLS *ClientTLSConfig
 
 	// AccountCacheTTL controls how long the `(tenant_id, kchat_user_id)
 	// → stalwart_account_id` cache entries live. Defaults to 5
@@ -77,16 +92,112 @@ type ProxyConfig struct {
 	PreDeliverHook func(ctx context.Context, body []byte) error
 }
 
+// ClientTLSConfig configures the BFF→Stalwart mTLS transport.
+//
+// The expected layout in production is that cert-manager issues a
+// short-lived (24h) leaf certificate for each BFF pod from an
+// internal Issuer/ClusterIssuer, mounted via a Kubernetes Secret
+// onto `/etc/kmail/tls`. The Stalwart server is configured to
+// trust the same root and demand a client certificate (TLS
+// `verify_client = required`).
+//
+// `CAFile` is the PEM bundle that pins which CAs Stalwart's
+// server certificate must chain to. `ServerName` overrides the
+// SNI / `tls.Config.ServerName` value; default is derived from
+// the StalwartURL host. `MinVersion` raises the floor; the
+// transport never speaks below TLS 1.2 even when this is zero.
+type ClientTLSConfig struct {
+	CertFile   string
+	KeyFile    string
+	CAFile     string
+	ServerName string
+	MinVersion uint16
+}
+
+// validate returns an error when the config is unusable. Empty
+// configs are caught here so callers don't have to repeat the
+// guard.
+func (c *ClientTLSConfig) validate() error {
+	if c == nil {
+		return errors.New("jmap.ClientTLSConfig: nil receiver")
+	}
+	if strings.TrimSpace(c.CertFile) == "" {
+		return errors.New("jmap.ClientTLSConfig: CertFile is required")
+	}
+	if strings.TrimSpace(c.KeyFile) == "" {
+		return errors.New("jmap.ClientTLSConfig: KeyFile is required")
+	}
+	return nil
+}
+
+// build assembles the *tls.Config that the BFF transport presents
+// to Stalwart. The client certificate is loaded once at startup;
+// rotation is handled by the deployment (pods restart when
+// cert-manager rotates the underlying Secret, per the
+// reloader.stakater.com/auto annotation set in the Helm chart).
+func (c *ClientTLSConfig) build() (*tls.Config, error) {
+	if err := c.validate(); err != nil {
+		return nil, err
+	}
+	cert, err := tls.LoadX509KeyPair(c.CertFile, c.KeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("jmap.ClientTLSConfig: load keypair: %w", err)
+	}
+	min := c.MinVersion
+	if min == 0 {
+		min = tls.VersionTLS12
+	}
+	cfg := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   min,
+		ServerName:   c.ServerName,
+	}
+	if strings.TrimSpace(c.CAFile) != "" {
+		pem, err := os.ReadFile(c.CAFile)
+		if err != nil {
+			return nil, fmt.Errorf("jmap.ClientTLSConfig: read CA bundle: %w", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf("jmap.ClientTLSConfig: CA bundle %q contained no usable certs", c.CAFile)
+		}
+		cfg.RootCAs = pool
+	}
+	return cfg, nil
+}
+
+// newClientTLSTransport returns an *http.Transport configured for
+// mTLS to Stalwart. The dialer and timeout values match the
+// stdlib defaults (`http.DefaultTransport`) so retry / dial
+// behaviour is unchanged when the only addition is a client cert.
+func newClientTLSTransport(tlsCfg *tls.Config) *http.Transport {
+	return &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   10,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		TLSClientConfig:       tlsCfg,
+	}
+}
+
 // Proxy forwards authenticated JMAP requests from the React client
 // to Stalwart, injecting the acting user's Stalwart account ID
 // (resolved and cached from Postgres) into the `X-KMail-Stalwart-Account-Id`
 // header for the downstream.
 //
-// In Phase 1 the proxy does not mint the Stalwart-trusted internal
-// OIDC token documented in `docs/JMAP-CONTRACT.md` §3.2 — that
-// signing-key dance lands in Phase 2. The header-based account
-// identification is a deliberate placeholder that the upstream
-// Stalwart config pairs with a trusted-network rule in local dev.
+// Production hardening: the BFF presents a mutual-TLS client
+// certificate to Stalwart (see `ClientTLSConfig` and the
+// cert-manager Certificate resource in the Helm chart). Stalwart
+// is configured to require a client cert (`verify_client = required`)
+// and pins the BFF's issuing CA. This replaces the trusted-network
+// posture used in early Phase 4 development.
 //
 // Phase 4 adds shard-aware routing: when `cfg.Shards` is wired, the
 // proxy resolves each tenant's primary Stalwart URL on every
@@ -150,10 +261,28 @@ func NewProxy(cfg ProxyConfig) (*Proxy, error) {
 		stripPR:  "/jmap",
 		breakers: map[string]int{},
 	}
+	base := http.DefaultTransport
+	if cfg.TLS != nil {
+		tlsCfg, err := cfg.TLS.build()
+		if err != nil {
+			return nil, fmt.Errorf("jmap.NewProxy: build TLS client config: %w", err)
+		}
+		// When the operator did not pin a ServerName, fall back to
+		// the target host so SNI / verification still works.
+		if tlsCfg.ServerName == "" {
+			host := target.Hostname()
+			if host != "" {
+				tlsCfg.ServerName = host
+			}
+		}
+		base = newClientTLSTransport(tlsCfg)
+	} else if target.Scheme == "https" {
+		logger.Printf("jmap proxy: WARNING StalwartURL=%s is HTTPS but no client TLS configured \u2014 falling back to default transport (no mutual auth)", cfg.StalwartURL)
+	}
 	p.rp = &httputil.ReverseProxy{
 		Rewrite:      p.rewrite,
 		ErrorHandler: p.errorHandler,
-		Transport:    &shardFailoverTransport{proxy: p, base: http.DefaultTransport},
+		Transport:    &shardFailoverTransport{proxy: p, base: base},
 	}
 	return p, nil
 }
@@ -463,8 +592,16 @@ func (p *Proxy) rewrite(r *httputil.ProxyRequest) {
 	if accountID != "" {
 		r.Out.Header.Set("X-KMail-Stalwart-Account-Id", accountID)
 	}
-	// Stalwart's JMAP is authoritative for its own auth; the BFF's
-	// Phase 1 posture is trusted-network only (see package doc).
+	// The BFF authenticates itself to Stalwart via the mutual-TLS
+	// client certificate presented by the transport (see
+	// `ClientTLSConfig`). Stalwart pins the issuing CA and refuses
+	// any connection that does not chain to it, so the
+	// X-KMail-* identity headers are only honoured for callers
+	// the transport already vouched for cryptographically. The
+	// inbound `Authorization` header (the user's OIDC bearer) is
+	// stripped because Stalwart neither needs it nor trusts it —
+	// the BFF is the authentication boundary, the mTLS handshake
+	// is the BFF→Stalwart trust boundary.
 	r.Out.Header.Del("Authorization")
 }
 

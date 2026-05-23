@@ -98,3 +98,37 @@ serviceAccount:
   create: true
   annotations: {}
   name: ""
+
+# BFF→Stalwart mutual-TLS. Production posture pairs cert-manager
+# (issuing short-lived leaf certs) with Reloader (auto-restarting
+# pods on Secret rotation). Two Certificate resources are
+# rendered when `enabled=true`: one client cert mounted on the
+# kmail-api Deployment, one server cert mounted on the Stalwart
+# StatefulSet. Both must chain to the same Issuer.
+#
+# When `enabled=false` (the chart default for backwards-compat
+# with existing dev / staging clusters), no Certificate is
+# rendered and the BFF speaks plain HTTP to Stalwart's :8080
+# port. This matches the legacy trusted-network posture.
+mtls:
+  enabled: false
+  # Reference to an existing cert-manager Issuer / ClusterIssuer.
+  # Production deployments are expected to point this at the
+  # internal PKI (e.g., a Vault-backed Issuer); kind / minikube
+  # clusters can use cert-manager's built-in `selfsigned` issuer
+  # for smoke testing.
+  issuerRef:
+    name: ""
+    kind: ClusterIssuer
+  # Certificate lifetime. Short rotations are the point of
+  # cert-manager — the default is one day with an 8h renewal
+  # window so a single rollout can absorb a stuck Issuer without
+  # an outage.
+  duration: 24h
+  renewBefore: 8h
+  # SNI / `tls.Config.ServerName` value the BFF uses when
+  # presenting the upstream certificate. Defaults to the
+  # StalwartURL host (parsed by the proxy); set explicitly if
+  # KMAIL_STALWART_URL goes through a pod-local sidecar or
+  # otherwise diverges from the cert DNSName.
+  serverName: ""

@@ -1,0 +1,90 @@
+{{- /*
+BFF -> Stalwart mutual-TLS material.
+
+cert-manager issues two short-lived leaf certificates from the
+internal Issuer/ClusterIssuer named in `.Values.mtls.issuerRef`:
+
+  1. A *client* certificate the kmail-api Deployment presents to
+     Stalwart on every JMAP request (`-stalwart-client`).
+  2. A *server* certificate Stalwart listens with on the JMAP
+     port (`-stalwart-server`).
+
+Both chain to the same root, so Stalwart can configure
+`verify_client = required` and pin the issuing CA, and the BFF
+can pin the same CA via KMAIL_STALWART_TLS_CA when verifying the
+upstream certificate.
+
+The Certificate resources are gated on `.Values.mtls.enabled`
+because in local kind clusters cert-manager may not be installed
+yet. Toggling the flag from values yields a clean delete.
+*/}}
+{{- if .Values.mtls.enabled }}
+{{- if not .Values.mtls.issuerRef.name }}
+{{- fail "mtls.enabled=true requires mtls.issuerRef.name to be set" }}
+{{- end }}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "kmail.fullname" . }}-stalwart-client
+  labels:
+    {{- include "kmail.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  secretName: {{ include "kmail.fullname" . }}-stalwart-client-tls
+  duration: {{ .Values.mtls.duration | default "24h" }}
+  renewBefore: {{ .Values.mtls.renewBefore | default "8h" }}
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  usages:
+    - client auth
+    - digital signature
+    - key encipherment
+  commonName: {{ include "kmail.fullname" . }}-api
+  dnsNames:
+    - {{ include "kmail.fullname" . }}-api
+    - {{ include "kmail.fullname" . }}-api.{{ .Release.Namespace }}.svc
+    - {{ include "kmail.fullname" . }}-api.{{ .Release.Namespace }}.svc.cluster.local
+  issuerRef:
+    name: {{ .Values.mtls.issuerRef.name }}
+    kind: {{ .Values.mtls.issuerRef.kind | default "ClusterIssuer" }}
+    group: cert-manager.io
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "kmail.fullname" . }}-stalwart-server
+  labels:
+    {{- include "kmail.labels" . | nindent 4 }}
+    app.kubernetes.io/component: stalwart
+spec:
+  secretName: {{ include "kmail.fullname" . }}-stalwart-server-tls
+  duration: {{ .Values.mtls.duration | default "24h" }}
+  renewBefore: {{ .Values.mtls.renewBefore | default "8h" }}
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  usages:
+    - server auth
+    - digital signature
+    - key encipherment
+  commonName: {{ .Values.stalwart.service.headlessName }}
+  dnsNames:
+    - {{ .Values.stalwart.service.headlessName }}
+    - {{ .Values.stalwart.service.headlessName }}.{{ .Release.Namespace }}.svc
+    - {{ .Values.stalwart.service.headlessName }}.{{ .Release.Namespace }}.svc.cluster.local
+    {{- $name := include "kmail.fullname" . }}
+    {{- $svc := .Values.stalwart.service.headlessName }}
+    {{- $ns := .Release.Namespace }}
+    {{- range $i, $_ := until (int .Values.stalwart.replicaCount) }}
+    - {{ printf "%s-stalwart-%d.%s" $name $i $svc | quote }}
+    - {{ printf "%s-stalwart-%d.%s.%s.svc.cluster.local" $name $i $svc $ns | quote }}
+    {{- end }}
+  issuerRef:
+    name: {{ .Values.mtls.issuerRef.name }}
+    kind: {{ .Values.mtls.issuerRef.kind | default "ClusterIssuer" }}
+    group: cert-manager.io
+{{- end }}

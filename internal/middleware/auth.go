@@ -44,10 +44,19 @@ const (
 // real OIDC issuer. `Pool` is used by `LoadTenantScope` to resolve
 // the acting user's tenant and push the `app.tenant_id` GUC before
 // handler code runs.
+//
+// Env controls whether developer-only auth paths (the
+// `DevBypassToken` and the unverified-JWT fallback) are reachable.
+// Any value other than "development" (case-insensitive) — including
+// the empty string — disables those paths and forces every request
+// through full JWKS-verified JWT validation. This is the
+// fail-closed posture: a misconfigured deployment never silently
+// downgrades to dev-only auth in production.
 type OIDCConfig struct {
 	Issuer         string
 	Audience       string
 	DevBypassToken string
+	Env            string
 	Pool           *pgxpool.Pool
 	Logger         *log.Logger
 	// JWKS, when non-nil, is used to verify RS/ES/PS tokens.
@@ -55,6 +64,17 @@ type OIDCConfig struct {
 	// dev-bypass path is then usable. NewOIDC auto-populates this
 	// field from cfg.Issuer when Issuer is non-empty.
 	JWKS *JWKSFetcher
+}
+
+// EnvDevelopment is the only `OIDCConfig.Env` value that unlocks
+// the `DevBypassToken` and unverified-JWT fallback paths. The
+// comparison is case-insensitive.
+const EnvDevelopment = "development"
+
+// isDevEnv reports whether the configured environment string
+// unlocks dev-only auth shortcuts.
+func (c OIDCConfig) isDevEnv() bool {
+	return strings.EqualFold(strings.TrimSpace(c.Env), EnvDevelopment)
 }
 
 // OIDC is the middleware factory. The JWKS cache lives on this
@@ -66,7 +86,9 @@ type OIDC struct {
 // NewOIDC returns an OIDC middleware with the provided configuration.
 // When cfg.Issuer is non-empty but cfg.JWKS is nil, a JWKSFetcher
 // is built automatically so production code does not have to wire
-// one up manually. Returns an error when JWKS construction fails.
+// one up manually. Returns an error when JWKS construction fails,
+// or when a deployment outside of `development` is missing the
+// JWKS issuer that real token verification needs.
 func NewOIDC(cfg OIDCConfig) (*OIDC, error) {
 	if cfg.Issuer != "" && cfg.JWKS == nil {
 		fetcher, err := NewJWKSFetcher(JWKSConfig{Issuer: cfg.Issuer})
@@ -74,6 +96,18 @@ func NewOIDC(cfg OIDCConfig) (*OIDC, error) {
 			return nil, fmt.Errorf("build JWKS fetcher: %w", err)
 		}
 		cfg.JWKS = fetcher
+	}
+	if !cfg.isDevEnv() {
+		// Production-grade deployments MUST verify JWTs against a
+		// JWKS. Refuse to boot rather than silently accept the
+		// unverified-claims fallback or a dev bypass token at
+		// runtime.
+		if cfg.JWKS == nil {
+			return nil, fmt.Errorf("middleware.NewOIDC: KMAIL_ENV=%q requires a JWKS issuer (set KCHAT_OIDC_ISSUER)", cfg.Env)
+		}
+		if cfg.DevBypassToken != "" {
+			return nil, fmt.Errorf("middleware.NewOIDC: KMAIL_ENV=%q forbids KMAIL_DEV_BYPASS_TOKEN; unset it", cfg.Env)
+		}
 	}
 	return &OIDC{cfg: cfg}, nil
 }
@@ -142,9 +176,16 @@ func (o *OIDC) authenticate(r *http.Request) (*Claims, error) {
 	}
 
 	// Dev-bypass path. The static token unlocks a synthesized set of
-	// claims from headers or env defaults — never wire this on in
-	// production.
+	// claims from headers or env defaults. It is only honoured when
+	// KMAIL_ENV=development; in every other deployment posture the
+	// bypass is rejected, even if a token was accidentally left
+	// configured. NewOIDC also refuses to build with a non-empty
+	// DevBypassToken outside development, so this is a defence in
+	// depth — the middleware itself fails closed at request time.
 	if o.cfg.DevBypassToken != "" && token == o.cfg.DevBypassToken {
+		if !o.cfg.isDevEnv() {
+			return nil, errors.New("dev bypass token is disabled outside KMAIL_ENV=development")
+		}
 		return devClaimsFromHeaders(r), nil
 	}
 
@@ -152,11 +193,15 @@ func (o *OIDC) authenticate(r *http.Request) (*Claims, error) {
 		return o.verifyAndExtract(r.Context(), token)
 	}
 
-	// Last-resort path: no JWKS configured (no issuer set) and not
-	// the dev-bypass token. Decode the claims but do NOT mark the
-	// token as trusted. This keeps local dev without an OIDC
-	// issuer working while refusing to surface identity data in
-	// deployments that forgot to configure an issuer.
+	// No JWKS configured. In development we still accept an
+	// unverified token so contributors can hit endpoints with a
+	// hand-rolled JWT against a stack that has no real issuer.
+	// Outside development this path is closed — refusing here keeps
+	// the BFF from ever serving a request whose identity was not
+	// cryptographically verified.
+	if !o.cfg.isDevEnv() {
+		return nil, errors.New("no JWKS issuer configured (set KCHAT_OIDC_ISSUER)")
+	}
 	claims, err := decodeJWTClaims(token)
 	if err != nil {
 		return nil, fmt.Errorf("invalid JWT: %w", err)

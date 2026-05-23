@@ -17,6 +17,7 @@ func TestLoadReturnsDefaults(t *testing.T) {
 		"VALKEY_URL",
 		"KCHAT_OIDC_ISSUER",
 		"KMAIL_DEV_BYPASS_TOKEN",
+		"KMAIL_ENV",
 		"ZK_FABRIC_S3_URL",
 		"ZK_FABRIC_CONSOLE_URL",
 		"ZK_FABRIC_ACCESS_KEY",
@@ -53,6 +54,9 @@ func TestLoadReturnsDefaults(t *testing.T) {
 	}
 	if cfg.DevBypassToken != "" {
 		t.Errorf("DevBypassToken default should be empty, got %q", cfg.DevBypassToken)
+	}
+	if cfg.Env != "production" {
+		t.Errorf("Env default should be 'production' (fail-closed), got %q", cfg.Env)
 	}
 	if cfg.ZKFabric.S3URL != "http://localhost:9080" {
 		t.Errorf("ZKFabric.S3URL = %q, want http://localhost:9080", cfg.ZKFabric.S3URL)

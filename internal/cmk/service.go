@@ -56,12 +56,39 @@ type Key struct {
 
 // CMKService is the service implementation.
 type CMKService struct {
-	pool *pgxpool.Pool
+	pool     *pgxpool.Pool
+	envelope SecretsEnvelope
 }
 
-// NewCMKService returns a service.
+// NewCMKService returns a service. No envelope is configured, so
+// HSM credential writes are rejected (the only safe default for
+// non-test callers).
 func NewCMKService(pool *pgxpool.Pool) *CMKService {
 	return &CMKService{pool: pool}
+}
+
+// NewCMKServiceWithEnvelope returns a service wired with the
+// kmail-secrets envelope. The envelope wraps HSM connection
+// credentials (KMIP password, PKCS#11 PIN) before they are
+// written to `cmk_hsm_configs.credentials_encrypted` and unwraps
+// them at read time. Pass NoopEnvelope explicitly if a caller
+// wants the legacy plaintext behaviour (tests only).
+func NewCMKServiceWithEnvelope(pool *pgxpool.Pool, envelope SecretsEnvelope) *CMKService {
+	return &CMKService{pool: pool, envelope: envelope}
+}
+
+// SetEnvelope wires the secrets envelope onto an existing
+// service. Provided for the cmd/* binaries that build the
+// service before they have resolved the envelope.
+func (s *CMKService) SetEnvelope(envelope SecretsEnvelope) {
+	s.envelope = envelope
+}
+
+// Envelope returns the configured envelope or nil. Exposed for
+// callers that need to wrap secondary fields the same way (e.g.
+// migration code).
+func (s *CMKService) Envelope() SecretsEnvelope {
+	return s.envelope
 }
 
 // ErrPlanNotEligible is returned when a non-privacy tenant tries

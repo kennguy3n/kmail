@@ -16,6 +16,16 @@ spec:
       labels:
         {{- include "kmail.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: api
+      {{- if .Values.mtls.enabled }}
+      annotations:
+        # When cert-manager rotates the underlying Secret the pod
+        # is restarted so the new keypair gets picked up. The
+        # Reloader controller (https://github.com/stakater/Reloader)
+        # is the recommended way to surface this; the annotation
+        # is a no-op if Reloader is not installed.
+        reloader.stakater.com/auto: "true"
+        secret.reloader.stakater.com/reload: "{{ include "kmail.fullname" . }}-stalwart-client-tls"
+      {{- end }}
     spec:
       serviceAccountName: {{ include "kmail.serviceAccountName" . }}
       containers:
@@ -31,6 +41,23 @@ spec:
                 name: {{ include "kmail.fullname" . }}-config
             - secretRef:
                 name: {{ include "kmail.secretName" . }}
+          {{- if .Values.mtls.enabled }}
+          env:
+            - name: KMAIL_STALWART_TLS_CERT
+              value: /etc/kmail/tls/stalwart-client/tls.crt
+            - name: KMAIL_STALWART_TLS_KEY
+              value: /etc/kmail/tls/stalwart-client/tls.key
+            - name: KMAIL_STALWART_TLS_CA
+              value: /etc/kmail/tls/stalwart-client/ca.crt
+            {{- with .Values.mtls.serverName }}
+            - name: KMAIL_STALWART_TLS_SERVER_NAME
+              value: {{ . | quote }}
+            {{- end }}
+          volumeMounts:
+            - name: stalwart-client-tls
+              mountPath: /etc/kmail/tls/stalwart-client
+              readOnly: true
+          {{- end }}
           readinessProbe:
             httpGet:
               path: /readyz
@@ -45,3 +72,10 @@ spec:
             periodSeconds: 20
           resources:
             {{- toYaml .Values.kmailApi.resources | nindent 12 }}
+      {{- if .Values.mtls.enabled }}
+      volumes:
+        - name: stalwart-client-tls
+          secret:
+            secretName: {{ include "kmail.fullname" . }}-stalwart-client-tls
+            defaultMode: 0400
+      {{- end }}
