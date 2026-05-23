@@ -90,6 +90,33 @@ kmail-stalwart     Up (healthy)
 There is no setup wizard to walk through — `stalwart-init` runs
 the configuration for you. See §4 for what it does under the hood.
 
+Once the compose stack is up, start the Go BFF and the Vite dev
+server on your host. The BFF refuses to boot in production-shaped
+configurations (no JWKS issuer, or a dev bypass token wired in)
+unless `KMAIL_ENV=development` is exported, so the local shell
+needs the flag:
+
+```bash
+# In one shell — the Go BFF.
+export KMAIL_ENV=development                # unlocks unverified-JWT fallback + dev bypass
+export KMAIL_DEV_BYPASS_TOKEN=dev-token      # optional; only honoured when KMAIL_ENV=development
+go run ./cmd/kmail-api
+
+# In another shell — the React frontend.
+cd web && npm install && npm run dev
+```
+
+`KMAIL_ENV` defaults to `production` (see `internal/config/config.go`)
+so that a misconfigured deployment fails closed. Recognised values
+are `development`, `staging`, and `production`; anything else is
+treated as `production` and `NewOIDC` emits an operator-facing
+warning at startup.
+
+In production the BFF presents a client certificate to Stalwart
+(mTLS) instead of relying on a trusted-network header. The Helm
+chart wires this up via cert-manager; local dev keeps using
+plain HTTP against `http://localhost:8080`.
+
 
 ## 4. Automated first-boot configuration
 

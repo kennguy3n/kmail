@@ -11,8 +11,10 @@ package jmap
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -136,18 +138,19 @@ func (c *ClientTLSConfig) validate() error {
 }
 
 // build assembles the *tls.Config that the BFF transport presents
-// to Stalwart. The initial keypair load runs at startup so a
-// misconfigured deployment fails fast on boot; subsequent
-// rotations are picked up on the next handshake via the
-// `GetClientCertificate` callback (see keypairLoader) without
-// requiring a pod restart. This means cert-manager rotation
-// continues to work even in clusters where Reloader is not
-// installed.
+// to Stalwart. The initial keypair and CA bundle loads run at
+// startup so a misconfigured deployment fails fast on boot;
+// subsequent rotations are picked up on the next handshake via
+// the `GetClientCertificate` and `VerifyConnection` callbacks
+// (see keypairLoader / caPoolLoader). This means cert-manager
+// rotation — of either the BFF leaf certificate OR the trust
+// root — continues to work even in clusters where the Reloader
+// controller is not installed.
 func (c *ClientTLSConfig) build(logger *log.Logger) (*tls.Config, error) {
 	if err := c.validate(); err != nil {
 		return nil, err
 	}
-	loader := &keypairLoader{
+	kpLoader := &keypairLoader{
 		certFile: c.CertFile,
 		keyFile:  c.KeyFile,
 		logger:   logger,
@@ -155,7 +158,7 @@ func (c *ClientTLSConfig) build(logger *log.Logger) (*tls.Config, error) {
 	// Validate the on-disk keypair once at startup so we surface
 	// `bad cert / bad key` to the operator before serving traffic
 	// rather than at the first handshake.
-	if _, err := loader.load(); err != nil {
+	if _, err := kpLoader.load(); err != nil {
 		return nil, fmt.Errorf("jmap.ClientTLSConfig: load keypair: %w", err)
 	}
 	min := c.MinVersion
@@ -163,20 +166,50 @@ func (c *ClientTLSConfig) build(logger *log.Logger) (*tls.Config, error) {
 		min = tls.VersionTLS12
 	}
 	cfg := &tls.Config{
-		GetClientCertificate: loader.get,
+		GetClientCertificate: kpLoader.get,
 		MinVersion:           min,
 		ServerName:           c.ServerName,
 	}
 	if strings.TrimSpace(c.CAFile) != "" {
-		pem, err := os.ReadFile(c.CAFile)
-		if err != nil {
-			return nil, fmt.Errorf("jmap.ClientTLSConfig: read CA bundle: %w", err)
+		caLoader := &caPoolLoader{
+			caFile: c.CAFile,
+			logger: logger,
 		}
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(pem) {
-			return nil, fmt.Errorf("jmap.ClientTLSConfig: CA bundle %q contained no usable certs", c.CAFile)
+		// Validate the trust root at startup for the same fail-fast
+		// reason as the keypair. The pool is cached and re-loaded on
+		// the next handshake whenever the file's mtime changes.
+		if _, err := caLoader.load(); err != nil {
+			return nil, fmt.Errorf("jmap.ClientTLSConfig: load CA bundle: %w", err)
 		}
-		cfg.RootCAs = pool
+		// `InsecureSkipVerify=true` *combined with* `VerifyConnection`
+		// is the documented Go stdlib pattern for swapping in a
+		// custom verifier — it disables the built-in cert chain
+		// check so we can do it ourselves against a freshly-loaded
+		// pool. The verification logic below is otherwise identical
+		// to the default behaviour: it pins the chain to our CA
+		// roots and enforces the SNI hostname matches a SAN.
+		cfg.InsecureSkipVerify = true
+		cfg.VerifyConnection = func(state tls.ConnectionState) error {
+			if len(state.PeerCertificates) == 0 {
+				return errors.New("jmap.ClientTLSConfig: peer presented no certificate")
+			}
+			pool, err := caLoader.load()
+			if err != nil {
+				return fmt.Errorf("jmap.ClientTLSConfig: load CA bundle: %w", err)
+			}
+			opts := x509.VerifyOptions{
+				Roots:         pool,
+				Intermediates: x509.NewCertPool(),
+				DNSName:       state.ServerName,
+			}
+			for _, ic := range state.PeerCertificates[1:] {
+				opts.Intermediates.AddCert(ic)
+			}
+			if _, err := state.PeerCertificates[0].Verify(opts); err != nil {
+				return fmt.Errorf("jmap.ClientTLSConfig: verify peer: %w", err)
+			}
+			return nil
+		}
 	}
 	return cfg, nil
 }
@@ -260,6 +293,77 @@ func (l *keypairLoader) load() (*tls.Certificate, error) {
 		}
 	}
 	return l.cert, nil
+}
+
+// caPoolLoader is the dynamic trust-root provider used by the
+// mTLS transport. It mirrors keypairLoader for the CA bundle:
+// each handshake stats the file, returns the cached pool when
+// unchanged, and re-parses the on-disk PEM whenever mtime moves
+// forward. CA rotations are far rarer than leaf rotations (the
+// internal PKI root typically lasts years) but the same
+// "rotation works without Reloader" guarantee applies — when
+// cert-manager updates the CA bundle in the mounted Secret we
+// pick it up on the next request.
+type caPoolLoader struct {
+	caFile string
+	logger *log.Logger
+
+	mu     sync.RWMutex
+	pool   *x509.CertPool
+	mtime  time.Time
+	digest string
+}
+
+// load returns the cached *x509.CertPool, re-parsing the PEM
+// bundle from disk whenever the underlying file has been
+// replaced since the last successful load.
+func (l *caPoolLoader) load() (*x509.CertPool, error) {
+	info, err := os.Stat(l.caFile)
+	if err != nil {
+		return nil, fmt.Errorf("jmap.caPoolLoader: stat CA %q: %w", l.caFile, err)
+	}
+
+	l.mu.RLock()
+	if l.pool != nil && info.ModTime().Equal(l.mtime) {
+		pool := l.pool
+		l.mu.RUnlock()
+		return pool, nil
+	}
+	l.mu.RUnlock()
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	// Double-check under the write lock.
+	if l.pool != nil && info.ModTime().Equal(l.mtime) {
+		return l.pool, nil
+	}
+
+	pem, err := os.ReadFile(l.caFile)
+	if err != nil {
+		return nil, fmt.Errorf("jmap.caPoolLoader: read CA %q: %w", l.caFile, err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pem) {
+		return nil, fmt.Errorf("jmap.caPoolLoader: CA bundle %q contained no usable certs", l.caFile)
+	}
+	// SHA-256 digest of the PEM bytes lets us suppress log spam
+	// when the file mtime changes but the contents are byte-
+	// identical (e.g. a noop reconciliation in cert-manager).
+	sum := sha256.Sum256(pem)
+	digest := hex.EncodeToString(sum[:])
+	prev := l.pool
+	l.pool = pool
+	l.mtime = info.ModTime()
+	prevDigest := l.digest
+	l.digest = digest
+	if l.logger != nil && digest != prevDigest {
+		if prev == nil {
+			l.logger.Printf("jmap proxy: loaded CA bundle sha256=%s", digest)
+		} else {
+			l.logger.Printf("jmap proxy: rotated CA bundle sha256=%s (was %s)", digest, prevDigest)
+		}
+	}
+	return l.pool, nil
 }
 
 // newClientTLSTransport returns an *http.Transport configured for

@@ -43,6 +43,16 @@ spec:
                 name: {{ include "kmail.secretName" . }}
           {{- if .Values.mtls.enabled }}
           env:
+            # When mTLS is enabled the BFF MUST speak HTTPS on
+            # Stalwart's `jmap-tls` listener (port 8443), and the
+            # hostname MUST be one of the SANs cert-manager baked
+            # into the server certificate (see stalwart-mtls.yaml).
+            # The .svc-only short form is NOT in the SAN list, so
+            # we override KMAIL_STALWART_URL here with the FQDN
+            # form. `env:` takes precedence over the ConfigMap
+            # value carried in envFrom.
+            - name: KMAIL_STALWART_URL
+              value: {{ printf "https://%s-stalwart-0.%s.%s.svc.cluster.local:8443" (include "kmail.fullname" .) .Values.stalwart.service.headlessName .Release.Namespace | quote }}
             - name: KMAIL_STALWART_TLS_CERT
               value: /etc/kmail/tls/stalwart-client/tls.crt
             - name: KMAIL_STALWART_TLS_KEY

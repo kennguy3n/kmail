@@ -49,6 +49,13 @@ kmailApi:
     minAvailable: 1
   config:
     KMAIL_LOG_FORMAT: "json"
+    # Default upstream is plain HTTP on the `jmap` port for legacy
+    # / dev clusters. When `mtls.enabled=true` this value is
+    # overridden in `deployment-api.yaml` to the cluster.local FQDN
+    # on the `jmap-tls` port (8443), so that SNI matches one of the
+    # SANs cert-manager bakes into the server cert
+    # (`stalwart-mtls.yaml`). Override here only when the BFF
+    # routes through a sidecar or a non-default port.
     KMAIL_STALWART_URL: "http://kmail-stalwart-0.kmail-stalwart.svc:8080"
     KMAIL_RETENTION_DRY_RUN: "false"
     KMAIL_TRACING_OTLP_ENDPOINT: ""

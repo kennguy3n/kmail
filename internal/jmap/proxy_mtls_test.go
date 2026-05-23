@@ -251,6 +251,12 @@ func TestKeypairLoader_HotReloads(t *testing.T) {
 	}
 }
 
+// TestClientTLSConfig_BuildLoadsCABundle asserts the CA bundle
+// is wired into the tls.Config as a custom verifier — `RootCAs`
+// is deliberately left nil because the verifier loads the pool
+// fresh on every handshake (see caPoolLoader). Pinning this
+// behaviour stops a future refactor from quietly reintroducing
+// the once-at-startup load that motivated the change.
 func TestClientTLSConfig_BuildLoadsCABundle(t *testing.T) {
 	dir := t.TempDir()
 	cert, key, _ := genCert(t, "kmail-bff", []string{"kmail-bff"}, false)
@@ -264,8 +270,57 @@ func TestClientTLSConfig_BuildLoadsCABundle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
-	if tlsCfg.RootCAs == nil {
-		t.Fatal("RootCAs not populated")
+	if tlsCfg.VerifyConnection == nil {
+		t.Fatal("VerifyConnection callback not wired")
+	}
+	if !tlsCfg.InsecureSkipVerify {
+		t.Fatal("expected InsecureSkipVerify=true so VerifyConnection is the only verifier")
+	}
+}
+
+// TestCAPoolLoader_HotReloads writes a CA bundle, snapshots the
+// loaded pool, replaces the file with a different CA, and checks
+// that the loader picks up the new bundle on the next call. This
+// is the parity test with TestKeypairLoader_HotReloads.
+func TestCAPoolLoader_HotReloads(t *testing.T) {
+	dir := t.TempDir()
+	caA, _, _ := genCert(t, "kmail-ca-a", nil, true)
+	caB, _, _ := genCert(t, "kmail-ca-b", nil, true)
+	path := writeTempPEM(t, dir, "ca.pem", caA)
+
+	loader := &caPoolLoader{caFile: path, logger: testLogger(t)}
+	first, err := loader.load()
+	if err != nil {
+		t.Fatalf("first load: %v", err)
+	}
+	if first == nil {
+		t.Fatal("expected non-nil pool")
+	}
+
+	// Cached load returns the same pool when mtime is unchanged.
+	cached, err := loader.load()
+	if err != nil {
+		t.Fatalf("cached load: %v", err)
+	}
+	if cached != first {
+		t.Fatal("expected cached pool to be returned without re-parse")
+	}
+
+	// Replace the file and advance mtime; next load must re-parse
+	// from disk and return a different pool than the cached one.
+	if err := os.WriteFile(path, caB, 0o600); err != nil {
+		t.Fatalf("rewrite CA: %v", err)
+	}
+	future := time.Now().Add(2 * time.Second)
+	if err := os.Chtimes(path, future, future); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+	reloaded, err := loader.load()
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if reloaded == first {
+		t.Fatal("expected reload to return a fresh *x509.CertPool")
 	}
 }
 
