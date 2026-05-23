@@ -6,22 +6,28 @@ import (
 )
 
 func TestLoadReturnsDefaults(t *testing.T) {
-	// Clear relevant env vars so defaults kick in regardless of
-	// the developer's shell.
+	// Clear BOTH the bare and `KMAIL_`-prefixed names so the
+	// defaults kick in regardless of the developer's shell. The
+	// getenvKMail helper checks the prefixed form first, so the
+	// only way to truly exercise the defaults is to unset both.
 	for _, k := range []string{
 		"KMAIL_API_ADDR",
 		"KMAIL_API_READ_HEADER_TIMEOUT",
 		"KMAIL_API_SHUTDOWN_TIMEOUT",
-		"DATABASE_URL",
-		"STALWART_URL",
-		"VALKEY_URL",
-		"KCHAT_OIDC_ISSUER",
+		"DATABASE_URL", "KMAIL_DATABASE_URL",
+		"STALWART_URL", "KMAIL_STALWART_URL",
+		"VALKEY_URL", "KMAIL_VALKEY_URL",
+		"KCHAT_OIDC_ISSUER", "KMAIL_KCHAT_OIDC_ISSUER",
+		"KCHAT_OIDC_AUDIENCE", "KMAIL_KCHAT_OIDC_AUDIENCE",
 		"KMAIL_DEV_BYPASS_TOKEN",
 		"KMAIL_ENV",
-		"ZK_FABRIC_S3_URL",
-		"ZK_FABRIC_CONSOLE_URL",
-		"ZK_FABRIC_ACCESS_KEY",
-		"ZK_FABRIC_SECRET_KEY",
+		"ZK_FABRIC_S3_URL", "KMAIL_ZK_FABRIC_S3_URL",
+		"ZK_FABRIC_CONSOLE_URL", "KMAIL_ZK_FABRIC_CONSOLE_URL",
+		"ZK_FABRIC_ACCESS_KEY", "KMAIL_ZK_FABRIC_ACCESS_KEY",
+		"ZK_FABRIC_SECRET_KEY", "KMAIL_ZK_FABRIC_SECRET_KEY",
+		"KCHAT_API_URL", "KMAIL_KCHAT_API_URL",
+		"KCHAT_API_TOKEN", "KMAIL_KCHAT_API_TOKEN",
+		"KCHAT_MLS_ENDPOINT", "KMAIL_KCHAT_MLS_ENDPOINT",
 	} {
 		t.Setenv(k, "")
 	}
@@ -109,6 +115,52 @@ func TestLoadHonoursEnv(t *testing.T) {
 	}
 	if cfg.ZKFabric.SecretKey != "override-secret" {
 		t.Errorf("ZKFabric.SecretKey = %q", cfg.ZKFabric.SecretKey)
+	}
+}
+
+// TestGetenvKMail pins the two-step lookup that makes the Helm
+// chart functional: `KMAIL_X` wins over `X`, and `X` wins over the
+// default. Without this layer the mTLS URL override emitted by
+// `deploy/helm/kmail/templates/deployment-api.yaml` would be a
+// no-op and the BFF would silently talk plain HTTP to Stalwart.
+func TestGetenvKMail(t *testing.T) {
+	t.Setenv("KMAIL_TEST_KMAIL", "")
+	t.Setenv("TEST_KMAIL", "")
+	if got := getenvKMail("TEST_KMAIL", "fallback"); got != "fallback" {
+		t.Errorf("both unset: got %q, want fallback", got)
+	}
+
+	t.Setenv("TEST_KMAIL", "bare")
+	if got := getenvKMail("TEST_KMAIL", "fallback"); got != "bare" {
+		t.Errorf("bare set, prefixed unset: got %q, want bare", got)
+	}
+
+	t.Setenv("KMAIL_TEST_KMAIL", "prefixed")
+	if got := getenvKMail("TEST_KMAIL", "fallback"); got != "prefixed" {
+		t.Errorf("both set: got %q, want prefixed (KMAIL_-prefixed wins)", got)
+	}
+
+	t.Setenv("TEST_KMAIL", "")
+	t.Setenv("KMAIL_TEST_KMAIL", "prefixed-only")
+	if got := getenvKMail("TEST_KMAIL", "fallback"); got != "prefixed-only" {
+		t.Errorf("prefixed set, bare unset: got %q", got)
+	}
+}
+
+// TestLoad_PrefersKMailPrefixedStalwartURL is the regression test
+// for the Devin Review finding that surfaced this PR's worst bug:
+// the Helm chart set `KMAIL_STALWART_URL` but the binary read
+// `STALWART_URL`, so the mTLS HTTPS override never reached the
+// proxy. Asserting the precedence here pins the fix.
+func TestLoad_PrefersKMailPrefixedStalwartURL(t *testing.T) {
+	t.Setenv("STALWART_URL", "http://legacy:8080")
+	t.Setenv("KMAIL_STALWART_URL", "https://prod:8443")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.StalwartURL != "https://prod:8443" {
+		t.Errorf("StalwartURL = %q, want the KMAIL_-prefixed override", cfg.StalwartURL)
 	}
 }
 

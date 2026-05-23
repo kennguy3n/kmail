@@ -359,22 +359,31 @@ func Load() (*Config, error) {
 			ReadHeaderTimeout: getenvDuration("KMAIL_API_READ_HEADER_TIMEOUT", 10*time.Second),
 			ShutdownTimeout:   getenvDuration("KMAIL_API_SHUTDOWN_TIMEOUT", 30*time.Second),
 		},
-		DatabaseURL:     getenv("DATABASE_URL", "postgresql://kmail:kmail@localhost:5432/kmail?sslmode=disable"),
+		// Every KMail-owned env var is read with the `KMAIL_` prefix
+		// first (the convention enforced by the Helm chart's ConfigMap
+		// and Secret), falling back to the bare name so docker-compose
+		// and existing shell scripts keep working without churn. The
+		// Helm-only override at deployment-api.yaml depends on the
+		// KMail-prefixed lookup landing here.
+		DatabaseURL: getenvKMail("DATABASE_URL", "postgresql://kmail:kmail@localhost:5432/kmail?sslmode=disable"),
 		// Stalwart's container port 8080 is published to host 18080
 		// in `docker-compose.yml` precisely so a host-run BFF
 		// (`go run ./cmd/kmail-api`) can reach it without colliding
 		// with the BFF's own :8080 listener. Inside compose, override
-		// this with `STALWART_URL=http://stalwart:8080`.
-		StalwartURL: getenv("STALWART_URL", "http://localhost:18080"),
+		// this with `STALWART_URL=http://stalwart:8080`; in Kubernetes
+		// the Helm chart sets `KMAIL_STALWART_URL` (which wins over
+		// `STALWART_URL` per getenvKMail's lookup order) and is what
+		// switches the proxy from HTTP to HTTPS-with-mTLS.
+		StalwartURL: getenvKMail("STALWART_URL", "http://localhost:18080"),
 		StalwartMTLS: StalwartMTLSConfig{
 			CertFile:   getenv("KMAIL_STALWART_TLS_CERT", ""),
 			KeyFile:    getenv("KMAIL_STALWART_TLS_KEY", ""),
 			CAFile:     getenv("KMAIL_STALWART_TLS_CA", ""),
 			ServerName: getenv("KMAIL_STALWART_TLS_SERVER_NAME", ""),
 		},
-		ValkeyURL:       getenv("VALKEY_URL", "valkey:6379"),
-		KChatOIDCIssuer:   getenv("KCHAT_OIDC_ISSUER", ""),
-		KChatOIDCAudience: getenv("KCHAT_OIDC_AUDIENCE", ""),
+		ValkeyURL:         getenvKMail("VALKEY_URL", "valkey:6379"),
+		KChatOIDCIssuer:   getenvKMail("KCHAT_OIDC_ISSUER", ""),
+		KChatOIDCAudience: getenvKMail("KCHAT_OIDC_AUDIENCE", ""),
 		DevBypassToken:    getenv("KMAIL_DEV_BYPASS_TOKEN", ""),
 		Env:               getenv("KMAIL_ENV", "production"),
 		RateLimit: RateLimitConfig{
@@ -388,11 +397,12 @@ func Load() (*Config, error) {
 			// publishes zk-fabric on host `:9080` (S3) and `:9081`
 			// (console) to avoid collision with the BFF on :8080.
 			// Inside compose, override with
-			// `ZK_FABRIC_S3_URL=http://zk-fabric:8080`.
-			S3URL:      getenv("ZK_FABRIC_S3_URL", "http://localhost:9080"),
-			ConsoleURL: getenv("ZK_FABRIC_CONSOLE_URL", "http://localhost:9081"),
-			AccessKey:  getenv("ZK_FABRIC_ACCESS_KEY", "kmail-access-key"),
-			SecretKey:  getenv("ZK_FABRIC_SECRET_KEY", "kmail-secret-key"),
+			// `ZK_FABRIC_S3_URL=http://zk-fabric:8080`; the Helm chart
+			// uses the `KMAIL_`-prefixed forms via getenvKMail.
+			S3URL:      getenvKMail("ZK_FABRIC_S3_URL", "http://localhost:9080"),
+			ConsoleURL: getenvKMail("ZK_FABRIC_CONSOLE_URL", "http://localhost:9081"),
+			AccessKey:  getenvKMail("ZK_FABRIC_ACCESS_KEY", "kmail-access-key"),
+			SecretKey:  getenvKMail("ZK_FABRIC_SECRET_KEY", "kmail-secret-key"),
 		},
 		DNS: DNSConfig{
 			Addr:             getenv("KMAIL_DNS_ADDR", ":8090"),
@@ -405,9 +415,9 @@ func Load() (*Config, error) {
 			BIMILogoURL:      getenv("KMAIL_DNS_BIMI_LOGO_URL", ""),
 			BIMIVMCURL:       getenv("KMAIL_DNS_BIMI_VMC_URL", ""),
 		},
-		KChatAPIURL:      getenv("KCHAT_API_URL", ""),
-		KChatAPIToken:    getenv("KCHAT_API_TOKEN", ""),
-		KChatMLSEndpoint: getenv("KCHAT_MLS_ENDPOINT", ""),
+		KChatAPIURL:      getenvKMail("KCHAT_API_URL", ""),
+		KChatAPIToken:    getenvKMail("KCHAT_API_TOKEN", ""),
+		KChatMLSEndpoint: getenvKMail("KCHAT_MLS_ENDPOINT", ""),
 		ChatBridge: ChatBridgeConfig{
 			Addr: getenv("KMAIL_CHAT_BRIDGE_ADDR", ":8091"),
 		},
@@ -462,6 +472,27 @@ func getenvInt64(key string, fallback int64) int64 {
 // getenv returns the value of the named environment variable or the
 // provided default if it is unset.
 func getenv(key, fallback string) string {
+	if v, ok := os.LookupEnv(key); ok && v != "" {
+		return v
+	}
+	return fallback
+}
+
+// getenvKMail resolves a KMail-owned environment variable. It
+// checks the `KMAIL_`-prefixed name first (the convention used by
+// the Helm chart's ConfigMap / Secret, and the only name the chart
+// guarantees to set), then falls back to the bare name for
+// compose / dev / scripts compatibility, then to the supplied
+// default. The two-step lookup is what makes the mTLS override
+// from the Helm template at `deploy/helm/kmail/templates/
+// deployment-api.yaml` (which sets `KMAIL_STALWART_URL`) actually
+// take effect — without this layer the binary would read
+// `STALWART_URL`, miss the override, and silently talk plain HTTP
+// to Stalwart instead of HTTPS-with-mTLS.
+func getenvKMail(key, fallback string) string {
+	if v, ok := os.LookupEnv("KMAIL_" + key); ok && v != "" {
+		return v
+	}
 	if v, ok := os.LookupEnv(key); ok && v != "" {
 		return v
 	}

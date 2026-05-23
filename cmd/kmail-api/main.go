@@ -353,18 +353,28 @@ func main() {
 	})
 	push.NewHandlers(pushSvc, logger).Register(mux, authMW)
 
+	// kmail-secrets envelope. KMAIL_SECRETS_KEY is the single
+	// master key from which every BFF-side at-rest encryption key
+	// derives — DKIM private keys, TOTP shared secrets, recovery
+	// codes, HSM credentials. We load it exactly once, here, so
+	// the operational signal ("is the envelope wired up?") is
+	// logged once instead of three times, and so every consumer
+	// shares the same `*cmk.AESGCMEnvelope` value (cheaper, and
+	// makes future KMS-backed rotations a single swap).
+	secretsEnvelope, secretsEnvelopeErr := cmk.LoadEnvelope()
+	if secretsEnvelopeErr != nil {
+		logger.Printf("secrets: KMAIL_SECRETS_KEY unset (%v) — DKIM/TOTP/HSM secrets will be stored unwrapped (DEV ONLY)", secretsEnvelopeErr)
+		secretsEnvelope = nil
+	}
+
 	// DKIM rotation surface (Phase 7). Lives next to the DNS
 	// wizard so the wizard UI can show "rotation pending" rows
 	// when an admin has rolled a new selector but DNS hasn't
 	// caught up yet. The kmail-secrets envelope wraps freshly
-	// generated private keys before they hit dkim_keys; in dev
-	// (no KMAIL_SECRETS_KEY) the service logs a loud warning and
-	// stores plaintext PEM.
+	// generated private keys before they hit dkim_keys.
 	dkimSvc := dns.NewDKIMRotationService(pool, logger)
-	if env, err := cmk.LoadEnvelope(); err == nil {
-		dkimSvc = dkimSvc.WithEnvelope(env)
-	} else {
-		logger.Printf("dkim: KMAIL_SECRETS_KEY unset (%v) — DKIM private keys will be stored as plaintext PEM", err)
+	if secretsEnvelope != nil {
+		dkimSvc = dkimSvc.WithEnvelope(secretsEnvelope)
 	}
 	dns.NewDKIMHandlers(dkimSvc, logger).Register(mux, authMW)
 
@@ -418,16 +428,11 @@ func main() {
 	// usable from any authenticator app. The shared secret is
 	// wrapped by the kmail-secrets envelope; recovery codes are
 	// SHA-256 hashed.
-	envelope, err := cmk.LoadEnvelope()
-	if err != nil {
-		logger.Printf("totp: KMAIL_SECRETS_KEY not set — TOTP secrets stored unwrapped (DEV ONLY): %v", err)
-		envelope = nil
-	}
 	middleware.NewTOTPHandlers(middleware.TOTPConfig{
 		Pool:     pool,
 		Logger:   logger,
 		Issuer:   "KMail",
-		Envelope: envelope,
+		Envelope: secretsEnvelope,
 	}).Register(mux, authMW)
 
 	// Shared-inbox workflow state machine. The service was built
@@ -552,11 +557,11 @@ func main() {
 	// Phase 5 — Customer-managed keys (privacy plan only; the
 	// handler enforces the plan gate via a per-request lookup).
 	// The kmail-secrets envelope wraps HSM connection credentials
-	// (KMIP password, PKCS#11 PIN) at rest. We reuse the same
-	// envelope instance already loaded for TOTP — KMAIL_SECRETS_KEY
-	// is the single master key for every BFF-side secret.
-	cmkSvc := cmk.NewCMKServiceWithEnvelope(pool, envelope)
-	if envelope == nil {
+	// (KMIP password, PKCS#11 PIN) at rest. We reuse the shared
+	// `secretsEnvelope` loaded above so KMAIL_SECRETS_KEY is the
+	// single master key for every BFF-side at-rest secret.
+	cmkSvc := cmk.NewCMKServiceWithEnvelope(pool, secretsEnvelope)
+	if secretsEnvelope == nil {
 		logger.Printf("cmk: KMAIL_SECRETS_KEY not set — HSM credential registration will be refused (set the env var to enable BYOC HSM)")
 	}
 	cmk.NewHandlers(cmkSvc, pool, logger).Register(mux, authMW)

@@ -472,6 +472,18 @@ func NewProxy(cfg ProxyConfig) (*Proxy, error) {
 		// each upstream URL, which is the correct behaviour for shard
 		// failover where the secondary's certificate may not carry
 		// the primary's hostname.
+		//
+		// If both Shards AND a pinned ServerName are wired, the SNI
+		// is frozen to that single name on every retry, which means
+		// every shard's server certificate MUST also carry that
+		// name as a SAN or the failover handshake will fail with
+		// `certificate is valid for X, not Y`. Loudly warn the
+		// operator at startup so they either widen the SAN list on
+		// every shard's server cert or remove the pin from
+		// `mtls.serverName` in the Helm values.
+		if cfg.Shards != nil && strings.TrimSpace(cfg.TLS.ServerName) != "" {
+			logger.Printf("jmap proxy: WARNING shard failover is wired but a pinned TLS ServerName=%q is set; every shard's server certificate MUST list %q as a SAN or failover handshakes will fail. Leave mtls.serverName empty to let the transport derive SNI per-connection from each shard URL.", cfg.TLS.ServerName, cfg.TLS.ServerName)
+		}
 		base = newClientTLSTransport(tlsCfg)
 	} else if target.Scheme == "https" {
 		logger.Printf("jmap proxy: WARNING StalwartURL=%s is HTTPS but no client TLS configured \u2014 falling back to default transport (no mutual auth)", cfg.StalwartURL)
