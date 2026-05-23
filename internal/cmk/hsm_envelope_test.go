@@ -6,6 +6,8 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"log"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -55,8 +57,12 @@ func TestRegisterHSMKey_RefusesWithoutEnvelope(t *testing.T) {
 	// envelope landed should remain readable rather than blowing
 	// up the entire service).
 	s2 := &CMKService{}
-	if got, err := s2.unwrapHSMCredentials([]byte("plaintext")); err != nil || !bytes.Equal(got, []byte("plaintext")) {
+	got, wasEnc, err := s2.unwrapHSMCredentials([]byte("plaintext"))
+	if err != nil || !bytes.Equal(got, []byte("plaintext")) {
 		t.Fatalf("nil-envelope unwrap should pass-through, got %q err=%v", got, err)
+	}
+	if wasEnc {
+		t.Errorf("nil-envelope unwrap reported wasEncrypted=true")
 	}
 }
 
@@ -73,12 +79,15 @@ func TestUnwrapHSMCredentials_RoundtripWithEnvelope(t *testing.T) {
 		t.Fatal("wrap produced plaintext output")
 	}
 
-	got, err := s.unwrapHSMCredentials(wrapped)
+	got, wasEnc, err := s.unwrapHSMCredentials(wrapped)
 	if err != nil {
 		t.Fatalf("unwrapHSMCredentials: %v", err)
 	}
 	if !bytes.Equal(got, plain) {
 		t.Errorf("unwrap mismatch: got %q want %q", got, plain)
+	}
+	if !wasEnc {
+		t.Errorf("expected wasEncrypted=true for envelope-wrapped blob")
 	}
 }
 
@@ -91,12 +100,40 @@ func TestUnwrapHSMCredentials_LegacyPlaintextPassthrough(t *testing.T) {
 	s := &CMKService{envelope: env}
 
 	plain := []byte("legacy-plaintext-cred")
-	got, err := s.unwrapHSMCredentials(plain)
+	got, wasEnc, err := s.unwrapHSMCredentials(plain)
 	if err != nil {
 		t.Fatalf("unwrapHSMCredentials: %v", err)
 	}
 	if !bytes.Equal(got, plain) {
 		t.Errorf("legacy passthrough mismatch: got %q want %q", got, plain)
+	}
+	if wasEnc {
+		t.Errorf("expected wasEncrypted=false for legacy plaintext blob")
+	}
+}
+
+func TestWarnLegacyPlaintextHSM_DeduplicatesPerConfig(t *testing.T) {
+	var buf bytes.Buffer
+	s := &CMKService{envelope: newTestEnvelope(t)}
+	s.SetLogger(log.New(&buf, "", 0))
+
+	s.warnLegacyPlaintextHSM("tenant-a", "cfg-1")
+	s.warnLegacyPlaintextHSM("tenant-a", "cfg-1") // duplicate
+	s.warnLegacyPlaintextHSM("tenant-a", "cfg-2") // different config
+	s.warnLegacyPlaintextHSM("tenant-b", "cfg-1") // different tenant
+
+	out := buf.String()
+	if n := strings.Count(out, "legacy-plaintext HSM credentials"); n != 3 {
+		t.Errorf("got %d warnings, want 3 (one per unique tenant/config): %s", n, out)
+	}
+	if !strings.Contains(out, "tenant=tenant-a config=cfg-1") {
+		t.Errorf("missing tenant-a/cfg-1 warning: %s", out)
+	}
+	if !strings.Contains(out, "tenant=tenant-a config=cfg-2") {
+		t.Errorf("missing tenant-a/cfg-2 warning: %s", out)
+	}
+	if !strings.Contains(out, "tenant=tenant-b config=cfg-1") {
+		t.Errorf("missing tenant-b/cfg-1 warning: %s", out)
 	}
 }
 

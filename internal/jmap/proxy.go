@@ -102,9 +102,14 @@ type ProxyConfig struct {
 // `verify_client = required`).
 //
 // `CAFile` is the PEM bundle that pins which CAs Stalwart's
-// server certificate must chain to. `ServerName` overrides the
-// SNI / `tls.Config.ServerName` value; default is derived from
-// the StalwartURL host. `MinVersion` raises the floor; the
+// server certificate must chain to. `ServerName` is the SNI /
+// `tls.Config.ServerName` value. Leaving it empty lets Go's
+// transport derive SNI per-connection from each upstream URL —
+// the correct default for shard failover, where the secondary's
+// certificate may not carry the primary's hostname. Set it
+// explicitly only when the upstream URL host does not match the
+// SAN on Stalwart's server cert (e.g. when going through a
+// pod-local sidecar). `MinVersion` raises the floor; the
 // transport never speaks below TLS 1.2 even when this is zero.
 type ClientTLSConfig struct {
 	CertFile   string
@@ -131,16 +136,26 @@ func (c *ClientTLSConfig) validate() error {
 }
 
 // build assembles the *tls.Config that the BFF transport presents
-// to Stalwart. The client certificate is loaded once at startup;
-// rotation is handled by the deployment (pods restart when
-// cert-manager rotates the underlying Secret, per the
-// reloader.stakater.com/auto annotation set in the Helm chart).
-func (c *ClientTLSConfig) build() (*tls.Config, error) {
+// to Stalwart. The initial keypair load runs at startup so a
+// misconfigured deployment fails fast on boot; subsequent
+// rotations are picked up on the next handshake via the
+// `GetClientCertificate` callback (see keypairLoader) without
+// requiring a pod restart. This means cert-manager rotation
+// continues to work even in clusters where Reloader is not
+// installed.
+func (c *ClientTLSConfig) build(logger *log.Logger) (*tls.Config, error) {
 	if err := c.validate(); err != nil {
 		return nil, err
 	}
-	cert, err := tls.LoadX509KeyPair(c.CertFile, c.KeyFile)
-	if err != nil {
+	loader := &keypairLoader{
+		certFile: c.CertFile,
+		keyFile:  c.KeyFile,
+		logger:   logger,
+	}
+	// Validate the on-disk keypair once at startup so we surface
+	// `bad cert / bad key` to the operator before serving traffic
+	// rather than at the first handshake.
+	if _, err := loader.load(); err != nil {
 		return nil, fmt.Errorf("jmap.ClientTLSConfig: load keypair: %w", err)
 	}
 	min := c.MinVersion
@@ -148,9 +163,9 @@ func (c *ClientTLSConfig) build() (*tls.Config, error) {
 		min = tls.VersionTLS12
 	}
 	cfg := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   min,
-		ServerName:   c.ServerName,
+		GetClientCertificate: loader.get,
+		MinVersion:           min,
+		ServerName:           c.ServerName,
 	}
 	if strings.TrimSpace(c.CAFile) != "" {
 		pem, err := os.ReadFile(c.CAFile)
@@ -164,6 +179,87 @@ func (c *ClientTLSConfig) build() (*tls.Config, error) {
 		cfg.RootCAs = pool
 	}
 	return cfg, nil
+}
+
+// keypairLoader is the `GetClientCertificate` provider used by
+// the mTLS transport. It caches the most-recently-loaded keypair
+// and re-reads the underlying files whenever either file's mtime
+// changes, so cert-manager rotations land on the next handshake.
+//
+// The cache is keyed on a tuple of (cert mtime, key mtime). A
+// shared RWMutex protects the cache; the common path (no
+// rotation) takes the read lock and returns immediately.
+type keypairLoader struct {
+	certFile string
+	keyFile  string
+	logger   *log.Logger
+
+	mu        sync.RWMutex
+	cert      *tls.Certificate
+	certMTime time.Time
+	keyMTime  time.Time
+}
+
+// get satisfies tls.Config.GetClientCertificate.
+func (l *keypairLoader) get(_ *tls.CertificateRequestInfo) (*tls.Certificate, error) {
+	return l.load()
+}
+
+// load returns the cached *tls.Certificate, reloading from disk
+// if either underlying file has been replaced since the last read.
+func (l *keypairLoader) load() (*tls.Certificate, error) {
+	certInfo, err := os.Stat(l.certFile)
+	if err != nil {
+		return nil, fmt.Errorf("jmap.keypairLoader: stat cert %q: %w", l.certFile, err)
+	}
+	keyInfo, err := os.Stat(l.keyFile)
+	if err != nil {
+		return nil, fmt.Errorf("jmap.keypairLoader: stat key %q: %w", l.keyFile, err)
+	}
+
+	l.mu.RLock()
+	if l.cert != nil && certInfo.ModTime().Equal(l.certMTime) && keyInfo.ModTime().Equal(l.keyMTime) {
+		cert := l.cert
+		l.mu.RUnlock()
+		return cert, nil
+	}
+	l.mu.RUnlock()
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	// Double-check under the write lock — another goroutine may
+	// have reloaded while we were upgrading.
+	if l.cert != nil && certInfo.ModTime().Equal(l.certMTime) && keyInfo.ModTime().Equal(l.keyMTime) {
+		return l.cert, nil
+	}
+
+	loaded, err := tls.LoadX509KeyPair(l.certFile, l.keyFile)
+	if err != nil {
+		return nil, fmt.Errorf("jmap.keypairLoader: reload keypair: %w", err)
+	}
+	prev := l.cert
+	l.cert = &loaded
+	l.certMTime = certInfo.ModTime()
+	l.keyMTime = keyInfo.ModTime()
+	if l.logger != nil {
+		leafNotAfter := "unknown"
+		leafSubject := "unknown"
+		if len(loaded.Certificate) > 0 {
+			if leaf, perr := x509.ParseCertificate(loaded.Certificate[0]); perr == nil {
+				leafNotAfter = leaf.NotAfter.UTC().Format(time.RFC3339)
+				leafSubject = leaf.Subject.CommonName
+				if leafSubject == "" && len(leaf.DNSNames) > 0 {
+					leafSubject = leaf.DNSNames[0]
+				}
+			}
+		}
+		if prev == nil {
+			l.logger.Printf("jmap proxy: loaded client TLS keypair subject=%q notAfter=%s", leafSubject, leafNotAfter)
+		} else {
+			l.logger.Printf("jmap proxy: rotated client TLS keypair subject=%q notAfter=%s", leafSubject, leafNotAfter)
+		}
+	}
+	return l.cert, nil
 }
 
 // newClientTLSTransport returns an *http.Transport configured for
@@ -263,18 +359,15 @@ func NewProxy(cfg ProxyConfig) (*Proxy, error) {
 	}
 	base := http.DefaultTransport
 	if cfg.TLS != nil {
-		tlsCfg, err := cfg.TLS.build()
+		tlsCfg, err := cfg.TLS.build(logger)
 		if err != nil {
 			return nil, fmt.Errorf("jmap.NewProxy: build TLS client config: %w", err)
 		}
-		// When the operator did not pin a ServerName, fall back to
-		// the target host so SNI / verification still works.
-		if tlsCfg.ServerName == "" {
-			host := target.Hostname()
-			if host != "" {
-				tlsCfg.ServerName = host
-			}
-		}
+		// ServerName intentionally left empty when the operator did
+		// not pin it: Go's transport derives SNI per-connection from
+		// each upstream URL, which is the correct behaviour for shard
+		// failover where the secondary's certificate may not carry
+		// the primary's hostname.
 		base = newClientTLSTransport(tlsCfg)
 	} else if target.Scheme == "https" {
 		logger.Printf("jmap proxy: WARNING StalwartURL=%s is HTTPS but no client TLS configured \u2014 falling back to default transport (no mutual auth)", cfg.StalwartURL)

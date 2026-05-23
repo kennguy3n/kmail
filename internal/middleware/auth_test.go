@@ -1,12 +1,14 @@
 package middleware
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/base64"
 	"encoding/json"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -465,5 +467,57 @@ func TestDecodeJWTClaims_Malformed(t *testing.T) {
 	}
 	if _, err := decodeJWTClaims(strings.Repeat("a", 10)); err == nil {
 		t.Error("expected not-a-jwt error")
+	}
+}
+
+// TestNewOIDC_WarnsOnUnknownEnv exercises the operator-typo
+// guard: a KMAIL_ENV value that isn't one of the recognised
+// strings silently falls through to production-grade behaviour,
+// so NewOIDC must log a warning that names the unknown value.
+func TestNewOIDC_WarnsOnUnknownEnv(t *testing.T) {
+	priv, _ := rsa.GenerateKey(rand.Reader, 2048)
+	issuer, stop := newTestJWKSServer(t, priv, "test-kid")
+	defer stop()
+
+	var buf bytes.Buffer
+	_, err := NewOIDC(OIDCConfig{
+		Issuer: issuer,
+		Env:    "develpment", // typo
+		Logger: log.New(&buf, "", 0),
+	})
+	if err != nil {
+		t.Fatalf("NewOIDC: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, `KMAIL_ENV="develpment"`) {
+		t.Errorf("expected warning naming the unknown env, got: %q", out)
+	}
+	if !strings.Contains(out, "treating as production") {
+		t.Errorf("expected warning to explain fail-safe behaviour, got: %q", out)
+	}
+}
+
+// TestNewOIDC_DoesNotWarnOnKnownEnv pins the silent path: each
+// of the recognised KMAIL_ENV values must NOT emit the
+// unknown-env warning.
+func TestNewOIDC_DoesNotWarnOnKnownEnv(t *testing.T) {
+	priv, _ := rsa.GenerateKey(rand.Reader, 2048)
+	issuer, stop := newTestJWKSServer(t, priv, "test-kid")
+	defer stop()
+	for _, env := range []string{"", "development", "DEVELOPMENT", "  staging  ", "production"} {
+		t.Run(env, func(t *testing.T) {
+			var buf bytes.Buffer
+			_, err := NewOIDC(OIDCConfig{
+				Issuer: issuer,
+				Env:    env,
+				Logger: log.New(&buf, "", 0),
+			})
+			if err != nil {
+				t.Fatalf("NewOIDC: %v", err)
+			}
+			if strings.Contains(buf.String(), "is not one of") {
+				t.Errorf("unexpected unknown-env warning for Env=%q: %s", env, buf.String())
+			}
+		})
 	}
 }

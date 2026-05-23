@@ -21,7 +21,10 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
+	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -58,13 +61,24 @@ type Key struct {
 type CMKService struct {
 	pool     *pgxpool.Pool
 	envelope SecretsEnvelope
+
+	// logger receives operational notices (e.g. legacy-plaintext
+	// HSM credential reads, which signal that a config row was
+	// written before the envelope landed and should be re-saved).
+	// Defaults to log.Default(); SetLogger overrides for tests.
+	logger *log.Logger
+
+	// legacyPlaintextSeen deduplicates the legacy-plaintext
+	// warning per (tenant, config) so a hot read path doesn't
+	// fill the log with the same notice.
+	legacyPlaintextSeen sync.Map
 }
 
 // NewCMKService returns a service. No envelope is configured, so
 // HSM credential writes are rejected (the only safe default for
 // non-test callers).
 func NewCMKService(pool *pgxpool.Pool) *CMKService {
-	return &CMKService{pool: pool}
+	return &CMKService{pool: pool, logger: log.Default()}
 }
 
 // NewCMKServiceWithEnvelope returns a service wired with the
@@ -74,7 +88,16 @@ func NewCMKService(pool *pgxpool.Pool) *CMKService {
 // them at read time. Pass NoopEnvelope explicitly if a caller
 // wants the legacy plaintext behaviour (tests only).
 func NewCMKServiceWithEnvelope(pool *pgxpool.Pool, envelope SecretsEnvelope) *CMKService {
-	return &CMKService{pool: pool, envelope: envelope}
+	return &CMKService{pool: pool, envelope: envelope, logger: log.Default()}
+}
+
+// SetLogger overrides the default logger. Pass log.New(io.Discard, ...)
+// from tests to suppress the legacy-plaintext warning.
+func (s *CMKService) SetLogger(logger *log.Logger) {
+	if logger == nil {
+		logger = log.New(io.Discard, "", 0)
+	}
+	s.logger = logger
 }
 
 // SetEnvelope wires the secrets envelope onto an existing

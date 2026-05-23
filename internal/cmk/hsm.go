@@ -302,29 +302,57 @@ func (s *CMKService) loadHSMConfig(ctx context.Context, tenantID, configID strin
 	if err != nil {
 		return nil, nil, err
 	}
-	plain, err := s.unwrapHSMCredentials(creds)
+	plain, wasEncrypted, err := s.unwrapHSMCredentials(creds)
 	if err != nil {
 		return nil, nil, err
+	}
+	if !wasEncrypted && s.envelope != nil && len(creds) > 0 {
+		s.warnLegacyPlaintextHSM(tenantID, configID)
 	}
 	return &cfg, plain, nil
 }
 
 // unwrapHSMCredentials decrypts the stored credential blob with
-// the configured envelope and returns the plaintext bytes. Rows
+// the configured envelope and returns the plaintext bytes plus a
+// flag indicating whether the blob was AEAD-protected. Rows
 // written before the envelope was wired pass through verbatim
-// (the envelope's Unwrap contract reports `wasEncrypted=false`
-// in that case). When no envelope is configured a plaintext blob
+// (wasEncrypted=false). When no envelope is configured the blob
 // is returned as-is for read compatibility, but writes still
 // require the envelope — see RegisterHSMKey.
-func (s *CMKService) unwrapHSMCredentials(blob []byte) ([]byte, error) {
+//
+// Callers should treat `wasEncrypted=false` from an
+// envelope-configured service as a migration signal: the row was
+// written before the envelope landed and should be re-registered
+// so the next read takes the encrypted path.
+func (s *CMKService) unwrapHSMCredentials(blob []byte) ([]byte, bool, error) {
 	if s.envelope == nil {
-		return blob, nil
+		return blob, false, nil
 	}
-	plain, _, err := s.envelope.Unwrap(blob)
+	plain, wasEncrypted, err := s.envelope.Unwrap(blob)
 	if err != nil {
-		return nil, fmt.Errorf("cmk: unwrap HSM credentials: %w", err)
+		return nil, false, fmt.Errorf("cmk: unwrap HSM credentials: %w", err)
 	}
-	return plain, nil
+	return plain, wasEncrypted, nil
+}
+
+// warnLegacyPlaintextHSM logs a single warning the first time we
+// observe a legacy-plaintext credential blob for a given
+// (tenant, config) pair. Operators are expected to re-register
+// affected HSM configs through the API so the next write goes
+// through the envelope.
+func (s *CMKService) warnLegacyPlaintextHSM(tenantID, configID string) {
+	key := tenantID + "/" + configID
+	if _, loaded := s.legacyPlaintextSeen.LoadOrStore(key, struct{}{}); loaded {
+		return
+	}
+	if s.logger != nil {
+		s.logger.Printf(
+			"cmk: legacy-plaintext HSM credentials detected tenant=%s config=%s — "+
+				"re-register this HSM config through the API to wrap with the envelope; "+
+				"this warning will only fire once per (tenant, config) per process",
+			tenantID, configID,
+		)
+	}
 }
 
 // markHSMUsed bumps `last_used_at` to now() (Phase 8 column).
@@ -377,9 +405,12 @@ func (s *CMKService) TestHSMConnection(ctx context.Context, tenantID, configID s
 		if !ok {
 			return fmt.Errorf("cmk: unsupported provider_type %q", out.Provider)
 		}
-		plain, err := s.unwrapHSMCredentials(creds)
+		plain, wasEncrypted, err := s.unwrapHSMCredentials(creds)
 		if err != nil {
 			return err
+		}
+		if !wasEncrypted && s.envelope != nil && len(creds) > 0 {
+			s.warnLegacyPlaintextHSM(tenantID, configID)
 		}
 		validateErr := provider.Validate(ctx, out, string(plain))
 		newStatus := "active"

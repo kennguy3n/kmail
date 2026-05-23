@@ -106,6 +106,14 @@ func writeTempPEM(t *testing.T, dir, name string, contents []byte) string {
 	return path
 }
 
+// testLogger returns a *log.Logger that discards output. The
+// proxy plumbs a logger through ClientTLSConfig.build to report
+// keypair (re)loads; tests don't care about that surface.
+func testLogger(t *testing.T) *log.Logger {
+	t.Helper()
+	return log.New(io.Discard, "", 0)
+}
+
 func TestClientTLSConfig_ValidationRejectsEmpty(t *testing.T) {
 	cases := []struct {
 		name string
@@ -132,18 +140,114 @@ func TestClientTLSConfig_BuildLoadsCert(t *testing.T) {
 		KeyFile:    writeTempPEM(t, dir, "tls.key", key),
 		ServerName: "stalwart.kmail.internal",
 	}
-	tlsCfg, err := cfg.build()
+	tlsCfg, err := cfg.build(testLogger(t))
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
-	if len(tlsCfg.Certificates) != 1 {
-		t.Fatalf("expected 1 cert, got %d", len(tlsCfg.Certificates))
+	if tlsCfg.GetClientCertificate == nil {
+		t.Fatal("GetClientCertificate not wired")
+	}
+	got, err := tlsCfg.GetClientCertificate(&tls.CertificateRequestInfo{})
+	if err != nil {
+		t.Fatalf("GetClientCertificate: %v", err)
+	}
+	if got == nil || len(got.Certificate) == 0 {
+		t.Fatal("GetClientCertificate returned empty cert")
 	}
 	if tlsCfg.MinVersion < tls.VersionTLS12 {
 		t.Errorf("MinVersion = %v, want >= TLS 1.2", tlsCfg.MinVersion)
 	}
 	if tlsCfg.ServerName != "stalwart.kmail.internal" {
 		t.Errorf("ServerName = %q", tlsCfg.ServerName)
+	}
+}
+
+// TestClientTLSConfig_BuildLeavesServerNameEmpty pins the
+// shard-failover-friendly default: when the operator does not
+// set ServerName, build() leaves it empty so Go's transport
+// derives SNI per-connection from each upstream URL.
+func TestClientTLSConfig_BuildLeavesServerNameEmpty(t *testing.T) {
+	dir := t.TempDir()
+	cert, key, _ := genCert(t, "kmail-bff", []string{"kmail-bff"}, false)
+	cfg := ClientTLSConfig{
+		CertFile: writeTempPEM(t, dir, "tls.crt", cert),
+		KeyFile:  writeTempPEM(t, dir, "tls.key", key),
+	}
+	tlsCfg, err := cfg.build(testLogger(t))
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if tlsCfg.ServerName != "" {
+		t.Errorf("ServerName = %q, want empty so transport derives per-connection", tlsCfg.ServerName)
+	}
+}
+
+// TestKeypairLoader_HotReloads writes a keypair, snapshots the
+// loader's cached cert, overwrites the files with a different
+// keypair (and a fresh mtime), and confirms the next call returns
+// the new cert. This is what makes cert-manager rotations land
+// without a pod restart.
+func TestKeypairLoader_HotReloads(t *testing.T) {
+	dir := t.TempDir()
+	first := issueCert(t, "kmail-bff-v1", []string{"kmail-bff-v1"}, false, nil)
+	certPath := writeTempPEM(t, dir, "tls.crt", first.certPEM)
+	keyPath := writeTempPEM(t, dir, "tls.key", first.keyPEM)
+
+	loader := &keypairLoader{
+		certFile: certPath,
+		keyFile:  keyPath,
+		logger:   testLogger(t),
+	}
+	c1, err := loader.load()
+	if err != nil {
+		t.Fatalf("initial load: %v", err)
+	}
+	leaf1, err := x509.ParseCertificate(c1.Certificate[0])
+	if err != nil {
+		t.Fatalf("parse leaf 1: %v", err)
+	}
+	if leaf1.Subject.CommonName != "kmail-bff-v1" {
+		t.Fatalf("initial CN = %q, want kmail-bff-v1", leaf1.Subject.CommonName)
+	}
+
+	// Rotate: overwrite the files with a different keypair and
+	// bump mtime past whatever filesystem granularity the test
+	// runner uses (HFS+ / ext4 with relatime can have 1s steps).
+	second := issueCert(t, "kmail-bff-v2", []string{"kmail-bff-v2"}, false, nil)
+	if err := os.WriteFile(certPath, second.certPEM, 0o600); err != nil {
+		t.Fatalf("rewrite cert: %v", err)
+	}
+	if err := os.WriteFile(keyPath, second.keyPEM, 0o600); err != nil {
+		t.Fatalf("rewrite key: %v", err)
+	}
+	future := time.Now().Add(2 * time.Second)
+	if err := os.Chtimes(certPath, future, future); err != nil {
+		t.Fatalf("chtimes cert: %v", err)
+	}
+	if err := os.Chtimes(keyPath, future, future); err != nil {
+		t.Fatalf("chtimes key: %v", err)
+	}
+
+	c2, err := loader.load()
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	leaf2, err := x509.ParseCertificate(c2.Certificate[0])
+	if err != nil {
+		t.Fatalf("parse leaf 2: %v", err)
+	}
+	if leaf2.Subject.CommonName != "kmail-bff-v2" {
+		t.Errorf("rotated CN = %q, want kmail-bff-v2", leaf2.Subject.CommonName)
+	}
+
+	// Calling again without changing mtimes must hit the cache
+	// (same *tls.Certificate pointer).
+	c3, err := loader.load()
+	if err != nil {
+		t.Fatalf("third load: %v", err)
+	}
+	if c3 != c2 {
+		t.Errorf("expected cached pointer reuse when mtimes unchanged")
 	}
 }
 
@@ -156,7 +260,7 @@ func TestClientTLSConfig_BuildLoadsCABundle(t *testing.T) {
 		KeyFile:  writeTempPEM(t, dir, "tls.key", key),
 		CAFile:   writeTempPEM(t, dir, "ca.pem", caCert),
 	}
-	tlsCfg, err := cfg.build()
+	tlsCfg, err := cfg.build(testLogger(t))
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
@@ -173,7 +277,7 @@ func TestClientTLSConfig_BuildRejectsBadCABundle(t *testing.T) {
 		KeyFile:  writeTempPEM(t, dir, "tls.key", key),
 		CAFile:   writeTempPEM(t, dir, "bad.pem", []byte("not a pem")),
 	}
-	if _, err := cfg.build(); err == nil {
+	if _, err := cfg.build(testLogger(t)); err == nil {
 		t.Fatal("expected error for non-PEM CA bundle")
 	}
 }
@@ -222,7 +326,7 @@ func TestProxy_MTLSHandshake(t *testing.T) {
 		CAFile:     writeTempPEM(t, dir, "ca.pem", ca.certPEM),
 		ServerName: "127.0.0.1",
 	}
-	tlsCfg, err := cfg.build()
+	tlsCfg, err := cfg.build(testLogger(t))
 	if err != nil {
 		t.Fatalf("build TLS: %v", err)
 	}
@@ -246,6 +350,7 @@ func TestProxy_MTLSHandshake(t *testing.T) {
 	// client material.
 	noClientCfg := tlsCfg.Clone()
 	noClientCfg.Certificates = nil
+	noClientCfg.GetClientCertificate = nil
 	noClientTransport := newClientTLSTransport(noClientCfg)
 	if _, err := noClientTransport.RoundTrip(req.Clone(context.Background())); err == nil {
 		t.Errorf("expected handshake failure without client cert")

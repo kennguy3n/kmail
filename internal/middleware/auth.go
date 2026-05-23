@@ -69,12 +69,44 @@ type OIDCConfig struct {
 // EnvDevelopment is the only `OIDCConfig.Env` value that unlocks
 // the `DevBypassToken` and unverified-JWT fallback paths. The
 // comparison is case-insensitive.
-const EnvDevelopment = "development"
+const (
+	EnvDevelopment = "development"
+	EnvStaging     = "staging"
+	EnvProduction  = "production"
+)
+
+// knownEnvs enumerates the operator-facing environment names the
+// auth middleware recognises. An OIDCConfig.Env value outside
+// this set is treated as production (fail-safe) but logs a
+// warning at construction so operator typos surface immediately.
+var knownEnvs = map[string]struct{}{
+	EnvDevelopment: {},
+	EnvStaging:     {},
+	EnvProduction:  {},
+}
+
+// normalizedEnv returns the trimmed/lower-cased environment name.
+func (c OIDCConfig) normalizedEnv() string {
+	return strings.ToLower(strings.TrimSpace(c.Env))
+}
 
 // isDevEnv reports whether the configured environment string
 // unlocks dev-only auth shortcuts.
 func (c OIDCConfig) isDevEnv() bool {
-	return strings.EqualFold(strings.TrimSpace(c.Env), EnvDevelopment)
+	return c.normalizedEnv() == EnvDevelopment
+}
+
+// isKnownEnv reports whether the configured environment is one
+// of the recognized strings (development|staging|production).
+// Empty Env counts as known (it pins production-grade behaviour
+// without needing the operator to set anything).
+func (c OIDCConfig) isKnownEnv() bool {
+	env := c.normalizedEnv()
+	if env == "" {
+		return true
+	}
+	_, ok := knownEnvs[env]
+	return ok
 }
 
 // OIDC is the middleware factory. The JWKS cache lives on this
@@ -96,6 +128,20 @@ func NewOIDC(cfg OIDCConfig) (*OIDC, error) {
 			return nil, fmt.Errorf("build JWKS fetcher: %w", err)
 		}
 		cfg.JWKS = fetcher
+	}
+	// Surface operator typos early: an unrecognised Env string
+	// silently falls through to production behaviour, so warn at
+	// construction time rather than discovering it via a confused
+	// auth flow.
+	if !cfg.isKnownEnv() {
+		logger := cfg.Logger
+		if logger == nil {
+			logger = log.Default()
+		}
+		logger.Printf(
+			"middleware.NewOIDC: KMAIL_ENV=%q is not one of [%s, %s, %s] — treating as production (dev shortcuts disabled)",
+			cfg.Env, EnvDevelopment, EnvStaging, EnvProduction,
+		)
 	}
 	if !cfg.isDevEnv() {
 		// Production-grade deployments MUST verify JWTs against a
