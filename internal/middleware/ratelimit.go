@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -25,6 +26,13 @@ import (
 // replaces the previous fixed-window counter, which would let
 // callers see 2x the configured RPM at bucket boundaries (`burst at
 // 59s, burst again at 61s`).
+//
+// The tenant and user checks are issued in a single Lua call so
+// that a request rejected at the user ceiling does NOT consume any
+// tenant budget — the script atomically rolls back the tenant
+// admission when the user check fails. The previous two-call
+// approach inflated the tenant counter under sustained user-level
+// rate limiting.
 type RateLimiterConfig struct {
 	// Client is the Valkey (Redis-compatible) client used for
 	// counter storage. Required; leave nil to short-circuit the
@@ -52,15 +60,31 @@ type RateLimiterConfig struct {
 // RateLimiterStore is the narrow surface RateLimiter depends on.
 // Implemented by `*RedisStore`, tests substitute a fake.
 //
-// `Allow` is the single sliding-window primitive: it atomically (a)
-// drops every member of the sorted set older than `now - window`,
-// (b) counts the survivors, and (c) inserts a new member at `now`
-// iff the post-insert count would not exceed `limit`. The return
-// values are the post-call count and whether the new request was
-// admitted. Implementations MUST run all three steps in a single
-// atomic context (Lua / MULTI-EXEC).
+// `Allow` is the single combined tenant+user sliding-window
+// primitive. Both keys are checked atomically: if the tenant check
+// passes but the user check fails, the tenant admission is rolled
+// back so the rejected request does NOT consume tenant budget.
+//
+// Pass `userKey == ""` (and `userLimit == 0`) for tenant-only
+// scoring (e.g. anonymous/unattributed traffic that still has a
+// tenant context). Implementations MUST run all three steps —
+// trim, check, admit-or-reject — for each scope in a single atomic
+// context (Lua / MULTI-EXEC), and MUST roll back the tenant
+// admission when the user check rejects.
+//
+// Returns `(tenantOK, userOK, err)`, where each bool reports
+// whether THAT scope's check passed (not the post-rollback state).
+// Callers should report "tenant" rejection only when `!tenantOK`,
+// and "user" rejection when `tenantOK && !userOK`. When `userKey`
+// is empty, `userOK` is always true.
 type RateLimiterStore interface {
-	Allow(ctx context.Context, key string, window time.Duration, limit int, now time.Time) (count int64, allowed bool, err error)
+	Allow(
+		ctx context.Context,
+		tenantKey, userKey string,
+		window time.Duration,
+		tenantLimit, userLimit int,
+		now time.Time,
+	) (tenantAdmitted, userAdmitted bool, err error)
 }
 
 // RateLimiter is the HTTP middleware. Construct once at boot and
@@ -113,30 +137,37 @@ func (r *RateLimiter) Wrap(next http.Handler) http.Handler {
 		now := r.cfg.Now()
 		window := r.cfg.Window
 
-		tenantKey := fmt.Sprintf("kmail:rl:tenant:%s", tenantID)
-		_, allowed, err := r.cfg.Client.Allow(req.Context(), tenantKey, window, r.cfg.TenantRPM, now)
+		// Hash-tag the key shape so the tenant and user keys land
+		// in the same Valkey-cluster slot. Cluster Lua requires
+		// every KEYS[i] to be co-located; `{<tid>}` is the standard
+		// Redis hash-tag convention.
+		tenantKey := fmt.Sprintf("kmail:rl:tenant:{%s}", tenantID)
+		userKey := ""
+		userLimit := 0
+		if userID != "" {
+			userKey = fmt.Sprintf("kmail:rl:user:{%s}:%s", tenantID, userID)
+			userLimit = r.cfg.UserRPM
+		}
+
+		tenantOK, userOK, err := r.cfg.Client.Allow(
+			req.Context(),
+			tenantKey, userKey,
+			window,
+			r.cfg.TenantRPM, userLimit,
+			now,
+		)
 		if err != nil {
-			r.cfg.Logger.Printf("ratelimit: tenant allow %s: %v", tenantKey, err)
+			r.cfg.Logger.Printf("ratelimit: allow tenant=%s user=%s: %v", tenantKey, userKey, err)
 			next.ServeHTTP(w, req)
 			return
 		}
-		if !allowed {
+		if !tenantOK {
 			writeRateLimitExceeded(w, window, r.cfg.TenantRPM, "tenant")
 			return
 		}
-
-		if userID != "" {
-			userKey := fmt.Sprintf("kmail:rl:user:%s:%s", tenantID, userID)
-			_, allowed, err := r.cfg.Client.Allow(req.Context(), userKey, window, r.cfg.UserRPM, now)
-			if err != nil {
-				r.cfg.Logger.Printf("ratelimit: user allow %s: %v", userKey, err)
-				next.ServeHTTP(w, req)
-				return
-			}
-			if !allowed {
-				writeRateLimitExceeded(w, window, r.cfg.UserRPM, "user")
-				return
-			}
+		if !userOK {
+			writeRateLimitExceeded(w, window, r.cfg.UserRPM, "user")
+			return
 		}
 		next.ServeHTTP(w, req)
 	})
@@ -155,44 +186,82 @@ func writeRateLimitExceeded(w http.ResponseWriter, window time.Duration, rpm int
 	http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 }
 
-// slidingWindowScript is the atomic ZSET-based sliding-window log:
+// slidingWindowScript is the atomic ZSET-based sliding-window log
+// covering BOTH the tenant and (optionally) the user scope in a
+// single call.
 //
-//	KEYS[1]   the per-scope ZSET key (kmail:rl:tenant:<tid>, ...)
+//	KEYS[1]   tenant ZSET key (kmail:rl:tenant:{<tid>})
+//	KEYS[2]   user ZSET key (kmail:rl:user:{<tid>}:<uid>), may be ""
 //	ARGV[1]   window duration in milliseconds (integer)
-//	ARGV[2]   limit (max admitted requests within the window)
-//	ARGV[3]   `now` epoch milliseconds
-//	ARGV[4]   unique member to insert (`now-ms:<random hex>`)
+//	ARGV[2]   tenant limit
+//	ARGV[3]   user limit (0 if KEYS[2] is empty)
+//	ARGV[4]   `now` epoch milliseconds
+//	ARGV[5]   unique member to insert (`now-ms:<random hex>`)
 //
-// The script drops every entry older than `now - window`, counts
-// the survivors, and admits-or-rejects atomically. We refresh the
-// PEXPIRE on every call so a quiet scope ages out naturally and we
-// never have to GC the sorted set out-of-band.
+// The script processes the tenant scope first; if the tenant
+// admission succeeds AND a user key is provided, the user scope is
+// processed next. When the user check rejects, the script ZREMs
+// the just-inserted tenant member so a request rejected at the
+// user ceiling does not consume tenant budget.
 //
-// Returns `{post_count, admitted_int}` where `admitted_int` is 1 if
-// the new request was added to the set, 0 if it was rejected.
+// PEXPIRE is refreshed on every call so idle scopes age out
+// naturally and we never have to GC the sorted sets out-of-band.
+// A 5s grace on top of the window handles small clock skew on the
+// Valkey side.
+//
+// Returns `{tenant_admitted, user_admitted}` (both integers 0/1).
+// When KEYS[2] is empty, `user_admitted` is 1 (no-op).
 const slidingWindowScript = `
-local key       = KEYS[1]
-local window    = tonumber(ARGV[1])
-local limit     = tonumber(ARGV[2])
-local now       = tonumber(ARGV[3])
-local member    = ARGV[4]
-local cutoff    = now - window
+local tenant_key   = KEYS[1]
+local user_key     = KEYS[2]
+local window       = tonumber(ARGV[1])
+local tenant_limit = tonumber(ARGV[2])
+local user_limit   = tonumber(ARGV[3])
+local now          = tonumber(ARGV[4])
+local member       = ARGV[5]
+local cutoff       = now - window
 
-redis.call("ZREMRANGEBYSCORE", key, "-inf", "(" .. tostring(cutoff))
-local count = tonumber(redis.call("ZCARD", key))
+-- Tenant scope: trim + count + conditional add.
+redis.call("ZREMRANGEBYSCORE", tenant_key, "-inf", "(" .. tostring(cutoff))
+local tenant_count = tonumber(redis.call("ZCARD", tenant_key))
+local tenant_admitted = 0
+if tenant_count < tenant_limit then
+    redis.call("ZADD", tenant_key, now, member)
+    tenant_admitted = 1
+end
+redis.call("PEXPIRE", tenant_key, window + 5000)
 
-local admitted = 0
-if count < limit then
-    redis.call("ZADD", key, now, member)
-    count = count + 1
-    admitted = 1
+-- Short-circuit: tenant rejected, nothing to do for user.
+if tenant_admitted == 0 then
+    return {0, 0}
 end
 
--- Refresh TTL so an idle key eventually disappears even if the next
--- caller never returns. +5s grace handles small clock skew on the
--- Valkey side.
-redis.call("PEXPIRE", key, window + 5000)
-return {count, admitted}
+-- No user scope provided — tenant-only mode.
+if user_key == nil or user_key == "" then
+    return {1, 1}
+end
+
+-- User scope: same trim + count + conditional add.
+redis.call("ZREMRANGEBYSCORE", user_key, "-inf", "(" .. tostring(cutoff))
+local user_count = tonumber(redis.call("ZCARD", user_key))
+local user_admitted = 0
+if user_count < user_limit then
+    redis.call("ZADD", user_key, now, member)
+    user_admitted = 1
+end
+redis.call("PEXPIRE", user_key, window + 5000)
+
+-- Roll back the tenant admission if the user check rejected, so
+-- rejected requests don't inflate the tenant counter. The first
+-- return value is "did the tenant CHECK pass" (so the middleware
+-- can attribute the rejection to the user scope) even though the
+-- tenant ZSET was just restored to its pre-call state.
+if user_admitted == 0 then
+    redis.call("ZREM", tenant_key, member)
+    return {1, 0}
+end
+
+return {1, 1}
 `
 
 // RedisStore wraps a *redis.Client so it satisfies the
@@ -201,7 +270,13 @@ return {count, admitted}
 // (`redis.NewScript` caches the SHA) and re-used on every call.
 type RedisStore struct {
 	Client *redis.Client
-	script *redis.Script
+
+	// scriptOnce guards lazy compilation when the struct is built
+	// literally (`&RedisStore{Client: c}`) rather than via the
+	// `NewRedisStoreFromClient` constructor. Eager-compiling
+	// callers see `scriptOnce.Do` short-circuit immediately.
+	scriptOnce sync.Once
+	script     *redis.Script
 }
 
 // NewRedisStore is a convenience constructor that dials Valkey at
@@ -220,10 +295,20 @@ func NewRedisStore(url string) (*RedisStore, error) {
 // `*redis.Script` is shared across calls so each Allow only pays
 // for an EVALSHA round-trip.
 func NewRedisStoreFromClient(c *redis.Client) *RedisStore {
-	return &RedisStore{
-		Client: c,
-		script: redis.NewScript(slidingWindowScript),
-	}
+	s := &RedisStore{Client: c}
+	s.ensureScript()
+	return s
+}
+
+// ensureScript compiles the sliding-window Lua script exactly once,
+// safely across concurrent Allow callers when the store was built
+// via the struct literal rather than the constructor. `sync.Once`
+// gives us happens-before for the `script` write so subsequent
+// goroutines observe the compiled handle without a data race.
+func (s *RedisStore) ensureScript() {
+	s.scriptOnce.Do(func() {
+		s.script = redis.NewScript(slidingWindowScript)
+	})
 }
 
 func parseValkeyURL(url string) (*redis.Options, error) {
@@ -238,20 +323,25 @@ func parseValkeyURL(url string) (*redis.Options, error) {
 	return &redis.Options{Addr: url}, nil
 }
 
-// Allow runs the sliding-window Lua script against Valkey. The
-// member inserted into the ZSET is `<now-ms>:<8-byte-hex>` so two
-// requests landing in the same millisecond (which collides under
-// ZADD's `score` is the timestamp but `member` is the dedup key)
-// still both get counted.
-func (s *RedisStore) Allow(ctx context.Context, key string, window time.Duration, limit int, now time.Time) (int64, bool, error) {
+// Allow runs the combined tenant+user sliding-window Lua script
+// against Valkey. The ZSET member inserted on admission is
+// `<now-ms>:<8-byte-hex>` so two requests landing in the same
+// millisecond still both get counted (ZADD member uniqueness is
+// what dedupes, not the score). Returns `(tenantOK, userOK, err)`
+// per the RateLimiterStore contract: each flag reports whether
+// that scope's CHECK passed, not the post-rollback ZSET state.
+func (s *RedisStore) Allow(
+	ctx context.Context,
+	tenantKey, userKey string,
+	window time.Duration,
+	tenantLimit, userLimit int,
+	now time.Time,
+) (bool, bool, error) {
 	if s.Client == nil {
-		return 0, false, errors.New("RedisStore: Client is nil")
+		return false, false, errors.New("RedisStore: Client is nil")
 	}
-	if s.script == nil {
-		// Defensive: someone built the struct literally rather
-		// than via NewRedisStoreFromClient. Compile lazily.
-		s.script = redis.NewScript(slidingWindowScript)
-	}
+	s.ensureScript()
+
 	windowMs := window.Milliseconds()
 	if windowMs <= 0 {
 		windowMs = int64(time.Minute / time.Millisecond)
@@ -259,19 +349,20 @@ func (s *RedisStore) Allow(ctx context.Context, key string, window time.Duration
 	nowMs := now.UnixMilli()
 	member, err := newUniqueMember(nowMs)
 	if err != nil {
-		return 0, false, fmt.Errorf("ratelimit: generate member: %w", err)
+		return false, false, fmt.Errorf("ratelimit: generate member: %w", err)
 	}
-	res, err := s.script.Run(ctx, s.Client, []string{key}, windowMs, limit, nowMs, member).Result()
+	keys := []string{tenantKey, userKey}
+	res, err := s.script.Run(ctx, s.Client, keys, windowMs, tenantLimit, userLimit, nowMs, member).Result()
 	if err != nil {
-		return 0, false, fmt.Errorf("ratelimit: EVAL: %w", err)
+		return false, false, fmt.Errorf("ratelimit: EVAL: %w", err)
 	}
 	pair, ok := res.([]interface{})
 	if !ok || len(pair) != 2 {
-		return 0, false, fmt.Errorf("ratelimit: unexpected script result shape: %T", res)
+		return false, false, fmt.Errorf("ratelimit: unexpected script result shape: %T", res)
 	}
-	count, _ := pair[0].(int64)
-	admittedI, _ := pair[1].(int64)
-	return count, admittedI == 1, nil
+	tenantI, _ := pair[0].(int64)
+	userI, _ := pair[1].(int64)
+	return tenantI == 1, userI == 1, nil
 }
 
 // newUniqueMember produces a per-request ZSET member that won't
@@ -279,7 +370,8 @@ func (s *RedisStore) Allow(ctx context.Context, key string, window time.Duration
 // Format: `<now-ms>:<16 hex chars>`. The leading timestamp keeps
 // the member sortable, which is occasionally useful for debugging
 // dumps; the random suffix is what guarantees uniqueness under
-// `ZADD` (which would otherwise no-op on a duplicate).
+// `ZADD` (which would otherwise no-op on a duplicate) and matches
+// the value used by the rollback ZREM in the Lua script.
 func newUniqueMember(nowMs int64) (string, error) {
 	var b [8]byte
 	if _, err := rand.Read(b[:]); err != nil {

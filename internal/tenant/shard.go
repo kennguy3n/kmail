@@ -180,10 +180,13 @@ func (s *ShardService) UpdateShard(ctx context.Context, shardID string, in Shard
 	if err != nil {
 		return nil, fmt.Errorf("update shard: %w", err)
 	}
-	// stalwart_url may have just changed; the per-tenant URL cache
-	// in GetTenantShard has no TTL, so flush every tenant on this
-	// shard. Worst case: each tenant pays one extra DB lookup on
-	// the next JMAP request.
+	// stalwart_url may have just changed; eagerly evict every
+	// tenant on this shard from the per-tenant URL cache so the
+	// new URL is visible immediately. The expirable LRU does
+	// re-resolve on its own after `shardCacheTTL`, but we don't
+	// want operators to wait up to 5 minutes for a rebalance to
+	// take effect. Worst case: each tenant pays one extra DB
+	// lookup on the next JMAP request.
 	tenants, terr := s.ListTenantsOnShard(ctx, shardID)
 	if terr != nil {
 		return nil, fmt.Errorf("update shard: refresh cache: %w", terr)

@@ -141,7 +141,12 @@ func NewProxy(cfg ProxyConfig) (*Proxy, error) {
 	}
 	ttl := cfg.AccountCacheTTL
 	if ttl <= 0 {
-		ttl = 5 * time.Minute
+		// Single source of truth lives next to the cache itself
+		// (see `accountCacheDefaultTTL`). `newAccountCache`
+		// applies the same default on ttl<=0, so this is
+		// belt-and-braces — but referencing the constant keeps
+		// the two defaults in lockstep if someone tunes one.
+		ttl = accountCacheDefaultTTL
 	}
 	p := &Proxy{
 		cfg:      cfg,

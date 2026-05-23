@@ -12,21 +12,19 @@ import (
 // fakeStore implements RateLimiterStore in-process so the
 // middleware tests don't need Valkey. Each `Allow` call records the
 // request timestamp in a per-key slice and applies the same
-// trim-then-admit logic the production Lua script does, so the
-// tests are exercising the full sliding-window semantics rather
-// than a stub that always says yes.
+// trim-then-admit-then-rollback logic the production Lua script
+// does, so the tests are exercising the full sliding-window
+// semantics — including the user-rejection-rolls-back-tenant
+// invariant — rather than a stub that always says yes.
 type fakeStore struct {
 	log  map[string][]time.Time
 	fail error
 }
 
-func (f *fakeStore) Allow(_ context.Context, key string, window time.Duration, limit int, now time.Time) (int64, bool, error) {
-	if f.fail != nil {
-		return 0, false, f.fail
-	}
-	if f.log == nil {
-		f.log = map[string][]time.Time{}
-	}
+// trimAndCount returns the surviving entries for `key` after
+// dropping anything older than `now - window`. Mutates f.log[key]
+// in place to keep it bounded.
+func (f *fakeStore) trimAndCount(key string, window time.Duration, now time.Time) []time.Time {
 	cutoff := now.Add(-window)
 	kept := f.log[key][:0]
 	for _, ts := range f.log[key] {
@@ -34,13 +32,41 @@ func (f *fakeStore) Allow(_ context.Context, key string, window time.Duration, l
 			kept = append(kept, ts)
 		}
 	}
-	if len(kept) >= limit {
-		f.log[key] = kept
-		return int64(len(kept)), false, nil
-	}
-	kept = append(kept, now)
 	f.log[key] = kept
-	return int64(len(kept)), true, nil
+	return kept
+}
+
+func (f *fakeStore) Allow(_ context.Context, tenantKey, userKey string, window time.Duration, tenantLimit, userLimit int, now time.Time) (bool, bool, error) {
+	if f.fail != nil {
+		return false, false, f.fail
+	}
+	if f.log == nil {
+		f.log = map[string][]time.Time{}
+	}
+
+	tenantKept := f.trimAndCount(tenantKey, window, now)
+	if len(tenantKept) >= tenantLimit {
+		return false, false, nil
+	}
+	f.log[tenantKey] = append(tenantKept, now)
+
+	if userKey == "" {
+		return true, true, nil
+	}
+	userKept := f.trimAndCount(userKey, window, now)
+	if len(userKept) >= userLimit {
+		// Roll back the tenant admission so a user-level
+		// rejection does NOT consume tenant budget. Mirrors
+		// the ZREM in the production Lua script. The return
+		// `(true, false)` reports "tenant check passed, user
+		// check failed" so the middleware attributes the
+		// rejection to the user scope.
+		tenantLog := f.log[tenantKey]
+		f.log[tenantKey] = tenantLog[:len(tenantLog)-1]
+		return true, false, nil
+	}
+	f.log[userKey] = append(userKept, now)
+	return true, true, nil
 }
 
 // authedRequest returns an httptest request with tenant + user
@@ -276,5 +302,73 @@ func TestRateLimiter_SlidingWindow_NoBoundaryBurst(t *testing.T) {
 	h.ServeHTTP(rec, authedRequest("t1", "u1"))
 	if rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("expected 429 at t=63s (window full again), got %d", rec.Code)
+	}
+}
+
+// TestRateLimiter_UserRejection_DoesNotConsumeTenantBudget pins the
+// atomic-rollback invariant: when the tenant check passes but the
+// user check fails, the tenant counter must be restored so a
+// chatty user can't starve their own tenant's budget. The previous
+// two-call implementation violated this — every user-level
+// rejection still incremented the tenant counter.
+func TestRateLimiter_UserRejection_DoesNotConsumeTenantBudget(t *testing.T) {
+	store := &fakeStore{}
+	now := time.Unix(0, 0)
+	rl := NewRateLimiter(RateLimiterConfig{
+		Client:    store,
+		TenantRPM: 5, // small enough that we can see budget drift
+		UserRPM:   1, // single-shot per user inside the window
+		Window:    time.Minute,
+		Now:       func() time.Time { return now },
+	})
+	h := rl.Wrap(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	// First request from u1: tenant=1, user=1, admitted.
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, authedRequest("t1", "u1"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("first u1 request: expected 200, got %d", rec.Code)
+	}
+
+	// 10 more u1 requests, all rejected at the user ceiling.
+	// Each rejection must roll back the tenant admission so the
+	// tenant budget is unaffected.
+	for i := 0; i < 10; i++ {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, authedRequest("t1", "u1"))
+		if rec.Code != http.StatusTooManyRequests {
+			t.Fatalf("iter %d u1: expected 429, got %d", i, rec.Code)
+		}
+		if rec.Header().Get("X-RateLimit-Scope") != "user" {
+			t.Errorf("iter %d u1: expected user scope, got %q", i, rec.Header().Get("X-RateLimit-Scope"))
+		}
+	}
+
+	// Now drive 4 more *distinct* users. Each gets a fresh user
+	// budget; the tenant ZSET should currently sit at 1 (u1's
+	// admitted request). If the rollback worked, all 4 must be
+	// admitted (1 + 4 = 5 == TenantRPM). If rollback was
+	// missing, the tenant counter would have already reached
+	// 11 (1 + 10 inflated) and these would all be 429.
+	for i, user := range []string{"u2", "u3", "u4", "u5"} {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, authedRequest("t1", user))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("iter %d %s: expected 200 (tenant budget preserved across u1 rejections), got %d / scope=%q",
+				i, user, rec.Code, rec.Header().Get("X-RateLimit-Scope"))
+		}
+	}
+
+	// The next request from a 6th user should hit the tenant
+	// ceiling exactly (TenantRPM=5 reached by u1+u2+u3+u4+u5).
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, authedRequest("t1", "u6"))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("u6 should hit tenant ceiling, got %d", rec.Code)
+	}
+	if rec.Header().Get("X-RateLimit-Scope") != "tenant" {
+		t.Errorf("u6: expected tenant scope, got %q", rec.Header().Get("X-RateLimit-Scope"))
 	}
 }
