@@ -462,6 +462,20 @@ func GetenvInt(key string, fallback int) int {
 	return n
 }
 
+// GetenvInt64 mirrors GetenvInt for int64 values (e.g. byte
+// thresholds that exceed math.MaxInt32 on 32-bit builds).
+func GetenvInt64(key string, fallback int64) int64 {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		return fallback
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return fallback
+	}
+	return n
+}
+
 // String renders a human-readable, secret-masked summary of the
 // config for startup logging.
 func (c *Config) String() string {

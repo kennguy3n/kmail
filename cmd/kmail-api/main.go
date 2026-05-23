@@ -141,12 +141,41 @@ func main() {
 		malware.NewHandlers(malware.NewNoopScanner(), logger).Register(mux, authMW.Wrap)
 	}
 
+	// Valkey is consumed by deliverability, push, calendar reminders,
+	// the SLO tracker, AND the shared JMAP circuit breaker (Phase 5).
+	// Stand it up early so the breaker can share trip state across
+	// every BFF pod — a 5xx storm against shard X opens the breaker
+	// once across the fleet instead of once per pod.
+	var valkeyClient *redis.Client
+	if cfg.ValkeyURL != "" {
+		valkeyClient = redis.NewClient(&redis.Options{Addr: cfg.ValkeyURL})
+	}
+
+	var jmapBreaker jmap.CircuitBreaker
+	if valkeyClient != nil {
+		shared, breakerErr := jmap.NewRedisCircuitBreaker(jmap.RedisCircuitBreakerConfig{
+			Client:    valkeyClient,
+			Logger:    logger,
+			Threshold: config.GetenvInt("KMAIL_BREAKER_THRESHOLD", 3),
+			Cooldown:  getenvDuration("KMAIL_BREAKER_COOLDOWN", 30*time.Second),
+			Window:    getenvDuration("KMAIL_BREAKER_WINDOW", 60*time.Second),
+		})
+		if breakerErr != nil {
+			logger.Fatalf("jmap.NewRedisCircuitBreaker: %v", breakerErr)
+		}
+		jmapBreaker = shared
+		logger.Printf("jmap: shared circuit breaker enabled against %s", cfg.ValkeyURL)
+	} else {
+		logger.Printf("jmap: shared circuit breaker disabled (KMAIL_VALKEY_URL unset); falling back to per-pod breaker")
+	}
+
 	proxy, err := jmap.NewProxy(jmap.ProxyConfig{
 		StalwartURL:    cfg.StalwartURL,
 		Pool:           pool,
 		Logger:         logger,
 		Shards:         shardSvc,
 		PreDeliverHook: malwareHook,
+		Breaker:        jmapBreaker,
 	})
 	if err != nil {
 		logger.Fatalf("jmap.NewProxy: %v", err)
@@ -258,14 +287,6 @@ func main() {
 	migrationHandlers := migration.NewHandlers(migrationSvc, logger)
 	migrationHandlers.Register(mux, authMW)
 
-	// Valkey is consumed by deliverability, push, calendar reminders,
-	// and the SLO tracker. Stand it up early so every downstream
-	// service can share the same client.
-	var valkeyClient *redis.Client
-	if cfg.ValkeyURL != "" {
-		valkeyClient = redis.NewClient(&redis.Options{Addr: cfg.ValkeyURL})
-	}
-
 	chatbridgeSvc := chatbridge.NewService(chatbridge.Config{
 		KChatAPIURL:   cfg.KChatAPIURL,
 		KChatAPIToken: cfg.KChatAPIToken,
@@ -371,6 +392,51 @@ func main() {
 		Backends: searchBackends,
 	})
 	search.NewHandlers(searchSvc, logger).Register(mux, authMW)
+
+	// Phase 5: auto-cutover from Meilisearch to OpenSearch.
+	// Disabled when either backend is missing (we'd have nowhere
+	// to read from or write to). The worker polls hourly and
+	// promotes any tenant whose mailbox is past the configured
+	// byte threshold — see `internal/search/cutover.go`.
+	hasMeili, hasOpen := false, false
+	for _, b := range searchBackends {
+		switch b.Name() {
+		case search.BackendMeilisearch:
+			hasMeili = true
+		case search.BackendOpenSearch:
+			hasOpen = true
+		}
+	}
+	if hasMeili && hasOpen {
+		sizer := search.MailboxSizerFunc(func(ctx context.Context, tenantID string) (int64, error) {
+			q, err := billingSvc.GetQuota(ctx, tenantID)
+			if err != nil {
+				return 0, err
+			}
+			return q.StorageUsedBytes, nil
+		})
+		source := search.MessageSourceFunc(func(ctx context.Context, tenantID string) ([]search.Message, error) {
+			return searchSvc.Export(ctx, tenantID)
+		})
+		cutover, cutErr := search.NewCutoverWorker(search.CutoverConfig{
+			Pool:        pool,
+			Service:     searchSvc,
+			Sizer:       sizer,
+			Source:      source,
+			Logger:      logger,
+			Threshold:   int64(config.GetenvInt64("KMAIL_SEARCH_CUTOVER_THRESHOLD_BYTES", 0)),
+			Interval:    getenvDuration("KMAIL_SEARCH_CUTOVER_INTERVAL", time.Hour),
+			MaxFailures: config.GetenvInt("KMAIL_SEARCH_CUTOVER_MAX_FAILURES", 5),
+			MaxRetryGap: getenvDuration("KMAIL_SEARCH_CUTOVER_RETRY_GAP", time.Hour),
+		})
+		if cutErr != nil {
+			logger.Fatalf("search.NewCutoverWorker: %v", cutErr)
+		}
+		go cutover.Run(ctx)
+		logger.Printf("search: auto-cutover worker started (poll=%s)", getenvDuration("KMAIL_SEARCH_CUTOVER_INTERVAL", time.Hour))
+	} else {
+		logger.Printf("search: auto-cutover worker disabled (need both Meilisearch and OpenSearch configured)")
+	}
 
 	// Sieve rule management (Phase 7).
 	sieveSvc := sieve.NewService(sieve.Config{Pool: pool, Logger: logger})

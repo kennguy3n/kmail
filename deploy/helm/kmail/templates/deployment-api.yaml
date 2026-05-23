@@ -18,6 +18,10 @@ spec:
         app.kubernetes.io/component: api
     spec:
       serviceAccountName: {{ include "kmail.serviceAccountName" . }}
+      {{- with .Values.kmailApi.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: kmail-api
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
@@ -31,6 +35,21 @@ spec:
                 name: {{ include "kmail.fullname" . }}-config
             - secretRef:
                 name: {{ include "kmail.secretName" . }}
+          {{- if .Values.multiregion.enabled }}
+          env:
+            {{- with .Values.multiregion.region }}
+            - name: KMAIL_REGION
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.multiregion.peerRegions }}
+            - name: KMAIL_REGION_PEERS
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- with .Values.multiregion.valkeyReplicaURLs }}
+            - name: KMAIL_VALKEY_REPLICA_URLS
+              value: {{ . | quote }}
+            {{- end }}
+          {{- end }}
           readinessProbe:
             httpGet:
               path: /readyz

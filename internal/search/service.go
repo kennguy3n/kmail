@@ -88,7 +88,18 @@ type SearchBackend interface {
 	// tenant index. Used by `Service.Reindex` when switching
 	// backends.
 	MigrateIndex(ctx context.Context, tenantID string, msgs []Message) error
+	// ExportMessages returns every document currently in the
+	// tenant index. Used by `Service.Export` during the auto-
+	// cutover (Phase 5) so the worker can read messages out of
+	// the old backend and push them into the new one. Backends
+	// that don't support bulk export return ErrNotSupported.
+	ExportMessages(ctx context.Context, tenantID string) ([]Message, error)
 }
+
+// ErrNotSupported is returned by SearchBackend implementations
+// that can't honour an optional method (e.g. an upstream that has
+// no bulk-export API).
+var ErrNotSupported = errors.New("backend does not support operation")
 
 // Service manages per-tenant backend selection and reindex jobs.
 type Service struct {
@@ -180,6 +191,22 @@ func (s *Service) SetBackend(ctx context.Context, tenantID, backend string) erro
 		}
 		return nil
 	})
+}
+
+// Export returns every indexed message for `tenantID` from the
+// tenant's CURRENT backend. Used by the Phase 5 auto-cutover
+// worker as its MessageSource: read from Meilisearch, flip the
+// backend column, push into OpenSearch.
+func (s *Service) Export(ctx context.Context, tenantID string) ([]Message, error) {
+	name, err := s.GetBackend(ctx, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	b, ok := s.backends[name]
+	if !ok {
+		return nil, fmt.Errorf("%w: backend %q not configured", ErrNotFound, name)
+	}
+	return b.ExportMessages(ctx, tenantID)
 }
 
 // Reindex re-imports every message in `msgs` into whatever backend

@@ -12,6 +12,7 @@ package search
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"time"
 )
@@ -93,6 +94,41 @@ func (m *MeilisearchBackend) DeleteIndex(ctx context.Context, tenantID string) e
 func (m *MeilisearchBackend) MigrateIndex(ctx context.Context, tenantID string, msgs []Message) error {
 	endpoint := m.BaseURL + "/indexes/" + indexNameFor(tenantID) + "/documents"
 	return httpJSON(ctx, m.HTTPClient, http.MethodPost, endpoint, m.headers(), msgs, nil)
+}
+
+// ExportMessages pages through every document in the tenant
+// index. Meilisearch's `/documents` endpoint supports `offset` +
+// `limit` for cursor-style pagination; we use a page size of 1000
+// to keep memory bounded during the cutover.
+func (m *MeilisearchBackend) ExportMessages(ctx context.Context, tenantID string) ([]Message, error) {
+	const pageSize = 1000
+	var out []Message
+	offset := 0
+	for {
+		endpoint := fmt.Sprintf("%s/indexes/%s/documents?limit=%d&offset=%d",
+			m.BaseURL, indexNameFor(tenantID), pageSize, offset)
+		var resp struct {
+			Results []Message `json:"results"`
+			Total   int       `json:"total"`
+		}
+		if err := httpJSON(ctx, m.HTTPClient, http.MethodGet, endpoint, m.headers(), nil, &resp); err != nil {
+			// 404 means the tenant has no index yet — nothing
+			// to export, return an empty slice.
+			if isNotFound(err) {
+				return nil, nil
+			}
+			return nil, err
+		}
+		if len(resp.Results) == 0 {
+			break
+		}
+		out = append(out, resp.Results...)
+		if len(resp.Results) < pageSize {
+			break
+		}
+		offset += pageSize
+	}
+	return out, nil
 }
 
 func (m *MeilisearchBackend) headers() http.Header {
