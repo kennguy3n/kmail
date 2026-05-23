@@ -45,8 +45,18 @@ kmail.multiregionIngressAnnotations renders provider-specific
 ExternalDNS annotations so a single chart install can publish both
 the regional hostname (mail-<region>.<domain>) AND participate in
 the global DNS-failover record (<globalHost>). The helper is a
-no-op when `multiregion.enabled=false` or no provider is selected,
-so single-region installs see no change.
+no-op when `multiregion.enabled=false`, no provider is selected,
+the region is empty, the base `domain` is empty, or `globalHost`
+is empty — all four are required to produce well-formed annotations.
+
+The regional hostname is constructed as `mail-<region>.<domain>`,
+so a `domain` of `kmail.example.com` and region `us-west-2`
+yields `mail-us-west-2.kmail.example.com`. `globalHost` is a
+SEPARATE FQDN that points at the global failover record (e.g.
+`mail.kmail.example.com`); ExternalDNS publishes both as a
+comma-separated list because each provider supports multi-host
+annotations natively. Using `globalHost` as the `domain` would
+produce `mail-us-west-2.mail.kmail.example.com`, which is wrong.
 
 Supported providers:
   - aws        Route 53 weighted + active-passive failover.
@@ -60,9 +70,9 @@ weighted/failover groupings stay stable across helm upgrades.
 */}}
 {{- define "kmail.multiregionIngressAnnotations" -}}
 {{- $mr := .Values.multiregion -}}
-{{- if and $mr.enabled $mr.externalDNSProvider $mr.region -}}
+{{- if and $mr.enabled $mr.externalDNSProvider $mr.region $mr.domain $mr.globalHost -}}
 {{- $weight := default 100 $mr.dnsWeight -}}
-external-dns.alpha.kubernetes.io/hostname: {{ printf "mail-%s.%s,%s" $mr.region (default "" $mr.globalHost) (default "" $mr.globalHost) | trimSuffix "," | quote }}
+external-dns.alpha.kubernetes.io/hostname: {{ printf "mail-%s.%s,%s" $mr.region $mr.domain $mr.globalHost | quote }}
 external-dns.alpha.kubernetes.io/set-identifier: {{ $mr.region | quote }}
 {{- if eq $mr.externalDNSProvider "aws" }}
 external-dns.alpha.kubernetes.io/aws-weight: {{ $weight | quote }}

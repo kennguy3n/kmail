@@ -51,13 +51,25 @@ func (f MessageSourceFunc) MessagesForTenant(ctx context.Context, tenantID strin
 }
 
 // BackendFlipper is the subset of *Service the cutover worker
-// needs: flip a tenant's backend and bulk-reindex into it. Stating
-// the surface explicitly keeps the worker testable (the test
-// substitutes a recorder) and decouples the state machine from
-// the full Service surface.
+// needs. Order matters: the worker MUST reindex into the target
+// backend first (via ReindexTo, which targets a specific backend
+// regardless of the tenant's current `search_backend` column) and
+// only flip the column via SetBackend after the reindex succeeds.
+// If we flipped the column first and the reindex failed, the
+// tenant would be permanently invisible to retries (the candidate
+// query filters on `search_backend = 'meilisearch'`) and stuck
+// reading from an empty OpenSearch index.
 type BackendFlipper interface {
+	// ReindexTo bulk-imports `msgs` into a SPECIFIC backend,
+	// independent of the tenant's `search_backend` column. The
+	// worker calls this BEFORE SetBackend so a transient
+	// destination-side failure (OpenSearch 502, network blip)
+	// leaves the tenant readable on the source backend.
+	ReindexTo(ctx context.Context, tenantID, backend string, msgs []Message) error
+	// SetBackend flips the tenant's `search_backend` column.
+	// Called only AFTER ReindexTo succeeds so reads route to a
+	// fully-populated index.
 	SetBackend(ctx context.Context, tenantID, backend string) error
-	Reindex(ctx context.Context, tenantID string, msgs []Message) error
 }
 
 // CutoverState enumerates the per-tenant cutover job states.
@@ -269,19 +281,29 @@ func (w *CutoverWorker) cutoverOne(ctx context.Context, tenantID string, size in
 		_ = w.cfg.Store.MarkFailed(ctx, tenantID, fmt.Sprintf("fetch messages: %v", fetchErr), w.cfg.Now())
 		return fmt.Errorf("fetch messages: %w", fetchErr)
 	}
-	// Flip the backend column BEFORE the reindex. If Reindex
-	// crashes halfway, the tenant ends up on OpenSearch with a
-	// partial index — which Reindex re-creates on retry (it does
-	// a DeleteIndex first). Doing it in the other order would
-	// leave a fully-populated OpenSearch index that's never read
-	// (because the backend column still says Meilisearch).
+	// Reindex into OpenSearch FIRST so reads keep going to
+	// Meilisearch until OpenSearch is fully populated. If the
+	// reindex fails for any reason — destination 502, partial
+	// network failure, schema rejection — the tenant's
+	// `search_backend` column is still `meilisearch`, which
+	// keeps the tenant readable AND keeps it visible to
+	// `ListCandidates` for the next retry. ReindexTo deletes the
+	// destination index first so a half-written previous attempt
+	// doesn't leave orphan documents.
+	if err := w.cfg.Service.ReindexTo(ctx, tenantID, BackendOpenSearch, msgs); err != nil {
+		_ = w.cfg.Store.MarkFailed(ctx, tenantID, fmt.Sprintf("reindex: %v", err), w.cfg.Now())
+		return fmt.Errorf("reindex: %w", err)
+	}
+	// OpenSearch is now warm; atomically flip reads over. A
+	// SetBackend failure here is the unfortunate-but-recoverable
+	// case: the OpenSearch index is fully populated but reads
+	// still go to Meilisearch. The next tick re-discovers the
+	// tenant (still on `meilisearch`), the ReindexTo wipes & re-
+	// fills OpenSearch (idempotent), and the SetBackend is
+	// retried.
 	if err := w.cfg.Service.SetBackend(ctx, tenantID, BackendOpenSearch); err != nil {
 		_ = w.cfg.Store.MarkFailed(ctx, tenantID, fmt.Sprintf("set backend: %v", err), w.cfg.Now())
 		return fmt.Errorf("set backend: %w", err)
-	}
-	if err := w.cfg.Service.Reindex(ctx, tenantID, msgs); err != nil {
-		_ = w.cfg.Store.MarkFailed(ctx, tenantID, fmt.Sprintf("reindex: %v", err), w.cfg.Now())
-		return fmt.Errorf("reindex: %w", err)
 	}
 	if err := w.cfg.Store.MarkCompleted(ctx, tenantID, w.cfg.Now()); err != nil {
 		return fmt.Errorf("mark completed: %w", err)

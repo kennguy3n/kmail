@@ -47,9 +47,10 @@ func newSharedBreaker(t *testing.T, threshold int, window, cooldown time.Duratio
 // TestInProcessCircuitBreaker_TripsAtThreshold pins the default
 // per-pod breaker against the same invariant the existing
 // shard-failover test relied on: N failures opens the breaker, a
-// success closes it.
+// success closes it. With zero cooldown/window this exercises the
+// legacy count-only path so older tests keep working unchanged.
 func TestInProcessCircuitBreaker_TripsAtThreshold(t *testing.T) {
-	b := newInProcessCircuitBreaker(3)
+	b := newInProcessCircuitBreaker(inProcessBreakerConfig{Threshold: 3})
 	ctx := context.Background()
 	host := "shard-a:8080"
 	for i := 0; i < 2; i++ {
@@ -65,6 +66,104 @@ func TestInProcessCircuitBreaker_TripsAtThreshold(t *testing.T) {
 	b.RecordSuccess(ctx, host)
 	if b.Open(ctx, host) {
 		t.Fatal("breaker still open after RecordSuccess")
+	}
+}
+
+// TestInProcessCircuitBreaker_CooldownAllowsHalfOpenProbe mirrors
+// the Redis breaker's cooldown test against the in-process impl
+// so the two implementations have provably-equivalent state
+// machines. Trips at threshold, stays open through the cooldown,
+// half-opens (Open=false) after the cooldown, and closes fully on
+// a successful probe.
+func TestInProcessCircuitBreaker_CooldownAllowsHalfOpenProbe(t *testing.T) {
+	clock := &fakeClock{now: time.Unix(1_700_000_000, 0)}
+	b := newInProcessCircuitBreaker(inProcessBreakerConfig{
+		Threshold: 2,
+		Cooldown:  10 * time.Second,
+		Window:    time.Minute,
+		Now:       clock.Now,
+	})
+	ctx := context.Background()
+	host := "shard-a:8080"
+
+	b.RecordFailure(ctx, host)
+	b.RecordFailure(ctx, host)
+	if !b.Open(ctx, host) {
+		t.Fatal("expected breaker open after 2 failures")
+	}
+
+	// Still inside the cooldown window.
+	clock.Advance(5 * time.Second)
+	if !b.Open(ctx, host) {
+		t.Fatal("expected breaker still open mid-cooldown")
+	}
+
+	// Cooldown elapsed — half-open: Open() returns false so the
+	// next call probes the host.
+	clock.Advance(6 * time.Second)
+	if b.Open(ctx, host) {
+		t.Fatal("expected breaker half-open (Open=false) after cooldown")
+	}
+
+	// A successful probe closes the breaker fully.
+	b.RecordSuccess(ctx, host)
+	if b.Open(ctx, host) {
+		t.Fatal("expected breaker closed after successful probe")
+	}
+}
+
+// TestInProcessCircuitBreaker_SlidingWindowDoesNotTripOnStaleFailures
+// pins the sliding-window semantics: failures older than `window`
+// must not count toward the trip threshold, so a long-running pod
+// doesn't accumulate stale 5xx into a false trip.
+func TestInProcessCircuitBreaker_SlidingWindowDoesNotTripOnStaleFailures(t *testing.T) {
+	clock := &fakeClock{now: time.Unix(1_700_000_000, 0)}
+	b := newInProcessCircuitBreaker(inProcessBreakerConfig{
+		Threshold: 3,
+		Cooldown:  30 * time.Second,
+		Window:    30 * time.Second,
+		Now:       clock.Now,
+	})
+	ctx := context.Background()
+	host := "shard-a:8080"
+
+	b.RecordFailure(ctx, host)
+	b.RecordFailure(ctx, host)
+
+	clock.Advance(31 * time.Second)
+
+	b.RecordFailure(ctx, host)
+	if b.Open(ctx, host) {
+		t.Fatal("breaker opened on stale-failure accumulation; window did not slide")
+	}
+}
+
+// TestInProcessCircuitBreaker_HalfOpenProbeFailureReTrips verifies
+// the half-open re-trip path: after the cooldown a failed probe
+// must re-open the breaker for another cooldown cycle.
+func TestInProcessCircuitBreaker_HalfOpenProbeFailureReTrips(t *testing.T) {
+	clock := &fakeClock{now: time.Unix(1_700_000_000, 0)}
+	b := newInProcessCircuitBreaker(inProcessBreakerConfig{
+		Threshold: 2,
+		Cooldown:  10 * time.Second,
+		Window:    time.Minute,
+		Now:       clock.Now,
+	})
+	ctx := context.Background()
+	host := "shard-a:8080"
+
+	b.RecordFailure(ctx, host)
+	b.RecordFailure(ctx, host)
+	clock.Advance(11 * time.Second)
+	if b.Open(ctx, host) {
+		t.Fatal("expected half-open after cooldown")
+	}
+
+	// Failed probe — the breaker must re-trip into the open
+	// plateau for another cooldown cycle.
+	b.RecordFailure(ctx, host)
+	if !b.Open(ctx, host) {
+		t.Fatal("expected re-trip after failed half-open probe")
 	}
 }
 

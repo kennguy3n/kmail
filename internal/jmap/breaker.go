@@ -50,44 +50,135 @@ type CircuitBreaker interface {
 	RecordFailure(ctx context.Context, host string)
 }
 
-// inProcessCircuitBreaker keeps consecutive-failure counters in a
-// process-local map. This is the default when the proxy is built
-// without a Valkey wire, and it's the behavior the existing tests
-// pin. Tripping is a simple count-threshold check; the threshold
-// is configured per-proxy and passed in via `threshold`.
+// inProcessCircuitBreaker keeps failure state in a process-local
+// map. This is the default when the proxy is built without a
+// Valkey wire — single-pod deployments and tests use it.
+//
+// The state machine is intentionally identical to the Redis-backed
+// implementation so behavior doesn't drift when an operator turns
+// `KMAIL_VALKEY_URL` on or off:
+//
+//   - Sliding `window`: failure timestamps older than `now - window`
+//     are dropped on every call before counting against the trip
+//     threshold. A burst that straddles the window doesn't
+//     accumulate stale failures across long gaps.
+//   - Trip-and-cooldown: when `len(failures) >= threshold`, the
+//     breaker opens until `tripTime + cooldown`.
+//   - Half-open probe: once the cooldown elapses, `Open` returns
+//     false so exactly one caller probes the host. A successful
+//     probe (`RecordSuccess`) clears the state; a failed probe
+//     (`RecordFailure`) re-trips the cooldown.
+//
+// Zero `cooldown` / `window` retain the original count-only
+// behavior (no time-based eviction, breaker stays open until the
+// next `RecordSuccess`) — this preserves bug-for-bug compatibility
+// for tests that never advance a clock.
 type inProcessCircuitBreaker struct {
 	threshold int
+	cooldown  time.Duration
+	window    time.Duration
+	now       func() time.Time
 
-	mu       sync.Mutex
-	failures map[string]int
+	mu    sync.Mutex
+	state map[string]*hostBreakerState
 }
 
-func newInProcessCircuitBreaker(threshold int) *inProcessCircuitBreaker {
-	if threshold <= 0 {
-		threshold = 3
+// hostBreakerState is the per-host counter. `failures` is a
+// sliding window of failure timestamps (kept ordered, oldest
+// first). `openUntil` is the wall-clock instant after which the
+// breaker leaves the "open" plateau; the zero value means the
+// breaker has never tripped.
+type hostBreakerState struct {
+	failures  []time.Time
+	openUntil time.Time
+}
+
+// inProcessBreakerConfig parameterises the local breaker so the
+// proxy can thread the same Threshold/Cooldown/Window values into
+// it as the Redis-backed impl. Zero fields take safe defaults.
+type inProcessBreakerConfig struct {
+	Threshold int
+	Cooldown  time.Duration
+	Window    time.Duration
+	Now       func() time.Time
+}
+
+func newInProcessCircuitBreaker(cfg inProcessBreakerConfig) *inProcessCircuitBreaker {
+	if cfg.Threshold <= 0 {
+		cfg.Threshold = 3
+	}
+	if cfg.Now == nil {
+		cfg.Now = time.Now
 	}
 	return &inProcessCircuitBreaker{
-		threshold: threshold,
-		failures:  map[string]int{},
+		threshold: cfg.Threshold,
+		cooldown:  cfg.Cooldown,
+		window:    cfg.Window,
+		now:       cfg.Now,
+		state:     map[string]*hostBreakerState{},
+	}
+}
+
+// trimLocked drops failure timestamps older than `now - window`
+// from the front of the slice. With `window=0` the function is a
+// no-op so the legacy count-only path (preserved by zero-config
+// callers) still works.
+func (b *inProcessCircuitBreaker) trimLocked(s *hostBreakerState, now time.Time) {
+	if b.window <= 0 || len(s.failures) == 0 {
+		return
+	}
+	cutoff := now.Add(-b.window)
+	i := 0
+	for i < len(s.failures) && s.failures[i].Before(cutoff) {
+		i++
+	}
+	if i > 0 {
+		s.failures = s.failures[i:]
 	}
 }
 
 func (b *inProcessCircuitBreaker) Open(_ context.Context, host string) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.failures[host] >= b.threshold
+	s, ok := b.state[host]
+	if !ok {
+		return false
+	}
+	now := b.now()
+	b.trimLocked(s, now)
+	if b.cooldown > 0 {
+		// Open plateau: the breaker tripped recently and the
+		// cooldown hasn't elapsed yet. Half-open: the cooldown
+		// elapsed — return false so the next caller probes.
+		return !s.openUntil.IsZero() && now.Before(s.openUntil)
+	}
+	// Cooldown disabled — match the original count-only
+	// behavior used by tests that never advance a clock.
+	return len(s.failures) >= b.threshold
 }
 
 func (b *inProcessCircuitBreaker) RecordSuccess(_ context.Context, host string) {
 	b.mu.Lock()
-	delete(b.failures, host)
+	delete(b.state, host)
 	b.mu.Unlock()
 }
 
 func (b *inProcessCircuitBreaker) RecordFailure(_ context.Context, host string) {
 	b.mu.Lock()
-	b.failures[host]++
-	b.mu.Unlock()
+	defer b.mu.Unlock()
+	s, ok := b.state[host]
+	if !ok {
+		s = &hostBreakerState{}
+		b.state[host] = s
+	}
+	now := b.now()
+	b.trimLocked(s, now)
+	s.failures = append(s.failures, now)
+	if len(s.failures) >= b.threshold {
+		if b.cooldown > 0 {
+			s.openUntil = now.Add(b.cooldown)
+		}
+	}
 }
 
 // RedisCircuitBreaker is the multi-pod, Valkey-backed breaker.

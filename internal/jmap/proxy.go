@@ -19,6 +19,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -64,6 +65,19 @@ type ProxyConfig struct {
 	// Ignored when `Breaker` is non-nil — a custom breaker is
 	// expected to own its own threshold configuration.
 	CircuitBreakThreshold int
+
+	// CircuitBreakCooldown and CircuitBreakWindow tune the
+	// fallback in-process breaker so its sliding-window /
+	// cooldown semantics line up with the Redis-backed
+	// implementation. Defaults: 30s cooldown, 60s window — the
+	// same values the production main wires into
+	// `RedisCircuitBreakerConfig`. Ignored when `Breaker` is
+	// non-nil.
+	//
+	// Setting both to zero falls back to the legacy count-only
+	// behavior used by older tests that never advance a clock.
+	CircuitBreakCooldown time.Duration
+	CircuitBreakWindow   time.Duration
 
 	// Breaker is the optional shared circuit breaker. Wire a
 	// `*RedisCircuitBreaker` (via `NewRedisCircuitBreaker`) to
@@ -156,11 +170,17 @@ func NewProxy(cfg ProxyConfig) (*Proxy, error) {
 	}
 	breaker := cfg.Breaker
 	if breaker == nil {
-		// Default: the historical per-pod counter map. Threshold
-		// flows from `CircuitBreakThreshold`; zero/negative
-		// values pick up the breaker's own default (3) inside
-		// the constructor.
-		breaker = newInProcessCircuitBreaker(cfg.CircuitBreakThreshold)
+		// Default: per-pod sliding-window breaker. Threshold /
+		// cooldown / window flow from the proxy config; zero
+		// fields pick up the breaker's own defaults so older
+		// callers that only set `CircuitBreakThreshold` keep
+		// working unchanged (Cooldown=0 → legacy count-only
+		// behavior).
+		breaker = newInProcessCircuitBreaker(inProcessBreakerConfig{
+			Threshold: cfg.CircuitBreakThreshold,
+			Cooldown:  cfg.CircuitBreakCooldown,
+			Window:    cfg.CircuitBreakWindow,
+		})
 	}
 	p := &Proxy{
 		cfg:     cfg,

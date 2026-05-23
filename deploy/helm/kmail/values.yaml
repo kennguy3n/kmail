@@ -27,6 +27,13 @@ multiregion:
   # into the KMAIL_REGION env var and into ExternalDNS set
   # identifiers so client-side routing can prefer a region.
   region: ""
+  # Base DNS domain (e.g. "kmail.example.com"). The regional
+  # hostname is composed as `mail-<region>.<domain>` — so
+  # region="us-west-2" + domain="kmail.example.com" yields
+  # mail-us-west-2.kmail.example.com. This is distinct from
+  # `globalHost` (which is the global failover record, NOT a
+  # parent zone of the regional record).
+  domain: ""
   # Global hostname that DNS-failovers across regions. Each region
   # publishes its regional record (e.g. mail-us-west-2.kmail.example.com)
   # AND participates in the global record (mail.kmail.example.com).

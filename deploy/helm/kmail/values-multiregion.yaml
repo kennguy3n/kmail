@@ -39,6 +39,13 @@ multiregion:
   # Override at install time:
   #   --set multiregion.region=us-west-2
   region: ""
+  # Base domain. The regional hostname is composed as
+  # `mail-<region>.<domain>`, so domain="kmail.example.com" +
+  # region="us-west-2" gives mail-us-west-2.kmail.example.com.
+  # Keep this distinct from `globalHost`: `globalHost` is the
+  # failover/aggregate record and should NOT include the
+  # `mail-<region>.` prefix.
+  domain: "kmail.example.com"
   # Global DNS record that aggregates every regional install.
   globalHost: "mail.kmail.example.com"
   # Override at install time. The chart joins this into a single

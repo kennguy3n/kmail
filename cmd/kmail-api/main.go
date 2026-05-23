@@ -146,9 +146,27 @@ func main() {
 	// Stand it up early so the breaker can share trip state across
 	// every BFF pod — a 5xx storm against shard X opens the breaker
 	// once across the fleet instead of once per pod.
+	// Resolve breaker tunables once so both the shared
+	// (Valkey-backed) and per-pod fallback paths use the same
+	// threshold / cooldown / window. Keeping the two impls in
+	// lockstep prevents semantic drift when an operator toggles
+	// `KMAIL_VALKEY_URL` on or off.
+	breakerThreshold := config.GetenvInt("KMAIL_BREAKER_THRESHOLD", 3)
+	breakerCooldown := getenvDuration("KMAIL_BREAKER_COOLDOWN", 30*time.Second)
+	breakerWindow := getenvDuration("KMAIL_BREAKER_WINDOW", 60*time.Second)
+
 	var valkeyClient *redis.Client
 	if cfg.ValkeyURL != "" {
 		valkeyClient = redis.NewClient(&redis.Options{Addr: cfg.ValkeyURL})
+		// Release the connection pool on shutdown so the
+		// process exits cleanly (and so leak detectors in CI
+		// don't flag a dangling client). The redis client's
+		// Close is idempotent and safe to call from defer.
+		defer func() {
+			if cerr := valkeyClient.Close(); cerr != nil {
+				logger.Printf("valkey: close: %v", cerr)
+			}
+		}()
 	}
 
 	var jmapBreaker jmap.CircuitBreaker
@@ -156,9 +174,9 @@ func main() {
 		shared, breakerErr := jmap.NewRedisCircuitBreaker(jmap.RedisCircuitBreakerConfig{
 			Client:    valkeyClient,
 			Logger:    logger,
-			Threshold: config.GetenvInt("KMAIL_BREAKER_THRESHOLD", 3),
-			Cooldown:  getenvDuration("KMAIL_BREAKER_COOLDOWN", 30*time.Second),
-			Window:    getenvDuration("KMAIL_BREAKER_WINDOW", 60*time.Second),
+			Threshold: breakerThreshold,
+			Cooldown:  breakerCooldown,
+			Window:    breakerWindow,
 		})
 		if breakerErr != nil {
 			logger.Fatalf("jmap.NewRedisCircuitBreaker: %v", breakerErr)
@@ -170,12 +188,15 @@ func main() {
 	}
 
 	proxy, err := jmap.NewProxy(jmap.ProxyConfig{
-		StalwartURL:    cfg.StalwartURL,
-		Pool:           pool,
-		Logger:         logger,
-		Shards:         shardSvc,
-		PreDeliverHook: malwareHook,
-		Breaker:        jmapBreaker,
+		StalwartURL:          cfg.StalwartURL,
+		Pool:                 pool,
+		Logger:               logger,
+		Shards:               shardSvc,
+		PreDeliverHook:       malwareHook,
+		Breaker:              jmapBreaker,
+		CircuitBreakThreshold: breakerThreshold,
+		CircuitBreakCooldown:  breakerCooldown,
+		CircuitBreakWindow:    breakerWindow,
 	})
 	if err != nil {
 		logger.Fatalf("jmap.NewProxy: %v", err)
