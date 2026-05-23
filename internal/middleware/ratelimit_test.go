@@ -9,23 +9,38 @@ import (
 	"time"
 )
 
-// fakeStore records every Incr call it sees and returns a
-// deterministic counter per key. Used instead of a real Valkey for
-// unit tests.
+// fakeStore implements RateLimiterStore in-process so the
+// middleware tests don't need Valkey. Each `Allow` call records the
+// request timestamp in a per-key slice and applies the same
+// trim-then-admit logic the production Lua script does, so the
+// tests are exercising the full sliding-window semantics rather
+// than a stub that always says yes.
 type fakeStore struct {
-	counts map[string]int64
-	fail   error
+	log  map[string][]time.Time
+	fail error
 }
 
-func (f *fakeStore) IncrWithTTL(_ context.Context, key string, _ time.Duration) (int64, error) {
+func (f *fakeStore) Allow(_ context.Context, key string, window time.Duration, limit int, now time.Time) (int64, bool, error) {
 	if f.fail != nil {
-		return 0, f.fail
+		return 0, false, f.fail
 	}
-	if f.counts == nil {
-		f.counts = map[string]int64{}
+	if f.log == nil {
+		f.log = map[string][]time.Time{}
 	}
-	f.counts[key]++
-	return f.counts[key], nil
+	cutoff := now.Add(-window)
+	kept := f.log[key][:0]
+	for _, ts := range f.log[key] {
+		if ts.After(cutoff) || ts.Equal(cutoff) {
+			kept = append(kept, ts)
+		}
+	}
+	if len(kept) >= limit {
+		f.log[key] = kept
+		return int64(len(kept)), false, nil
+	}
+	kept = append(kept, now)
+	f.log[key] = kept
+	return int64(len(kept)), true, nil
 }
 
 // authedRequest returns an httptest request with tenant + user
@@ -192,5 +207,74 @@ func TestRateLimiter_BucketsByWindow(t *testing.T) {
 	h.ServeHTTP(rec, authedRequest("t1", "u1"))
 	if rec.Code != http.StatusOK {
 		t.Errorf("expected reset after window, got %d", rec.Code)
+	}
+}
+
+// TestRateLimiter_SlidingWindow_NoBoundaryBurst pins the property
+// the migration to a sliding-window log was meant to provide: a
+// caller cannot double their effective RPM by timing requests
+// around a bucket boundary. With the previous fixed-window
+// counter, 2 requests at t=59s + 2 requests at t=61s would all
+// succeed (4 admitted within ~2 seconds, 4x the configured RPM=2).
+// With the sliding-window log every request inside the rolling
+// 60-second window counts, so the second batch is rejected until
+// the first ages out.
+func TestRateLimiter_SlidingWindow_NoBoundaryBurst(t *testing.T) {
+	store := &fakeStore{}
+	now := time.Unix(0, 0)
+	rl := NewRateLimiter(RateLimiterConfig{
+		Client:    store,
+		TenantRPM: 1000,
+		UserRPM:   2,
+		Window:    time.Minute,
+		Now:       func() time.Time { return now },
+	})
+	h := rl.Wrap(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	// At t=0s: 2 admitted (fills the user window).
+	for i := 0; i < 2; i++ {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, authedRequest("t1", "u1"))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("iter %d at t=0: expected 200, got %d", i, rec.Code)
+		}
+	}
+
+	// At t=59s: still inside the rolling window, must reject.
+	now = time.Unix(59, 0)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, authedRequest("t1", "u1"))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 at t=59s (still inside window), got %d", rec.Code)
+	}
+
+	// At t=61s: the two t=0 entries have just rolled out of the
+	// window (window=60s, cutoff=t=1s). New request admitted.
+	now = time.Unix(61, 0)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, authedRequest("t1", "u1"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 at t=61s (oldest entries aged out), got %d", rec.Code)
+	}
+
+	// At t=62s: only 1 admitted in the rolling window so far
+	// (the t=61s one), so room for 1 more.
+	now = time.Unix(62, 0)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, authedRequest("t1", "u1"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 at t=62s (one slot still free), got %d", rec.Code)
+	}
+
+	// At t=63s: the two t=61s/t=62s entries now fill the
+	// rolling window. Must reject — this is the property the
+	// old fixed-window counter violated.
+	now = time.Unix(63, 0)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, authedRequest("t1", "u1"))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 at t=63s (window full again), got %d", rec.Code)
 	}
 }

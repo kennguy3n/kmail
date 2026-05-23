@@ -2,6 +2,8 @@ package middleware
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
@@ -15,6 +17,14 @@ import (
 // RateLimiterConfig wires the Valkey-backed sliding-window rate
 // limiter. Both tenant and user ceilings are applied; a request is
 // rejected if either ceiling is exceeded.
+//
+// The sliding window is implemented as a Valkey sorted set per
+// `(scope, identity)` keyed by request timestamp; on every call we
+// trim entries older than `now - Window`, count the survivors, and
+// admit or reject the new request atomically via a Lua script. This
+// replaces the previous fixed-window counter, which would let
+// callers see 2x the configured RPM at bucket boundaries (`burst at
+// 59s, burst again at 61s`).
 type RateLimiterConfig struct {
 	// Client is the Valkey (Redis-compatible) client used for
 	// counter storage. Required; leave nil to short-circuit the
@@ -40,16 +50,17 @@ type RateLimiterConfig struct {
 }
 
 // RateLimiterStore is the narrow surface RateLimiter depends on.
-// Implemented by *redis.Client, tests substitute a fake.
+// Implemented by `*RedisStore`, tests substitute a fake.
+//
+// `Allow` is the single sliding-window primitive: it atomically (a)
+// drops every member of the sorted set older than `now - window`,
+// (b) counts the survivors, and (c) inserts a new member at `now`
+// iff the post-insert count would not exceed `limit`. The return
+// values are the post-call count and whether the new request was
+// admitted. Implementations MUST run all three steps in a single
+// atomic context (Lua / MULTI-EXEC).
 type RateLimiterStore interface {
-	// Incr atomically increments the counter at `key` by 1 and
-	// sets the TTL to `ttl` on the first increment. Returns the
-	// new counter value.
-	//
-	// The contract mirrors the standard `INCR + EXPIRE NX` pattern;
-	// concrete implementations MUST ensure the two operations are
-	// observed together (e.g. via MULTI or a Lua script).
-	IncrWithTTL(ctx context.Context, key string, ttl time.Duration) (int64, error)
+	Allow(ctx context.Context, key string, window time.Duration, limit int, now time.Time) (count int64, allowed bool, err error)
 }
 
 // RateLimiter is the HTTP middleware. Construct once at boot and
@@ -99,38 +110,30 @@ func (r *RateLimiter) Wrap(next http.Handler) http.Handler {
 			return
 		}
 
+		now := r.cfg.Now()
 		window := r.cfg.Window
-		// Bucket each request into a discrete window so we can
-		// drop the counter with a TTL rather than bookkeeping a
-		// ZSET of timestamps. For 60s windows the identity of the
-		// current bucket flips once per minute; callers see at
-		// worst 2x their limit at bucket boundaries, which is the
-		// documented tradeoff for fixed-window counters.
-		bucket := r.cfg.Now().UTC().Truncate(window).Unix()
 
-		tenantKey := fmt.Sprintf("kmail:rl:tenant:%s:%d", tenantID, bucket)
-		ttl := window + 5*time.Second // small grace so late callers still see the TTL
-
-		count, err := r.cfg.Client.IncrWithTTL(req.Context(), tenantKey, ttl)
+		tenantKey := fmt.Sprintf("kmail:rl:tenant:%s", tenantID)
+		_, allowed, err := r.cfg.Client.Allow(req.Context(), tenantKey, window, r.cfg.TenantRPM, now)
 		if err != nil {
-			r.cfg.Logger.Printf("ratelimit: tenant incr %s: %v", tenantKey, err)
+			r.cfg.Logger.Printf("ratelimit: tenant allow %s: %v", tenantKey, err)
 			next.ServeHTTP(w, req)
 			return
 		}
-		if count > int64(r.cfg.TenantRPM) {
+		if !allowed {
 			writeRateLimitExceeded(w, window, r.cfg.TenantRPM, "tenant")
 			return
 		}
 
 		if userID != "" {
-			userKey := fmt.Sprintf("kmail:rl:user:%s:%s:%d", tenantID, userID, bucket)
-			count, err := r.cfg.Client.IncrWithTTL(req.Context(), userKey, ttl)
+			userKey := fmt.Sprintf("kmail:rl:user:%s:%s", tenantID, userID)
+			_, allowed, err := r.cfg.Client.Allow(req.Context(), userKey, window, r.cfg.UserRPM, now)
 			if err != nil {
-				r.cfg.Logger.Printf("ratelimit: user incr %s: %v", userKey, err)
+				r.cfg.Logger.Printf("ratelimit: user allow %s: %v", userKey, err)
 				next.ServeHTTP(w, req)
 				return
 			}
-			if count > int64(r.cfg.UserRPM) {
+			if !allowed {
 				writeRateLimitExceeded(w, window, r.cfg.UserRPM, "user")
 				return
 			}
@@ -140,10 +143,11 @@ func (r *RateLimiter) Wrap(next http.Handler) http.Handler {
 }
 
 func writeRateLimitExceeded(w http.ResponseWriter, window time.Duration, rpm int, scope string) {
-	// Retry-After is the most pessimistic estimate: the remainder
-	// of the current window. Fixed-window counters reset at the
-	// boundary so a caller that waits this long is guaranteed to
-	// land in a fresh bucket.
+	// Retry-After is the most pessimistic estimate: a full
+	// window. A sliding-window log doesn't have a single "reset"
+	// instant the way a fixed window does (older entries roll off
+	// continuously), so we surface the worst-case wait and rely
+	// on clients backing off exponentially from there.
 	retry := int(window.Seconds())
 	w.Header().Set("Retry-After", strconv.Itoa(retry))
 	w.Header().Set("X-RateLimit-Limit", strconv.Itoa(rpm))
@@ -151,25 +155,75 @@ func writeRateLimitExceeded(w http.ResponseWriter, window time.Duration, rpm int
 	http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 }
 
+// slidingWindowScript is the atomic ZSET-based sliding-window log:
+//
+//	KEYS[1]   the per-scope ZSET key (kmail:rl:tenant:<tid>, ...)
+//	ARGV[1]   window duration in milliseconds (integer)
+//	ARGV[2]   limit (max admitted requests within the window)
+//	ARGV[3]   `now` epoch milliseconds
+//	ARGV[4]   unique member to insert (`now-ms:<random hex>`)
+//
+// The script drops every entry older than `now - window`, counts
+// the survivors, and admits-or-rejects atomically. We refresh the
+// PEXPIRE on every call so a quiet scope ages out naturally and we
+// never have to GC the sorted set out-of-band.
+//
+// Returns `{post_count, admitted_int}` where `admitted_int` is 1 if
+// the new request was added to the set, 0 if it was rejected.
+const slidingWindowScript = `
+local key       = KEYS[1]
+local window    = tonumber(ARGV[1])
+local limit     = tonumber(ARGV[2])
+local now       = tonumber(ARGV[3])
+local member    = ARGV[4]
+local cutoff    = now - window
+
+redis.call("ZREMRANGEBYSCORE", key, "-inf", "(" .. tostring(cutoff))
+local count = tonumber(redis.call("ZCARD", key))
+
+local admitted = 0
+if count < limit then
+    redis.call("ZADD", key, now, member)
+    count = count + 1
+    admitted = 1
+end
+
+-- Refresh TTL so an idle key eventually disappears even if the next
+-- caller never returns. +5s grace handles small clock skew on the
+-- Valkey side.
+redis.call("PEXPIRE", key, window + 5000)
+return {count, admitted}
+`
+
 // RedisStore wraps a *redis.Client so it satisfies the
-// RateLimiterStore interface. The MULTI/EXEC pipeline here is the
-// canonical "INCR + EXPIRE NX" pattern — both commands are
-// pipelined in a single RTT, and the pipeline's `Exec` surface
-// returns the INCR result.
+// RateLimiterStore interface. The sliding-window log is implemented
+// as an `EVAL`'d Lua script — the script handle is loaded once
+// (`redis.NewScript` caches the SHA) and re-used on every call.
 type RedisStore struct {
 	Client *redis.Client
+	script *redis.Script
 }
 
 // NewRedisStore is a convenience constructor that dials Valkey at
 // `url` and returns a RedisStore wrapping the client. Callers that
-// already own a *redis.Client should assign it to the struct field
-// directly.
+// already own a *redis.Client should use NewRedisStoreFromClient.
 func NewRedisStore(url string) (*RedisStore, error) {
 	opts, err := parseValkeyURL(url)
 	if err != nil {
 		return nil, err
 	}
-	return &RedisStore{Client: redis.NewClient(opts)}, nil
+	return NewRedisStoreFromClient(redis.NewClient(opts)), nil
+}
+
+// NewRedisStoreFromClient wraps an existing *redis.Client. The
+// sliding-window Lua script is compiled here and the resulting
+// `*redis.Script` is shared across calls so each Allow only pays
+// for an EVALSHA round-trip.
+func NewRedisStoreFromClient(c *redis.Client) *RedisStore {
+	return &RedisStore{
+		Client: c,
+		script: redis.NewScript(slidingWindowScript),
+	}
 }
 
 func parseValkeyURL(url string) (*redis.Options, error) {
@@ -184,22 +238,52 @@ func parseValkeyURL(url string) (*redis.Options, error) {
 	return &redis.Options{Addr: url}, nil
 }
 
-// IncrWithTTL runs the INCR + EXPIRE NX pipeline against Valkey.
-// Returns the post-increment counter value so the caller can
-// compare it against the ceiling.
-func (s *RedisStore) IncrWithTTL(ctx context.Context, key string, ttl time.Duration) (int64, error) {
+// Allow runs the sliding-window Lua script against Valkey. The
+// member inserted into the ZSET is `<now-ms>:<8-byte-hex>` so two
+// requests landing in the same millisecond (which collides under
+// ZADD's `score` is the timestamp but `member` is the dedup key)
+// still both get counted.
+func (s *RedisStore) Allow(ctx context.Context, key string, window time.Duration, limit int, now time.Time) (int64, bool, error) {
 	if s.Client == nil {
-		return 0, errors.New("RedisStore: Client is nil")
+		return 0, false, errors.New("RedisStore: Client is nil")
 	}
-	pipe := s.Client.TxPipeline()
-	incr := pipe.Incr(ctx, key)
-	// ExpireNX (not Expire) to match the documented "INCR + EXPIRE
-	// NX" contract — the TTL is set once on the first increment and
-	// left alone thereafter, so old-bucket keys age out on schedule
-	// rather than being kept alive by every subsequent hit.
-	pipe.ExpireNX(ctx, key, ttl)
-	if _, err := pipe.Exec(ctx); err != nil {
-		return 0, err
+	if s.script == nil {
+		// Defensive: someone built the struct literally rather
+		// than via NewRedisStoreFromClient. Compile lazily.
+		s.script = redis.NewScript(slidingWindowScript)
 	}
-	return incr.Val(), nil
+	windowMs := window.Milliseconds()
+	if windowMs <= 0 {
+		windowMs = int64(time.Minute / time.Millisecond)
+	}
+	nowMs := now.UnixMilli()
+	member, err := newUniqueMember(nowMs)
+	if err != nil {
+		return 0, false, fmt.Errorf("ratelimit: generate member: %w", err)
+	}
+	res, err := s.script.Run(ctx, s.Client, []string{key}, windowMs, limit, nowMs, member).Result()
+	if err != nil {
+		return 0, false, fmt.Errorf("ratelimit: EVAL: %w", err)
+	}
+	pair, ok := res.([]interface{})
+	if !ok || len(pair) != 2 {
+		return 0, false, fmt.Errorf("ratelimit: unexpected script result shape: %T", res)
+	}
+	count, _ := pair[0].(int64)
+	admittedI, _ := pair[1].(int64)
+	return count, admittedI == 1, nil
+}
+
+// newUniqueMember produces a per-request ZSET member that won't
+// collide with concurrent calls landing at the same millisecond.
+// Format: `<now-ms>:<16 hex chars>`. The leading timestamp keeps
+// the member sortable, which is occasionally useful for debugging
+// dumps; the random suffix is what guarantees uniqueness under
+// `ZADD` (which would otherwise no-op on a duplicate).
+func newUniqueMember(nowMs int64) (string, error) {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return strconv.FormatInt(nowMs, 10) + ":" + hex.EncodeToString(b[:]), nil
 }

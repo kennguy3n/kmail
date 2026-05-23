@@ -6,11 +6,24 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"sync"
 	"time"
 
+	lru "github.com/hashicorp/golang-lru/v2/expirable"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// shardCacheMaxEntries bounds the in-process tenant -> StalwartURL
+// cache so a tenant-enumeration attack (or a noisy multi-tenant
+// workload) can't drive memory unbounded. 10,000 entries at ~200 B
+// per entry caps the cache at ~2 MiB. The cache TTL pairs with the
+// max-entries cap: even a fully-warm cache turns over every five
+// minutes, so an operator-triggered shard rebalance lands on the
+// next request after the TTL without requiring an explicit
+// `invalidate` call on every pod.
+const (
+	shardCacheMaxEntries = 10_000
+	shardCacheTTL        = 5 * time.Minute
 )
 
 // Shard statuses.
@@ -53,8 +66,12 @@ type ShardService struct {
 	HTTPClient *http.Client
 	Logger     *log.Logger
 
-	mu    sync.RWMutex
-	cache map[string]string // tenantID -> StalwartURL
+	// cache maps tenantID -> StalwartURL. The hashicorp/golang-lru
+	// `expirable` implementation gives us bounded entries (LRU
+	// eviction once full) plus a per-entry TTL in one structure;
+	// it does its own locking, so callers don't need a separate
+	// RWMutex around `Get` / `Add` / `Remove`.
+	cache *lru.LRU[string, string]
 }
 
 // NewShardService builds a ShardService with sensible defaults.
@@ -66,7 +83,7 @@ func NewShardService(pool *pgxpool.Pool, logger *log.Logger) *ShardService {
 		Pool:       pool,
 		HTTPClient: &http.Client{Timeout: 5 * time.Second},
 		Logger:     logger,
-		cache:      make(map[string]string),
+		cache:      lru.NewLRU[string, string](shardCacheMaxEntries, nil, shardCacheTTL),
 	}
 }
 
@@ -280,15 +297,15 @@ func (s *ShardService) GetTenantShard(ctx context.Context, tenantID string) (str
 	if tenantID == "" {
 		return "", fmt.Errorf("tenantID required")
 	}
-	s.mu.RLock()
-	url, ok := s.cache[tenantID]
-	s.mu.RUnlock()
-	if ok {
-		return url, nil
+	if s.cache != nil {
+		if url, ok := s.cache.Get(tenantID); ok {
+			return url, nil
+		}
 	}
 	if s.Pool == nil {
 		return "", ErrNoCapacity
 	}
+	var url string
 	err := s.Pool.QueryRow(ctx, `
 		SELECT sh.stalwart_url
 		FROM tenant_shard_assignments tsa
@@ -301,9 +318,9 @@ func (s *ShardService) GetTenantShard(ctx context.Context, tenantID string) (str
 	if err != nil {
 		return "", fmt.Errorf("get tenant shard: %w", err)
 	}
-	s.mu.Lock()
-	s.cache[tenantID] = url
-	s.mu.Unlock()
+	if s.cache != nil {
+		s.cache.Add(tenantID, url)
+	}
 	return url, nil
 }
 
@@ -371,9 +388,9 @@ func (s *ShardService) ListTenantsOnShard(ctx context.Context, shardID string) (
 }
 
 func (s *ShardService) invalidate(tenantID string) {
-	s.mu.Lock()
-	delete(s.cache, tenantID)
-	s.mu.Unlock()
+	if s.cache != nil {
+		s.cache.Remove(tenantID)
+	}
 }
 
 // HealthCheck runs one HTTP probe per shard and calls
