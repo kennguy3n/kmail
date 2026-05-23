@@ -50,7 +50,10 @@ func (f *fakeStore) Allow(_ context.Context, tenantKey, userKey string, window t
 	}
 	f.log[tenantKey] = append(tenantKept, now)
 
-	if userKey == "" {
+	// No user scope active — caller passed tenantKey as the
+	// KEYS[2] placeholder. Mirror the production script and
+	// ignore the placeholder.
+	if userLimit <= 0 {
 		return true, true, nil
 	}
 	userKept := f.trimAndCount(userKey, window, now)
@@ -370,5 +373,56 @@ func TestRateLimiter_UserRejection_DoesNotConsumeTenantBudget(t *testing.T) {
 	}
 	if rec.Header().Get("X-RateLimit-Scope") != "tenant" {
 		t.Errorf("u6: expected tenant scope, got %q", rec.Header().Get("X-RateLimit-Scope"))
+	}
+}
+
+// TestRateLimiter_TenantOnly_NoUserContext exercises the
+// no-user-scope branch: requests without a KChat user ID must
+// still rate-limit at the tenant ceiling. This pins the
+// `userLimit <= 0` short-circuit AND the cluster-co-located
+// `userKey == tenantKey` placeholder added to address the Devin
+// Review CROSSSLOT finding.
+func TestRateLimiter_TenantOnly_NoUserContext(t *testing.T) {
+	store := &fakeStore{}
+	now := time.Unix(0, 0)
+	rl := NewRateLimiter(RateLimiterConfig{
+		Client:    store,
+		TenantRPM: 3,
+		UserRPM:   100, // user limit irrelevant — no user context
+		Window:    time.Minute,
+		Now:       func() time.Time { return now },
+	})
+	h := rl.Wrap(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	// Tenant-scoped request with NO user ID. The placeholder
+	// userKey must be ignored; only the tenant scope counts.
+	for i := 0; i < 3; i++ {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, authedRequest("t1", ""))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("iter %d: expected 200, got %d", i, rec.Code)
+		}
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, authedRequest("t1", ""))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("4th tenant-only request: expected 429, got %d", rec.Code)
+	}
+	if rec.Header().Get("X-RateLimit-Scope") != "tenant" {
+		t.Errorf("4th request: expected tenant scope, got %q", rec.Header().Get("X-RateLimit-Scope"))
+	}
+	// The user-keyed placeholder must NOT have been written to.
+	// Only the tenant ZSET should have entries.
+	tenantKey := "kmail:rl:tenant:{t1}"
+	if got := len(store.log[tenantKey]); got != 3 {
+		t.Errorf("tenant ZSET: expected 3 entries, got %d", got)
+	}
+	// No `kmail:rl:user:...` key should exist for this tenant.
+	for k := range store.log {
+		if k != tenantKey {
+			t.Errorf("unexpected key written in tenant-only mode: %q (len=%d)", k, len(store.log[k]))
+		}
 	}
 }

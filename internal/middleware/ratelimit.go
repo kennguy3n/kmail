@@ -65,18 +65,22 @@ type RateLimiterConfig struct {
 // passes but the user check fails, the tenant admission is rolled
 // back so the rejected request does NOT consume tenant budget.
 //
-// Pass `userKey == ""` (and `userLimit == 0`) for tenant-only
-// scoring (e.g. anonymous/unattributed traffic that still has a
-// tenant context). Implementations MUST run all three steps —
-// trim, check, admit-or-reject — for each scope in a single atomic
-// context (Lua / MULTI-EXEC), and MUST roll back the tenant
+// For tenant-only scoring (e.g. anonymous/unattributed traffic that
+// still has a tenant context), pass `userKey == tenantKey` and
+// `userLimit == 0`. The tenant-key placeholder is what lets the
+// call pass Redis Cluster's pre-execution slot-co-location check;
+// implementations MUST ignore the placeholder when `userLimit <=
+// 0` and not touch it. Implementations MUST run all three steps —
+// trim, check, admit-or-reject — for each active scope in a single
+// atomic context (Lua / MULTI-EXEC), and MUST roll back the tenant
 // admission when the user check rejects.
 //
 // Returns `(tenantOK, userOK, err)`, where each bool reports
 // whether THAT scope's check passed (not the post-rollback state).
 // Callers should report "tenant" rejection only when `!tenantOK`,
-// and "user" rejection when `tenantOK && !userOK`. When `userKey`
-// is empty, `userOK` is always true.
+// and "user" rejection when `tenantOK && !userOK`. When no user
+// scope is active (signalled by `userLimit <= 0`), `userOK` is
+// always true.
 type RateLimiterStore interface {
 	Allow(
 		ctx context.Context,
@@ -142,7 +146,13 @@ func (r *RateLimiter) Wrap(next http.Handler) http.Handler {
 		// every KEYS[i] to be co-located; `{<tid>}` is the standard
 		// Redis hash-tag convention.
 		tenantKey := fmt.Sprintf("kmail:rl:tenant:{%s}", tenantID)
-		userKey := ""
+		// When there is no user scope, pass `tenantKey` as the
+		// KEYS[2] placeholder (NOT an empty string) so Redis
+		// Cluster's pre-execution slot-co-location check still
+		// passes. The Lua script ignores KEYS[2] entirely when
+		// `userLimit <= 0`, so the placeholder is never written
+		// to.
+		userKey := tenantKey
 		userLimit := 0
 		if userID != "" {
 			userKey = fmt.Sprintf("kmail:rl:user:{%s}:%s", tenantID, userID)
@@ -191,15 +201,22 @@ func writeRateLimitExceeded(w http.ResponseWriter, window time.Duration, rpm int
 // single call.
 //
 //	KEYS[1]   tenant ZSET key (kmail:rl:tenant:{<tid>})
-//	KEYS[2]   user ZSET key (kmail:rl:user:{<tid>}:<uid>), may be ""
+//	KEYS[2]   user ZSET key (kmail:rl:user:{<tid>}:<uid>), or a
+//	          copy of KEYS[1] when there is no user scope — the
+//	          script ignores it in that case. KEYS[2] must hash
+//	          to the same Valkey-cluster slot as KEYS[1] (which
+//	          is why the caller passes KEYS[1] itself as the
+//	          placeholder, not an empty string or a fixed
+//	          sentinel).
 //	ARGV[1]   window duration in milliseconds (integer)
 //	ARGV[2]   tenant limit
-//	ARGV[3]   user limit (0 if KEYS[2] is empty)
+//	ARGV[3]   user limit (<=0 signals "no user scope, skip
+//	          KEYS[2]")
 //	ARGV[4]   `now` epoch milliseconds
 //	ARGV[5]   unique member to insert (`now-ms:<random hex>`)
 //
 // The script processes the tenant scope first; if the tenant
-// admission succeeds AND a user key is provided, the user scope is
+// admission succeeds AND a user scope is active, the user scope is
 // processed next. When the user check rejects, the script ZREMs
 // the just-inserted tenant member so a request rejected at the
 // user ceiling does not consume tenant budget.
@@ -210,7 +227,7 @@ func writeRateLimitExceeded(w http.ResponseWriter, window time.Duration, rpm int
 // Valkey side.
 //
 // Returns `{tenant_admitted, user_admitted}` (both integers 0/1).
-// When KEYS[2] is empty, `user_admitted` is 1 (no-op).
+// When no user scope is active, `user_admitted` is 1 (no-op).
 const slidingWindowScript = `
 local tenant_key   = KEYS[1]
 local user_key     = KEYS[2]
@@ -236,8 +253,10 @@ if tenant_admitted == 0 then
     return {0, 0}
 end
 
--- No user scope provided — tenant-only mode.
-if user_key == nil or user_key == "" then
+-- No user scope active — the caller passed tenant_key as KEYS[2]
+-- placeholder (for cluster slot co-location) and signalled "skip"
+-- via user_limit<=0. Don't touch KEYS[2] in this branch.
+if user_limit <= 0 then
     return {1, 1}
 end
 
