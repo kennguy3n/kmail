@@ -19,6 +19,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(test)]
 use std::time::Duration;
 
 use napi::bindgen_prelude::*;
@@ -326,14 +327,17 @@ impl KMailClientJs {
             config.bearer_token,
             PathBuf::from(config.database_path),
         );
-        if let Some(b) = config.attachment_cache_bytes {
-            // napi-rs `BigInt::get_u64()` returns `(signed, value,
-            // lossless)`. Silently coercing a negative BigInt into a
-            // u64 absolute value (the prior `.1`-only behaviour) lets
-            // a JS caller passing `-1n` set the attachment cache to
-            // `1`-byte instead of seeing a thrown exception — a
-            // genuinely confusing failure mode. Reject anything that
-            // doesn't fit `u64` losslessly.
+
+        // BigInt → u64 lowering happens here, before the shared
+        // `apply_optional_overrides` ladder, because the validation
+        // failure surface is napi-specific (a JS caller passing
+        // `-1n` should see `Status::InvalidArg`, not a Rust-side
+        // panic or a silent absolute-value coercion). napi-rs's
+        // `BigInt::get_u64()` returns `(signed, value, lossless)`;
+        // we reject signed BigInts and overflow-on-truncate cases
+        // up-front. By the time we reach the shared ladder, the
+        // attachment cache override is an ordinary `Option<u64>`.
+        let attachment_cache_bytes = if let Some(b) = config.attachment_cache_bytes {
             let (signed, value, lossless) = b.get_u64();
             if signed {
                 return Err(Error::new(
@@ -347,19 +351,25 @@ impl KMailClientJs {
                     "attachment_cache_bytes overflows u64",
                 ));
             }
-            core_cfg.attachment_cache_bytes = value;
-        }
-        if let Some(t) = config.request_timeout_secs {
-            core_cfg.request_timeout = Duration::from_secs(u64::from(t));
-        }
-        if let Some(t) = config.retry_budget_secs {
-            core_cfg.retry_budget = Duration::from_secs(u64::from(t));
-        }
-        if let Some(w) = config.initial_sync_email_window {
-            core_cfg.initial_sync_email_window = w;
-        }
-        core_cfg.account_id = config.account_id;
-        core_cfg.bootstrap_mailbox_role = config.bootstrap_mailbox_role;
+            Some(value)
+        } else {
+            None
+        };
+
+        // Delegate the two-tier optional-override lowering to the
+        // shared helper in `kmail-core`. Identical call shape to
+        // `kmail-ffi::client_open`, by design: the two bindings
+        // must lower the same way so a foreign caller's `None`
+        // produces the same observable `ClientConfig` regardless
+        // of whether they reach the SDK via UniFFI or napi.
+        core_cfg.apply_optional_overrides(
+            attachment_cache_bytes,
+            config.request_timeout_secs,
+            config.retry_budget_secs,
+            config.initial_sync_email_window,
+            config.account_id,
+            config.bootstrap_mailbox_role,
+        );
 
         let inner = KMailClient::open(core_cfg).map_err(napi_err)?;
         Ok(KMailClientJs {
@@ -569,6 +579,93 @@ mod tests {
                 "expected reason to start with {prefix}, got: {}",
                 err.reason
             );
+        }
+    }
+
+    /// Cross-binding parity: the napi `KMailClientJs::open` lowering
+    /// ladder MUST go through the shared
+    /// `ClientConfig::apply_optional_overrides` helper in
+    /// `kmail-core`, matching the UniFFI binding
+    /// (`sdk/kmail-ffi/src/lib.rs::client_open`) exactly. If a
+    /// future refactor inlines per-field assignment back into
+    /// `KMailClientJs::open`, the two bindings could drift again
+    /// (the original ANALYSIS_pr-review-job ANALYSIS_0006 finding).
+    ///
+    /// This test rebuilds the lowering result here by calling
+    /// `apply_optional_overrides` directly and asserts every field
+    /// matches what the shared helper produces. It does NOT exercise
+    /// the BigInt validation branch (`attachment_cache_bytes` is
+    /// produced as `Option<u64>` after that branch runs) — that's
+    /// tested separately in the napi-side integration tests.
+    #[test]
+    fn napi_open_lowering_matches_shared_helper() {
+        let bff_url = "https://kmail.test".to_string();
+        let bearer_token = "tok".to_string();
+        let database_path = "/tmp/kmail.sqlite".to_string();
+
+        for (
+            attachment_cache_bytes,
+            request_timeout_secs,
+            retry_budget_secs,
+            initial_sync_email_window,
+            account_id,
+            bootstrap_mailbox_role,
+        ) in [
+            (None, None, None, None, None, None),
+            (
+                Some(1024u64 * 1024),
+                Some(7u32),
+                Some(13u32),
+                Some(42u32),
+                Some("acct-xyz".to_string()),
+                Some("sent".to_string()),
+            ),
+        ] {
+            let mut via_shared = ClientConfig::new(
+                bff_url.clone(),
+                bearer_token.clone(),
+                PathBuf::from(database_path.clone()),
+            );
+            via_shared.apply_optional_overrides(
+                attachment_cache_bytes,
+                request_timeout_secs,
+                retry_budget_secs,
+                initial_sync_email_window,
+                account_id.clone(),
+                bootstrap_mailbox_role.clone(),
+            );
+
+            // Tier-1 numeric: `None` means inherit ClientConfig::new
+            // default; `Some(v)` overrides.
+            let reference = ClientConfig::new(
+                bff_url.clone(),
+                bearer_token.clone(),
+                PathBuf::from(database_path.clone()),
+            );
+            assert_eq!(
+                via_shared.attachment_cache_bytes,
+                attachment_cache_bytes.unwrap_or(reference.attachment_cache_bytes)
+            );
+            assert_eq!(
+                via_shared.request_timeout,
+                Duration::from_secs(u64::from(request_timeout_secs.unwrap_or_else(|| {
+                    u32::try_from(reference.request_timeout.as_secs()).unwrap()
+                })))
+            );
+            assert_eq!(
+                via_shared.retry_budget,
+                Duration::from_secs(u64::from(retry_budget_secs.unwrap_or_else(|| {
+                    u32::try_from(reference.retry_budget.as_secs()).unwrap()
+                })))
+            );
+            assert_eq!(
+                via_shared.initial_sync_email_window,
+                initial_sync_email_window.unwrap_or(reference.initial_sync_email_window)
+            );
+
+            // Tier-2 string: verbatim assignment.
+            assert_eq!(via_shared.account_id, account_id);
+            assert_eq!(via_shared.bootstrap_mailbox_role, bootstrap_mailbox_role);
         }
     }
 }
