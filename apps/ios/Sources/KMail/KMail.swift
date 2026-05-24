@@ -186,6 +186,52 @@ extension FfiEmailAddress: Codable {
     }
 }
 
+/// Canonical `JSONEncoder` for the SDK's wire-format payloads
+/// (`EmailDraft`, keyword maps, etc.).
+///
+/// **The configuration here is load-bearing for cross-binding
+/// parity with Kotlin.** Kotlin's `wireFormatJson` at
+/// `apps/android/kmail-sdk/src/main/kotlin/com/kmail/sdk/KMail.kt`
+/// sets `encodeDefaults = true` explicitly because
+/// kotlinx-serialization's default `Json` *elides* fields that
+/// match their declared default (e.g. an `EmailDraft` with empty
+/// `cc` / `bcc` / `inReplyTo` would emit an object missing those
+/// keys). Swift's `JSONEncoder` always emits every `Codable`
+/// property regardless of value, so the parity *happens to hold*
+/// today without any explicit configuration — but that's the
+/// kind of "implicit guarantee" Devin Review correctly flagged.
+///
+/// By plumbing every encode call through this factory, the
+/// invariant is documented in code: a future contributor who
+/// wants to add (say) `keyEncodingStrategy = .convertToSnakeCase`
+/// will see this comment block and the cross-binding parity test
+/// (`testEmailDraftEncodesToRustWireFormat`) and understand that
+/// Kotlin's `wireFormatJson` MUST be kept in lockstep with this
+/// factory. Today both encoders are configured to emit:
+///
+///   - Every property, regardless of default-equality.
+///   - JSON keys in property-declaration order (Swift `Codable`'s
+///     synthesized order; kotlinx-serialization's declaration
+///     order — they coincide because both bindings declare the
+///     fields in RFC 8621 wire-format order).
+///   - camelCase keys (matches RFC 8621 and the React web client).
+///
+/// Used by:
+///   - `KMailClient.sendEmail(_ draft:)`
+///   - `KMailClient.enqueueSetKeywords(emailID:keywords:)`
+internal func makeKMailWireFormatJSONEncoder() -> JSONEncoder {
+    let encoder = JSONEncoder()
+    // No `.outputFormatting = .sortedKeys` here on purpose: Swift's
+    // synthesized `Codable` encoder uses property-declaration order,
+    // kotlinx-serialization's default emitter does the same, and
+    // both bindings declare `EmailDraft` fields in identical
+    // declaration order. Sorting keys would diverge from Kotlin
+    // (which doesn't sort by default) and force the Kotlin side
+    // to adopt the same opt-in, expanding the surface area of the
+    // parity contract.
+    return encoder
+}
+
 // MARK: - Client configuration
 
 /// Configuration for opening a `KMailClient`.
@@ -430,7 +476,11 @@ public final class KMailClient {
     /// email. The action is persisted in the outbound-action
     /// queue and replayed against JMAP on the next `sync()`.
     public func enqueueSetKeywords(emailID: String, keywords: [String: Bool]) throws {
-        let json = try JSONEncoder().encode(keywords)
+        // Routed through `makeKMailWireFormatJSONEncoder()` so the
+        // cross-binding parity invariant with Kotlin's
+        // `wireFormatJson` is documented at every call site rather
+        // than relying on Swift's implicit default-emission behaviour.
+        let json = try makeKMailWireFormatJSONEncoder().encode(keywords)
         guard let str = String(data: json, encoding: .utf8) else {
             throw KMailError.InvalidArgument(description: "keywords dictionary did not encode to UTF-8")
         }
@@ -441,7 +491,13 @@ public final class KMailClient {
     /// email id. Internally encodes the draft to JSON and threads
     /// it through the FFI's string-based interface.
     public func sendEmail(_ draft: EmailDraft) async throws -> String {
-        let encoder = JSONEncoder()
+        // Routed through `makeKMailWireFormatJSONEncoder()` so the
+        // cross-binding parity invariant with Kotlin's
+        // `wireFormatJson` is documented at the call site. A future
+        // contributor changing this configuration must also change
+        // the Kotlin side or break the byte-for-byte JMAP payload
+        // parity that the BFF observability dashboards rely on.
+        let encoder = makeKMailWireFormatJSONEncoder()
         let data = try encoder.encode(draft)
         guard let json = String(data: data, encoding: .utf8) else {
             throw KMailError.InvalidArgument(description: "EmailDraft did not encode to UTF-8")

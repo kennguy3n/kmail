@@ -238,7 +238,13 @@ final class KMailIntegrationTests: XCTestCase {
             subject: "hello",
             textBody: "hi bob"
         )
-        let data = try JSONEncoder().encode(draft)
+        // Encode via the same `makeKMailWireFormatJSONEncoder()`
+        // factory that `KMailClient.sendEmail` uses in production.
+        // Using a fresh `JSONEncoder()` here would let the test pass
+        // even if the production encoder later gained a configuration
+        // (e.g. snake_case key conversion) that broke cross-binding
+        // parity with Kotlin's `wireFormatJson`.
+        let data = try makeKMailWireFormatJSONEncoder().encode(draft)
         let json = try XCTUnwrap(String(data: data, encoding: .utf8))
 
         // Keys must be exactly the JMAP RFC 8621 field names —
@@ -250,6 +256,16 @@ final class KMailIntegrationTests: XCTestCase {
         XCTAssertTrue(json.contains("\"textBody\""), "expected textBody key, got: \(json)")
         XCTAssertTrue(json.contains("\"inReplyTo\""), "expected inReplyTo key, got: \(json)")
         XCTAssertTrue(json.contains("alice@kmail.test"))
+
+        // Lock in the cross-binding parity invariant: every
+        // optional/empty-default field must be emitted, even when
+        // its value matches the declared default. This is the
+        // Swift-side mirror of Kotlin's `encodeDefaults = true`
+        // (see `KMail.kt`'s `wireFormatJson` doc block).
+        XCTAssertTrue(json.contains("\"cc\""), "expected cc key (empty), got: \(json)")
+        XCTAssertTrue(json.contains("\"bcc\""), "expected bcc key (empty), got: \(json)")
+        XCTAssertTrue(json.contains("\"replyTo\""), "expected replyTo key (empty), got: \(json)")
+        XCTAssertTrue(json.contains("\"references\""), "expected references key (empty), got: \(json)")
     }
 
     // MARK: - Default contract
