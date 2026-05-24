@@ -45,13 +45,6 @@ impl Store {
         })
     }
 
-    /// Access the underlying `Arc<Mutex<Connection>>`. Internal
-    /// repos in this crate use this directly; external callers
-    /// should prefer the typed repo helpers.
-    pub(crate) fn conn(&self) -> Arc<Mutex<Connection>> {
-        Arc::clone(&self.conn)
-    }
-
     /// Run a synchronous closure against a locked connection. Used
     /// by the unit tests and by repos that need ad-hoc SQL.
     pub fn with_conn<R, F>(&self, f: F) -> Result<R>

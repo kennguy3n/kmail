@@ -146,6 +146,64 @@ impl JmapClient {
         resp.parse(&id)
     }
 
+    /// Atomic bootstrap: combine `Email/query` (newest-N IDs) with
+    /// an `Email/get ids: []` state probe into a single batched
+    /// JMAP request. RFC 8620 §3.4 guarantees that all method
+    /// calls within one request are processed against the same
+    /// server state snapshot, which closes the race window where a
+    /// new email arriving between two HTTP round-trips would be
+    /// permanently missed from the local cache (the state token
+    /// from a later `Email/get` would already cover it, so the
+    /// next `Email/changes` would not return it either).
+    ///
+    /// Returns `(ids_newest_first, canonical_email_state)`.
+    pub async fn bootstrap_email_window(
+        &self,
+        session: &JmapSession,
+        account_id: &str,
+        mailbox_id: &str,
+        limit: u32,
+    ) -> Result<(Vec<String>, String)> {
+        let mut req = JmapRequest::new(vec![CAP_CORE.into(), CAP_MAIL.into()]);
+
+        let query_id = req.call(
+            "Email/query",
+            serde_json::to_value(EmailQueryArgs {
+                account_id: account_id.to_string(),
+                filter: Some(serde_json::json!({"inMailbox": mailbox_id})),
+                sort: Some(serde_json::json!([
+                    {"property": "receivedAt", "isAscending": false}
+                ])),
+                position: Some(0),
+                limit: Some(limit),
+                collapse_threads: Some(false),
+            })?,
+        );
+
+        // `Email/get` with an empty `ids` array is the canonical
+        // JMAP way to ask "what is the current state token for
+        // this type?" — RFC 8620 §5.1 explicitly requires the
+        // server to return `state` regardless of how many objects
+        // matched. Co-locating it in the same request as the query
+        // is what gives us the atomicity guarantee.
+        let state_id = req.call(
+            "Email/get",
+            serde_json::to_value(EmailGetArgs {
+                account_id: account_id.to_string(),
+                ids: Vec::new(),
+                properties: None,
+                fetch_text_body_values: None,
+                fetch_html_body_values: None,
+                fetch_all_body_values: None,
+            })?,
+        );
+
+        let resp = self.dispatch(session, &req).await?;
+        let q: EmailQueryResponse = resp.parse(&query_id)?;
+        let g: EmailGetResponse = resp.parse(&state_id)?;
+        Ok((q.ids, g.state))
+    }
+
     /// Fetch full `Email` payloads by ID.
     pub async fn get_emails(
         &self,
@@ -204,6 +262,15 @@ impl JmapClient {
 
     /// Persist a draft + submit it via `EmailSubmission/set`.
     /// Returns the server-assigned Email ID.
+    ///
+    /// The `Email/set` response is parsed first and any
+    /// `notCreated` entry is surfaced as the underlying JMAP
+    /// method error (`overQuota`, `tooManyKeywords`, ...) BEFORE
+    /// looking at `EmailSubmission/set`. If we skipped that and
+    /// went straight to the submission response, the user would
+    /// see `invalidResultReference` (because the `#draft1`
+    /// back-reference failed to resolve) instead of the actual
+    /// failure reason — bad UX and bad telemetry.
     pub async fn send_email(
         &self,
         session: &JmapSession,
@@ -251,11 +318,23 @@ impl JmapClient {
                 }
             }),
         );
-        let _ = (create_id, &submit_id);
 
         let resp = self.dispatch(session, &req).await?;
-        let sub: EmailSubmissionSetResponse = resp.parse(&submit_id)?;
 
+        // 1. Surface `Email/set` creation errors first. If draft
+        //    creation failed, the EmailSubmission/set back-reference
+        //    would have produced a confusing `invalidResultReference`
+        //    response — return the real reason instead.
+        let create_resp: crate::jmap::response::EmailSetResponse = resp.parse(&create_id)?;
+        if let Some((_, err)) = create_resp.not_created.into_iter().next() {
+            return Err(Error::JmapMethod {
+                code: err.r#type,
+                description: err.description.unwrap_or_default(),
+            });
+        }
+
+        // 2. Now parse the submission response normally.
+        let sub: EmailSubmissionSetResponse = resp.parse(&submit_id)?;
         if let Some((_, err)) = sub.not_created.into_iter().next() {
             return Err(Error::JmapMethod {
                 code: err.r#type,
@@ -263,11 +342,21 @@ impl JmapClient {
             });
         }
 
-        // Resolve `#draft1` against the response's `createdIds`.
+        // 3. Resolve `#draft1` against the response's `createdIds`
+        //    (server-assigned ID for the creation tag) or the
+        //    submission's echo, whichever is populated.
         let created_id = resp
             .created_ids
             .get("draft1")
             .cloned()
+            .or_else(|| {
+                create_resp
+                    .created
+                    .get("draft1")
+                    .and_then(|v| v.get("id"))
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            })
             .or_else(|| {
                 sub.created
                     .get("submit1")
@@ -485,5 +574,89 @@ mod tests {
                 retry_after_seconds: 7
             }
         ));
+    }
+
+    /// When `Email/set` rejects the draft (e.g. `overQuota`,
+    /// `invalidProperties`), the chained `EmailSubmission/set`
+    /// fails with the opaque `invalidResultReference` because the
+    /// `#draft1` back-reference cannot resolve. `send_email` MUST
+    /// look at the `Email/set` response first and surface the real
+    /// reason rather than the misleading reference error.
+    #[tokio::test]
+    async fn send_email_surfaces_email_set_failure_before_submission() {
+        let server = MockServer::start().await;
+        let api_url = format!("{}/jmap/api", server.uri());
+        Mock::given(method("POST"))
+            .and(path("/jmap/api"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "sessionState": "s-1",
+                "methodResponses": [
+                    ["Email/set", {
+                        "accountId": "acct-1",
+                        "newState": "e-state-2",
+                        "created": {},
+                        "notCreated": {
+                            "draft1": {
+                                "type": "urn:ietf:params:jmap:error:overQuota",
+                                "description": "mailbox quota exceeded"
+                            }
+                        }
+                    }, "c0"],
+                    ["error", {
+                        "type": "urn:ietf:params:jmap:error:invalidResultReference",
+                        "description": "could not resolve #draft1"
+                    }, "c1"]
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = fresh_client(&server).await;
+        let sess = fake_session(&api_url);
+        let draft = EmailDraft {
+            subject: "test".into(),
+            to: vec![crate::models::EmailAddress {
+                name: "Recipient".into(),
+                email: "rcpt@example.com".into(),
+            }],
+            ..EmailDraft::default()
+        };
+        let err = client
+            .send_email(&sess, "acct-1", &draft)
+            .await
+            .unwrap_err();
+        match err {
+            Error::JmapMethod { code, description } => {
+                // The real failure reason (overQuota) must surface,
+                // NOT the downstream `invalidResultReference` from
+                // the broken `#draft1` back-reference.
+                assert!(
+                    code.ends_with("overQuota"),
+                    "expected overQuota, got {code}"
+                );
+                assert!(description.contains("quota"));
+            }
+            other => panic!("expected JmapMethod overQuota, got {other:?}"),
+        }
+    }
+
+    /// `Email/changes` may signal `hasMoreChanges: true` when the
+    /// returned change set is truncated. Verifies the response type
+    /// parses the flag correctly (the loop wiring lives in
+    /// `client::tests::*`).
+    #[tokio::test]
+    async fn email_changes_has_more_flag_parses() {
+        let raw = serde_json::json!({
+            "accountId": "acct-1",
+            "oldState": "s-old",
+            "newState": "s-new",
+            "hasMoreChanges": true,
+            "created": [],
+            "updated": ["e-1", "e-2"],
+            "destroyed": []
+        });
+        let r: EmailChangesResponse = serde_json::from_value(raw).unwrap();
+        assert!(r.has_more_changes);
+        assert_eq!(r.updated, vec!["e-1", "e-2"]);
     }
 }

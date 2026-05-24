@@ -177,6 +177,35 @@ pub struct EmailSubmissionSetResponse {
     pub not_created: std::collections::BTreeMap<String, MethodErrorPayload>,
 }
 
+/// `Email/set` response payload (subset).
+///
+/// We only parse the fields that drive send-flow correctness:
+/// `created` (so we can recover the server-assigned draft ID
+/// when `createdIds` is absent from the envelope) and
+/// `notCreated` (so quota / mime-validation failures surface as
+/// the actual `overQuota` / `invalidProperties` error rather
+/// than the downstream `invalidResultReference` from the
+/// `#draft1` back-reference in `EmailSubmission/set`).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmailSetResponse {
+    pub account_id: String,
+    #[serde(default)]
+    pub new_state: String,
+    #[serde(default)]
+    pub created: std::collections::BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
+    pub not_created: std::collections::BTreeMap<String, MethodErrorPayload>,
+    #[serde(default)]
+    pub updated: std::collections::BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
+    pub not_updated: std::collections::BTreeMap<String, MethodErrorPayload>,
+    #[serde(default)]
+    pub destroyed: Vec<String>,
+    #[serde(default)]
+    pub not_destroyed: std::collections::BTreeMap<String, MethodErrorPayload>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

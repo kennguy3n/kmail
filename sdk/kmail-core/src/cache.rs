@@ -5,6 +5,13 @@
 // across re-fetches and we can dedupe across mailboxes without
 // extra bookkeeping. The cache is bounded by total bytes; LRU
 // eviction runs on every successful `put` once the limit is hit.
+//
+// All SQLite access is funnelled through `Store::with_conn`, which
+// converts a poisoned `Mutex<Connection>` into `Error::Store`
+// rather than panicking. This matches the convention used by the
+// repo types in `sync::*Repo` so a poisoned lock surfaces as a
+// recoverable error everywhere, not "process aborts on cache call
+// vs. error on repo call".
 
 use crate::error::{Error, Result};
 use crate::sync::store::Store;
@@ -31,102 +38,104 @@ impl AttachmentCache {
             return Err(Error::InvalidArgument("blob_id is empty".into()));
         }
         let now = Utc::now().timestamp();
-        let conn = self.store.conn();
-        let mut guard = conn.lock().expect("store mutex poisoned");
-        let tx = guard.transaction()?;
-        tx.execute(
-            "INSERT INTO blob_cache (blob_id, content_type, size, fetched_at, last_accessed_at, payload)
-             VALUES (?1, ?2, ?3, ?4, ?4, ?5)
-             ON CONFLICT(blob_id) DO UPDATE SET
-                content_type = excluded.content_type,
-                size = excluded.size,
-                fetched_at = excluded.fetched_at,
-                last_accessed_at = excluded.last_accessed_at,
-                payload = excluded.payload",
-            rusqlite::params![
-                blob_id,
-                content_type,
-                payload.len() as i64,
-                now,
-                payload,
-            ],
-        )?;
-        // Evict LRU rows until total cached bytes fit.
-        let total: i64 =
-            tx.query_row("SELECT COALESCE(SUM(size), 0) FROM blob_cache", [], |r| {
-                r.get(0)
-            })?;
-        if (total as u64) > self.max_bytes {
-            let mut over = (total as u64) - self.max_bytes;
-            let mut stmt =
-                tx.prepare("SELECT blob_id, size FROM blob_cache ORDER BY last_accessed_at ASC")?;
-            let mut rows = stmt.query([])?;
-            let mut victims: Vec<String> = Vec::new();
-            while let Some(row) = rows.next()? {
-                if over == 0 {
-                    break;
+        let max_bytes = self.max_bytes;
+        self.store.with_conn(|conn| {
+            let tx = conn.transaction()?;
+            tx.execute(
+                "INSERT INTO blob_cache (blob_id, content_type, size, fetched_at, last_accessed_at, payload)
+                 VALUES (?1, ?2, ?3, ?4, ?4, ?5)
+                 ON CONFLICT(blob_id) DO UPDATE SET
+                    content_type = excluded.content_type,
+                    size = excluded.size,
+                    fetched_at = excluded.fetched_at,
+                    last_accessed_at = excluded.last_accessed_at,
+                    payload = excluded.payload",
+                rusqlite::params![
+                    blob_id,
+                    content_type,
+                    payload.len() as i64,
+                    now,
+                    payload,
+                ],
+            )?;
+            // Evict LRU rows until total cached bytes fit.
+            let total: i64 =
+                tx.query_row("SELECT COALESCE(SUM(size), 0) FROM blob_cache", [], |r| {
+                    r.get(0)
+                })?;
+            if (total as u64) > max_bytes {
+                let mut over = (total as u64) - max_bytes;
+                let mut victims: Vec<String> = Vec::new();
+                {
+                    let mut stmt = tx.prepare(
+                        "SELECT blob_id, size FROM blob_cache ORDER BY last_accessed_at ASC",
+                    )?;
+                    let mut rows = stmt.query([])?;
+                    while let Some(row) = rows.next()? {
+                        if over == 0 {
+                            break;
+                        }
+                        let id: String = row.get(0)?;
+                        let sz: i64 = row.get(1)?;
+                        victims.push(id);
+                        over = over.saturating_sub(sz.max(0) as u64);
+                    }
                 }
-                let id: String = row.get(0)?;
-                let sz: i64 = row.get(1)?;
-                victims.push(id);
-                over = over.saturating_sub(sz.max(0) as u64);
+                for v in victims {
+                    tx.execute("DELETE FROM blob_cache WHERE blob_id = ?1", [&v])?;
+                }
             }
-            drop(rows);
-            drop(stmt);
-            for v in victims {
-                tx.execute("DELETE FROM blob_cache WHERE blob_id = ?1", [&v])?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
+            tx.commit()?;
+            Ok(())
+        })
     }
 
     /// Return the cached payload (and refresh its `last_accessed_at`)
     /// or `None` if absent.
     pub fn get(&self, blob_id: &str) -> Result<Option<Vec<u8>>> {
-        let conn = self.store.conn();
-        let mut guard = conn.lock().expect("store mutex poisoned");
-        let tx = guard.transaction()?;
-        let payload: Option<Vec<u8>> = tx
-            .query_row(
-                "SELECT payload FROM blob_cache WHERE blob_id = ?1",
-                [blob_id],
-                |r| r.get::<_, Vec<u8>>(0),
-            )
-            .map(Some)
-            .or_else(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => {
-                    Ok::<Option<Vec<u8>>, rusqlite::Error>(None)
-                }
-                other => Err(other),
-            })?;
-        if payload.is_some() {
-            tx.execute(
-                "UPDATE blob_cache SET last_accessed_at = ?1 WHERE blob_id = ?2",
-                rusqlite::params![Utc::now().timestamp(), blob_id],
-            )?;
-        }
-        tx.commit()?;
-        Ok(payload)
+        self.store.with_conn(|conn| {
+            let tx = conn.transaction()?;
+            let payload: Option<Vec<u8>> = tx
+                .query_row(
+                    "SELECT payload FROM blob_cache WHERE blob_id = ?1",
+                    [blob_id],
+                    |r| r.get::<_, Vec<u8>>(0),
+                )
+                .map(Some)
+                .or_else(|e| match e {
+                    rusqlite::Error::QueryReturnedNoRows => {
+                        Ok::<Option<Vec<u8>>, rusqlite::Error>(None)
+                    }
+                    other => Err(other),
+                })?;
+            if payload.is_some() {
+                tx.execute(
+                    "UPDATE blob_cache SET last_accessed_at = ?1 WHERE blob_id = ?2",
+                    rusqlite::params![Utc::now().timestamp(), blob_id],
+                )?;
+            }
+            tx.commit()?;
+            Ok(payload)
+        })
     }
 
     /// Total cached bytes. Used by the desktop "Storage" pane.
     pub fn total_bytes(&self) -> Result<u64> {
-        let conn = self.store.conn();
-        let guard = conn.lock().expect("store mutex poisoned");
-        let total: i64 =
-            guard.query_row("SELECT COALESCE(SUM(size), 0) FROM blob_cache", [], |r| {
-                r.get(0)
-            })?;
-        Ok(total.max(0) as u64)
+        self.store.with_conn(|conn| {
+            let total: i64 =
+                conn.query_row("SELECT COALESCE(SUM(size), 0) FROM blob_cache", [], |r| {
+                    r.get(0)
+                })?;
+            Ok(total.max(0) as u64)
+        })
     }
 
     /// Drop every cached entry. Used by the "Clear cache" affordance.
     pub fn purge(&self) -> Result<u64> {
-        let conn = self.store.conn();
-        let guard = conn.lock().expect("store mutex poisoned");
-        let purged = guard.execute("DELETE FROM blob_cache", [])?;
-        Ok(purged as u64)
+        self.store.with_conn(|conn| {
+            let purged = conn.execute("DELETE FROM blob_cache", [])?;
+            Ok(purged as u64)
+        })
     }
 }
 
@@ -190,5 +199,16 @@ mod tests {
         cache.put("b", None, &[0u8; 8]).unwrap();
         assert_eq!(cache.purge().unwrap(), 2);
         assert_eq!(cache.total_bytes().unwrap(), 0);
+    }
+
+    /// Regression: empty `blob_id` must be rejected up-front, not
+    /// reach the SQLite layer and produce a confusing constraint
+    /// error.
+    #[test]
+    fn empty_blob_id_rejected() {
+        let store = fresh_store();
+        let cache = AttachmentCache::new(store, 1024);
+        let err = cache.put("", None, b"x").unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
     }
 }

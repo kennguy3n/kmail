@@ -105,6 +105,54 @@ pub enum MailboxRole {
     Unknown,
 }
 
+impl MailboxRole {
+    /// Canonical lowercase identifier for this role, matching the
+    /// JMAP wire spelling exactly.
+    ///
+    /// This is the *only* sanctioned way for SDK / shell code to
+    /// compare a role against a string — the previous habit of
+    /// using `format!("{:?}", role).to_lowercase()` produced a
+    /// fragile coupling to the `Debug` derive's output and made
+    /// substring matches (e.g. `"a".contains(inbox_role)`) silently
+    /// match the wrong variant (`archive`, `all`, `flagged`, ...).
+    pub const fn canonical_name(self) -> &'static str {
+        match self {
+            MailboxRole::Inbox => "inbox",
+            MailboxRole::Archive => "archive",
+            MailboxRole::Drafts => "drafts",
+            MailboxRole::Sent => "sent",
+            MailboxRole::Trash => "trash",
+            MailboxRole::Junk => "junk",
+            MailboxRole::Important => "important",
+            MailboxRole::All => "all",
+            MailboxRole::Flagged => "flagged",
+            MailboxRole::Vault => "vault",
+            MailboxRole::Unknown => "unknown",
+        }
+    }
+
+    /// Inverse of `canonical_name`. Returns `None` for inputs that
+    /// don't match a known role label — callers should treat that
+    /// as a configuration error rather than silently defaulting to
+    /// `Unknown` so a typo in `ClientConfig::bootstrap_mailbox_role`
+    /// surfaces explicitly.
+    pub fn from_canonical_name(s: &str) -> Option<Self> {
+        match s {
+            "inbox" => Some(MailboxRole::Inbox),
+            "archive" => Some(MailboxRole::Archive),
+            "drafts" => Some(MailboxRole::Drafts),
+            "sent" => Some(MailboxRole::Sent),
+            "trash" => Some(MailboxRole::Trash),
+            "junk" => Some(MailboxRole::Junk),
+            "important" => Some(MailboxRole::Important),
+            "all" => Some(MailboxRole::All),
+            "flagged" => Some(MailboxRole::Flagged),
+            "vault" => Some(MailboxRole::Vault),
+            _ => None,
+        }
+    }
+}
+
 /// JMAP `Mailbox` as exposed via the BFF.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Mailbox {
@@ -407,5 +455,57 @@ mod tests {
         });
         let mbx: Mailbox = serde_json::from_value(raw).unwrap();
         assert_eq!(mbx.role, Some(MailboxRole::Unknown));
+    }
+
+    /// `canonical_name` must match the JMAP wire spelling exactly
+    /// (lowercase, no underscores) and round-trip through
+    /// `from_canonical_name`. This is the contract that the
+    /// bootstrap-mailbox lookup in `KMailClient::initial_email_pull`
+    /// depends on; if it ever silently drifts (e.g. because a new
+    /// variant is added and forgotten here), the inbox lookup will
+    /// fail at runtime — but the test will catch it at build time.
+    #[test]
+    fn mailbox_role_canonical_name_matches_wire() {
+        let all = [
+            MailboxRole::Inbox,
+            MailboxRole::Archive,
+            MailboxRole::Drafts,
+            MailboxRole::Sent,
+            MailboxRole::Trash,
+            MailboxRole::Junk,
+            MailboxRole::Important,
+            MailboxRole::All,
+            MailboxRole::Flagged,
+            MailboxRole::Vault,
+        ];
+        for r in all {
+            let name = r.canonical_name();
+            assert_eq!(
+                MailboxRole::from_canonical_name(name),
+                Some(r),
+                "canonical_name round-trip failed for {r:?}"
+            );
+
+            // The canonical name must also match the serde-encoded
+            // form (i.e. the on-the-wire JMAP spelling). That's the
+            // whole point of using this method instead of the
+            // Debug-derived string.
+            let wire = serde_json::to_string(&r).unwrap();
+            // serde_json wraps strings in quotes.
+            assert_eq!(wire, format!("\"{}\"", name));
+        }
+
+        // Unknown is the catch-all and has no wire spelling of its
+        // own, but `canonical_name` still has to return *something*
+        // distinct so it can't collide with a real role.
+        assert_eq!(MailboxRole::Unknown.canonical_name(), "unknown");
+        assert!(MailboxRole::from_canonical_name("unknown").is_none());
+
+        // Misspellings must NOT match — the substring-collision
+        // regression that motivated this method (e.g. `"a"` matching
+        // `archive`) must stay fixed.
+        assert!(MailboxRole::from_canonical_name("a").is_none());
+        assert!(MailboxRole::from_canonical_name("INBOX").is_none());
+        assert!(MailboxRole::from_canonical_name("").is_none());
     }
 }

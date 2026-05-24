@@ -37,6 +37,19 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::OnceCell;
 
+/// Upper bound on the number of `Email/changes` batches we will
+/// drain in a single `sync()` call.
+///
+/// RFC 8620 §5.2 lets the server signal `hasMoreChanges: true` to
+/// indicate that the returned change set is truncated and the
+/// client should call `Foo/changes` again with the new state. At
+/// 500 changes per batch (our `max_changes` argument), 64 batches
+/// is 32k changes — more than enough headroom for typical first-
+/// sync catch-up, and a hard ceiling so a buggy server that
+/// always returns `hasMoreChanges: true` can't make `sync()` spin
+/// forever.
+const MAX_EMAIL_CHANGES_BATCHES_PER_SYNC: u32 = 64;
+
 /// SDK configuration.
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
@@ -190,6 +203,12 @@ impl KMailClient {
 
     /// Delta-pull sync. See module-level doc-comment for the
     /// sequence of operations.
+    ///
+    /// `sync()` converges fully in one invocation — if the server
+    /// returns `Email/changes` with `hasMoreChanges: true`, the
+    /// loop iterates against the new state until all batches are
+    /// drained. Bound by `MAX_EMAIL_CHANGES_BATCHES_PER_SYNC` as a
+    /// safety valve against pathological servers that never settle.
     pub async fn sync(&self) -> Result<SyncSummary> {
         let session = self.discover_session().await?;
         let account_id = self.account_id().await?;
@@ -206,60 +225,104 @@ impl KMailClient {
         self.state_repo
             .put(SyncTypeName::Mailbox, &mailboxes.state)?;
 
-        // 2. Emails — branch on whether we have a saved state token.
+        // 2. Emails — branch on whether we have a saved state
+        //    token. The bootstrap path returns the canonical state
+        //    captured atomically with the initial Email/query, so
+        //    after persisting it we can skip the delta loop — an
+        //    immediate `Email/changes` against a just-acquired
+        //    state would always return empty and just waste a
+        //    round-trip. Only the incremental path (saved_state
+        //    present) drives the delta loop below.
         let saved_state = self.state_repo.get(SyncTypeName::Email)?;
+        let mut current_state = match saved_state {
+            Some(s) => s,
+            None => {
+                // First sync: atomic bootstrap (Email/query +
+                // Email/get state probe in one JMAP request — see
+                // `JmapClient::bootstrap_email_window`). Closes
+                // the race window between query and state read.
+                let (ids, state) = self
+                    .bootstrap_initial_email_pull(&session, &account_id)
+                    .await?;
+                self.hydrate_email_ids(&session, &account_id, &ids).await?;
+                summary.emails_created = ids.len() as u64;
+                self.state_repo.put(SyncTypeName::Email, &state)?;
 
-        let (created, updated, destroyed, new_state) = match saved_state {
-            None => self.initial_email_pull(&session, &account_id).await?,
-            Some(token) => match self.jmap.email_changes(&session, &account_id, &token).await {
-                Ok(changes) => (
-                    changes.created,
-                    changes.updated,
-                    changes.destroyed,
-                    changes.new_state,
-                ),
-                Err(Error::SyncStateDiverged) => {
-                    // Server can't catch us up; drop the stale token
-                    // and re-bootstrap. Mailbox state is unaffected.
-                    self.initial_email_pull(&session, &account_id).await?
-                }
-                Err(other) => return Err(other),
-            },
+                // 3. Flush queued offline actions and return.
+                summary.pending_actions_flushed = self
+                    .flush_pending_actions(&session, &account_id, 50)
+                    .await?;
+                return Ok(summary);
+            }
         };
 
-        // 3. Hydrate created + updated.
-        let mut to_fetch = Vec::with_capacity(created.len() + updated.len());
-        to_fetch.extend(created.iter().cloned());
-        to_fetch.extend(updated.iter().cloned());
-        if !to_fetch.is_empty() {
-            // Chunk fetches at 100 IDs per Email/get call — the BFF
-            // enforces a hard cap (`maxObjectsInGet`); 100 is the
-            // RFC 8620 §6.4 recommended ceiling.
-            for chunk in to_fetch.chunks(100) {
-                let emails = self
-                    .jmap
-                    .get_emails(&session, &account_id, chunk, /* with_bodies */ false)
-                    .await?;
-                let mutations: Vec<_> = emails
-                    .into_iter()
-                    .map(|e| crate::sync::EmailMutation::Upsert(Box::new(e.summary)))
-                    .collect();
-                self.email_repo.apply(&mutations)?;
+        // 3. Delta loop — drain Email/changes until
+        //    `has_more_changes == false`. Bounded so a buggy
+        //    server can't spin us forever.
+        let mut iterations = 0u32;
+        loop {
+            iterations += 1;
+            if iterations > MAX_EMAIL_CHANGES_BATCHES_PER_SYNC {
+                return Err(Error::Protocol(format!(
+                    "Email/changes did not converge after {MAX_EMAIL_CHANGES_BATCHES_PER_SYNC} batches"
+                )));
+            }
+
+            let changes = match self
+                .jmap
+                .email_changes(&session, &account_id, &current_state)
+                .await
+            {
+                Ok(c) => c,
+                Err(Error::SyncStateDiverged) => {
+                    // Server can't catch us up; drop the stale
+                    // token and re-bootstrap. Mailbox state is
+                    // unaffected; we just rebuild the email window.
+                    // The freshly-issued atomic bootstrap returns
+                    // the canonical Email state, so we persist that
+                    // and stop iterating — Email/changes would just
+                    // return an empty diff against it on the next
+                    // call anyway.
+                    let (ids, state) = self
+                        .bootstrap_initial_email_pull(&session, &account_id)
+                        .await?;
+                    self.hydrate_email_ids(&session, &account_id, &ids).await?;
+                    summary.emails_created += ids.len() as u64;
+                    self.state_repo.put(SyncTypeName::Email, &state)?;
+                    break;
+                }
+                Err(other) => return Err(other),
+            };
+
+            let created = changes.created;
+            let updated = changes.updated;
+            let destroyed = changes.destroyed;
+
+            // Hydrate created + updated.
+            let mut to_fetch = Vec::with_capacity(created.len() + updated.len());
+            to_fetch.extend(created.iter().cloned());
+            to_fetch.extend(updated.iter().cloned());
+            self.hydrate_email_ids(&session, &account_id, &to_fetch)
+                .await?;
+
+            // Apply destroys.
+            for d in &destroyed {
+                self.email_repo.delete(d)?;
+            }
+
+            summary.emails_created += created.len() as u64;
+            summary.emails_updated += updated.len() as u64;
+            summary.emails_destroyed += destroyed.len() as u64;
+
+            current_state = changes.new_state;
+            self.state_repo.put(SyncTypeName::Email, &current_state)?;
+
+            if !changes.has_more_changes {
+                break;
             }
         }
 
-        // 4. Apply destroys.
-        for d in &destroyed {
-            self.email_repo.delete(d)?;
-        }
-
-        summary.emails_created = created.len() as u64;
-        summary.emails_updated = updated.len() as u64;
-        summary.emails_destroyed = destroyed.len() as u64;
-
-        self.state_repo.put(SyncTypeName::Email, &new_state)?;
-
-        // 5. Flush queued offline actions.
+        // 4. Flush queued offline actions.
         summary.pending_actions_flushed = self
             .flush_pending_actions(&session, &account_id, 50)
             .await?;
@@ -267,78 +330,80 @@ impl KMailClient {
         Ok(summary)
     }
 
-    /// First-time email pull: Email/query newest N → read state.
-    ///
-    /// Returns the queried IDs as `created` so the outer `sync()`
-    /// hydration loop fetches and persists them. We intentionally do
-    /// NOT hydrate here to avoid a duplicate `Email/get` round-trip
-    /// (sync() already chunks + hydrates `created` ids in step 3).
-    async fn initial_email_pull(
+    /// Hydrate `Email/get` for the given IDs in chunks of 100
+    /// (RFC 8620 §6.4 recommended ceiling) and upsert each chunk
+    /// into the local store.
+    async fn hydrate_email_ids(
         &self,
         session: &JmapSession,
         account_id: &str,
-    ) -> Result<(Vec<String>, Vec<String>, Vec<String>, String)> {
-        let inbox_role = self
+        ids: &[String],
+    ) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        for chunk in ids.chunks(100) {
+            let emails = self
+                .jmap
+                .get_emails(session, account_id, chunk, /* with_bodies */ false)
+                .await?;
+            let mutations: Vec<_> = emails
+                .into_iter()
+                .map(|e| crate::sync::EmailMutation::Upsert(Box::new(e.summary)))
+                .collect();
+            self.email_repo.apply(&mutations)?;
+        }
+        Ok(())
+    }
+
+    /// First-time email pull. Locates the bootstrap mailbox (by
+    /// canonical role name — exact-match, never substring) and
+    /// issues a single atomic JMAP request that combines
+    /// `Email/query` with an `Email/get ids: []` state probe.
+    /// RFC 8620 §3.4's same-request atomicity guarantee closes the
+    /// race window where an email arriving between query and state
+    /// read would be permanently missed from the local cache.
+    ///
+    /// Returns `(ids_to_hydrate, canonical_email_state)`. The
+    /// caller is responsible for hydrating the IDs via
+    /// `Email/get` (see `hydrate_email_ids`) and persisting the
+    /// state token.
+    async fn bootstrap_initial_email_pull(
+        &self,
+        session: &JmapSession,
+        account_id: &str,
+    ) -> Result<(Vec<String>, String)> {
+        let inbox_role_raw = self
             .config
             .bootstrap_mailbox_role
             .as_deref()
             .unwrap_or("inbox");
+        let inbox_role = crate::models::MailboxRole::from_canonical_name(inbox_role_raw)
+            .ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "bootstrap_mailbox_role={inbox_role_raw:?} is not a known MailboxRole"
+                ))
+            })?;
         let inbox = self
             .mailbox_repo
             .list()?
             .into_iter()
-            .find(|m| {
-                m.role
-                    .as_ref()
-                    .map(|r| format!("{:?}", r).to_lowercase().contains(inbox_role))
-                    .unwrap_or(false)
-            })
+            .find(|m| m.role == Some(inbox_role))
             .ok_or_else(|| {
                 Error::Protocol(format!(
-                    "no mailbox with role={inbox_role} after Mailbox/get"
+                    "no mailbox with role={role} after Mailbox/get",
+                    role = inbox_role.canonical_name()
                 ))
             })?;
 
-        let q = self
-            .jmap
-            .query_emails_in_mailbox(
+        self.jmap
+            .bootstrap_email_window(
                 session,
                 account_id,
                 &inbox.id,
                 self.config.initial_sync_email_window,
             )
-            .await?;
-        // Email/query gives us `queryState` but the upper layer
-        // wants the canonical Email state, which is what
-        // Email/changes will track against. Pull it from Email/get
-        // by issuing a no-op call with `ids: []` — Stalwart accepts
-        // it and returns the current state cheaply. We approximate
-        // by issuing the smallest possible Email/get and reading
-        // the state from the response.
-        let state = self.read_email_state(session, account_id).await?;
-        Ok((q.ids, Vec::new(), Vec::new(), state))
-    }
-
-    /// Read the current `Email` state token by issuing a minimal
-    /// `Email/get` against an empty ID list. JMAP's `Foo/get`
-    /// always returns the current state, even when `list` is empty
-    /// (RFC 8620 §5.1). This avoids fetching any rows we don't
-    /// need just to discover the state token.
-    async fn read_email_state(&self, session: &JmapSession, account_id: &str) -> Result<String> {
-        let mut req = crate::jmap::request::JmapRequest::new(vec![
-            crate::jmap::request::CAP_CORE.into(),
-            crate::jmap::request::CAP_MAIL.into(),
-        ]);
-        let id = req.call(
-            "Email/get",
-            serde_json::json!({
-                "accountId": account_id,
-                "ids": [],
-            }),
-        );
-        let resp = self.jmap.dispatch(session, &req).await?;
-        let parsed: crate::jmap::response::EmailGetResponse = resp.parse(&id)?;
-        Ok(parsed.state)
+            .await
     }
 
     /// Return cached mailboxes from the local store. Does NOT make
@@ -603,7 +668,12 @@ mod tests {
         })
     }
 
-    fn email_query_body() -> serde_json::Value {
+    /// Combined bootstrap response. `Email/query` (call id `c0`)
+    /// returns the newest-N IDs and `Email/get ids: []` (call id
+    /// `c1`) returns the canonical Email state in the same JMAP
+    /// request envelope — see `JmapClient::bootstrap_email_window`
+    /// for the atomicity rationale.
+    fn bootstrap_email_window_body() -> serde_json::Value {
         serde_json::json!({
             "sessionState": "s-1",
             "methodResponses": [
@@ -614,7 +684,13 @@ mod tests {
                     "position": 0,
                     "total": 2,
                     "ids": ["e-1", "e-2"]
-                }, "c0"]
+                }, "c0"],
+                ["Email/get", {
+                    "accountId": "acct-1",
+                    "state": "e-state-1",
+                    "list": [],
+                    "notFound": []
+                }, "c1"]
             ]
         })
     }
@@ -660,20 +736,6 @@ mod tests {
         })
     }
 
-    fn empty_email_get_state_body() -> serde_json::Value {
-        serde_json::json!({
-            "sessionState": "s-1",
-            "methodResponses": [
-                ["Email/get", {
-                    "accountId": "acct-1",
-                    "state": "e-state-1",
-                    "list": [],
-                    "notFound": []
-                }, "c0"]
-            ]
-        })
-    }
-
     async fn mount_session(server: &MockServer) {
         Mock::given(method("GET"))
             .and(path("/jmap/session"))
@@ -706,11 +768,12 @@ mod tests {
 
         // Sequence of POSTs the SDK will issue:
         //   1) Mailbox/get      -> mailbox_get_body
-        //   2) Email/query      -> email_query_body
-        //   3) Email/get(ids)   -> email_get_body
-        //   4) Email/get(empty) -> empty_email_get_state_body (for state)
+        //   2) Email/query + Email/get(ids:[])  (one batched POST)
+        //                       -> bootstrap_email_window_body
+        //   3) Email/get(ids)   -> email_get_body  (hydration)
         // wiremock matchers are FIFO when same path is matched.
-        // We use a one-shot stub per response to enforce order.
+        // We use one-shot stubs (expect(1)) and disambiguate via
+        // body_string_contains.
         use wiremock::matchers::body_string_contains;
 
         Mock::given(method("POST"))
@@ -721,36 +784,27 @@ mod tests {
             .mount(&server)
             .await;
 
+        // The atomic bootstrap request batches `Email/query` and an
+        // `Email/get ids: []` state probe into a single POST. The
+        // body contains *both* strings, so we match on the unique
+        // `"Email/query"` token to keep this stub from also
+        // matching the hydration `Email/get` POST below.
         Mock::given(method("POST"))
             .and(path("/jmap/api"))
             .and(body_string_contains("\"Email/query\""))
-            .respond_with(ResponseTemplate::new(200).set_body_json(email_query_body()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(bootstrap_email_window_body()))
             .expect(1)
             .mount(&server)
             .await;
 
-        // The SDK issues one Email/get to hydrate the queried IDs,
-        // then a second Email/get with `ids: []` to read the
-        // canonical Email state. The first call's request body
-        // contains non-empty "ids", the second contains "[]".
-        // Disambiguate Email/get calls: the initial hydration
-        // batch contains BOTH ids `"e-1"` and `"e-2"`, the
-        // canonical state-probe call has `"ids":[]`.
+        // Hydration call: `Email/get` for the queried IDs (no
+        // `Email/query` in the body, both `"e-1"` and `"e-2"`).
         Mock::given(method("POST"))
             .and(path("/jmap/api"))
             .and(body_string_contains("\"Email/get\""))
             .and(body_string_contains("\"e-1\""))
             .and(body_string_contains("\"e-2\""))
             .respond_with(ResponseTemplate::new(200).set_body_json(email_get_body()))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        Mock::given(method("POST"))
-            .and(path("/jmap/api"))
-            .and(body_string_contains("\"Email/get\""))
-            .and(body_string_contains("\"ids\":[]"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(empty_email_get_state_body()))
             .expect(1)
             .mount(&server)
             .await;
@@ -805,7 +859,8 @@ mod tests {
 
         use wiremock::matchers::body_string_contains;
 
-        // First sync setup (same as the previous test).
+        // First sync setup: mailbox + atomic bootstrap (Email/query
+        // + Email/get state probe in one POST) + hydration.
         Mock::given(method("POST"))
             .and(path("/jmap/api"))
             .and(body_string_contains("\"Mailbox/get\""))
@@ -815,7 +870,8 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/jmap/api"))
             .and(body_string_contains("\"Email/query\""))
-            .respond_with(ResponseTemplate::new(200).set_body_json(email_query_body()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(bootstrap_email_window_body()))
+            .expect(1)
             .mount(&server)
             .await;
         // First-sync hydration call: contains BOTH `"e-1"` and
@@ -828,14 +884,6 @@ mod tests {
             .and(body_string_contains("\"e-1\""))
             .and(body_string_contains("\"e-2\""))
             .respond_with(ResponseTemplate::new(200).set_body_json(email_get_body()))
-            .expect(1)
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/jmap/api"))
-            .and(body_string_contains("\"Email/get\""))
-            .and(body_string_contains("\"ids\":[]"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(empty_email_get_state_body()))
             .expect(1)
             .mount(&server)
             .await;
@@ -949,10 +997,12 @@ mod tests {
             .mount(&server)
             .await;
 
+        // Re-bootstrap path issues the atomic Email/query +
+        // Email/get(ids:[]) batch in a single POST.
         Mock::given(method("POST"))
             .and(path("/jmap/api"))
             .and(body_string_contains("\"Email/query\""))
-            .respond_with(ResponseTemplate::new(200).set_body_json(email_query_body()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(bootstrap_email_window_body()))
             .expect(1)
             .mount(&server)
             .await;
@@ -961,15 +1011,9 @@ mod tests {
             .and(path("/jmap/api"))
             .and(body_string_contains("\"Email/get\""))
             .and(body_string_contains("\"e-1\""))
+            .and(body_string_contains("\"e-2\""))
             .respond_with(ResponseTemplate::new(200).set_body_json(email_get_body()))
-            .mount(&server)
-            .await;
-
-        Mock::given(method("POST"))
-            .and(path("/jmap/api"))
-            .and(body_string_contains("\"Email/get\""))
-            .and(body_string_contains("\"ids\":[]"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(empty_email_get_state_body()))
+            .expect(1)
             .mount(&server)
             .await;
 
@@ -984,5 +1028,165 @@ mod tests {
 
         let summary = client.sync().await.unwrap();
         assert_eq!(summary.emails_created, 2, "must re-bootstrap on divergence");
+    }
+
+    /// `sync()` must drain `Email/changes` until the server reports
+    /// `hasMoreChanges: false`. A single batch that returns
+    /// `hasMoreChanges: true` would otherwise leave the local state
+    /// behind by however many extra batches the server has queued
+    /// up — the symptom in production would be a freshly-synced
+    /// inbox missing emails until the next sync() call.
+    #[tokio::test]
+    async fn sync_drains_email_changes_until_has_more_is_false() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+        use wiremock::matchers::body_string_contains;
+        use wiremock::Respond;
+
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("kmail.db");
+        mount_session(&server).await;
+
+        // Mailbox/get stub — same as the other tests.
+        Mock::given(method("POST"))
+            .and(path("/jmap/api"))
+            .and(body_string_contains("\"Mailbox/get\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(mailbox_get_body()))
+            .mount(&server)
+            .await;
+
+        // Counter-driven Email/changes responder: batch 1 returns
+        // `hasMoreChanges: true` with one `created`; batch 2
+        // returns `hasMoreChanges: false` with a second `created`.
+        // If the SDK respects the flag, both should be hydrated;
+        // if it ignores the flag (the original bug), only the
+        // first batch's email is hydrated.
+        struct ChangesSequence {
+            counter: Arc<AtomicU32>,
+        }
+        impl Respond for ChangesSequence {
+            fn respond(&self, _req: &wiremock::Request) -> ResponseTemplate {
+                let n = self.counter.fetch_add(1, Ordering::SeqCst);
+                let body = if n == 0 {
+                    serde_json::json!({
+                        "sessionState": "s-2",
+                        "methodResponses": [
+                            ["Email/changes", {
+                                "accountId": "acct-1",
+                                "oldState": "e-state-1",
+                                "newState": "e-state-1b",
+                                "hasMoreChanges": true,
+                                "created": ["e-batch1"],
+                                "updated": [],
+                                "destroyed": []
+                            }, "c0"]
+                        ]
+                    })
+                } else {
+                    serde_json::json!({
+                        "sessionState": "s-2",
+                        "methodResponses": [
+                            ["Email/changes", {
+                                "accountId": "acct-1",
+                                "oldState": "e-state-1b",
+                                "newState": "e-state-2",
+                                "hasMoreChanges": false,
+                                "created": ["e-batch2"],
+                                "updated": [],
+                                "destroyed": []
+                            }, "c0"]
+                        ]
+                    })
+                };
+                ResponseTemplate::new(200).set_body_json(body)
+            }
+        }
+        let counter = Arc::new(AtomicU32::new(0));
+        Mock::given(method("POST"))
+            .and(path("/jmap/api"))
+            .and(body_string_contains("\"Email/changes\""))
+            .respond_with(ChangesSequence {
+                counter: Arc::clone(&counter),
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        // One hydration stub per batch — match on the unique ID.
+        let hydration_body = |id: &str| -> serde_json::Value {
+            serde_json::json!({
+                "sessionState": "s-2",
+                "methodResponses": [
+                    ["Email/get", {
+                        "accountId": "acct-1",
+                        "state": "e-state-2",
+                        "list": [{
+                            "id": id,
+                            "threadId": format!("t-{id}"),
+                            "blobId": format!("blob-{id}"),
+                            "mailboxIds": {"mbx-inbox": true},
+                            "keywords": {},
+                            "size": 64,
+                            "receivedAt": "2026-05-24T10:00:00Z",
+                            "from": [{"name": "X", "email": "x@example.com"}],
+                            "to": [{"name": "", "email": "bob@example.com"}],
+                            "subject": format!("subj {id}"),
+                            "preview": ""
+                        }],
+                        "notFound": []
+                    }, "c0"]
+                ]
+            })
+        };
+        Mock::given(method("POST"))
+            .and(path("/jmap/api"))
+            .and(body_string_contains("\"Email/get\""))
+            .and(body_string_contains("\"e-batch1\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(hydration_body("e-batch1")))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/jmap/api"))
+            .and(body_string_contains("\"Email/get\""))
+            .and(body_string_contains("\"e-batch2\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(hydration_body("e-batch2")))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Pre-seed a saved state token so the SDK takes the
+        // Email/changes path immediately, skipping bootstrap.
+        let cfg = ClientConfig::new(server.uri(), "test-token", db);
+        let client = KMailClient::open(cfg).unwrap();
+        client
+            .state_repo
+            .put(SyncTypeName::Email, "e-state-1")
+            .unwrap();
+
+        let summary = client.sync().await.unwrap();
+        // Both batches must be ingested.
+        assert_eq!(
+            summary.emails_created, 2,
+            "both Email/changes batches must hydrate"
+        );
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+
+        // Saved state token must advance to the FINAL batch's
+        // newState — not the intermediate "e-state-1b".
+        assert_eq!(
+            client
+                .state_repo
+                .get(SyncTypeName::Email)
+                .unwrap()
+                .as_deref(),
+            Some("e-state-2")
+        );
+
+        // Both hydrated emails are in cache.
+        let in_inbox = client.cached_emails_in_mailbox("mbx-inbox", 50).unwrap();
+        assert!(in_inbox.iter().any(|e| e.id == "e-batch1"));
+        assert!(in_inbox.iter().any(|e| e.id == "e-batch2"));
     }
 }
