@@ -226,6 +226,16 @@ func (s *CMKService) EncryptDEK(ctx context.Context, tenantID, configID, keyLabe
 	if err != nil {
 		return nil, nil, err
 	}
+	// Best-effort PIN scrubbing. Go's GC may have already copied
+	// the underlying bytes elsewhere by the time the wire call
+	// returns (and the `string(creds)` conversion on the KMIP path
+	// produces an unreachable heap copy that cannot be zeroed at
+	// all), so this is a defense-in-depth measure rather than a
+	// hard guarantee. It still narrows the in-process exposure
+	// window from "until next GC + N other allocations" down to
+	// "until function return". See pkcs11Encrypt doc for the full
+	// lifetime-contract rationale.
+	defer clear(creds)
 	switch cfg.Provider {
 	case HSMKMIP:
 		client := NewKMIPClient(strings.TrimPrefix(strings.TrimPrefix(cfg.Endpoint, "kmips://"), "kmip://"), nil)
@@ -256,6 +266,8 @@ func (s *CMKService) DecryptDEK(ctx context.Context, tenantID, configID, keyLabe
 	if err != nil {
 		return nil, err
 	}
+	// See EncryptDEK for the lifetime rationale.
+	defer clear(creds)
 	var out []byte
 	switch cfg.Provider {
 	case HSMKMIP:

@@ -548,6 +548,69 @@ func TestProxy_MTLSIPLiteralVerifiesAgainstIPAddressesSAN(t *testing.T) {
 	}
 }
 
+// TestNewClientTLSTransport_TLSClientConfigPointerEqualsBaseForHTTP2 pins
+// the contract called out by the round-6 Devin Review finding:
+// the transport's `TLSClientConfig` MUST be the SAME pointer that
+// `clientTLSBuild.perConnConfig` clones from. The reason is
+// load-bearing — when `ForceAttemptHTTP2` is true, net/http's
+// `http2configureTransports` mutates `TLSClientConfig.NextProtos`
+// to add `"h2"` so ALPN announces HTTP/2 on the wire. Per-
+// connection configs are clones of `b.base`, so the mutation
+// propagates and every BFF→Stalwart connection negotiates HTTP/2.
+//
+// A future refactor that points the transport's `TLSClientConfig`
+// at a *different* tls.Config than `perConnConfig` clones from
+// would silently downgrade every BFF→Stalwart request to HTTP/1.1
+// — there's no error, the handshake just doesn't advertise h2.
+// This test guards that contract by asserting pointer equality.
+func TestNewClientTLSTransport_TLSClientConfigPointerEqualsBaseForHTTP2(t *testing.T) {
+	dir := t.TempDir()
+
+	ca := issueCert(t, "kmail-ca", nil, true, nil)
+	client := issueCert(t, "kmail-bff", nil, false, ca)
+	cfg := &ClientTLSConfig{
+		CertFile: writeTempPEM(t, dir, "tls.crt", client.certPEM),
+		KeyFile:  writeTempPEM(t, dir, "tls.key", client.keyPEM),
+		CAFile:   writeTempPEM(t, dir, "ca.pem", ca.certPEM),
+	}
+	built, err := cfg.build(testLogger(t))
+	if err != nil {
+		t.Fatalf("build TLS: %v", err)
+	}
+
+	tr := newClientTLSTransport(built)
+
+	if tr.TLSClientConfig != built.base {
+		t.Fatalf("TLSClientConfig pointer must equal built.base for HTTP/2 NextProtos "+
+			"mutation to propagate into per-connection clones; got tr.TLSClientConfig=%p, built.base=%p",
+			tr.TLSClientConfig, built.base)
+	}
+	if !tr.ForceAttemptHTTP2 {
+		t.Errorf("ForceAttemptHTTP2 must be true for HTTP/2 ALPN negotiation; got %v", tr.ForceAttemptHTTP2)
+	}
+	if tr.DialTLSContext == nil {
+		t.Fatal("DialTLSContext must be set so per-connection perConnConfig is used")
+	}
+
+	// Simulate http2configureTransports's mutation by appending
+	// "h2" to NextProtos. perConnConfig must reflect this in the
+	// clone — that's the property HTTP/2 negotiation depends on.
+	tr.TLSClientConfig.NextProtos = append(tr.TLSClientConfig.NextProtos, "h2")
+	perConn := built.perConnConfig("stalwart.test")
+	found := false
+	for _, p := range perConn.NextProtos {
+		if p == "h2" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("perConnConfig clone did not inherit \"h2\" from the shared base; "+
+			"NextProtos = %v; HTTP/2 negotiation would silently fall back to HTTP/1.1",
+			perConn.NextProtos)
+	}
+}
+
 // issueCertForIP is a variant of issueCert that overrides the
 // default 127.0.0.1 IPAddresses entry with a caller-supplied IP.
 // Used by the negative branch of the IP-SAN verification test.

@@ -568,10 +568,25 @@ func newClientTLSTransport(b *clientTLSBuild) *http.Transport {
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
-		// Provide a base TLSClientConfig too so http.Transport
-		// internals (HTTP/2 negotiation, protocols, ALPN) that
-		// peek at NextProtos / MinVersion still see consistent
-		// values. The actual handshake runs in DialTLSContext.
+		// Pointer-equal `b.base` is INTENTIONAL and load-bearing
+		// for HTTP/2 negotiation; do not "decouple" the transport's
+		// TLSClientConfig from the per-connection clone source.
+		//
+		// When `ForceAttemptHTTP2` is true, the net/http package's
+		// `http2configureTransports` registration mutates
+		// `TLSClientConfig.NextProtos` to prepend `"h2"` so ALPN
+		// announces HTTP/2 on the wire. Because `perConnConfig`
+		// clones `b.base` (which IS this same pointer) at dial
+		// time, every per-connection *tls.Config inherits the
+		// HTTP/2-aware NextProtos and the handshake negotiates
+		// HTTP/2 cleanly. A future refactor that points
+		// `TLSClientConfig` at a *different* *tls.Config than
+		// `perConnConfig` clones from would silently downgrade
+		// every BFF→Stalwart request to HTTP/1.1.
+		//
+		// The actual handshake runs in DialTLSContext below; this
+		// field is kept populated so the transport's HTTP/2 setup
+		// path has a config to mutate and ALPN works as expected.
 		TLSClientConfig: b.base,
 	}
 	tr.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
