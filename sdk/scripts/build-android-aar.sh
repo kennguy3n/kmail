@@ -192,18 +192,40 @@ fi
 echo "==> Using host cdylib at ${HOST_CDYLIB}"
 
 # Copy the host cdylib into the Gradle module's host-jna path
-# under the linux name so JNA can find it via java.library.path.
-# We always copy as `libkmail_ffi.so` because the Gradle
-# unitTests run on the ubuntu CI runner — even when a developer
-# is on macOS, the linux name is what CI ultimately consumes.
-if [[ "${HOST_CDYLIB}" == *.so ]]; then
-    cp "${HOST_CDYLIB}" "${HOST_JNA_OUT}/libkmail_ffi.so"
-elif [[ "${HOST_CDYLIB}" == *.dylib ]]; then
-    # macOS dev host: copy alongside the linux name so a
-    # developer can also run gradle test locally.
-    cp "${HOST_CDYLIB}" "${HOST_JNA_OUT}/libkmail_ffi.dylib"
-    cp "${HOST_CDYLIB}" "${HOST_JNA_OUT}/libkmail_ffi.so"
-fi
+# under a name that matches the *actual* binary format on this
+# host. JNA's library search uses the OS-conventional extension:
+#
+#   Linux:   libkmail_ffi.so   (ELF)
+#   macOS:   libkmail_ffi.dylib (Mach-O)
+#   Windows: kmail_ffi.dll      (PE/COFF)
+#
+# JNA + java.library.path resolve the correct extension per OS
+# automatically — there's no need (and it would be misleading)
+# to put a macOS Mach-O file under a `.so` filename. macOS's
+# dlopen IS liberal about extensions and would happily load a
+# Mach-O bundle named `.so`, but `file libkmail_ffi.so` would
+# then mis-report the binary format and confuse anyone
+# triaging a JNA load failure.
+#
+# On macOS dev machines, `./gradlew :kmail-sdk:test` will
+# pick up `libkmail_ffi.dylib` via the same JVM args we set
+# on `java.library.path` — JNA's `Native.loadLibrary("kmail_ffi")`
+# tries the platform-native extension first.
+case "${HOST_CDYLIB}" in
+    *.so)
+        cp "${HOST_CDYLIB}" "${HOST_JNA_OUT}/libkmail_ffi.so"
+        ;;
+    *.dylib)
+        cp "${HOST_CDYLIB}" "${HOST_JNA_OUT}/libkmail_ffi.dylib"
+        ;;
+    *.dll)
+        cp "${HOST_CDYLIB}" "${HOST_JNA_OUT}/kmail_ffi.dll"
+        ;;
+    *)
+        echo "error: unrecognised host cdylib extension on ${HOST_CDYLIB}" >&2
+        exit 1
+        ;;
+esac
 
 echo "==> Generating Kotlin bindings from host cdylib"
 # Generate into a scratch directory first, then move the
@@ -260,17 +282,60 @@ cargo ndk \
     -p kmail-ffi
 
 echo "==> Staging .so files into AGP jniLibs layout"
+# Strip the cross-compiled .so files with the NDK's llvm-strip.
+# The `release-with-symbols` profile keeps debug symbols so
+# `uniffi-bindgen` can read `UNIFFI_META_*` symbols from the
+# host cdylib (see the profile comment block in sdk/Cargo.toml).
+# Those symbols are NOT needed at runtime on Android — the .so
+# is loaded via System.loadLibrary and resolved dynamically.
+# Without stripping, each Android .so is ~3-6x larger than
+# necessary (uniffi metadata alone is ~2 MiB / arch). Strip them
+# here so the AAR ships at the size a production library expects.
+#
+# llvm-strip lives at `<NDK>/toolchains/llvm/prebuilt/<host>/bin/llvm-strip`.
+# We discover the host-prebuilt dir generically (linux-x86_64 on
+# CI, darwin-x86_64 / darwin-arm64 locally) so this works on any
+# NDK install.
+LLVM_STRIP=""
+for candidate in \
+    "${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" \
+    "${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-strip" \
+    "${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/darwin-arm64/bin/llvm-strip" \
+    "${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-strip.exe"
+do
+    if [[ -x "${candidate}" ]]; then
+        LLVM_STRIP="${candidate}"
+        break
+    fi
+done
+if [[ -z "${LLVM_STRIP}" ]]; then
+    echo "warning: llvm-strip not found under ${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/*/bin/" >&2
+    echo "warning: Android .so files will ship unstripped (larger AAR)" >&2
+fi
+
 for triple in "${ANDROID_TARGETS[@]}"; do
     abi="${ABI_FOR_TRIPLE[${triple}]}"
     src="${SDK_DIR}/target/${triple}/${PROFILE}/libkmail_ffi.so"
     dst_dir="${JNILIBS_OUT}/${abi}"
+    dst="${dst_dir}/libkmail_ffi.so"
     mkdir -p "${dst_dir}"
     if [[ ! -f "${src}" ]]; then
         echo "error: expected staticlib at ${src} after cargo-ndk build" >&2
         exit 1
     fi
-    cp "${src}" "${dst_dir}/libkmail_ffi.so"
-    echo "    ${triple} -> ${abi}/libkmail_ffi.so"
+    cp "${src}" "${dst}"
+    if [[ -n "${LLVM_STRIP}" ]]; then
+        # `--strip-unneeded` drops debug symbols and unreferenced
+        # symbols while keeping the dynamic-linker symbols
+        # (uniffi's `extern "C"` entrypoints) that Android's
+        # System.loadLibrary actually needs.
+        before=$(stat -c '%s' "${dst}" 2>/dev/null || stat -f '%z' "${dst}")
+        "${LLVM_STRIP}" --strip-unneeded "${dst}"
+        after=$(stat -c '%s' "${dst}" 2>/dev/null || stat -f '%z' "${dst}")
+        echo "    ${triple} -> ${abi}/libkmail_ffi.so (stripped: ${before} -> ${after} bytes)"
+    else
+        echo "    ${triple} -> ${abi}/libkmail_ffi.so (unstripped, no llvm-strip available)"
+    fi
 done
 
 # Sanity-check: AGP requires at least one .so per declared ABI
@@ -292,4 +357,4 @@ echo "  jniLibs:        ${JNILIBS_OUT}"
 echo "  Kotlin binding: ${BINDINGS_OUT}"
 echo "  Host JNA .so:   ${HOST_JNA_OUT}"
 echo ""
-echo "Next: cd apps/android && gradle :kmail-sdk:assembleRelease test"
+echo "Next: cd apps/android && ./gradlew :kmail-sdk:assembleRelease test"

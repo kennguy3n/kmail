@@ -137,7 +137,11 @@ jobs:
           cargo --version
           cargo-ndk --version
           java -version
-          gradle --version || true
+          # `./gradlew` (Gradle Wrapper, 8.7) downloads its pinned
+          # distribution on first use. Pre-warm the wrapper here so
+          # the cold-distro-download cost is paid before the build
+          # step, keeping the build step's timing meaningful.
+          (cd apps/android && ./gradlew --version)
           ls -la "$ANDROID_NDK_HOME" | head -5
 
       - name: Build AAR (cross-compile + Kotlin bindings + jniLibs)
@@ -215,8 +219,15 @@ jobs:
       # log readable.
       - name: Gradle assemble + test
         working-directory: apps/android
+        # Use the wrapper (`./gradlew`) instead of the runner's
+        # system-installed Gradle. The wrapper pins Gradle to 8.7
+        # via `gradle/wrapper/gradle-wrapper.properties`, which is
+        # the version AGP 8.5.0 was tested against. Without the
+        # wrapper, a future runner image bump that includes Gradle
+        # 9.x would break the build (AGP 8.5.0 doesn't support
+        # Gradle 9 — see https://developer.android.com/build/releases/gradle-plugin#updating-gradle).
         run: |
-          gradle :kmail-sdk:assembleRelease :kmail-sdk:test \
+          ./gradlew :kmail-sdk:assembleRelease :kmail-sdk:test \
             --no-daemon \
             --warning-mode=summary
 

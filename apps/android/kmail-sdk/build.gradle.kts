@@ -109,7 +109,17 @@ android {
             isReturnDefaultValues = false
             isIncludeAndroidResources = false
 
-            all {
+            // `all` in AGP's `UnitTestOptions` accepts a Groovy
+            // closure with `Test` as the implicit receiver. From
+            // Kotlin DSL we have to surface the receiver
+            // explicitly via the lambda parameter — the bare
+            // `jvmArgs(...)` form would resolve against the
+            // outer closure receiver (`AndroidComponentsExtension`
+            // / `UnitTestOptions`), neither of which defines
+            // `jvmArgs`. The `Test`-typed lambda parameter
+            // (auto-inferred by the Kotlin compiler) gives us
+            // the gradle `Test` task API.
+            all { testTask ->
                 // Point both `jna.library.path` AND
                 // `java.library.path` at `build/host-jna`. JNA
                 // consults its own property first (and falls
@@ -120,7 +130,7 @@ android {
                 // `project.projectDir` resolves it
                 // deterministically across CI and local runs.
                 val hostJnaDir = "${project.projectDir}/build/host-jna"
-                jvmArgs(
+                testTask.jvmArgs(
                     "-Djna.library.path=$hostJnaDir",
                     "-Djava.library.path=$hostJnaDir",
                 )

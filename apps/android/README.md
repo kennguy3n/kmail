@@ -53,8 +53,11 @@ to match.
 - **cargo-ndk** — `cargo install cargo-ndk`
 - **Android NDK r25c+** — set `ANDROID_NDK_HOME` to the install root
 - **JDK 17** — AGP 8 requires Java 17
-- **Gradle 8.0+** (the wrapper resolves this; running `gradle`
-  directly requires a host install)
+- The Gradle Wrapper (`./gradlew`) is committed; it pins Gradle 8.7
+  (the version AGP 8.5.0 was tested against) and downloads it on
+  first use. Avoid invoking a host `gradle` directly — that would
+  bypass the pinned version and risk build breakage on a host
+  Gradle 9+ install (AGP 8.5.0 does not support Gradle 9).
 
 ## Local build
 
@@ -65,10 +68,10 @@ to match.
 
 # 2. Assemble the release AAR.
 cd apps/android
-gradle :kmail-sdk:assembleRelease
+./gradlew :kmail-sdk:assembleRelease
 
 # 3. Run the host-JVM unit tests against the linux-x86_64 .so.
-gradle :kmail-sdk:test
+./gradlew :kmail-sdk:test
 ```
 
 The assembled AAR lands at
