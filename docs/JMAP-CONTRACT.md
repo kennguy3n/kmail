@@ -126,6 +126,27 @@ Zero-Access Vault folders. The BFF enforces:
   application-level JMAP `urn:ietf:params:jmap:error:unauthorized`
   error in the response body for in-session discovery.
 
+#### OIDC fail-closed (Phase A hardening)
+
+`NewOIDC` REQUIRES `KCHAT_OIDC_ISSUER` to be set when
+`KMAIL_ENV` is anything other than `development` (or its `dev`
+alias). Specifically:
+
+- `KMAIL_ENV` empty / `production` / `staging`: missing or empty
+  `KCHAT_OIDC_ISSUER` is fatal at startup. The unverified-JWT
+  fallback is disabled in this mode — every request MUST present
+  a token whose signature verifies against the JWKS.
+- `KMAIL_ENV=development` (or `dev`): the BFF tolerates a missing
+  issuer and falls back to decoding the bearer token without
+  signature verification, ONLY to make local development against
+  the docker-compose stack possible.
+
+Migration: an existing staging deployment that omitted the
+issuer must add it before upgrading. There is no toggle to
+opt out — both the unverified fallback and the
+`KMAIL_DEV_BYPASS_TOKEN` shortcut are authentication-bypass
+vectors and are locked behind the development gate by design.
+
 ### 3.2 BFF → Stalwart authentication
 
 - The BFF authenticates itself to Stalwart with a **mutual-TLS

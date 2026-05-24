@@ -36,6 +36,14 @@ type issuedCert struct {
 // the cert is signed by the issuer's key, producing a proper
 // chain so RequireAndVerifyClientCert works.
 func issueCert(t *testing.T, cn string, dnsNames []string, isCA bool, issuer *issuedCert) *issuedCert {
+	return issueCertWithLifetime(t, cn, dnsNames, isCA, issuer, time.Hour)
+}
+
+// issueCertWithLifetime is the variant of issueCert that lets a
+// test pin the leaf NotAfter horizon. Used by the near-expiry
+// WARN regression so the cert can be minted with e.g. a 1-hour
+// remaining lifetime relative to the loader's injected clock.
+func issueCertWithLifetime(t *testing.T, cn string, dnsNames []string, isCA bool, issuer *issuedCert, lifetime time.Duration) *issuedCert {
 	t.Helper()
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -49,7 +57,7 @@ func issueCert(t *testing.T, cn string, dnsNames []string, isCA bool, issuer *is
 		SerialNumber:          serial,
 		Subject:               pkix.Name{CommonName: cn},
 		NotBefore:             time.Now().Add(-time.Minute),
-		NotAfter:              time.Now().Add(time.Hour),
+		NotAfter:              time.Now().Add(lifetime),
 		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 		DNSNames:              dnsNames,
@@ -430,5 +438,149 @@ func TestNewProxy_LogsWarningOnHTTPSWithoutTLS(t *testing.T) {
 	}
 	if !strings.Contains(logBuf.String(), "no client TLS configured") {
 		t.Errorf("expected mTLS warning, got: %q", logBuf.String())
+	}
+}
+
+// TestKeypairLoader_WarnsWithinExpiryThreshold pins the operator
+// safety net: when a loaded client cert is within
+// certExpiryWarnThreshold of expiry (default 24h), the loader
+// MUST emit a WARN log. Default cert-manager config issues 24h
+// certs with 8h renewal -- anything inside 24h means renewal is
+// broken or Reloader never restarted the pod.
+func TestKeypairLoader_WarnsWithinExpiryThreshold(t *testing.T) {
+	dir := t.TempDir()
+	c := issueCertWithLifetime(t, "kmail-bff-soon-to-expire", []string{"kmail-bff"}, false, nil, time.Hour)
+	certPath := writeTempPEM(t, dir, "tls.crt", c.certPEM)
+	keyPath := writeTempPEM(t, dir, "tls.key", c.keyPEM)
+
+	var buf strings.Builder
+	loader := &keypairLoader{
+		certFile: certPath,
+		keyFile:  keyPath,
+		logger:   log.New(&buf, "", 0),
+		now:      func() time.Time { return time.Now() },
+	}
+	if _, err := loader.load(); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if !strings.Contains(buf.String(), "WARN") || !strings.Contains(buf.String(), "expires in") {
+		t.Errorf("expected near-expiry WARN, got: %q", buf.String())
+	}
+
+	before := buf.Len()
+	if _, err := loader.load(); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if buf.Len() != before {
+		t.Errorf("expected WARN dedup, but log grew from %d to %d", before, buf.Len())
+	}
+}
+
+func TestKeypairLoader_DoesNotWarnFarFromExpiry(t *testing.T) {
+	dir := t.TempDir()
+	c := issueCertWithLifetime(t, "kmail-bff-fresh", []string{"kmail-bff"}, false, nil, 720*time.Hour)
+	certPath := writeTempPEM(t, dir, "tls.crt", c.certPEM)
+	keyPath := writeTempPEM(t, dir, "tls.key", c.keyPEM)
+
+	var buf strings.Builder
+	loader := &keypairLoader{
+		certFile: certPath,
+		keyFile:  keyPath,
+		logger:   log.New(&buf, "", 0),
+	}
+	if _, err := loader.load(); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if strings.Contains(buf.String(), "expires in") || strings.Contains(buf.String(), "EXPIRED") {
+		t.Errorf("unexpected near-expiry WARN for fresh cert: %q", buf.String())
+	}
+}
+
+func TestKeypairLoader_WarnsOnExpiredCert(t *testing.T) {
+	dir := t.TempDir()
+	c := issueCertWithLifetime(t, "kmail-bff-expired", []string{"kmail-bff"}, false, nil, -time.Hour)
+	certPath := writeTempPEM(t, dir, "tls.crt", c.certPEM)
+	keyPath := writeTempPEM(t, dir, "tls.key", c.keyPEM)
+
+	var buf strings.Builder
+	loader := &keypairLoader{
+		certFile: certPath,
+		keyFile:  keyPath,
+		logger:   log.New(&buf, "", 0),
+	}
+	if _, err := loader.load(); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if !strings.Contains(buf.String(), "EXPIRED") {
+		t.Errorf("expected EXPIRED WARN, got: %q", buf.String())
+	}
+}
+
+func TestNewProxy_LogsWarningOnMTLSWithBareSvcHostname(t *testing.T) {
+	dir := t.TempDir()
+	c := issueCert(t, "kmail-bff", []string{"kmail-bff"}, false, nil)
+	certPath := writeTempPEM(t, dir, "tls.crt", c.certPEM)
+	keyPath := writeTempPEM(t, dir, "tls.key", c.keyPEM)
+
+	var buf strings.Builder
+	_, err := NewProxy(ProxyConfig{
+		StalwartURL: "https://kmail-stalwart-0.kmail-stalwart.svc:8443",
+		Pool:        newDummyPool(t),
+		Logger:      log.New(&buf, "", 0),
+		TLS: &ClientTLSConfig{
+			CertFile: certPath,
+			KeyFile:  keyPath,
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewProxy: %v", err)
+	}
+	if !strings.Contains(buf.String(), "WARNING mTLS is enabled but StalwartURL hostname") {
+		t.Errorf("expected bare-svc mTLS WARN, got: %q", buf.String())
+	}
+}
+
+func TestNewProxy_LogsWarningOnMTLSWithHTTPURL(t *testing.T) {
+	dir := t.TempDir()
+	c := issueCert(t, "kmail-bff", []string{"kmail-bff"}, false, nil)
+	certPath := writeTempPEM(t, dir, "tls.crt", c.certPEM)
+	keyPath := writeTempPEM(t, dir, "tls.key", c.keyPEM)
+
+	var buf strings.Builder
+	_, err := NewProxy(ProxyConfig{
+		StalwartURL: "http://kmail-stalwart-0.kmail-stalwart.svc.cluster.local:8080",
+		Pool:        newDummyPool(t),
+		Logger:      log.New(&buf, "", 0),
+		TLS: &ClientTLSConfig{
+			CertFile: certPath,
+			KeyFile:  keyPath,
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewProxy: %v", err)
+	}
+	if !strings.Contains(buf.String(), "mutual-TLS only fires on https URLs") {
+		t.Errorf("expected http+mTLS WARN, got: %q", buf.String())
+	}
+}
+
+func TestIsBareSvcHostname(t *testing.T) {
+	cases := []struct {
+		host string
+		want bool
+	}{
+		{"kmail-stalwart-0.kmail-stalwart.svc", true},
+		{"kmail-stalwart-0.kmail-stalwart.svc.cluster.local", false},
+		{"kmail-stalwart-0.kmail-stalwart.svc.example.com", false},
+		{"localhost", false},
+		{"stalwart.kmail.internal", false},
+		{"", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.host, func(t *testing.T) {
+			if got := isBareSvcHostname(tc.host); got != tc.want {
+				t.Errorf("isBareSvcHostname(%q) = %v, want %v", tc.host, got, tc.want)
+			}
+		})
 	}
 }

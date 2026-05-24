@@ -226,12 +226,32 @@ type keypairLoader struct {
 	certFile string
 	keyFile  string
 	logger   *log.Logger
+	// now is the wall-clock source used by the expiry check.
+	// Defaults to time.Now; tests inject a fixed clock to make
+	// the WARN threshold deterministic.
+	now func() time.Time
 
 	mu        sync.RWMutex
 	cert      *tls.Certificate
 	certMTime time.Time
 	keyMTime  time.Time
+	// lastExpiryWarn dedup's the WARN log so a single near-
+	// expiry cert doesn't spam the log on every reload check.
+	// The map key is the leaf NotAfter so a rotated cert with
+	// a new horizon emits a fresh WARN if it also lands inside
+	// the threshold.
+	lastExpiryWarn time.Time
 }
+
+// certExpiryWarnThreshold is the maximum remaining lifetime
+// below which the keypair loader logs a WARN on every reload
+// (deduplicated per leaf NotAfter). The default Helm chart
+// configures cert-manager for 24h certs with 8h renewal, so any
+// remaining lifetime < 24h means either renewal is broken or
+// the Reloader controller never restarted the pod — both are
+// production-affecting conditions an operator needs to see in
+// the BFF logs.
+const certExpiryWarnThreshold = 24 * time.Hour
 
 // get satisfies tls.Config.GetClientCertificate.
 func (l *keypairLoader) get(_ *tls.CertificateRequestInfo) (*tls.Certificate, error) {
@@ -277,12 +297,14 @@ func (l *keypairLoader) load() (*tls.Certificate, error) {
 	if l.logger != nil {
 		leafNotAfter := "unknown"
 		leafSubject := "unknown"
+		var leaf *x509.Certificate
 		if len(loaded.Certificate) > 0 {
-			if leaf, perr := x509.ParseCertificate(loaded.Certificate[0]); perr == nil {
-				leafNotAfter = leaf.NotAfter.UTC().Format(time.RFC3339)
-				leafSubject = leaf.Subject.CommonName
-				if leafSubject == "" && len(leaf.DNSNames) > 0 {
-					leafSubject = leaf.DNSNames[0]
+			if parsed, perr := x509.ParseCertificate(loaded.Certificate[0]); perr == nil {
+				leaf = parsed
+				leafNotAfter = parsed.NotAfter.UTC().Format(time.RFC3339)
+				leafSubject = parsed.Subject.CommonName
+				if leafSubject == "" && len(parsed.DNSNames) > 0 {
+					leafSubject = parsed.DNSNames[0]
 				}
 			}
 		}
@@ -291,8 +313,54 @@ func (l *keypairLoader) load() (*tls.Certificate, error) {
 		} else {
 			l.logger.Printf("jmap proxy: rotated client TLS keypair subject=%q notAfter=%s", leafSubject, leafNotAfter)
 		}
+		if leaf != nil {
+			l.maybeWarnNearExpiryLocked(leaf, leafSubject)
+		}
 	}
 	return l.cert, nil
+}
+
+// maybeWarnNearExpiryLocked emits a WARN when the loaded leaf is
+// within `certExpiryWarnThreshold` of expiry — or already past
+// it. The caller MUST hold l.mu in write mode. The WARN is
+// dedup'd per (leaf NotAfter) so a near-expiry cert that gets
+// re-checked on every handshake doesn't spam the log; an
+// operational rotation that lands a fresh cert resets the
+// dedup key naturally.
+func (l *keypairLoader) maybeWarnNearExpiryLocked(leaf *x509.Certificate, subject string) {
+	now := l.clockLocked()
+	remaining := leaf.NotAfter.Sub(now)
+	if remaining > certExpiryWarnThreshold {
+		return
+	}
+	if l.lastExpiryWarn.Equal(leaf.NotAfter) {
+		return
+	}
+	l.lastExpiryWarn = leaf.NotAfter
+	switch {
+	case remaining <= 0:
+		l.logger.Printf(
+			"WARN: jmap proxy: client TLS keypair subject=%q is EXPIRED (notAfter=%s, expired %s ago); "+
+				"cert-manager renewal may be broken or Reloader did not restart the pod.",
+			subject, leaf.NotAfter.UTC().Format(time.RFC3339), -remaining.Round(time.Second),
+		)
+	default:
+		l.logger.Printf(
+			"WARN: jmap proxy: client TLS keypair subject=%q expires in %s (notAfter=%s); "+
+				"verify cert-manager renewal is healthy and Reloader is installed so the BFF picks up the rotation.",
+			subject, remaining.Round(time.Second), leaf.NotAfter.UTC().Format(time.RFC3339),
+		)
+	}
+}
+
+// clockLocked returns the keypair loader's wall-clock instant.
+// Pulled into a helper so tests can inject a deterministic clock
+// via the `now` field.
+func (l *keypairLoader) clockLocked() time.Time {
+	if l.now != nil {
+		return l.now()
+	}
+	return time.Now()
 }
 
 // caPoolLoader is the dynamic trust-root provider used by the
@@ -364,6 +432,23 @@ func (l *caPoolLoader) load() (*x509.CertPool, error) {
 		}
 	}
 	return l.pool, nil
+}
+
+// isBareSvcHostname reports whether `host` is a Kubernetes
+// in-cluster DNS short form ending in `.svc` but not the FQDN
+// `.svc.cluster.local`. Cert-manager's Certificate resource
+// generates SANs for the FQDN form only (see
+// `templates/stalwart-mtls.yaml`), so any `.svc`-only hostname
+// will fail TLS hostname verification. The Helm chart's default
+// `KMAIL_STALWART_URL` and operator overrides both go through
+// this check.
+func isBareSvcHostname(host string) bool {
+	if !strings.HasSuffix(host, ".svc") {
+		return false
+	}
+	// Already-FQDN forms (`.svc.cluster.local`, `.svc.example.com`)
+	// are excluded because they DO match the cert SAN list.
+	return !strings.Contains(host, ".svc.")
 }
 
 // newClientTLSTransport returns an *http.Transport configured for
@@ -483,6 +568,19 @@ func NewProxy(cfg ProxyConfig) (*Proxy, error) {
 		// `mtls.serverName` in the Helm values.
 		if cfg.Shards != nil && strings.TrimSpace(cfg.TLS.ServerName) != "" {
 			logger.Printf("jmap proxy: WARNING shard failover is wired but a pinned TLS ServerName=%q is set; every shard's server certificate MUST list %q as a SAN or failover handshakes will fail. Leave mtls.serverName empty to let the transport derive SNI per-connection from each shard URL.", cfg.TLS.ServerName, cfg.TLS.ServerName)
+		}
+		// Defensive warning: mTLS is wired but the configured
+		// StalwartURL is plain HTTP or uses the bare `.svc` short
+		// hostname (which is NOT in the SAN list cert-manager
+		// generates in `stalwart-mtls.yaml` — those SANs are the
+		// FQDN `.svc.cluster.local` form). Either case will lead
+		// to a TLS handshake failure on the first request; flagging
+		// at startup lets the operator catch the mismatch before
+		// traffic starts flowing instead of after.
+		if target.Scheme != "https" {
+			logger.Printf("jmap proxy: WARNING mTLS is configured (KMAIL_STALWART_TLS_CERT set) but StalwartURL scheme is %q \u2014 mutual-TLS only fires on https URLs. Set KMAIL_STALWART_URL to an https://...:8443 endpoint or disable mTLS to silence this warning.", target.Scheme)
+		} else if isBareSvcHostname(target.Hostname()) {
+			logger.Printf("jmap proxy: WARNING mTLS is enabled but StalwartURL hostname %q uses the bare `.svc` short form, which is NOT in the SAN list of the server certificate (the Helm chart generates `.svc.cluster.local` SANs). Switch KMAIL_STALWART_URL to the `.svc.cluster.local` FQDN form or override mtls.serverName to match.", target.Hostname())
 		}
 		base = newClientTLSTransport(tlsCfg)
 	} else if target.Scheme == "https" {

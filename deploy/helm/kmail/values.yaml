@@ -54,8 +54,17 @@ kmailApi:
     # overridden in `deployment-api.yaml` to the cluster.local FQDN
     # on the `jmap-tls` port (8443), so that SNI matches one of the
     # SANs cert-manager bakes into the server cert
-    # (`stalwart-mtls.yaml`). Override here only when the BFF
-    # routes through a sidecar or a non-default port.
+    # (`stalwart-mtls.yaml`).
+    #
+    # IMPORTANT: the default hostname uses the bare `.svc` short
+    # form — this is NOT in the SAN list the chart generates.
+    # If you override this value with mtls.enabled=true, the
+    # hostname MUST be either:
+    #   (a) the full `<pod>.<headlessSvc>.<ns>.svc.cluster.local`
+    #       FQDN (the form `deployment-api.yaml` plugs in), OR
+    #   (b) a name covered by `mtls.serverName` if you pin SNI.
+    # The BFF logs a defensive WARN at startup if it detects an
+    # mTLS + bare-`.svc` hostname mismatch — see `jmap.NewProxy`.
     KMAIL_STALWART_URL: "http://kmail-stalwart-0.kmail-stalwart.svc:8080"
     KMAIL_RETENTION_DRY_RUN: "false"
     KMAIL_TRACING_OTLP_ENDPOINT: ""
@@ -66,6 +75,18 @@ kmailApi:
 # Stalwart — mail core, deployed as a StatefulSet with stable
 # per-pod IPs via spec.subdomain. Mail nodes are explicitly NOT
 # autoscaled (see `do-not-do.md`); resize replicaCount manually.
+#
+# IMPORTANT: when mtls.enabled=true, the server certificate SAN
+# list is generated from `replicaCount` at template-render time
+# (see templates/stalwart-mtls.yaml). Scaling the StatefulSet
+# *without* a corresponding `helm upgrade` will leave the new
+# replicas (e.g. stalwart-2, stalwart-3) presenting a certificate
+# whose SANs do not include their pod DNS names — BFF→Stalwart
+# TLS handshakes to those pods will fail with `x509: certificate
+# is valid for X, not Y`. Operational rule: ALWAYS scale via
+# `helm upgrade --set stalwart.replicaCount=N`, never via raw
+# `kubectl scale statefulset`. See docs/DEVELOPMENT.md
+# "Scaling Stalwart with mTLS enabled" for the procedure.
 stalwart:
   replicaCount: 2
   image:

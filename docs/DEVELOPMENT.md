@@ -108,9 +108,73 @@ cd web && npm install && npm run dev
 
 `KMAIL_ENV` defaults to `production` (see `internal/config/config.go`)
 so that a misconfigured deployment fails closed. Recognised values
-are `development`, `staging`, and `production`; anything else is
-treated as `production` and `NewOIDC` emits an operator-facing
-warning at startup.
+are `development`, `staging`, and `production`; the shorthand
+aliases `dev`, `stg`, and `prod` (matching the `docker-compose.yml`
+sidecar convention) are accepted and resolve to the canonical
+forms before any guard is evaluated. Anything else is treated as
+`production` and `NewOIDC` emits an operator-facing warning at
+startup.
+
+#### Migration note: OIDC fail-closed (production / staging)
+
+As of the Phase A hardening, `NewOIDC` refuses to construct when
+`KCHAT_OIDC_ISSUER` is empty *and* `KMAIL_ENV` is anything other
+than `development` / `dev`. Existing deployments that relied on
+the unverified-JWT fallback to boot will now fail with a startup
+error like:
+
+```
+NewOIDC: KCHAT_OIDC_ISSUER is required when KMAIL_ENV=%q
+```
+
+To migrate:
+
+1. Point `KCHAT_OIDC_ISSUER` (and `KMAIL_KCHAT_OIDC_ISSUER` in
+   the Helm ConfigMap) at the KChat OIDC issuer URL — the same
+   URL the KChat Authelia / Keycloak install advertises in its
+   `/.well-known/openid-configuration` document.
+2. Verify the JWKS endpoint is reachable from the BFF pods (the
+   chart's egress NetworkPolicy already allows DNS + the issuer
+   host).
+3. Re-roll the kmail-api deployment.
+
+There is no way to opt out of this check in staging or
+production — the dev bypass and unverified fallback are
+hard-locked behind `KMAIL_ENV=development`. This is intentional:
+both paths were authentication-bypass vectors before the Phase A
+fix. See `docs/JMAP-CONTRACT.md` "OIDC fail-closed" for the
+on-the-wire details.
+
+### Scaling Stalwart with mTLS enabled
+
+When `mtls.enabled=true` in the Helm values, the server
+certificate SANs are generated at template-render time from
+`stalwart.replicaCount` (see
+`deploy/helm/kmail/templates/stalwart-mtls.yaml`). Scaling the
+StatefulSet *without* a corresponding `helm upgrade` will leave
+the new replicas (e.g. `stalwart-2`, `stalwart-3`) presenting a
+certificate whose SAN list excludes their pod DNS names, and
+BFF→Stalwart handshakes to those pods will fail with `x509:
+certificate is valid for X, not Y`.
+
+The correct procedure is therefore:
+
+```bash
+# WRONG — leaves SAN list stale, new pods fail TLS handshake.
+kubectl scale statefulset/kmail-stalwart --replicas=4
+
+# RIGHT — re-renders Certificate resource, cert-manager reissues
+# with all four pod DNS names in the SAN list, Reloader restarts
+# the existing pods to pick up the new cert.
+helm upgrade kmail ./deploy/helm/kmail \
+  --reuse-values \
+  --set stalwart.replicaCount=4
+```
+
+The BFF logs a startup WARNING if it detects an mTLS + bare
+`.svc` hostname mismatch (see `internal/jmap/proxy.go`
+`NewProxy`), so a misconfigured override of `KMAIL_STALWART_URL`
+also surfaces immediately rather than after the first request.
 
 In production the BFF presents a client certificate to Stalwart
 (mTLS) instead of relying on a trusted-network header. The Helm

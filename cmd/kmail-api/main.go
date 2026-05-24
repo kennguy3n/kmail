@@ -105,13 +105,16 @@ func main() {
 		})
 	}
 	wrapAuthRL := func(h http.Handler) http.Handler {
-		wrapped := authMW.Wrap(h)
+		// Auth always sits at the outermost layer so 401s short
+		// out before the rate limiter ever consults Valkey. The
+		// rate limiter, when enabled, is inserted BETWEEN auth
+		// and the handler so the limiter can read tenant/user IDs
+		// from the context that auth populates.
+		inner := h
 		if rateLimiter != nil {
-			// Rate limit AFTER auth so tenant / user IDs are in
-			// context when the limiter consults Valkey.
-			wrapped = authMW.Wrap(rateLimiter.Wrap(h))
+			inner = rateLimiter.Wrap(h)
 		}
-		return wrapped
+		return authMW.Wrap(inner)
 	}
 
 	// Multi-tenant Stalwart shard routing — constructed early so

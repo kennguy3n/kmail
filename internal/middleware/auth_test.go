@@ -504,7 +504,10 @@ func TestNewOIDC_DoesNotWarnOnKnownEnv(t *testing.T) {
 	priv, _ := rsa.GenerateKey(rand.Reader, 2048)
 	issuer, stop := newTestJWKSServer(t, priv, "test-kid")
 	defer stop()
-	for _, env := range []string{"", "development", "DEVELOPMENT", "  staging  ", "production"} {
+	// "dev", "prod", "stg" are explicitly recognised aliases —
+	// the docker-compose convention (`KMAIL_ENV: dev`) must not
+	// silently trigger the unknown-env warning.
+	for _, env := range []string{"", "development", "DEVELOPMENT", "  staging  ", "production", "dev", "DEV", "prod", "stg"} {
 		t.Run(env, func(t *testing.T) {
 			var buf bytes.Buffer
 			_, err := NewOIDC(OIDCConfig{
@@ -517,6 +520,30 @@ func TestNewOIDC_DoesNotWarnOnKnownEnv(t *testing.T) {
 			}
 			if strings.Contains(buf.String(), "is not one of") {
 				t.Errorf("unexpected unknown-env warning for Env=%q: %s", env, buf.String())
+			}
+		})
+	}
+}
+
+// TestNewOIDC_DevAliasUnlocksDevBypass pins the docker-compose
+// developer-experience case: `KMAIL_ENV=dev` (the alias) must
+// be treated identically to `KMAIL_ENV=development`, including
+// allowing `DevBypassToken` to be wired without rejecting at
+// construction time.
+func TestNewOIDC_DevAliasUnlocksDevBypass(t *testing.T) {
+	for _, env := range []string{"dev", "DEV", "  dev  ", "development"} {
+		t.Run(env, func(t *testing.T) {
+			var buf bytes.Buffer
+			o, err := NewOIDC(OIDCConfig{
+				Env:            env,
+				DevBypassToken: "let-me-in",
+				Logger:         log.New(&buf, "", 0),
+			})
+			if err != nil {
+				t.Fatalf("NewOIDC(Env=%q): unexpected error: %v", env, err)
+			}
+			if !o.cfg.isDevEnv() {
+				t.Fatalf("isDevEnv()=false for Env=%q, want true", env)
 			}
 		})
 	}

@@ -85,9 +85,31 @@ var knownEnvs = map[string]struct{}{
 	EnvProduction:  {},
 }
 
-// normalizedEnv returns the trimmed/lower-cased environment name.
+// envAliases maps shorthand operator strings to canonical
+// `knownEnvs` entries. The `dev` alias exists specifically
+// because `docker-compose.yml` ships `KMAIL_ENV: dev` for the
+// promtail sidecar; a developer who copies that pattern for
+// `kmail-api` would otherwise see `dev` silently flip the BFF
+// into production-guard mode (the strictest path) on a dev box.
+// Resolution is case-insensitive / trim-tolerant via
+// `normalizedEnv`.
+var envAliases = map[string]string{
+	"dev":  EnvDevelopment,
+	"prod": EnvProduction,
+	"stg":  EnvStaging,
+}
+
+// normalizedEnv returns the trimmed/lower-cased environment name
+// after resolving any operator-facing alias (`dev` -> `development`,
+// `prod` -> `production`, `stg` -> `staging`). All downstream
+// checks see only canonical names, so the alias table is the one
+// place an operator-facing string is interpreted.
 func (c OIDCConfig) normalizedEnv() string {
-	return strings.ToLower(strings.TrimSpace(c.Env))
+	raw := strings.ToLower(strings.TrimSpace(c.Env))
+	if canonical, ok := envAliases[raw]; ok {
+		return canonical
+	}
+	return raw
 }
 
 // isDevEnv reports whether the configured environment string
