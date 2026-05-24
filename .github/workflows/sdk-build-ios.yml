@@ -31,7 +31,12 @@ on:
       - 'sdk/**'
       # The Swift package itself.
       - 'apps/ios/**'
-      # The build script that produces the XCFramework.
+      # The build script that produces the XCFramework. The
+      # path is technically a subset of `sdk/**` above, but we
+      # list it explicitly as a tripwire: if someone later
+      # narrows the `sdk/**` glob (e.g. to exclude `sdk/target/`
+      # or `sdk/scripts/`), this entry keeps the iOS pipeline
+      # triggering on script edits.
       - 'sdk/scripts/build-ios-xcframework.sh'
       # The workflow file itself (defence-in-depth so a CI edit
       # always re-runs the build it gates).
