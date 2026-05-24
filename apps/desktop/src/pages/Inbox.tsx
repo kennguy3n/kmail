@@ -23,8 +23,19 @@ export function Inbox(): JSX.Element {
   useEffect(() => {
     if (!mailboxId) {
       setEmails([]);
+      setSelected(null);
       return;
     }
+    // Clear `emails` and `selected` synchronously on every mailbox
+    // change so the UI never paints a single frame of stale data
+    // from the previous mailbox while the async cache read is in
+    // flight. Cache reads are sub-millisecond today, but if the
+    // cached path ever wraps an SDK call that hits the JMAP server,
+    // the stale-selection flash would become visible — this guards
+    // against that regression in advance.
+    setEmails([]);
+    setSelected(null);
+    setError(null);
     // The `cancelled` guard prevents stale closures when the user
     // navigates between mailboxes faster than the local SQLite
     // cache can respond. Without it, a resolved fetch from

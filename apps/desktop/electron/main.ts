@@ -321,6 +321,16 @@ function sanitiseError(err: unknown): string {
   return `[INTERNAL] ${String(err)}`;
 }
 
+// napi-rs maps Rust `Option<String>::None` to JavaScript `null`,
+// but TypeScript callers that simply omit `accountId` produce
+// `undefined`. The two are semantically equivalent in this codebase
+// — both mean "no account_id" — but `===` would treat them as
+// distinct. Collapse to a single `null` sentinel before comparison
+// so the identity check in `kmail:open` is robust to either source.
+function normaliseAccountId(id: string | null | undefined): string | null {
+  return id ?? null;
+}
+
 function requireSession(): KMailSession {
   if (!session) {
     // This is an [INTERNAL] error rather than a SDK [ARG] because
@@ -350,10 +360,22 @@ function registerIpc(): void {
           // Everything else differing means a different account
           // / shard, which would clobber the SQLite WAL: reject
           // and require an explicit kmail:close first.
+          //
+          // `normaliseAccountId` collapses `undefined` (TS-side
+          // omitted field) and `null` (napi mapping of Rust
+          // `Option<String>::None` — what `defaultClientConfig`
+          // returns) to a single `null` sentinel so the identity
+          // check doesn't falsely reject a caller that seeded the
+          // first open with `readSessionParams()` (which produces
+          // `undefined` for missing accountId) and the second open
+          // with `defaultClientConfig(...)` (which returns `null`).
+          // Both call sites are within the same renderer process
+          // and represent the same "no account" intent.
           const sameIdentity =
             session.config.bffUrl === config.bffUrl &&
             session.config.databasePath === config.databasePath &&
-            session.config.accountId === config.accountId;
+            normaliseAccountId(session.config.accountId) ===
+              normaliseAccountId(config.accountId);
           if (sameIdentity) {
             if (session.config.bearerToken !== config.bearerToken) {
               session.client.setBearerToken(config.bearerToken);
