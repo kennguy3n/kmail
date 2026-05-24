@@ -67,6 +67,8 @@ const dirname = __dirname;
 
 interface KMailSession {
   client: KMailClientJs;
+  // Mutable so token rotation (set-bearer-token / open with new
+  // token) can stay accurate without tearing down the session.
   config: JsClientConfig;
 }
 
@@ -286,15 +288,25 @@ function registerIpc(): void {
     async (_evt, config: JsClientConfig): Promise<void> => {
       try {
         if (session) {
-          // Idempotent: opening twice with the same config is a
-          // no-op. Different config rejected — the renderer must
-          // explicitly close first to avoid leaking the previous
-          // SQLite file handle.
-          if (
+          // Idempotent: opening twice with matching bffUrl /
+          // databasePath / accountId is a no-op. The bearer
+          // token is *not* part of the identity check because
+          // tokens rotate (OIDC refresh, KChat re-auth) far more
+          // often than the other fields — if it differs we
+          // forward to setBearerToken so the existing SQLite +
+          // JMAP transport carries on with fresh credentials.
+          // Everything else differing means a different account
+          // / shard, which would clobber the SQLite WAL: reject
+          // and require an explicit kmail:close first.
+          const sameIdentity =
             session.config.bffUrl === config.bffUrl &&
             session.config.databasePath === config.databasePath &&
-            session.config.accountId === config.accountId
-          ) {
+            session.config.accountId === config.accountId;
+          if (sameIdentity) {
+            if (session.config.bearerToken !== config.bearerToken) {
+              session.client.setBearerToken(config.bearerToken);
+              session.config = { ...session.config, bearerToken: config.bearerToken };
+            }
             return;
           }
           throw new Error(
@@ -320,45 +332,49 @@ function registerIpc(): void {
     session = null;
   });
 
-  ipcMain.handle('kmail:sync', async (): Promise<JsSyncSummary> => {
-    const s = requireSession();
+  // Every SDK-backed handler funnels its body through this helper
+  // so the [INTERNAL] "SDK not initialised" error from
+  // requireSession() and the [TAGGED] errors from the SDK both
+  // travel through the same sanitiseError() gate before being
+  // serialised across the IPC boundary. Without this the
+  // "called before open" error would skip sanitisation — it
+  // already starts with [INTERNAL], so the renderer parses it
+  // correctly, but uniformity guarantees that any future
+  // requireSession() rephrasing can't accidentally leak an
+  // un-prefixed message into the renderer.
+  async function inSession<T>(
+    op: (s: KMailSession) => T | Promise<T>,
+  ): Promise<T> {
     try {
-      return await s.client.sync();
+      const s = requireSession();
+      return await op(s);
     } catch (err) {
       throw new Error(sanitiseError(err));
     }
+  }
+
+  ipcMain.handle('kmail:sync', async (): Promise<JsSyncSummary> => {
+    return inSession((s) => s.client.sync());
   });
 
   ipcMain.handle(
     'kmail:set-bearer-token',
     async (_evt, token: string): Promise<void> => {
-      const s = requireSession();
-      try {
+      return inSession((s) => {
         s.client.setBearerToken(token);
-      } catch (err) {
-        throw new Error(sanitiseError(err));
-      }
+        s.config = { ...s.config, bearerToken: token };
+      });
     },
   );
 
   ipcMain.handle('kmail:invalidate-session', async (): Promise<void> => {
-    const s = requireSession();
-    try {
-      await s.client.invalidateSession();
-    } catch (err) {
-      throw new Error(sanitiseError(err));
-    }
+    return inSession((s) => s.client.invalidateSession());
   });
 
   ipcMain.handle(
     'kmail:cached-mailboxes',
     async (): Promise<JsMailbox[]> => {
-      const s = requireSession();
-      try {
-        return s.client.cachedMailboxes();
-      } catch (err) {
-        throw new Error(sanitiseError(err));
-      }
+      return inSession((s) => s.client.cachedMailboxes());
     },
   );
 
@@ -369,24 +385,14 @@ function registerIpc(): void {
       mailboxId: string,
       limit: number,
     ): Promise<JsEmailSummary[]> => {
-      const s = requireSession();
-      try {
-        return s.client.cachedEmailsInMailbox(mailboxId, limit);
-      } catch (err) {
-        throw new Error(sanitiseError(err));
-      }
+      return inSession((s) => s.client.cachedEmailsInMailbox(mailboxId, limit));
     },
   );
 
   ipcMain.handle(
     'kmail:send-email',
     async (_evt, draftJson: string): Promise<string> => {
-      const s = requireSession();
-      try {
-        return await s.client.sendEmail(draftJson);
-      } catch (err) {
-        throw new Error(sanitiseError(err));
-      }
+      return inSession((s) => s.client.sendEmail(draftJson));
     },
   );
 
@@ -397,12 +403,9 @@ function registerIpc(): void {
       emailId: string,
       keywordsJson: string,
     ): Promise<void> => {
-      const s = requireSession();
-      try {
+      return inSession((s) => {
         s.client.enqueueSetKeywords(emailId, keywordsJson);
-      } catch (err) {
-        throw new Error(sanitiseError(err));
-      }
+      });
     },
   );
 

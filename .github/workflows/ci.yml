@@ -244,10 +244,14 @@ jobs:
       # build (~3 min) down to ~30 seconds on subsequent runs.
       # Scoped to the `sdk/` workspace so it doesn't collide
       # with any future Rust workspaces elsewhere in the repo.
+      # `key: sdk-job` keeps this job's cache distinct from the
+      # `desktop` job (which also builds inside `sdk/`) so the
+      # two don't contend on the same save slot.
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: sdk -> target
+          key: sdk-job
 
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
@@ -308,6 +312,10 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: sdk -> target
+          # Distinct from the `sdk` job's `sdk-job` key so the
+          # two jobs maintain independent caches even when they
+          # run in parallel on the same commit.
+          key: desktop-job
 
       - name: Build napi-rs addon (@kmail/sdk-native)
         # The renderer never imports the addon (see vite alias

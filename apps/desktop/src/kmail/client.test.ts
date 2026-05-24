@@ -12,10 +12,12 @@
 //   3. Method dispatch goes through the bridge — no silent
 //      swallow / no double-encoding.
 
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  __resetKMailCacheForTests,
   encodeWireFormatDraft,
   KMailDesktopClient,
+  useKMail,
 } from './client';
 import type { EmailDraft } from './client';
 import { KMailError, parseKMailError } from './errors';
@@ -196,5 +198,43 @@ describe('KMailDesktopClient', () => {
       'email-1',
       JSON.stringify({ $seen: true, $flagged: false }),
     );
+  });
+});
+
+describe('useKMail stability contract', () => {
+  afterEach(() => {
+    __resetKMailCacheForTests();
+    // Clear any window.kmail injected by a test.
+    if (typeof window !== 'undefined') {
+      delete (window as unknown as { kmail?: KMailBridge }).kmail;
+    }
+  });
+
+  it('returns the same client on repeat calls for the same stub bridge', () => {
+    // Load-bearing: App.tsx / Inbox.tsx / Compose.tsx place the
+    // result into useEffect dependency arrays. A fresh reference
+    // every render would create an infinite re-render loop.
+    const bridge = makeStubBridge();
+    const c1 = useKMail(bridge);
+    const c2 = useKMail(bridge);
+    expect(c1).toBe(c2);
+  });
+
+  it('returns the same client on repeat calls in production mode (window.kmail backed)', () => {
+    const bridge = makeStubBridge();
+    (window as unknown as { kmail?: KMailBridge }).kmail = bridge;
+    const c1 = useKMail();
+    const c2 = useKMail();
+    expect(c1).toBe(c2);
+  });
+
+  it('returns distinct clients for distinct stub bridges', () => {
+    const c1 = useKMail(makeStubBridge());
+    const c2 = useKMail(makeStubBridge());
+    expect(c1).not.toBe(c2);
+  });
+
+  it('throws a typed KMailError when window.kmail is missing', () => {
+    expect(() => useKMail()).toThrowError(KMailError);
   });
 });

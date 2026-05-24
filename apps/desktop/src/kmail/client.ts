@@ -172,16 +172,45 @@ export class KMailDesktopClient {
  * Resolve the `KMailDesktopClient` instance the renderer should
  * use.
  *
- *   - Production: returns a client backed by `window.kmail`
- *     (the contextBridge surface from `preload.ts`).
- *   - Tests: accepts an injected `KMailBridge` stub.
+ *   - Production: returns a singleton client backed by
+ *     `window.kmail` (the contextBridge surface from
+ *     `preload.ts`). `window.kmail` is set exactly once by the
+ *     preload script and never replaced for the lifetime of the
+ *     renderer process, so caching the wrapper is safe.
+ *   - Tests: accepts an injected `KMailBridge` stub. Each stub
+ *     identity is wrapped in its own `KMailDesktopClient`
+ *     (cached via `WeakMap` so the same stub instance returns
+ *     the same client on repeat calls — required for any
+ *     consumer that places the result in a `useEffect`
+ *     dependency array).
+ *
+ * **Stability contract.** All three renderer consumers
+ * (`App.tsx`, `pages/Inbox.tsx`, `pages/Compose.tsx`) place the
+ * returned client into `useEffect` dependency arrays. If
+ * `useKMail()` ever returned a fresh object on every call,
+ * the effect would re-fire on every render and the resulting
+ * async state-setter cascade would silently saturate the IPC
+ * channel — React doesn't surface this as `Maximum update
+ * depth exceeded` because the state updates come from async
+ * callbacks. The cached references below are what keeps the
+ * renderer from melting.
  *
  * Throws `KMailError(kind: 'internal')` if `window.kmail` is
  * missing — that means the preload script never ran, which is
  * a fatal configuration error rather than a recoverable state.
  */
+let cachedDefaultClient: KMailDesktopClient | null = null;
+const stubClientCache = new WeakMap<KMailBridge, KMailDesktopClient>();
+
 export function useKMail(stub?: KMailBridge): KMailDesktopClient {
-  if (stub) return new KMailDesktopClient(stub);
+  if (stub) {
+    const existing = stubClientCache.get(stub);
+    if (existing) return existing;
+    const fresh = new KMailDesktopClient(stub);
+    stubClientCache.set(stub, fresh);
+    return fresh;
+  }
+  if (cachedDefaultClient) return cachedDefaultClient;
   if (typeof window === 'undefined' || !window.kmail) {
     throw new KMailError(
       'internal',
@@ -189,5 +218,16 @@ export function useKMail(stub?: KMailBridge): KMailDesktopClient {
       '[INTERNAL] window.kmail is missing — preload script did not run',
     );
   }
-  return new KMailDesktopClient(window.kmail);
+  cachedDefaultClient = new KMailDesktopClient(window.kmail);
+  return cachedDefaultClient;
+}
+
+/**
+ * Reset the cached default client. Test-only escape hatch for
+ * suites that need to re-evaluate `window.kmail` between
+ * specs (e.g. simulating missing preload). Production code
+ * never calls this.
+ */
+export function __resetKMailCacheForTests(): void {
+  cachedDefaultClient = null;
 }
