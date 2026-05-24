@@ -329,16 +329,25 @@ func (s *CMKService) loadHSMConfig(ctx context.Context, tenantID, configID strin
 
 // unwrapHSMCredentials decrypts the stored credential blob with
 // the configured envelope and returns the plaintext bytes plus a
-// flag indicating whether the blob was AEAD-protected. Rows
-// written before the envelope was wired pass through verbatim
-// (wasEncrypted=false). When no envelope is configured the blob
-// is returned as-is for read compatibility, but writes still
-// require the envelope — see RegisterHSMKey.
+// flag indicating whether the blob was AEAD-protected. The
+// envelope's magic-prefix check distinguishes three states:
 //
-// Callers should treat `wasEncrypted=false` from an
-// envelope-configured service as a migration signal: the row was
-// written before the envelope landed and should be re-registered
-// so the next read takes the encrypted path.
+//   - Blob carries the magic prefix AND auth succeeds →
+//     plaintext, wasEncrypted=true.
+//   - Blob carries the magic prefix AND auth fails →
+//     ErrEnvelopeCorrupted bubbles up. This is the case the bot
+//     called out: a master-key rotation leaves the previous
+//     epoch's rows un-decryptable, and surfacing this as an error
+//     prevents the worse failure of silently returning ciphertext
+//     as if it were a legacy plaintext credential.
+//   - Blob has NO magic prefix → legacy plaintext written before
+//     the envelope landed; returned as-is with wasEncrypted=false
+//     so warnLegacyPlaintextHSM can log a one-time migration
+//     signal at the call site.
+//
+// When no envelope is configured the blob is returned as-is for
+// read compatibility, but writes still require the envelope — see
+// RegisterHSMKey.
 func (s *CMKService) unwrapHSMCredentials(blob []byte) ([]byte, bool, error) {
 	if s.envelope == nil {
 		return blob, false, nil

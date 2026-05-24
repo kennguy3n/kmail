@@ -3,26 +3,40 @@
 // This is the kmail-secrets envelope referenced throughout the
 // codebase (DKIM private keys, HSM credentials, planned vault
 // fields). It is intentionally simple: AES-256-GCM with a
-// per-record 12-byte random nonce, prepended to the ciphertext.
-// The master key is sourced from the `KMAIL_SECRETS_KEY`
-// environment variable (32-byte hex or base64). A 32-byte
-// master is required — Wrap returns an error when the envelope
-// is unconfigured so callers fail closed instead of silently
-// storing plaintext.
+// per-record 12-byte random nonce, prepended to the ciphertext
+// and tagged with a 16-byte magic prefix so a wrapped blob is
+// unambiguously identifiable on read. The master key is sourced
+// from the `KMAIL_SECRETS_KEY` environment variable (32-byte hex
+// or base64). A 32-byte master is required — Wrap returns an
+// error when the envelope is unconfigured so callers fail closed
+// instead of silently storing plaintext.
 //
 // Wire shape (little-endian byte stream):
 //
-//	output = nonce(12) || ciphertext_with_tag
+//	output = magic(16) || nonce(12) || ciphertext_with_tag
+//
+//	magic = "kmail-cmk-v1\x00\x00\x00\x00" (constant, 16 bytes)
 //
 // Backwards-compatible read:
 //
-//	if Unwrap can't decrypt (e.g. legacy plaintext), it returns
-//	the input unchanged AND `wasEncrypted=false`. New writes always
-//	go through Wrap, so over time the database settles into
-//	all-ciphertext.
+//	The magic prefix lets Unwrap distinguish three states cleanly:
+//
+//	• Magic present + GCM auth OK   → plaintext, wasEncrypted=true.
+//	• Magic present + GCM auth fails → ERROR (corruption / wrong
+//	  key / tampered row). Callers must NOT silently fall through
+//	  to plaintext, which would surface raw ciphertext as if it
+//	  were a legacy plaintext credential.
+//	• Magic absent                  → legacy plaintext written
+//	  before the envelope landed; return as-is with
+//	  wasEncrypted=false. Callers WARN once per (tenant, config)
+//	  via warnLegacyPlaintextHSM so the migration is visible.
+//
+// New writes always go through Wrap, so over time the database
+// settles into all-ciphertext.
 package cmk
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -41,6 +55,25 @@ type SecretsEnvelope interface {
 	Wrap(plaintext []byte) ([]byte, error)
 	Unwrap(blob []byte) (plaintext []byte, wasEncrypted bool, err error)
 }
+
+// envelopeMagic identifies a wrapped blob unambiguously so Unwrap
+// can distinguish corruption (magic + auth fail) from a legacy
+// plaintext credential (no magic). 16 bytes is small enough not to
+// bloat per-record storage and large enough that the probability
+// of an organic 16-byte collision in legacy plaintext is
+// negligible.
+var envelopeMagic = [16]byte{
+	'k', 'm', 'a', 'i', 'l', '-', 'c', 'm', 'k', '-', 'v', '1',
+	0x00, 0x00, 0x00, 0x00,
+}
+
+// ErrEnvelopeCorrupted is returned by Unwrap when a blob carries
+// the kmail-cmk-v1 magic prefix but fails AEAD authentication. The
+// likely causes are (a) the master key was rotated and this row
+// is from the previous epoch, (b) the row was tampered with at
+// rest, or (c) the ciphertext was truncated. Callers MUST surface
+// this error rather than treating the blob as legacy plaintext.
+var ErrEnvelopeCorrupted = errors.New("cmk envelope: wrapped blob failed AEAD authentication (key rotation or corruption)")
 
 // AESGCMEnvelope is the production implementation.
 type AESGCMEnvelope struct {
@@ -78,35 +111,45 @@ func NewAESGCMEnvelopeFromKeyMaterial(material string) (SecretsEnvelope, error) 
 	return &AESGCMEnvelope{aead: aead}, nil
 }
 
-// Wrap returns nonce||ciphertext.
+// Wrap returns magic||nonce||ciphertext.
 func (e *AESGCMEnvelope) Wrap(plaintext []byte) ([]byte, error) {
 	nonce := make([]byte, e.aead.NonceSize())
 	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
 		return nil, fmt.Errorf("cmk envelope: read nonce: %w", err)
 	}
 	ct := e.aead.Seal(nil, nonce, plaintext, nil)
-	out := make([]byte, 0, len(nonce)+len(ct))
+	out := make([]byte, 0, len(envelopeMagic)+len(nonce)+len(ct))
+	out = append(out, envelopeMagic[:]...)
 	out = append(out, nonce...)
 	out = append(out, ct...)
 	return out, nil
 }
 
-// Unwrap reverses Wrap. If the blob doesn't decrypt with the
-// configured key (e.g. it's legacy plaintext PEM written before
-// the envelope landed), it returns the input verbatim with
-// wasEncrypted=false.
+// Unwrap reverses Wrap. The magic prefix lets us distinguish three
+// states cleanly (see package doc):
+//
+//   - Magic present + GCM auth OK   → returns plaintext, true, nil.
+//   - Magic present + GCM auth fails → returns nil, false,
+//     ErrEnvelopeCorrupted. The likely cause is key rotation
+//     pointed at the previous epoch's rows; callers MUST surface
+//     this rather than silently returning ciphertext-as-plaintext.
+//   - Magic absent                  → legacy plaintext (written
+//     before the envelope landed); returns blob, false, nil so
+//     migration callers can warn once and continue.
 func (e *AESGCMEnvelope) Unwrap(blob []byte) ([]byte, bool, error) {
-	ns := e.aead.NonceSize()
-	if len(blob) < ns+e.aead.Overhead() {
+	if len(blob) < len(envelopeMagic) || !bytes.Equal(blob[:len(envelopeMagic)], envelopeMagic[:]) {
 		return blob, false, nil
 	}
-	nonce := blob[:ns]
-	ct := blob[ns:]
+	body := blob[len(envelopeMagic):]
+	ns := e.aead.NonceSize()
+	if len(body) < ns+e.aead.Overhead() {
+		return nil, false, ErrEnvelopeCorrupted
+	}
+	nonce := body[:ns]
+	ct := body[ns:]
 	pt, err := e.aead.Open(nil, nonce, ct, nil)
 	if err != nil {
-		// Treat as legacy plaintext rather than blowing up — the
-		// migration story is "write encrypted, read either".
-		return blob, false, nil
+		return nil, false, fmt.Errorf("%w: %v", ErrEnvelopeCorrupted, err)
 	}
 	return pt, true, nil
 }

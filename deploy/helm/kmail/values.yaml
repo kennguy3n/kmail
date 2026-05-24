@@ -68,8 +68,19 @@ kmailApi:
     KMAIL_STALWART_URL: "http://kmail-stalwart-0.kmail-stalwart.svc:8080"
     KMAIL_RETENTION_DRY_RUN: "false"
     KMAIL_TRACING_OTLP_ENDPOINT: ""
-    KMAIL_KCHAT_OIDC_ISSUER: "https://kchat.example.com"
-    KMAIL_KCHAT_OIDC_AUDIENCE: "kmail"
+    # KMAIL_KCHAT_OIDC_ISSUER and _AUDIENCE MUST be overridden by
+    # the deployer for any non-development install. Empty defaults
+    # are intentional: leaving them empty causes the BFF to refuse
+    # to boot in non-dev (the fail-closed guard in
+    # `internal/middleware/auth.go:NewOIDC`), which is the correct
+    # signal that a placeholder was not customised. A non-empty
+    # placeholder default (e.g. "https://kchat.example.com") would
+    # instead cause the JWKS fetcher to try to resolve a domain
+    # the deployer never owned, surfacing as a confusing
+    # ":80 dial tcp: lookup …" error rather than a clean
+    # "OIDC issuer not configured" boot refusal.
+    KMAIL_KCHAT_OIDC_ISSUER: ""
+    KMAIL_KCHAT_OIDC_AUDIENCE: ""
     KMAIL_LOKI_ENV: "prod"
 
 # Stalwart — mail core, deployed as a StatefulSet with stable

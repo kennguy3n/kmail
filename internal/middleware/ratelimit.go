@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"github.com/kennguy3n/kmail/internal/valkeyurl"
 )
 
 // RateLimiterConfig wires the Valkey-backed sliding-window rate
@@ -163,25 +165,14 @@ type RedisStore struct {
 // NewRedisStore is a convenience constructor that dials Valkey at
 // `url` and returns a RedisStore wrapping the client. Callers that
 // already own a *redis.Client should assign it to the struct field
-// directly.
+// directly. URL form (`redis://` / `rediss://`) and bare `host:port`
+// are both accepted via `valkeyurl.Parse`.
 func NewRedisStore(url string) (*RedisStore, error) {
-	opts, err := parseValkeyURL(url)
+	opts, err := valkeyurl.Parse(url)
 	if err != nil {
 		return nil, err
 	}
 	return &RedisStore{Client: redis.NewClient(opts)}, nil
-}
-
-func parseValkeyURL(url string) (*redis.Options, error) {
-	if url == "" {
-		return nil, errors.New("valkey url is empty")
-	}
-	// Accept both full-DSN (redis://host:port) and bare host:port
-	// for convenience — the compose stack exposes the latter.
-	if len(url) > 8 && url[:8] == "redis://" || len(url) > 9 && url[:9] == "rediss://" {
-		return redis.ParseURL(url)
-	}
-	return &redis.Options{Addr: url}, nil
 }
 
 // IncrWithTTL runs the INCR + EXPIRE NX pipeline against Valkey.

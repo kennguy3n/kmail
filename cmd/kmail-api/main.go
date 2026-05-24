@@ -47,6 +47,7 @@ import (
 	"github.com/kennguy3n/kmail/internal/sieve"
 	"github.com/kennguy3n/kmail/internal/sharedinbox"
 	"github.com/kennguy3n/kmail/internal/tenant"
+	"github.com/kennguy3n/kmail/internal/valkeyurl"
 	"github.com/kennguy3n/kmail/internal/vault"
 	"github.com/kennguy3n/kmail/internal/webhooks"
 )
@@ -292,9 +293,23 @@ func main() {
 	// Valkey is consumed by deliverability, push, calendar reminders,
 	// and the SLO tracker. Stand it up early so every downstream
 	// service can share the same client.
+	//
+	// `cfg.ValkeyURL` can arrive in either of the two wire forms
+	// the codebase accepts — a `redis://` DSN (the Helm Secret
+	// default, useful for `rediss://` to managed Valkey) or a bare
+	// `host:port` (the docker-compose default). `redis.NewClient`
+	// only understands the bare form on `Options.Addr`, so route
+	// through `valkeyurl.Parse` to normalise both forms. Without
+	// this normalisation a Helm deployment that ships the chart's
+	// `redis://valkey:6379` Secret would try to resolve
+	// `redis://valkey` as a DNS name and fail at boot.
 	var valkeyClient *redis.Client
 	if cfg.ValkeyURL != "" {
-		valkeyClient = redis.NewClient(&redis.Options{Addr: cfg.ValkeyURL})
+		opts, err := valkeyurl.Parse(cfg.ValkeyURL)
+		if err != nil {
+			logger.Fatalf("valkey url %q: %v", cfg.ValkeyURL, err)
+		}
+		valkeyClient = redis.NewClient(opts)
 	}
 
 	chatbridgeSvc := chatbridge.NewService(chatbridge.Config{

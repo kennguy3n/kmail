@@ -112,6 +112,103 @@ func TestUnwrapHSMCredentials_LegacyPlaintextPassthrough(t *testing.T) {
 	}
 }
 
+// TestUnwrapHSMCredentials_CorruptionDetected pins the round-7
+// finding: a wrapped blob whose AEAD authentication fails must
+// surface ErrEnvelopeCorrupted instead of silently being returned
+// as if it were a legacy plaintext credential. The previous
+// silent-fallback behavior would have surfaced ciphertext bytes
+// from a key-rotation epoch as plaintext to the HSM provider.
+func TestUnwrapHSMCredentials_CorruptionDetected(t *testing.T) {
+	env := newTestEnvelope(t)
+	s := &CMKService{envelope: env}
+
+	wrapped, err := env.Wrap([]byte("kmip-user:pw"))
+	if err != nil {
+		t.Fatalf("env.Wrap: %v", err)
+	}
+	// Tamper with the ciphertext body (after the 16-byte magic
+	// header). Flipping a single byte invalidates the GCM tag.
+	if len(wrapped) <= 16 {
+		t.Fatalf("wrapped blob too short for tamper: %d bytes", len(wrapped))
+	}
+	tampered := append([]byte(nil), wrapped...)
+	tampered[len(tampered)-1] ^= 0xFF
+
+	_, _, err = s.unwrapHSMCredentials(tampered)
+	if err == nil {
+		t.Fatal("expected error from tampered wrapped blob; got nil (would surface ciphertext as plaintext)")
+	}
+	if !errors.Is(err, ErrEnvelopeCorrupted) {
+		t.Errorf("expected ErrEnvelopeCorrupted, got %v", err)
+	}
+}
+
+// TestUnwrapHSMCredentials_KeyRotationSurfacesAsCorruption pins
+// the specific scenario the bot called out: a master-key rotation
+// leaves the previous epoch's rows un-decryptable. The new key
+// MUST surface those rows as ErrEnvelopeCorrupted, never as
+// "legacy plaintext", or operations would silently send the OLD
+// epoch's ciphertext to the HSM provider as if it were a
+// plaintext credential.
+func TestUnwrapHSMCredentials_KeyRotationSurfacesAsCorruption(t *testing.T) {
+	keyA := make([]byte, 32)
+	if _, err := rand.Read(keyA); err != nil {
+		t.Fatalf("read keyA: %v", err)
+	}
+	envA, err := NewAESGCMEnvelopeFromKeyMaterial(hex.EncodeToString(keyA))
+	if err != nil {
+		t.Fatalf("envA: %v", err)
+	}
+
+	keyB := make([]byte, 32)
+	if _, err := rand.Read(keyB); err != nil {
+		t.Fatalf("read keyB: %v", err)
+	}
+	envB, err := NewAESGCMEnvelopeFromKeyMaterial(hex.EncodeToString(keyB))
+	if err != nil {
+		t.Fatalf("envB: %v", err)
+	}
+
+	wrappedWithA, err := envA.Wrap([]byte("rotated-epoch-cred"))
+	if err != nil {
+		t.Fatalf("envA.Wrap: %v", err)
+	}
+	s := &CMKService{envelope: envB} // simulating post-rotation
+	_, _, err = s.unwrapHSMCredentials(wrappedWithA)
+	if err == nil {
+		t.Fatal("post-rotation envelope must NOT silently return prior epoch's ciphertext as plaintext")
+	}
+	if !errors.Is(err, ErrEnvelopeCorrupted) {
+		t.Errorf("expected ErrEnvelopeCorrupted on key-rotation mismatch, got %v", err)
+	}
+}
+
+// TestUnwrapHSMCredentials_LegacyMagicAbsentReturnsPassthrough
+// guards the other side of the magic-prefix contract: a blob that
+// does NOT start with the magic prefix is treated as legacy
+// plaintext (the row was written before the envelope landed) and
+// returned verbatim with wasEncrypted=false. The migration warning
+// is the operator's signal to re-register such rows.
+func TestUnwrapHSMCredentials_LegacyMagicAbsentReturnsPassthrough(t *testing.T) {
+	env := newTestEnvelope(t)
+	s := &CMKService{envelope: env}
+
+	// Legacy plaintext: indistinguishable from a random short blob
+	// to the runtime, but we know it doesn't start with the
+	// kmail-cmk-v1 magic.
+	legacy := []byte("plaintext-creds-from-pre-envelope-era")
+	got, wasEnc, err := s.unwrapHSMCredentials(legacy)
+	if err != nil {
+		t.Fatalf("unwrapHSMCredentials: %v", err)
+	}
+	if !bytes.Equal(got, legacy) {
+		t.Errorf("legacy passthrough mismatch: %q != %q", got, legacy)
+	}
+	if wasEnc {
+		t.Error("expected wasEncrypted=false for magic-prefix-absent blob")
+	}
+}
+
 func TestWarnLegacyPlaintextHSM_DeduplicatesPerConfig(t *testing.T) {
 	var buf bytes.Buffer
 	s := &CMKService{envelope: newTestEnvelope(t)}
