@@ -233,6 +233,21 @@ func (s *Service) GetClient(ctx context.Context, tenantID, clientID string) (*Cl
 // a malicious client could exchange a code issued in tenant A
 // using a client registered in tenant B. The exchange flow below
 // enforces this invariant.
+//
+// RLS interaction: this query does NOT call middleware.SetTenantGUC
+// before issuing the SELECT, so the row is read across all tenants.
+// That works today because `migrations/046_oauth_clients.sql` does
+// NOT use FORCE ROW LEVEL SECURITY — the table owner (the role the
+// BFF's pgxpool runs as) bypasses the RLS policy by default. This
+// matches the existing cross-tenant lookup pattern at
+// `internal/tenant/service.go:252` and `internal/scim/service.go:57`.
+// If a future migration ever toggles FORCE ROW LEVEL SECURITY on
+// `oauth_clients`, this method will start returning zero rows for
+// every lookup — the wire protocol does not carry tenant context
+// before client resolution, so there is nothing to set the GUC to.
+// Don't enable FORCE on this table without first redesigning the
+// /oauth/token wire protocol to carry tenant scoping (e.g. a tenant
+// prefix on client_id, or a tenant-resolving subdomain).
 func (s *Service) LookupClientForExchange(ctx context.Context, clientID string) (*Client, error) {
 	if clientID == "" {
 		return nil, ErrClientNotFound
@@ -862,6 +877,19 @@ func (s *Service) revokeRefreshChain(ctx context.Context, tenantID, rootID strin
 //
 // Returns ErrAccessTokenNotFound for unknown / revoked / expired
 // tokens. Caller should map that to HTTP 401.
+//
+// RLS interaction: like LookupClientForExchange above, this query
+// does NOT call middleware.SetTenantGUC before the SELECT — the
+// access token IS the tenant resolution mechanism (the row's
+// tenant_id is what populates the returned context's TenantID,
+// which is then used by downstream handlers to set the per-request
+// GUC for scoped queries). Cross-tenant SELECT works today because
+// `migrations/046_oauth_clients.sql` does NOT use FORCE ROW LEVEL
+// SECURITY on `oauth_access_tokens`. If a future migration toggles
+// FORCE on, every bearer-token validation will return zero rows.
+// Don't enable FORCE without redesigning the bearer wire protocol
+// (e.g. tenant-scoped JWT with claims that drive a pre-validation
+// SetTenantGUC).
 func (s *Service) ValidateAccessToken(ctx context.Context, plaintextToken string) (*AccessTokenContext, error) {
 	if plaintextToken == "" {
 		return nil, ErrAccessTokenNotFound
