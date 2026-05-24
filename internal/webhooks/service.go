@@ -325,8 +325,38 @@ func (s *Service) DeleteWebhook(ctx context.Context, tenantID, id string) error 
 	})
 }
 
-// DeliverEvent enqueues a delivery for every endpoint subscribed
-// to the event type. Returns the number of deliveries enqueued.
+// DeliverEvent enqueues a delivery for every ADMIN-OWNED endpoint
+// subscribed to the event type. Returns the number of deliveries
+// enqueued.
+//
+// SCOPE NOTE — admin-owned only. Migration 047 added the
+// `oauth_client_id` column to `webhook_endpoints` so a row can be
+// either:
+//   - admin-owned (`oauth_client_id IS NULL`): BFF-internal webhook
+//     wired by an operator, no per-client scope filtering applies.
+//   - integration-owned (`oauth_client_id IS NOT NULL`): owned by a
+//     third-party OAuth2 client, MUST go through the dispatch-time
+//     `EventAllowedForClient` defense-in-depth check in
+//     `integrations.Service.DispatchEvent`.
+//
+// The WHERE clause below filters `oauth_client_id IS NULL` so this
+// legacy entry point only fans out to admin-owned endpoints. Any
+// future caller that needs to deliver to integration-owned
+// endpoints MUST go through `integrations.Service.DispatchEvent`,
+// which:
+//   - calls dispatchAdminOwned (this code path, equivalent semantics)
+//     for admin-owned rows, AND
+//   - calls dispatchIntegrationOwned for integration-owned rows,
+//     applying the per-client scope check that closes the
+//     post-subscribe-time scope revocation window.
+//
+// Without the `oauth_client_id IS NULL` filter, a future call to
+// DeliverEvent (e.g. from a new event source that doesn't know
+// about the integration framework) would silently bypass scope
+// enforcement and deliver to integration-owned endpoints whose
+// owning client may have lost the scope since subscribe time.
+// That's the exact gap the dispatch-time scope check was designed
+// to close.
 func (s *Service) DeliverEvent(ctx context.Context, tenantID, eventType string, payload map[string]any) (int, error) {
 	if s.pool == nil || tenantID == "" || eventType == "" {
 		return 0, nil
@@ -341,9 +371,14 @@ func (s *Service) DeliverEvent(ctx context.Context, tenantID, eventType string, 
 			return err
 		}
 		// Filter: events array is empty (-> all) OR contains the event.
+		// `oauth_client_id IS NULL` confines this legacy fan-out to
+		// admin-owned endpoints; integration-owned rows are reached
+		// via `integrations.Service.DispatchEvent` instead, which
+		// applies the per-client scope check (see SCOPE NOTE above).
 		rows, err := tx.Query(ctx, `
 			SELECT id::text FROM webhook_endpoints
 			WHERE tenant_id = $1::uuid AND active = true
+			  AND oauth_client_id IS NULL
 			  AND (jsonb_array_length(events) = 0 OR events ? $2)
 		`, tenantID, eventType)
 		if err != nil {

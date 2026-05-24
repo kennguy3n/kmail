@@ -193,12 +193,37 @@ func (s *Service) RegisterWebhookForClient(
 	if strings.TrimSpace(url) == "" {
 		return nil, errors.New("integrations: url required")
 	}
+	if len(requestedEvents) == 0 {
+		// Defense-in-depth: the boundary handler at
+		// internal/integrations/handlers.go already rejects
+		// `len(req.Events) == 0` with 400 invalid_request (the
+		// round-6 fix), but the service method MUST refuse it
+		// independently so a future caller that bypasses the
+		// HTTP handler (e.g. an internal admin path, a
+		// migration backfill, a programmatic client built on
+		// top of *Service directly) cannot persist a row with
+		// `events = []`. The underlying webhooks layer
+		// interprets `events = []` as "deliver every event"
+		// (see internal/webhooks/service.go DeliverEvent
+		// query — `jsonb_array_length(events) = 0 OR events ?
+		// $2`), so an empty array on an integration-owned row
+		// would otherwise become a wildcard subscription.
+		// Dispatch-time `EventAllowedForClient` still gates on
+		// actual scopes (no privilege escalation possible),
+		// but persisting a row that's broader than the
+		// caller's intent is a contract violation. Fail fast.
+		return nil, errors.New("integrations: requestedEvents required (at least one event)")
+	}
 
 	allowed, denied := FilterEventsForClient(grantedScopes, requestedEvents)
-	if len(requestedEvents) > 0 && len(allowed) == 0 {
+	if len(allowed) == 0 {
 		// Every requested event was denied — the integration
 		// has no scope to receive any of them. Fail fast
 		// rather than register a webhook that will never fire.
+		// `len(requestedEvents) > 0` is now guaranteed by the
+		// guard above, so the previous compound check
+		// (`len(requestedEvents) > 0 && len(allowed) == 0`)
+		// collapses to just `len(allowed) == 0`.
 		return &SubscribeResult{Denied: denied}, ErrInsufficientScope
 	}
 

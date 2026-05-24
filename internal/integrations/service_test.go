@@ -245,6 +245,50 @@ func TestRegisterWebhookForClient_InputValidation(t *testing.T) {
 	}
 }
 
+// TestRegisterWebhookForClient_RejectsEmptyEvents pins the
+// defense-in-depth empty-events guard at the SERVICE layer.
+// The HTTP boundary handler already rejects len(req.Events)
+// == 0 with 400 invalid_request (TestRegister_RejectsEmptyEvents
+// in handlers_test.go), but the service method must
+// independently refuse it so any future caller that bypasses
+// the handler — internal admin path, migration backfill,
+// programmatic embedding of *Service — cannot persist a row
+// with `events = []` (which the underlying webhooks layer
+// interprets as a wildcard subscription).
+func TestRegisterWebhookForClient_RejectsEmptyEvents(t *testing.T) {
+	svc := newServiceForUnitTests(t, nil, nil)
+	cases := []struct {
+		name   string
+		events []string
+	}{
+		{"nil events", nil},
+		{"empty slice events", []string{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := svc.RegisterWebhookForClient(
+				context.Background(),
+				"tenant-1",
+				"client-1",
+				"user-1",
+				[]string{"read:mail"},
+				"https://example.com",
+				tc.events,
+				"v2",
+			)
+			if err == nil {
+				t.Fatal("expected error rejecting empty events, got nil")
+			}
+			if !strings.Contains(err.Error(), "requestedEvents required") {
+				t.Errorf("error = %v; want substring %q", err, "requestedEvents required")
+			}
+			if result != nil {
+				t.Errorf("expected nil result for empty-events rejection, got %+v", result)
+			}
+		})
+	}
+}
+
 // TestRegisterWebhookForClient_AllEventsDenied pins the
 // subscribe-time scope filter. A client that requests only
 // events outside its scope set MUST receive
