@@ -22,8 +22,20 @@ set -u
 
 API="${KMAIL_API_URL:-http://localhost:8088}"
 TOK="${KMAIL_DEV_BEARER:-kmail-dev}"
-SCRATCH="${KMAIL_E2E_SDK_DIR:-$(mktemp -d)}"
+# If the caller passed `KMAIL_E2E_SDK_DIR` explicitly we leave
+# their scratch dir alone on exit so they can poke at the
+# resulting SQLite cache after a failing run. If we minted a
+# fresh `mktemp -d` ourselves, we own it and clean it up on EXIT
+# so repeated local invocations don't leak temp dirs.
+if [ -n "${KMAIL_E2E_SDK_DIR:-}" ]; then
+  SCRATCH="${KMAIL_E2E_SDK_DIR}"
+else
+  SCRATCH="$(mktemp -d)"
+  trap 'rm -rf "${SCRATCH}"' EXIT INT TERM
+fi
 DB="${SCRATCH}/kmail.db"
+LOG_DIR="${SCRATCH}/logs"
+mkdir -p "${LOG_DIR}"
 FAIL=0
 
 # Resolve the kmail repo root so the script is reusable from
@@ -65,11 +77,24 @@ require jq
 # of fast probes, not a build pipeline.
 step '0. cargo build --release -p kmail-cli'
 CLI_BIN="${SDK_DIR}/target/release/kmail"
-if ( cd "${SDK_DIR}" && cargo build --release -p kmail-cli >/dev/null 2>&1 ); then
+BUILD_LOG="${LOG_DIR}/cargo-build.log"
+# Cargo's stdout/stderr is captured to ${BUILD_LOG} instead of
+# /dev/null so a build failure leaves a forensic trail. In CI,
+# `.github/workflows/sdk-nightly.yml` step "Dump SDK e2e logs on
+# failure" tails this file alongside kmail-api / docker logs;
+# for local runs the cleanup trap above keeps the file alive
+# only when the caller provided `KMAIL_E2E_SDK_DIR` (i.e. they
+# explicitly opted into a persistent scratch dir).
+if ( cd "${SDK_DIR}" && cargo build --release -p kmail-cli >"${BUILD_LOG}" 2>&1 ); then
   if [ -x "${CLI_BIN}" ]; then ok
-  else fail "kmail binary missing at ${CLI_BIN} after release build"; fi
+  else fail "kmail binary missing at ${CLI_BIN} after release build (see ${BUILD_LOG})"; fi
 else
-  fail "cargo build -p kmail-cli (release) exited non-zero"
+  fail "cargo build -p kmail-cli (release) exited non-zero (see ${BUILD_LOG})"
+  # Surface the tail of the build log so the failure mode is
+  # visible directly in the run output even before the workflow's
+  # log-dump step fires. 50 lines is enough for most rustc
+  # error[E####] blocks without overwhelming the run log.
+  tail -n 50 "${BUILD_LOG}" 1>&2 || true
 fi
 
 # Every subsequent step short-circuits on a missing binary instead
@@ -104,15 +129,26 @@ else fail "session JSON has no accounts (.accounts is empty)"; fi
 # ---------------------------------------------------------------
 # `kmail sync` exercises the full Mailbox/get + Email/query +
 # Email/get pipeline (the cold-start path until #44's
-# `bootstrap_sync` lands). The dev stack's seeded mailboxes mean
-# at least one mailbox upsert is expected; the sync summary's
-# mailboxesUpserted field is the cheapest invariant to assert
-# without coupling the test to a specific seed count.
+# `bootstrap_sync` lands). The nightly workflow seeds a default
+# dev tenant + user via `scripts/seed-dev-tenant.sql`, and the
+# Stalwart side's `scripts/stalwart-init.sh` bootstraps the
+# `kmail-dev` account with the standard role mailboxes (Inbox,
+# Drafts, Sent, Trash, Junk). The cold-start sync therefore MUST
+# observe at least one mailbox upsert — a zero count signals a
+# regression somewhere in the JMAP proxy → SDK pipeline, not
+# just an empty seed, so we assert `> 0` rather than the weaker
+# `>= 0` (which would pass even when sync returned nothing). The
+# `-1` sentinel from jq lets us distinguish 'field missing' from
+# 'field present but zero' in the failure message.
 step '2. kmail sync (delta-pull)'
 SYNC_JSON=$("${CLI_BIN}" sync --bff "${API}" --token "${TOK}" --db "${DB}" 2>/dev/null || echo '{}')
 MBX_N=$(printf '%s' "${SYNC_JSON}" | jq -r '.mailboxesUpserted // -1')
-if [ "${MBX_N:-0}" -ge 0 ] 2>/dev/null; then ok
-else fail "sync summary missing mailboxesUpserted field"; fi
+if [ "${MBX_N:-0}" -gt 0 ] 2>/dev/null; then ok
+elif [ "${MBX_N:-0}" -eq 0 ] 2>/dev/null; then
+  fail "sync summary reports mailboxesUpserted=0 (expected the seeded Stalwart account to surface at least Inbox)"
+else
+  fail "sync summary missing mailboxesUpserted field"
+fi
 
 # ---------------------------------------------------------------
 # 3. Local SQLite read paths

@@ -189,14 +189,27 @@ jobs:
       # plain curl; this one drives the same backend through the
       # real SDK so the BFF↔SDK contract is the surface under
       # test, not the BFF API alone.
+      #
+      # `KMAIL_E2E_SDK_DIR` is pinned to a stable path so the
+      # cargo-build / SQLite cache artefacts survive the e2e step
+      # and stay available for the "Dump SDK e2e logs on failure"
+      # step below. Without the override the script would `mktemp
+      # -d` and trap-rm the dir on exit, deleting the cargo build
+      # log before we could dump it.
       - name: Run SDK e2e (scripts/test-e2e-sdk.sh)
-        run: ./scripts/test-e2e-sdk.sh
+        env:
+          KMAIL_E2E_SDK_DIR: /tmp/kmail-sdk-e2e
+        run: |
+          mkdir -p /tmp/kmail-sdk-e2e
+          ./scripts/test-e2e-sdk.sh
 
       - name: Dump logs on failure
         if: failure()
         run: |
           echo "===== kmail-api log ====="
           cat /tmp/kmail-logs/kmail-api.log || true
+          echo "===== kmail-cli cargo build log (last 200 lines) ====="
+          tail -200 /tmp/kmail-sdk-e2e/logs/cargo-build.log || true
           echo "===== docker compose ps ====="
           docker compose ps || true
           echo "===== stalwart log (last 200 lines) ====="
