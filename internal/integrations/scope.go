@@ -72,8 +72,15 @@ func EventAllowedForClient(grantedScopes []string, eventType string) bool {
 // The returned `denied` slice carries the rejected event types
 // in stable order (matches the input order) so the client can
 // surface a precise "missing scope X for event Y" message.
+//
+// Both `allowed` and `denied` are always returned as
+// non-nil slices (possibly empty) so callers that JSON-encode
+// the result get `[]` for "none" instead of `null`. The
+// `omitempty` tag on caller structs already collapses the
+// empty case if needed; consistency with `allowed` is the goal.
 func FilterEventsForClient(grantedScopes, requested []string) (allowed []string, denied []string) {
 	allowed = make([]string, 0, len(requested))
+	denied = make([]string, 0, len(requested))
 	for _, ev := range requested {
 		if EventAllowedForClient(grantedScopes, ev) {
 			allowed = append(allowed, ev)

@@ -741,7 +741,24 @@ func (h *Handlers) redirectWithOAuthError(w http.ResponseWriter, r *http.Request
 		h.redirectWithError(w, r, redirectURI, state, ErrCodeInvalidScope, "requested scope not allowed for this client")
 		return
 	case errors.Is(err, ErrInvalidRedirectURI):
-		h.redirectWithError(w, r, redirectURI, state, ErrCodeInvalidRequest, "redirect_uri does not match client allow-list")
+		// RFC 6749 §3.1.2.4: "If the request fails due to a
+		// missing, invalid, or mismatching redirection URI, the
+		// authorization server SHOULD inform the resource owner
+		// of the error and MUST NOT automatically redirect the
+		// user-agent to the invalid redirection URI."
+		//
+		// This case is unreachable today (`Approve` validates
+		// `redirectURIInAllowList` before calling IssueAuthorizationCode
+		// at handlers.go:455, so the service-layer
+		// `redirectURIInAllowList` check at service.go:357 cannot
+		// diverge), but if a future refactor caused
+		// `IssueAuthorizationCode` to surface this sentinel
+		// directly we would otherwise redirect the user-agent
+		// to whatever (potentially attacker-supplied) URI we
+		// have in hand — that's the exact failure mode the spec
+		// forbids. Returning an HTTP error keeps the defensive
+		// mapping AND stays spec-compliant.
+		http.Error(w, "redirect_uri does not match client allow-list", http.StatusBadRequest)
 		return
 	case errors.Is(err, ErrPKCERequiredButMissing):
 		h.redirectWithError(w, r, redirectURI, state, ErrCodeInvalidRequest, "PKCE required for public clients")

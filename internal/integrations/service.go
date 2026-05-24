@@ -601,6 +601,23 @@ func (s *Service) loadIntegrationSubscribers(ctx context.Context, tenantID, even
 			JOIN oauth_clients oc ON oc.id = we.oauth_client_id
 			WHERE we.tenant_id = $1::uuid
 			  AND we.active = true
+			  -- Filter on the OWNING OAuth2 client's active flag in
+			  -- addition to the endpoint's own. Without this, an
+			  -- operator deactivating a client (UPDATE oauth_clients
+			  -- SET active = false) revokes the client's INBOUND API
+			  -- surface immediately (ValidateAccessToken at
+			  -- internal/oauth/service.go has its own
+			  -- "AND c.active = true" predicate) but the OUTBOUND
+			  -- dispatch path keeps firing webhooks at the client's
+			  -- endpoints for up to AccessTokenTTL (1h) -- until
+			  -- the LATERAL subquery's "t.expires_at > now()"
+			  -- filter drains the pre-deactivation tokens out of
+			  -- the granted_scopes union. That's a data-leakage
+			  -- window the operator's deactivation gesture clearly
+			  -- intends to close: a deactivated client should stop
+			  -- receiving events with the same step that stops it
+			  -- accepting requests.
+			  AND oc.active = true
 			  AND we.oauth_client_id IS NOT NULL
 			  AND (jsonb_array_length(we.events) = 0 OR we.events ? $2)
 		`, tenantID, eventType)

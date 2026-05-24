@@ -110,6 +110,22 @@ func main() {
 	if err != nil {
 		logger.Fatalf("middleware.NewRedisStore: %v", err)
 	}
+	// Release the limiter store's connection pool on shutdown.
+	// `middleware.NewRedisStore` constructs its own `*redis.Client`
+	// with its own pool (separate from the `valkeyClient` pool
+	// closed at the analogous block ~135 lines below — see the
+	// "Two separate Redis client pools" doc block at the top of
+	// this function for the design rationale on why the two pools
+	// stay separate). Without this defer the pool's TCP
+	// connections would only be reclaimed by the GC finalizer at
+	// process exit; CI leak detectors and graceful-shutdown
+	// drains both treat that as a regression. `*redis.Client.Close`
+	// is idempotent and safe from defer.
+	defer func() {
+		if cerr := limiterStore.Client.Close(); cerr != nil {
+			logger.Printf("limiter store: close: %v", cerr)
+		}
+	}()
 
 	// Valkey-backed rate limiter. Enabled via config; when
 	// disabled the limiter is a no-op and the middleware passes
