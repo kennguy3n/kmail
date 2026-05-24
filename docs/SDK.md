@@ -15,10 +15,14 @@ sdk/
 │   └── src/
 │       ├── cache.rs            # attachment LRU over SQLite
 │       ├── client.rs           # KMailClient façade + delta-pull
-│       ├── crypto/             # AES-256-GCM, HKDF, KeyStore trait
-│       │   ├── aead.rs
-│       │   ├── kdf.rs
-│       │   └── keystore.rs
+│       ├── crypto/             # AES-256-GCM, HKDF, MLS bridge, vault + Confidential Send envelopes
+│       │   ├── mod.rs          # re-exports + KeyMaterial wrapper
+│       │   ├── aead.rs         # AES-256-GCM primitive
+│       │   ├── kdf.rs          # HKDF-SHA256 primitive
+│       │   ├── keystore.rs     # KeyStore trait + InMemoryKeyStore
+│       │   ├── mls.rs          # MlsKeyProvider trait + StaticMlsKeyProvider
+│       │   ├── confidential.rs # Confidential Send seal / open (MLS-leaf-keyed KEK + random DEK)
+│       │   └── vault.rs        # Zero-Access Vault seal / open (folder-master-keyed)
 │       ├── error.rs            # typed Error taxonomy
 │       ├── jmap/               # JMAP transport + request/response
 │       │   ├── ops.rs          # typed JmapClient methods
@@ -143,21 +147,59 @@ aggregate `CI Status` check that branch protection requires.
 
 ## Encryption
 
-The SDK enforces the contract documented in `ARCHITECTURE.md`
-§5. Vault decryption is keyed off MLS material that the platform
-shell hands in through the `KeyStore` trait:
+The SDK implements the contract documented in `ARCHITECTURE.md`
+§5. Two privacy modes have first-class envelope types, both
+sealed and opened entirely on-device:
 
-- iOS shell → Keychain Services
-- Android shell → Android Keystore
-- Electron shell → OS keyring (Secret Service / Keychain /
-  Windows Credential Manager) via `keyring`
+| Envelope                 | Crate path                       | Wrapping key derivation                                 | Per-message material                  |
+| ------------------------ | -------------------------------- | ------------------------------------------------------- | ------------------------------------- |
+| Zero-Access Vault        | `kmail_core::crypto::vault`      | HKDF-SHA256(folder master key, salt = nonce, label)     | 96-bit nonce sampled from `OsRng`     |
+| Confidential Send        | `kmail_core::crypto::confidential`| HKDF-SHA256(MLS leaf secret, salt = `kek_salt`, label) | Random DEK (32 bytes), random `kek_salt`|
 
-The Rust side never touches platform secure storage directly; it
-only ever sees opaque `KeyMaterial` byte slices via the
-`KeyStore::fetch_key_material` boundary.
+Both envelopes use AES-256-GCM under the hood (`crypto::aead`)
+and HKDF-SHA256 for key derivation (`crypto::kdf`). All
+derived keys and the random DEK are zeroized after use via
+`zeroize::Zeroize`; `KeyMaterial` is the canonical
+`ZeroizeOnDrop` wrapper for any key bytes that need to live
+across `await` points.
 
-The full vault decrypt path (vault envelope → MLS exporter →
-DEK unwrap → AES-256-GCM open) lands in the next SDK PR; the
-primitives (`crypto::aead`, `crypto::kdf`, `crypto::keystore`)
-are already in place and verified against the published test
-vectors.
+### MLS exporter bridge
+
+The SDK never derives MLS material itself — that's the KChat
+MLS SDK's job (per the do-not-do rule "do not build a parallel
+email-only key hierarchy"). The platform shell hands MLS
+exporter secrets in through the `MlsKeyProvider` trait
+(`crypto::mls`):
+
+```rust
+pub trait MlsKeyProvider: Send + Sync {
+    fn confidential_send_leaf_secret(&self, recipient_user_id: &str)
+        -> Result<KeyMaterial>;
+    fn vault_folder_master_secret(&self, folder_id: &str)
+        -> Result<KeyMaterial>;
+}
+```
+
+- `StaticMlsKeyProvider` (in the same module) is the test-only
+  in-memory implementation. Production providers wrap the
+  KChat MLS SDK and run in whichever process owns the MLS
+  tree.
+- FFI-side adapters (`kmail-ffi::ForeignMlsKeyProvider`,
+  `kmail-napi`'s equivalent) validate the 32-byte contract at
+  the boundary and surface mismatches as
+  `Error::KeyStore`. Wrong-length foreign-callback returns are
+  zeroized before being dropped — see the FFI tests for the
+  exact discipline.
+
+### KeyStore (session blobs)
+
+`KeyStore` (`crypto::keystore`) is unrelated to MLS material —
+it's the trait the SDK uses to persist OAuth / JMAP session
+blobs between launches. The default `InMemoryKeyStore` is
+fine for tests and the kmail-cli; production shells will plug
+in platform-native bridges in their respective follow-up PRs
+(Keychain Services / Android Keystore / OS keyring).
+
+The Rust side never touches platform secure storage directly;
+it only ever sees opaque `KeyMaterial` byte slices via the
+`MlsKeyProvider` and `KeyStore` boundaries.
