@@ -184,14 +184,120 @@ func main() {
 		// here makes the misconfiguration obvious at boot.
 		logger.Printf("jmap proxy: WARNING StalwartURL is HTTPS but KMAIL_STALWART_TLS_CERT/KEY are unset \u2014 BFF will not authenticate to Stalwart")
 	}
+	// Valkey is consumed by deliverability, push, calendar reminders,
+	// the SLO tracker, AND the shared JMAP circuit breaker (Phase 5).
+	// Stand it up early so the breaker can share trip state across
+	// every BFF pod — a 5xx storm against shard X opens the breaker
+	// once across the fleet instead of once per pod.
+	// Resolve breaker tunables once so both the shared
+	// (Valkey-backed) and per-pod fallback paths use the same
+	// threshold / cooldown / window. Keeping the two impls in
+	// lockstep prevents semantic drift when an operator toggles
+	// `KMAIL_VALKEY_URL` on or off.
+	breakerThreshold := config.GetenvInt("KMAIL_BREAKER_THRESHOLD", 3)
+	breakerCooldown := getenvDuration("KMAIL_BREAKER_COOLDOWN", 30*time.Second)
+	breakerWindow := getenvDuration("KMAIL_BREAKER_WINDOW", 60*time.Second)
 
+	// `cfg.ValkeyURL` arrives in one of two wire forms the codebase
+	// accepts — a `redis://` / `rediss://` DSN (the Helm Secret
+	// default, also the only form that lets an operator point at
+	// managed Valkey/Redis with TLS) or a bare `host:port`
+	// (the docker-compose default and the in-tree dev convention).
+	// `redis.NewClient` only understands the bare form on
+	// `Options.Addr`, so route through `valkeyurl.Parse` to
+	// normalise both. Without this normalisation a Helm deployment
+	// shipping the chart's `redis://valkey:6379` Secret would try
+	// to resolve the literal string `redis://valkey` as a DNS name
+	// and fail at boot — the exact failure mode Phase A's PR #31
+	// was opened to close.
+	var valkeyClient *redis.Client
+	if cfg.ValkeyURL != "" {
+		opts, err := valkeyurl.Parse(cfg.ValkeyURL)
+		if err != nil {
+			logger.Fatalf("valkey url %q: %v", cfg.ValkeyURL, err)
+		}
+		valkeyClient = redis.NewClient(opts)
+		// Release the connection pool on shutdown so the
+		// process exits cleanly (and so leak detectors in CI
+		// don't flag a dangling client). The redis client's
+		// Close is idempotent and safe to call from defer.
+		defer func() {
+			if cerr := valkeyClient.Close(); cerr != nil {
+				logger.Printf("valkey: close: %v", cerr)
+			}
+		}()
+	}
+
+	// Choose the breaker impl based on whether Valkey is actually
+	// reachable. cfg.ValkeyURL has a non-empty default ("valkey:6379")
+	// so `valkeyClient != nil` is always true in practice — that's
+	// fine because the rest of the program's Valkey consumers
+	// (deliverability, push, calendar reminder, SLO tracker, ...)
+	// already tolerate per-call errors and will recover when Valkey
+	// comes back. The JMAP shard breaker, however, is on the request
+	// hot path: if every Open() round-trips to an unreachable Valkey
+	// and we just log+allow, a 5xx storm against a shard never trips
+	// the breaker AND every request eats the round-trip latency.
+	//
+	// Strategy: ping Valkey with a short bounded timeout. If it
+	// answers, wire the shared (Valkey-backed) breaker so trip state
+	// is fleet-wide. If it doesn't, leave the *redis.Client live
+	// (consumers that tolerate failures may still benefit when
+	// Valkey recovers) but fall the proxy back to the in-process
+	// breaker so trip decisions happen locally, fast, and with no
+	// blocked-network surface area. The fallback is opt-out via
+	// `KMAIL_BREAKER_SHARED_FORCE` for the edge case of an operator
+	// who doesn't want the fallback (e.g., they prefer "fail loud").
+	var jmapBreaker jmap.CircuitBreaker
+	if valkeyClient != nil {
+		pingCtx, pingCancel := context.WithTimeout(ctx, 2*time.Second)
+		pingErr := valkeyClient.Ping(pingCtx).Err()
+		pingCancel()
+		forceShared := config.GetenvBool("KMAIL_BREAKER_SHARED_FORCE", false)
+		switch {
+		case pingErr == nil:
+			shared, breakerErr := jmap.NewRedisCircuitBreaker(jmap.RedisCircuitBreakerConfig{
+				Client:    valkeyClient,
+				Logger:    logger,
+				Threshold: breakerThreshold,
+				Cooldown:  breakerCooldown,
+				Window:    breakerWindow,
+			})
+			if breakerErr != nil {
+				logger.Fatalf("jmap.NewRedisCircuitBreaker: %v", breakerErr)
+			}
+			jmapBreaker = shared
+			logger.Printf("jmap: shared circuit breaker enabled against %s", cfg.ValkeyURL)
+		case forceShared:
+			shared, breakerErr := jmap.NewRedisCircuitBreaker(jmap.RedisCircuitBreakerConfig{
+				Client:    valkeyClient,
+				Logger:    logger,
+				Threshold: breakerThreshold,
+				Cooldown:  breakerCooldown,
+				Window:    breakerWindow,
+			})
+			if breakerErr != nil {
+				logger.Fatalf("jmap.NewRedisCircuitBreaker: %v", breakerErr)
+			}
+			jmapBreaker = shared
+			logger.Printf("jmap: shared circuit breaker forced (KMAIL_BREAKER_SHARED_FORCE=1) against unreachable %s: ping=%v", cfg.ValkeyURL, pingErr)
+		default:
+			logger.Printf("jmap: shared circuit breaker disabled — Valkey %s unreachable (%v); falling back to per-pod in-process breaker", cfg.ValkeyURL, pingErr)
+		}
+	} else {
+		logger.Printf("jmap: shared circuit breaker disabled (KMAIL_VALKEY_URL unset); falling back to per-pod breaker")
+	}
 	proxy, err := jmap.NewProxy(jmap.ProxyConfig{
-		StalwartURL:    cfg.StalwartURL,
-		Pool:           pool,
-		Logger:         logger,
-		Shards:         shardSvc,
-		PreDeliverHook: malwareHook,
-		TLS:            stalwartTLS,
+		StalwartURL:           cfg.StalwartURL,
+		Pool:                  pool,
+		Logger:                logger,
+		Shards:                shardSvc,
+		PreDeliverHook:        malwareHook,
+		TLS:                   stalwartTLS,
+		Breaker:               jmapBreaker,
+		CircuitBreakThreshold: breakerThreshold,
+		CircuitBreakCooldown:  breakerCooldown,
+		CircuitBreakWindow:    breakerWindow,
 	})
 	if err != nil {
 		logger.Fatalf("jmap.NewProxy: %v", err)
@@ -302,28 +408,6 @@ func main() {
 	})
 	migrationHandlers := migration.NewHandlers(migrationSvc, logger)
 	migrationHandlers.Register(mux, authMW)
-
-	// Valkey is consumed by deliverability, push, calendar reminders,
-	// and the SLO tracker. Stand it up early so every downstream
-	// service can share the same client.
-	//
-	// `cfg.ValkeyURL` can arrive in either of the two wire forms
-	// the codebase accepts — a `redis://` DSN (the Helm Secret
-	// default, useful for `rediss://` to managed Valkey) or a bare
-	// `host:port` (the docker-compose default). `redis.NewClient`
-	// only understands the bare form on `Options.Addr`, so route
-	// through `valkeyurl.Parse` to normalise both forms. Without
-	// this normalisation a Helm deployment that ships the chart's
-	// `redis://valkey:6379` Secret would try to resolve
-	// `redis://valkey` as a DNS name and fail at boot.
-	var valkeyClient *redis.Client
-	if cfg.ValkeyURL != "" {
-		opts, err := valkeyurl.Parse(cfg.ValkeyURL)
-		if err != nil {
-			logger.Fatalf("valkey url %q: %v", cfg.ValkeyURL, err)
-		}
-		valkeyClient = redis.NewClient(opts)
-	}
 
 	chatbridgeSvc := chatbridge.NewService(chatbridge.Config{
 		KChatAPIURL:   cfg.KChatAPIURL,
@@ -448,6 +532,51 @@ func main() {
 		Backends: searchBackends,
 	})
 	search.NewHandlers(searchSvc, logger).Register(mux, authMW)
+
+	// Phase 5: auto-cutover from Meilisearch to OpenSearch.
+	// Disabled when either backend is missing (we'd have nowhere
+	// to read from or write to). The worker polls hourly and
+	// promotes any tenant whose mailbox is past the configured
+	// byte threshold — see `internal/search/cutover.go`.
+	hasMeili, hasOpen := false, false
+	for _, b := range searchBackends {
+		switch b.Name() {
+		case search.BackendMeilisearch:
+			hasMeili = true
+		case search.BackendOpenSearch:
+			hasOpen = true
+		}
+	}
+	if hasMeili && hasOpen {
+		sizer := search.MailboxSizerFunc(func(ctx context.Context, tenantID string) (int64, error) {
+			q, err := billingSvc.GetQuota(ctx, tenantID)
+			if err != nil {
+				return 0, err
+			}
+			return q.StorageUsedBytes, nil
+		})
+		source := search.MessageSourceFunc(func(ctx context.Context, tenantID string) ([]search.Message, error) {
+			return searchSvc.Export(ctx, tenantID)
+		})
+		cutover, cutErr := search.NewCutoverWorker(search.CutoverConfig{
+			Pool:        pool,
+			Service:     searchSvc,
+			Sizer:       sizer,
+			Source:      source,
+			Logger:      logger,
+			Threshold:   int64(config.GetenvInt64("KMAIL_SEARCH_CUTOVER_THRESHOLD_BYTES", 0)),
+			Interval:    getenvDuration("KMAIL_SEARCH_CUTOVER_INTERVAL", time.Hour),
+			MaxFailures: config.GetenvInt("KMAIL_SEARCH_CUTOVER_MAX_FAILURES", 5),
+			MaxRetryGap: getenvDuration("KMAIL_SEARCH_CUTOVER_RETRY_GAP", time.Hour),
+		})
+		if cutErr != nil {
+			logger.Fatalf("search.NewCutoverWorker: %v", cutErr)
+		}
+		go cutover.Run(ctx)
+		logger.Printf("search: auto-cutover worker started (poll=%s)", getenvDuration("KMAIL_SEARCH_CUTOVER_INTERVAL", time.Hour))
+	} else {
+		logger.Printf("search: auto-cutover worker disabled (need both Meilisearch and OpenSearch configured)")
+	}
 
 	// Sieve rule management (Phase 7).
 	sieveSvc := sieve.NewService(sieve.Config{Pool: pool, Logger: logger})

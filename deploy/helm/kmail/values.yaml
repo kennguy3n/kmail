@@ -9,6 +9,56 @@
 # `kmailApi.config.*`. Values that should not live in plaintext
 # (DB URL, OIDC client secret, Stripe key, etc.) come from the
 # referenced Secret instead — see `secret.yaml`.
+#
+# For multi-region deployments, layer `values-multiregion.yaml` on
+# top of this file:
+#
+#   helm upgrade kmail . -f values.yaml -f values-multiregion.yaml \
+#                        --set multiregion.region=us-west-2
+
+# Multi-region topology. When `enabled: true`, the chart wires
+# region-aware ingress annotations, KMAIL_REGION env, topology
+# spread constraints, and a cross-region Valkey peer list.
+# Defaults are no-ops so single-region installs behave exactly
+# the way they always have.
+multiregion:
+  enabled: false
+  # Region of THIS deployment (e.g. us-west-2, eu-west-1). Stamped
+  # into the KMAIL_REGION env var and into ExternalDNS set
+  # identifiers so client-side routing can prefer a region.
+  region: ""
+  # Base DNS domain (e.g. "kmail.example.com"). The regional
+  # hostname is composed as `mail-<region>.<domain>` — so
+  # region="us-west-2" + domain="kmail.example.com" yields
+  # mail-us-west-2.kmail.example.com. This is distinct from
+  # `globalHost` (which is the global failover record, NOT a
+  # parent zone of the regional record).
+  domain: ""
+  # Global hostname that DNS-failovers across regions. Each region
+  # publishes its regional record (e.g. mail-us-west-2.kmail.example.com)
+  # AND participates in the global record (mail.kmail.example.com).
+  globalHost: ""
+  # Ordered list of peer region names this region can fail over to.
+  # The BFF doesn't actively probe peers — the list is exposed as
+  # KMAIL_REGION_PEERS so degraded-mode handlers can surface a
+  # readable target URL when the local region is unhealthy.
+  peerRegions: []
+  # Comma-separated Valkey URLs (one per peer region) for the BFF
+  # to replicate rate-limit / circuit-breaker / session state
+  # against. Local writes are still primary; peer writes are
+  # best-effort fan-out. Empty disables cross-region fan-out.
+  valkeyReplicaURLs: ""
+  # ExternalDNS provider ("aws", "google", "cloudflare"). Drives
+  # which set of provider-specific weighted/failover annotations
+  # the ingress template emits. Empty disables ExternalDNS
+  # entirely — the ingress remains a plain regional ingress.
+  externalDNSProvider: ""
+  # Weight for weighted DNS rotation (1–255 typical). Higher =
+  # more traffic. Use 0 to drain a region.
+  dnsWeight: 100
+  # Failover role when a provider supports active-passive
+  # (e.g. AWS Route 53). One of "PRIMARY", "SECONDARY", or "".
+  failoverRole: ""
 
 image:
   repository: ghcr.io/kennguy3n/kmail-api
@@ -18,6 +68,10 @@ image:
 # kmail-api — stateless BFF / control plane.
 kmailApi:
   replicaCount: 3
+  # Spread pods across availability zones (and, when multi-region
+  # is on, regions) so a single AZ / region outage doesn't take
+  # down every BFF replica.
+  topologySpreadConstraints: []
   service:
     type: ClusterIP
     port: 80

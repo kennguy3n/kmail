@@ -2,6 +2,7 @@ package jmap
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -95,16 +96,26 @@ func TestAccountCache_Expiry(t *testing.T) {
 	}
 }
 
-func TestAccountCache_EvictsExpiredEntryOnGet(t *testing.T) {
-	c := newAccountCache(10 * time.Millisecond)
-	c.set("t", "u", "acc-1")
-	time.Sleep(20 * time.Millisecond)
-	_, _ = c.get("t", "u") // triggers eviction
-	c.mu.RLock()
-	_, stillPresent := c.m[c.key("t", "u")]
-	c.mu.RUnlock()
-	if stillPresent {
-		t.Error("expected expired entry to be evicted from the map")
+// TestAccountCache_BoundedSize_EvictsLRU pins the bounded-size
+// behaviour we wanted from the migration: a stream of writes that
+// exceeds `accountCacheMaxEntries` must not grow the cache
+// without bound — the oldest unused entry is dropped (LRU). This
+// is the property the previous map-based implementation lacked
+// and which motivated the LRU migration.
+func TestAccountCache_BoundedSize_EvictsLRU(t *testing.T) {
+	c := newAccountCache(time.Hour) // long TTL so we test the LRU bound, not the TTL
+	// Touch tenant-0 first then write `accountCacheMaxEntries`
+	// fresh keys; tenant-0 should evict because it is the
+	// least-recently-used.
+	c.set("tenant-0", "user-0", "acc-0")
+	for i := 1; i <= accountCacheMaxEntries; i++ {
+		c.set(fmt.Sprintf("tenant-%d", i), "user-x", "acc-x")
+	}
+	if c.inner.Len() != accountCacheMaxEntries {
+		t.Errorf("cache len = %d after %d writes, want bounded to %d", c.inner.Len(), accountCacheMaxEntries+1, accountCacheMaxEntries)
+	}
+	if _, ok := c.get("tenant-0", "user-0"); ok {
+		t.Error("expected tenant-0 to have been evicted as LRU")
 	}
 }
 
@@ -289,7 +300,7 @@ func TestShardFailoverTransport_LastShardBreaker(t *testing.T) {
 	}
 
 	srvURL, _ := url.Parse(srv.URL)
-	if !p.breakerOpen(srvURL.Host, 3) {
+	if !p.breaker.Open(context.Background(), srvURL.Host) {
 		t.Errorf("breaker for %s did not open after 3 consecutive 5xx", srvURL.Host)
 	}
 }

@@ -1,0 +1,139 @@
+# KMail — multi-region values overlay (Phase 5).
+#
+# Layer this on top of `values.yaml`:
+#
+#   helm upgrade kmail . \
+#     -f values.yaml \
+#     -f values-multiregion.yaml \
+#     --set multiregion.region=us-west-2 \
+#     --set multiregion.peerRegions={eu-west-1,ap-southeast-1} \
+#     --set multiregion.valkeyReplicaURLs="redis://valkey-eu-west-1:6379,redis://valkey-ap-southeast-1:6379"
+#
+# The chart's defaults are no-ops, so applying this overlay is what
+# *turns on* multi-region behavior. The overlay does three things:
+#
+#  1. Stamps a region label, KMAIL_REGION env var, and topology
+#     spread constraints onto the BFF Deployment so a single-AZ /
+#     region outage doesn't take down every replica.
+#
+#  2. Emits ExternalDNS annotations on the ingress so every region's
+#     install publishes its own regional record AND participates in
+#     the global record (`globalHost`). DNS resolvers then route
+#     clients to the closest healthy region (weighted records) or
+#     to the active region (failover records), depending on
+#     `externalDNSProvider` and `failoverRole`.
+#
+#  3. Wires the BFF to cross-region Valkey replicas via
+#     KMAIL_VALKEY_REPLICA_URLS so rate-limit / circuit-breaker /
+#     session state survives a regional Valkey outage by reading
+#     from the next-best replica.
+#
+# Stalwart mailbox state itself does NOT fail over via DNS — that's
+# a separate (and slower) replication topology owned by Stalwart and
+# zk-object-fabric. This overlay is about the *control plane* (BFF)
+# being region-resilient so reads from the surviving region don't
+# require a full Stalwart cutover.
+
+multiregion:
+  enabled: true
+  # Override at install time:
+  #   --set multiregion.region=us-west-2
+  region: ""
+  # Base domain. The regional hostname is composed as
+  # `mail-<region>.<domain>`, so domain="kmail.example.com" +
+  # region="us-west-2" gives mail-us-west-2.kmail.example.com.
+  # Keep this distinct from `globalHost`: `globalHost` is the
+  # failover/aggregate record and should NOT include the
+  # `mail-<region>.` prefix.
+  domain: "kmail.example.com"
+  # Global DNS record that aggregates every regional install.
+  globalHost: "mail.kmail.example.com"
+  # Override at install time. The chart joins this into a single
+  # comma-separated KMAIL_REGION_PEERS env var.
+  peerRegions: []
+  # Set at install time to the URL list of peer regions' Valkey
+  # instances. Local Valkey is still primary; the peer list is
+  # used for fan-out replication of rate-limit and circuit-breaker
+  # state so a regional Valkey failure doesn't reset every counter.
+  valkeyReplicaURLs: ""
+  # AWS Route 53 is the most common DNS substrate for an
+  # ExternalDNS-managed multi-region rollout. Swap to "google" or
+  # "cloudflare" for the equivalent annotations.
+  externalDNSProvider: "aws"
+  dnsWeight: 100
+  # PRIMARY for the active region, SECONDARY for the standby.
+  # Leave empty for pure weighted (active-active) routing.
+  failoverRole: ""
+
+# Region-aware ingress hostnames. Each regional install publishes
+# its own hostname (mail-<region>.kmail.example.com) so clients can
+# pin to a region for compliance or latency reasons. The global
+# record (mail.kmail.example.com) lives on the ingress too via
+# ExternalDNS annotations (see the helper in `_helpers.tpl`).
+kmailApi:
+  ingress:
+    enabled: true
+    className: nginx
+    annotations:
+      # Force HTTPS at the ingress so DNS-based failover never
+      # downgrades a client from HTTPS to HTTP mid-failover.
+      nginx.ingress.kubernetes.io/ssl-redirect: "true"
+      # 60s per-request timeout matches the BFF's JMAP upload
+      # ceiling; long-poll JMAP push is on a different ingress.
+      nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+      nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+    hosts:
+      # Regional host. `multiregion.region` is interpolated at
+      # render time by ExternalDNS annotations, but the ingress
+      # rule itself uses a stable placeholder you override per
+      # region with `--set kmailApi.ingress.hosts[0].host`.
+      - host: mail-REGION.kmail.example.com
+        paths:
+          - path: /
+            pathType: Prefix
+    tls:
+      - secretName: kmail-tls
+        hosts:
+          - mail-REGION.kmail.example.com
+          # Global host — only emit when set, but we list it here
+          # so cert-manager / the existing cert covers it. Trim
+          # this entry if your TLS strategy is per-region certs.
+          - mail.kmail.example.com
+
+  # Spread BFF pods across availability zones inside the local
+  # region. Spreading across regions is handled by *running this
+  # chart in each region* — not by cross-region scheduling, which
+  # would require a service mesh KMail does not currently use.
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels:
+          app.kubernetes.io/name: kmail
+          app.kubernetes.io/component: api
+
+  # Multi-region runs require more headroom than single-region:
+  # a healthy region absorbs traffic from a draining peer during
+  # failover, so the HPA ceiling needs to be roughly the global
+  # traffic the region might briefly serve alone.
+  hpa:
+    enabled: true
+    minReplicas: 6
+    maxReplicas: 24
+    targetCPUUtilizationPercentage: 65
+
+  # PDB tightened: a region serving as failover target during a
+  # peer outage must keep at least 50% of replicas serving during
+  # rolling node drains.
+  pdb:
+    enabled: true
+    minAvailable: "50%"
+
+  config:
+    # Mirror the breaker thresholds across regions. A peer-region
+    # outage is the worst-case 5xx storm, so the breaker needs to
+    # open fast to short-circuit traffic away from the failing peer.
+    KMAIL_BREAKER_THRESHOLD: "3"
+    KMAIL_BREAKER_COOLDOWN: "30s"
+    KMAIL_BREAKER_WINDOW: "60s"

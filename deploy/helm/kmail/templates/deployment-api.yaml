@@ -28,6 +28,10 @@ spec:
       {{- end }}
     spec:
       serviceAccountName: {{ include "kmail.serviceAccountName" . }}
+      {{- with .Values.kmailApi.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: kmail-api
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
@@ -41,8 +45,24 @@ spec:
                 name: {{ include "kmail.fullname" . }}-config
             - secretRef:
                 name: {{ include "kmail.secretName" . }}
-          {{- if .Values.mtls.enabled }}
+          {{- /*
+            Two surfaces want to inject env vars into the kmail-api
+            container: Phase A's mTLS block (BFF→Stalwart HTTPS over
+            the cert-manager-issued client keypair) and Phase C's
+            multi-region block (per-pod replica routing).  YAML
+            forbids duplicate mapping keys, and Go's parser silently
+            drops all but the LAST `env:` it sees, so the two
+            blocks MUST live under a single `env:` mapping.  The
+            outer `{{- if }}` skips the key entirely when neither
+            feature is enabled — emitting `env:` with no children
+            renders `env: null`, which strict admission webhooks
+            (Gatekeeper / Kyverno default policies) reject.
+          */ -}}
+          {{- $mr := .Values.multiregion }}
+          {{- $needMR := and $mr.enabled (or $mr.region $mr.peerRegions $mr.valkeyReplicaURLs) }}
+          {{- if or .Values.mtls.enabled $needMR }}
           env:
+            {{- if .Values.mtls.enabled }}
             # When mTLS is enabled the BFF MUST speak HTTPS on
             # Stalwart's `jmap-tls` listener (port 8443), and the
             # hostname MUST be one of the SANs cert-manager baked
@@ -63,6 +83,23 @@ spec:
             - name: KMAIL_STALWART_TLS_SERVER_NAME
               value: {{ . | quote }}
             {{- end }}
+            {{- end }}
+            {{- if $needMR }}
+            {{- with $mr.region }}
+            - name: KMAIL_REGION
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with $mr.peerRegions }}
+            - name: KMAIL_REGION_PEERS
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- with $mr.valkeyReplicaURLs }}
+            - name: KMAIL_VALKEY_REPLICA_URLS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
+          {{- end }}
+          {{- if .Values.mtls.enabled }}
           volumeMounts:
             - name: stalwart-client-tls
               mountPath: /etc/kmail/tls/stalwart-client

@@ -432,7 +432,7 @@ func Load() (*Config, error) {
 		DevBypassToken:    getenv("KMAIL_DEV_BYPASS_TOKEN", ""),
 		Env:               getenv("KMAIL_ENV", "production"),
 		RateLimit: RateLimitConfig{
-			Enabled:   getenvBool("KMAIL_RATELIMIT_ENABLED", false),
+			Enabled:   GetenvBool("KMAIL_RATELIMIT_ENABLED", false),
 			TenantRPM: GetenvInt("KMAIL_RATELIMIT_TENANT_RPM", 1000),
 			UserRPM:   GetenvInt("KMAIL_RATELIMIT_USER_RPM", 200),
 			Window:    getenvDuration("KMAIL_RATELIMIT_WINDOW", 60*time.Second),
@@ -473,11 +473,11 @@ func Load() (*Config, error) {
 			CoreSeatCents:       GetenvInt("KMAIL_BILLING_CORE_CENTS", 300),
 			ProSeatCents:        GetenvInt("KMAIL_BILLING_PRO_CENTS", 600),
 			PrivacySeatCents:    GetenvInt("KMAIL_BILLING_PRIVACY_CENTS", 900),
-			CorePerSeatBytes:    getenvInt64("KMAIL_BILLING_CORE_PERSEAT_BYTES", 5*1024*1024*1024),
-			ProPerSeatBytes:     getenvInt64("KMAIL_BILLING_PRO_PERSEAT_BYTES", 15*1024*1024*1024),
-			PrivacyPerSeatBytes: getenvInt64("KMAIL_BILLING_PRIVACY_PERSEAT_BYTES", 50*1024*1024*1024),
+			CorePerSeatBytes:    GetenvInt64("KMAIL_BILLING_CORE_PERSEAT_BYTES", 5*1024*1024*1024),
+			ProPerSeatBytes:     GetenvInt64("KMAIL_BILLING_PRO_PERSEAT_BYTES", 15*1024*1024*1024),
+			PrivacyPerSeatBytes: GetenvInt64("KMAIL_BILLING_PRIVACY_PERSEAT_BYTES", 50*1024*1024*1024),
 			QuotaWorkerInterval: getenvDuration("KMAIL_QUOTA_WORKER_INTERVAL", 5*time.Minute),
-			QuotaWorkerEnabled:  getenvBool("KMAIL_QUOTA_WORKER_ENABLED", false),
+			QuotaWorkerEnabled:  GetenvBool("KMAIL_QUOTA_WORKER_ENABLED", false),
 		},
 		Deliverability: DeliverabilityConfig{
 			CoreDailyLimit:            GetenvInt("KMAIL_SEND_CORE_DAILY", 500),
@@ -488,30 +488,17 @@ func Load() (*Config, error) {
 			BounceSoftWindow:          getenvDuration("KMAIL_BOUNCE_SOFT_WINDOW", 72*time.Hour),
 		},
 		Observability: ObservabilityConfig{
-			MetricsEnabled: getenvBool("KMAIL_METRICS_ENABLED", true),
-			TracingEnabled: getenvBool("KMAIL_TRACING_ENABLED", false),
+			MetricsEnabled: GetenvBool("KMAIL_METRICS_ENABLED", true),
+			TracingEnabled: GetenvBool("KMAIL_TRACING_ENABLED", false),
 			OTLPEndpoint:   getenv("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
 			LogFormat:      getenv("KMAIL_LOG_FORMAT", "text"),
 		},
 		Attachments: AttachmentsConfig{
-			ThresholdBytes: getenvInt64("KMAIL_ATTACHMENT_THRESHOLD_BYTES", 10*1024*1024),
+			ThresholdBytes: GetenvInt64("KMAIL_ATTACHMENT_THRESHOLD_BYTES", 10*1024*1024),
 			DefaultExpiry:  getenvDuration("KMAIL_ATTACHMENT_EXPIRY", 7*24*time.Hour),
 			BucketName:     getenv("KMAIL_ATTACHMENT_BUCKET", "kmail-attachments"),
 		},
 	}, nil
-}
-
-// getenvInt64 parses the named environment variable as an int64.
-func getenvInt64(key string, fallback int64) int64 {
-	v, ok := os.LookupEnv(key)
-	if !ok || v == "" {
-		return fallback
-	}
-	n, err := strconv.ParseInt(v, 10, 64)
-	if err != nil {
-		return fallback
-	}
-	return n
 }
 
 // getenv returns the value of the named environment variable or the
@@ -528,12 +515,15 @@ func getenv(key, fallback string) string {
 // the Helm chart's ConfigMap / Secret, and the only name the chart
 // guarantees to set), then falls back to the bare name for
 // compose / dev / scripts compatibility, then to the supplied
-// default. The two-step lookup is what makes the mTLS override
-// from the Helm template at `deploy/helm/kmail/templates/
-// deployment-api.yaml` (which sets `KMAIL_STALWART_URL`) actually
-// take effect — without this layer the binary would read
-// `STALWART_URL`, miss the override, and silently talk plain HTTP
-// to Stalwart instead of HTTPS-with-mTLS.
+// default. The two-step lookup is what makes overrides emitted by
+// the Helm template at `deploy/helm/kmail/templates/
+// deployment-api.yaml` (which sets KMAIL_-prefixed names) actually
+// take effect — without this layer the binary would read the bare
+// name, miss the override, and silently talk plain HTTP to
+// Stalwart (when the mTLS override is dropped) or talk to the
+// dev-default `valkey:6379` instead of the chart-supplied host
+// (when the VALKEY_URL override is dropped — silently routing the
+// shared circuit breaker at the wrong target).
 func getenvKMail(key, fallback string) string {
 	if v, ok := os.LookupEnv("KMAIL_" + key); ok && v != "" {
 		return v
@@ -559,11 +549,12 @@ func getenvDuration(key string, fallback time.Duration) time.Duration {
 	return d
 }
 
-// getenvBool parses the named environment variable as a boolean.
+// GetenvBool parses the named environment variable as a boolean.
 // Accepted truthy values: 1, t, true, y, yes (case-insensitive);
 // everything else (including unset) falls back to the provided
-// default.
-func getenvBool(key string, fallback bool) bool {
+// default. Exported for use by sibling packages (e.g. cmd/kmail-api
+// for `KMAIL_BREAKER_SHARED_FORCE`).
+func GetenvBool(key string, fallback bool) bool {
 	v, ok := os.LookupEnv(key)
 	if !ok || v == "" {
 		return fallback
@@ -587,6 +578,20 @@ func GetenvInt(key string, fallback int) int {
 		return fallback
 	}
 	n, err := strconv.Atoi(v)
+	if err != nil {
+		return fallback
+	}
+	return n
+}
+
+// GetenvInt64 mirrors GetenvInt for int64 values (e.g. byte
+// thresholds that exceed math.MaxInt32 on 32-bit builds).
+func GetenvInt64(key string, fallback int64) int64 {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		return fallback
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
 	if err != nil {
 		return fallback
 	}

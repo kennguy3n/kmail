@@ -28,6 +28,7 @@ import (
 	"sync"
 	"time"
 
+	lru "github.com/hashicorp/golang-lru/v2/expirable"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -79,7 +80,31 @@ type ProxyConfig struct {
 	// CircuitBreakThreshold is the consecutive 5xx / transport
 	// failure count after which the proxy marks a shard URL
 	// unhealthy and routes to the next backup. Defaults to 3.
+	// Ignored when `Breaker` is non-nil — a custom breaker is
+	// expected to own its own threshold configuration.
 	CircuitBreakThreshold int
+
+	// CircuitBreakCooldown and CircuitBreakWindow tune the
+	// fallback in-process breaker so its sliding-window /
+	// cooldown semantics line up with the Redis-backed
+	// implementation. Defaults: 30s cooldown, 60s window — the
+	// same values the production main wires into
+	// `RedisCircuitBreakerConfig`. Ignored when `Breaker` is
+	// non-nil.
+	//
+	// Setting both to zero falls back to the legacy count-only
+	// behavior used by older tests that never advance a clock.
+	CircuitBreakCooldown time.Duration
+	CircuitBreakWindow   time.Duration
+
+	// Breaker is the optional shared circuit breaker. Wire a
+	// `*RedisCircuitBreaker` (via `NewRedisCircuitBreaker`) to
+	// share trip state across BFF pods so a 5xx storm against
+	// shard X opens the breaker once across the fleet instead of
+	// once per pod. When nil, the proxy falls back to a
+	// per-process counter map that matches the original Phase 4
+	// behavior — single-pod deployments are not affected.
+	Breaker CircuitBreaker
 
 	// PreDeliverHook (Phase 8) is invoked over the submit body
 	// before forwarding it to Stalwart. Returning a non-nil
@@ -642,11 +667,13 @@ type Proxy struct {
 	target  *url.URL
 	stripPR string
 
-	// breakerMu guards the circuit-breaker counters keyed by
-	// shard host (URL.Host). Counters live in-process for Phase 4 —
-	// a Valkey-backed shared breaker is a Phase 5 follow-up.
-	breakerMu sync.Mutex
-	breakers  map[string]int
+	// breaker is the active circuit-breaker implementation. It's
+	// either the per-process default (a thin wrapper over a
+	// counter map) or a `*RedisCircuitBreaker` wired by the
+	// embedder. The `Open / RecordSuccess / RecordFailure`
+	// surface is consulted by `shardFailoverTransport.RoundTrip`
+	// on every retry decision.
+	breaker CircuitBreaker
 }
 
 // shardCtxKey carries the resolved shard URL list (primary first)
@@ -680,15 +707,35 @@ func NewProxy(cfg ProxyConfig) (*Proxy, error) {
 	}
 	ttl := cfg.AccountCacheTTL
 	if ttl <= 0 {
-		ttl = 5 * time.Minute
+		// Single source of truth lives next to the cache itself
+		// (see `accountCacheDefaultTTL`). `newAccountCache`
+		// applies the same default on ttl<=0, so this is
+		// belt-and-braces — but referencing the constant keeps
+		// the two defaults in lockstep if someone tunes one.
+		ttl = accountCacheDefaultTTL
+	}
+	breaker := cfg.Breaker
+	if breaker == nil {
+		// Default: per-pod sliding-window breaker. Threshold /
+		// cooldown / window flow from the proxy config; zero
+		// fields pick up the breaker's own defaults so older
+		// callers that only set `CircuitBreakThreshold` keep
+		// working unchanged (Cooldown=0 → legacy count-only
+		// behavior).
+		breaker = newInProcessCircuitBreaker(inProcessBreakerConfig{
+			Threshold: cfg.CircuitBreakThreshold,
+			Cooldown:  cfg.CircuitBreakCooldown,
+			Window:    cfg.CircuitBreakWindow,
+			Logger:    logger,
+		})
 	}
 	p := &Proxy{
-		cfg:      cfg,
-		logger:   logger,
-		cache:    newAccountCache(ttl),
-		target:   target,
-		stripPR:  "/jmap",
-		breakers: map[string]int{},
+		cfg:     cfg,
+		logger:  logger,
+		cache:   newAccountCache(ttl),
+		target:  target,
+		stripPR: "/jmap",
+		breaker: breaker,
 	}
 	base := http.DefaultTransport
 	if cfg.TLS != nil {
@@ -754,10 +801,11 @@ func (t *shardFailoverTransport) RoundTrip(req *http.Request) (*http.Response, e
 		// No shard wiring; behave as the unmodified proxy.
 		return t.base.RoundTrip(req)
 	}
-	threshold := t.proxy.cfg.CircuitBreakThreshold
-	if threshold <= 0 {
-		threshold = 3
-	}
+	// Threshold comes from the breaker implementation, not the
+	// transport. The transport only consults `Open` per retry,
+	// `RecordFailure` on 5xx / transport errors, and
+	// `RecordSuccess` on a 2xx — the breaker owns its own
+	// trip / cooldown / window policy.
 	// Buffer the request body once so each retry can rewind. JMAP
 	// payloads are small JSON envelopes, so the in-memory cost is
 	// bounded; large attachment uploads go through a separate
@@ -793,8 +841,10 @@ func (t *shardFailoverTransport) RoundTrip(req *http.Request) (*http.Response, e
 		}
 		// Skip hosts that have tripped the breaker. The breaker
 		// auto-resets when a healthy probe rolls through (see the
-		// shard HealthWorker).
-		if t.proxy.breakerOpen(u.Host, threshold) && i+1 < len(urls) {
+		// shard HealthWorker). Only divert when there's a fallback
+		// shard available — with no candidates left, attempting
+		// the tripped host is still preferable to a guaranteed 502.
+		if t.proxy.breaker.Open(req.Context(), u.Host) && i+1 < len(urls) {
 			continue
 		}
 		clone := req.Clone(req.Context())
@@ -816,7 +866,7 @@ func (t *shardFailoverTransport) RoundTrip(req *http.Request) (*http.Response, e
 		}
 		resp, err := t.base.RoundTrip(clone)
 		if err != nil {
-			t.proxy.breakerInc(u.Host)
+			t.proxy.breaker.RecordFailure(req.Context(), u.Host)
 			lastErr = err
 			continue
 		}
@@ -826,7 +876,7 @@ func (t *shardFailoverTransport) RoundTrip(req *http.Request) (*http.Response, e
 			// when a fallback existed (`i+1 < len(urls)`), so the
 			// last shard could fail forever without ever tripping
 			// its breaker.
-			t.proxy.breakerInc(u.Host)
+			t.proxy.breaker.RecordFailure(req.Context(), u.Host)
 			if i+1 < len(urls) {
 				resp.Body.Close()
 				lastErr = fmt.Errorf("upstream %s returned %d", u.Host, resp.StatusCode)
@@ -836,7 +886,7 @@ func (t *shardFailoverTransport) RoundTrip(req *http.Request) (*http.Response, e
 			// the client without resetting its breaker.
 			return resp, nil
 		}
-		t.proxy.breakerReset(u.Host)
+		t.proxy.breaker.RecordSuccess(req.Context(), u.Host)
 		return resp, nil
 	}
 	if lastErr == nil {
@@ -845,23 +895,7 @@ func (t *shardFailoverTransport) RoundTrip(req *http.Request) (*http.Response, e
 	return nil, lastErr
 }
 
-func (p *Proxy) breakerOpen(host string, threshold int) bool {
-	p.breakerMu.Lock()
-	defer p.breakerMu.Unlock()
-	return p.breakers[host] >= threshold
-}
 
-func (p *Proxy) breakerInc(host string) {
-	p.breakerMu.Lock()
-	p.breakers[host]++
-	p.breakerMu.Unlock()
-}
-
-func (p *Proxy) breakerReset(host string) {
-	p.breakerMu.Lock()
-	delete(p.breakers, host)
-	p.breakerMu.Unlock()
-}
 
 // ServeHTTP implements http.Handler. It expects to run behind the
 // OIDC middleware: the acting tenant and KChat user are read from
@@ -914,12 +948,29 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	//     are the only methods that submit (or stage for
 	//     submission) a message.
 	if p.cfg.PreDeliverHook != nil && (r.Method == http.MethodPost || r.Method == http.MethodPut) && r.Body != nil && requestCarriesMessageContent(r) {
+		// Buffer up to 33 MiB (32 MiB cap + 1 byte sentinel) into
+		// the scan buffer. We deliberately do NOT stream-pipe to
+		// ClamAV in parallel with the upstream: ClamAV INSTREAM can
+		// return a FOUND verdict mid-body, but anything already
+		// forwarded to Stalwart would have leaked past the
+		// quarantine. The double-buffer that previously existed in
+		// the shard round tripper is eliminated by setting
+		// `r.GetBody` after the scan: the round tripper detects
+		// GetBody and reuses the same scan buffer for every retry
+		// instead of draining `r.Body` into a fresh allocation.
 		const maxScanBytes = 32 * 1024 * 1024
-		body, err := io.ReadAll(io.LimitReader(r.Body, maxScanBytes))
+		body, err := io.ReadAll(io.LimitReader(r.Body, maxScanBytes+1))
 		_ = r.Body.Close()
 		if err != nil {
 			p.logger.Printf("jmap proxy: read body for malware scan: %v", err)
 			http.Error(w, `{"type":"urn:ietf:params:jmap:error:serverFail","title":"read body"}`, http.StatusBadGateway)
+			return
+		}
+		if len(body) > maxScanBytes {
+			p.logger.Printf("jmap proxy: pre-deliver scan rejected tenant=%s reason=body-too-large bytes>%d", tenantID, maxScanBytes)
+			w.Header().Set("Content-Type", "application/problem+json")
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_, _ = w.Write([]byte(`{"type":"urn:ietf:params:jmap:error:tooLarge","title":"message exceeds malware-scan size limit"}` + "\n"))
 			return
 		}
 		if shouldScanBody(r, body) {
@@ -933,6 +984,15 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		r.Body = io.NopCloser(bytes.NewReader(body))
 		r.ContentLength = int64(len(body))
+		// Hand the same byte slice to the round tripper so it can
+		// retry across shards without re-buffering. Each call to
+		// GetBody returns a fresh reader over the SAME backing
+		// array (`bytes.NewReader` is a zero-copy wrapper), which
+		// is what eliminates the second allocation that the
+		// failover path used to make.
+		r.GetBody = func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(body)), nil
+		}
 	}
 	p.rp.ServeHTTP(w, r.WithContext(ctx))
 }
@@ -1092,24 +1152,36 @@ func (p *Proxy) resolveAccount(ctx context.Context, tenantID, kchatUserID string
 	return accountID, nil
 }
 
-// accountCache is a TTL'd in-process cache for the
-// `(tenant_id, kchat_user_id) → stalwart_account_id` mapping. It is
-// deliberately simple; the Valkey-backed shared cache (10 000 entries,
-// 5 min TTL) documented in `docs/JMAP-CONTRACT.md` §3.3 lands in
-// Phase 2.
-type accountCache struct {
-	ttl time.Duration
-	mu  sync.RWMutex
-	m   map[string]accountCacheEntry
-}
+// accountCacheMaxEntries bounds the in-process
+// `(tenant_id, kchat_user_id) → stalwart_account_id` cache. 50,000
+// entries at ~150 B per entry keeps the cache under ~8 MiB even on
+// a fully-warm shard while still comfortably exceeding the
+// typical concurrent-active-user count per pod (which is bound by
+// the BFF's outbound connection budget to Stalwart). Pair with a
+// 5-minute TTL so the Valkey-backed shared cache (Phase 3) sees
+// every key turn over within a session.
+const (
+	accountCacheMaxEntries = 50_000
+	accountCacheDefaultTTL = 5 * time.Minute
+)
 
-type accountCacheEntry struct {
-	accountID string
-	expiresAt time.Time
+// accountCache is the bounded, TTL'd in-process cache for the
+// `(tenant_id, kchat_user_id) → stalwart_account_id` mapping. The
+// hashicorp/golang-lru `expirable` LRU gives us bounded size + TTL
+// in one structure and is internally locked, so the public
+// `get` / `set` methods stay as thin pass-throughs that the proxy
+// already uses everywhere.
+type accountCache struct {
+	inner *lru.LRU[string, string]
 }
 
 func newAccountCache(ttl time.Duration) *accountCache {
-	return &accountCache{ttl: ttl, m: map[string]accountCacheEntry{}}
+	if ttl <= 0 {
+		ttl = accountCacheDefaultTTL
+	}
+	return &accountCache{
+		inner: lru.NewLRU[string, string](accountCacheMaxEntries, nil, ttl),
+	}
 }
 
 func (c *accountCache) key(tenantID, kchatUserID string) string {
@@ -1117,31 +1189,9 @@ func (c *accountCache) key(tenantID, kchatUserID string) string {
 }
 
 func (c *accountCache) get(tenantID, kchatUserID string) (string, bool) {
-	k := c.key(tenantID, kchatUserID)
-	c.mu.RLock()
-	entry, ok := c.m[k]
-	c.mu.RUnlock()
-	if !ok {
-		return "", false
-	}
-	if time.Now().After(entry.expiresAt) {
-		// Drop the expired entry eagerly so callers that only hit
-		// stale keys don't accumulate map entries forever.
-		c.mu.Lock()
-		if cur, still := c.m[k]; still && !time.Now().Before(cur.expiresAt) {
-			delete(c.m, k)
-		}
-		c.mu.Unlock()
-		return "", false
-	}
-	return entry.accountID, true
+	return c.inner.Get(c.key(tenantID, kchatUserID))
 }
 
 func (c *accountCache) set(tenantID, kchatUserID, accountID string) {
-	c.mu.Lock()
-	c.m[c.key(tenantID, kchatUserID)] = accountCacheEntry{
-		accountID: accountID,
-		expiresAt: time.Now().Add(c.ttl),
-	}
-	c.mu.Unlock()
+	c.inner.Add(c.key(tenantID, kchatUserID), accountID)
 }
