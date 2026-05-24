@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { Link, Outlet, useNavigate } from 'react-router-dom';
 import { useKMail } from './kmail/client';
 import { KMailError } from './kmail/errors';
+import { launchHashParams } from './launchParams';
 import type { JsMailbox } from './kmail/preload';
 
 // Top-level app shell.
@@ -27,14 +28,22 @@ interface SessionParams {
 function readSessionParams(): SessionParams | null {
   // 1. Hash-fragment params (production: KChat launches with
   //    `kmail.html#bff=...&token=...&db=...&acct=...`).
-  const hashParams = new URLSearchParams(window.location.hash.slice(1));
-  const bffUrl = hashParams.get('bff') ?? import.meta.env.VITE_KMAIL_BFF_URL;
+  //
+  // We read from `launchHashParams` — a snapshot of
+  // `window.location.hash` captured at module-load time, BEFORE
+  // `<HashRouter>` mounted and claimed ownership of the hash for
+  // routing. Reading `window.location.hash` directly here would
+  // return the router-normalised value (`/bff=...`), which
+  // `URLSearchParams` would parse with `/bff` as the first key.
+  // See `src/launchParams.ts` for the full rationale.
+  const bffUrl =
+    launchHashParams.get('bff') ?? import.meta.env.VITE_KMAIL_BFF_URL;
   const bearerToken =
-    hashParams.get('token') ?? import.meta.env.VITE_KMAIL_BEARER_TOKEN;
+    launchHashParams.get('token') ?? import.meta.env.VITE_KMAIL_BEARER_TOKEN;
   const databasePath =
-    hashParams.get('db') ?? import.meta.env.VITE_KMAIL_DATABASE_PATH;
+    launchHashParams.get('db') ?? import.meta.env.VITE_KMAIL_DATABASE_PATH;
   const accountId =
-    hashParams.get('acct') ?? import.meta.env.VITE_KMAIL_ACCOUNT_ID;
+    launchHashParams.get('acct') ?? import.meta.env.VITE_KMAIL_ACCOUNT_ID;
 
   if (!bffUrl || !bearerToken || !databasePath) return null;
   return {
@@ -50,7 +59,13 @@ export function App(): JSX.Element {
   const navigate = useNavigate();
 
   const [mailboxes, setMailboxes] = useState<JsMailbox[]>([]);
-  const [openError, setOpenError] = useState<string | null>(null);
+  // `setupError` is fatal — missing session params or a failed
+  // initial open(). The Sync button stays disabled while this is
+  // set because no SDK session exists to sync. `syncError` is
+  // transient — a failed sync() call once the SDK is open. The
+  // user can retry, so the button stays enabled.
+  const [setupError, setSetupError] = useState<string | null>(null);
+  const [syncError, setSyncError] = useState<string | null>(null);
   const [syncing, setSyncing] = useState(false);
   const [lastSyncAt, setLastSyncAt] = useState<Date | null>(null);
 
@@ -60,7 +75,7 @@ export function App(): JSX.Element {
   useEffect(() => {
     const params = readSessionParams();
     if (!params) {
-      setOpenError(
+      setSetupError(
         'Missing session parameters — launch from KChat or set VITE_KMAIL_* env vars in dev.',
       );
       return;
@@ -77,7 +92,7 @@ export function App(): JSX.Element {
         setMailboxes(m);
       } catch (err) {
         const e = err as KMailError;
-        setOpenError(`${e.tag} ${e.message}`);
+        setSetupError(`${e.tag} ${e.message}`);
       }
     })();
   }, [client]);
@@ -89,10 +104,10 @@ export function App(): JSX.Element {
       const m = await client.cachedMailboxes();
       setMailboxes(m);
       setLastSyncAt(new Date());
-      setOpenError(null);
+      setSyncError(null);
     } catch (err) {
       const e = err as KMailError;
-      setOpenError(`${e.tag} ${e.message}`);
+      setSyncError(`${e.tag} ${e.message}`);
     } finally {
       setSyncing(false);
     }
@@ -113,7 +128,12 @@ export function App(): JSX.Element {
           <button
             type="button"
             onClick={() => void runSync()}
-            disabled={syncing || !!openError}
+            // Disabled only while a sync is in flight or the SDK
+            // never opened (setupError). A transient runSync
+            // failure (syncError) MUST leave the button enabled
+            // so the user can retry — otherwise a single failed
+            // sync would lock the user out of the app.
+            disabled={syncing || !!setupError}
             className="sync-btn"
           >
             {syncing ? 'Syncing…' : 'Sync'}
@@ -127,7 +147,7 @@ export function App(): JSX.Element {
       </header>
       <aside className="app-sidebar">
         <h2>Mailboxes</h2>
-        {mailboxes.length === 0 && !openError && <p>Loading…</p>}
+        {mailboxes.length === 0 && !setupError && <p>Loading…</p>}
         <ul>
           {mailboxes.map((mb) => (
             <li key={mb.id}>
@@ -142,10 +162,16 @@ export function App(): JSX.Element {
             </li>
           ))}
         </ul>
-        {openError && (
+        {setupError && (
           <div className="error-banner" role="alert">
-            <strong>SDK error</strong>
-            <code>{openError}</code>
+            <strong>SDK setup error</strong>
+            <code>{setupError}</code>
+          </div>
+        )}
+        {syncError && (
+          <div className="error-banner sync-error" role="status">
+            <strong>Last sync failed</strong>
+            <code>{syncError}</code>
           </div>
         )}
       </aside>

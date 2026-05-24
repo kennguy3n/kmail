@@ -147,9 +147,18 @@ function createWindow(): BrowserWindow {
 
   // Open external links in the user's real browser, NOT a new
   // BrowserWindow. Stops "evil email link opens phishing page
-  // inside our Electron shell" attacks.
+  // inside our Electron shell" attacks. The protocol allowlist
+  // hardens against a compromised renderer that tries to pass
+  // `file://`, `smb://`, `vbscript:`, etc. through shell.openExternal
+  // — that would invoke the OS's default handler for those
+  // schemes and could trigger native code execution outside the
+  // sandbox.
   win.webContents.setWindowOpenHandler(({ url }) => {
-    void shell.openExternal(url);
+    if (isSafeExternalUrl(url)) {
+      void shell.openExternal(url);
+    } else {
+      console.warn('[security] blocked window.open for unsafe URL:', url);
+    }
     return { action: 'deny' };
   });
 
@@ -160,7 +169,11 @@ function createWindow(): BrowserWindow {
     const allowed = win.webContents.getURL();
     if (url !== allowed) {
       event.preventDefault();
-      void shell.openExternal(url);
+      if (isSafeExternalUrl(url)) {
+        void shell.openExternal(url);
+      } else {
+        console.warn('[security] blocked navigation to unsafe URL:', url);
+      }
     }
   });
 
@@ -236,8 +249,12 @@ function createTray(): Tray {
 // ---------------------------------------------------------------
 
 // Error tag prefixes match those emitted by `napi_err()` in
-// `sdk/kmail-napi/src/lib.rs`. The renderer parses these to
-// build typed exceptions.
+// `sdk/kmail-napi/src/lib.rs` plus `[INTERNAL]` for errors
+// originating in this main process (e.g. requireSession()).
+// The renderer parses these via `src/kmail/errors.ts` to
+// build typed exceptions. Keeping `[INTERNAL]` in the list
+// prevents `sanitiseError()` from double-wrapping a message
+// that already starts with `[INTERNAL]`.
 const KMAIL_ERROR_PREFIXES = [
   '[STORE]',
   '[TRANSPORT]',
@@ -254,7 +271,31 @@ const KMAIL_ERROR_PREFIXES = [
   '[KEYSTORE]',
   '[ARG]',
   '[CANCELLED]',
+  '[INTERNAL]',
 ] as const;
+
+// Protocol allowlist for `shell.openExternal`. Only schemes that
+// open a browser or a mail composer are permitted; everything
+// else (file://, smb://, vbscript:, javascript:, custom
+// app-specific schemes, etc.) is blocked. The renderer is
+// already sandboxed but this is a second line of defence if a
+// future XSS in email preview rendering tries to escape via
+// `window.open()`.
+const SAFE_EXTERNAL_PROTOCOLS: ReadonlySet<string> = new Set([
+  'http:',
+  'https:',
+  'mailto:',
+]);
+
+function isSafeExternalUrl(rawUrl: string): boolean {
+  try {
+    const parsed = new URL(rawUrl);
+    return SAFE_EXTERNAL_PROTOCOLS.has(parsed.protocol);
+  } catch {
+    // Invalid URL strings can never be safely opened.
+    return false;
+  }
+}
 
 // Lock down which prefix the renderer is allowed to see. If the
 // SDK emits a new error variant, the prefix must be added here

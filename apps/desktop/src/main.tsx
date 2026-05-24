@@ -1,3 +1,9 @@
+// `launchParams` MUST be imported first. Its module-level
+// initializer snapshots `window.location.hash` BEFORE the
+// `<HashRouter>` below mounts and rewrites the hash for
+// routing. See `src/launchParams.ts` for the full rationale.
+import './launchParams';
+
 import React from 'react';
 import ReactDOM from 'react-dom/client';
 import { HashRouter, Route, Routes } from 'react-router-dom';
