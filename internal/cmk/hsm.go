@@ -383,8 +383,14 @@ func (s *CMKService) warnLegacyPlaintextHSM(tenantID, configID string) {
 	if _, loaded := s.legacyPlaintextSeen.LoadOrStore(key, struct{}{}); loaded {
 		return
 	}
-	if s.logger != nil {
-		s.logger.Printf(
+	// Snapshot the logger pointer once under the read lock so a
+	// concurrent SetLogger swap cannot race the field read under
+	// Go's memory model (-race would otherwise flag this).
+	// getLogger also covers the zero-value-fixture case where
+	// `s.logger` is nil.
+	logger := s.getLogger()
+	if logger != nil {
+		logger.Printf(
 			"cmk: legacy-plaintext HSM credentials detected tenant=%s config=%s — "+
 				"re-register this HSM config through the API to wrap with the envelope; "+
 				"this warning will only fire once per (tenant, config) per process",

@@ -30,12 +30,26 @@ import (
 // Parse normalises `raw` into `*redis.Options`. An empty input
 // returns an error so callers can decide whether to fall back to
 // an in-process counter (dev) or refuse to boot (production).
+//
+// Scheme detection is case-insensitive: `redis.ParseURL` itself
+// accepts mixed-case schemes per RFC 3986 §3.1, so refusing
+// `Redis://...` here would create a needless gap between the two
+// code paths. Operator-pasted overrides (env files, shell exports)
+// are the most likely producers of mixed case; routing them
+// through `redis.ParseURL` keeps query-string parameters working.
 func Parse(raw string) (*redis.Options, error) {
-	if strings.TrimSpace(raw) == "" {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
 		return nil, errors.New("valkeyurl: empty url")
 	}
-	if strings.HasPrefix(raw, "redis://") || strings.HasPrefix(raw, "rediss://") {
-		return redis.ParseURL(raw)
+	// Match the scheme prefix on the lowercased form. Only the
+	// scheme prefix is lower-cased for the comparison; the
+	// original string is passed to `redis.ParseURL` so any
+	// case-sensitive parts (passwords, paths, query values)
+	// survive unchanged.
+	lower := strings.ToLower(trimmed)
+	if strings.HasPrefix(lower, "redis://") || strings.HasPrefix(lower, "rediss://") {
+		return redis.ParseURL(trimmed)
 	}
-	return &redis.Options{Addr: raw}, nil
+	return &redis.Options{Addr: trimmed}, nil
 }

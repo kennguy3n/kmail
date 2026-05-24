@@ -61,13 +61,18 @@ type Key struct {
 type CMKService struct {
 	pool *pgxpool.Pool
 
-	// envMu serialises access to the envelope pointer. The read
-	// side (HSM credential wrap/unwrap on every request) is the
-	// hot path; the write side (SetEnvelope / NewCMKService*) is
-	// almost always init-time, but key rotation will eventually
-	// swap the envelope at runtime, so the synchronisation is the
-	// load-bearing piece that lets that future change land
-	// without a refactor here.
+	// envMu serialises access to the envelope AND logger
+	// pointers. The read side (HSM credential wrap/unwrap on
+	// every request) is the hot path; the write side
+	// (SetEnvelope / SetLogger / NewCMKService*) is almost
+	// always init-time, but key rotation will eventually swap
+	// the envelope at runtime and a future hot-config-reload
+	// path may swap the logger too, so the synchronisation is
+	// the load-bearing piece that lets that future change land
+	// without a refactor here. The two fields share one mutex
+	// because they're updated by the same configuration-reload
+	// codepath in lockstep; a separate `logMu` would needlessly
+	// proliferate locks for an init-time-only contention path.
 	envMu    sync.RWMutex
 	envelope SecretsEnvelope
 
@@ -75,6 +80,10 @@ type CMKService struct {
 	// HSM credential reads, which signal that a config row was
 	// written before the envelope landed and should be re-saved).
 	// Defaults to log.Default(); SetLogger overrides for tests.
+	// MUST be accessed via getLogger() / SetLogger so the swap is
+	// race-safe under -race; the bare-pointer read in
+	// warnLegacyPlaintextHSM was the Devin-Review round-10
+	// finding.
 	logger *log.Logger
 
 	// legacyPlaintextSeen deduplicates the legacy-plaintext
@@ -96,6 +105,21 @@ func (s *CMKService) getEnvelope() SecretsEnvelope {
 	return s.envelope
 }
 
+// getLogger returns the currently configured logger, falling
+// back to log.Default() if a caller built the service via the
+// zero value (test fixture). All read paths in this package MUST
+// go through this helper so a concurrent SetLogger cannot race
+// the field read under Go's memory model.
+func (s *CMKService) getLogger() *log.Logger {
+	s.envMu.RLock()
+	logger := s.logger
+	s.envMu.RUnlock()
+	if logger == nil {
+		return log.Default()
+	}
+	return logger
+}
+
 // NewCMKService returns a service. No envelope is configured, so
 // HSM credential writes are rejected (the only safe default for
 // non-test callers).
@@ -114,12 +138,18 @@ func NewCMKServiceWithEnvelope(pool *pgxpool.Pool, envelope SecretsEnvelope) *CM
 }
 
 // SetLogger overrides the default logger. Pass log.New(io.Discard, ...)
-// from tests to suppress the legacy-plaintext warning.
+// from tests to suppress the legacy-plaintext warning. The write
+// is serialised through envMu so a concurrent
+// `warnLegacyPlaintextHSM` cannot observe a torn interface value;
+// this also makes the method safe to call from a future
+// hot-config-reload path, not just from init or tests.
 func (s *CMKService) SetLogger(logger *log.Logger) {
 	if logger == nil {
 		logger = log.New(io.Discard, "", 0)
 	}
+	s.envMu.Lock()
 	s.logger = logger
+	s.envMu.Unlock()
 }
 
 // SetEnvelope wires the secrets envelope onto an existing
