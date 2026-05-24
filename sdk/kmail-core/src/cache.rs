@@ -16,22 +16,31 @@
 use crate::error::{Error, Result};
 use crate::sync::store::Store;
 use chrono::Utc;
+use std::sync::Arc;
 
-/// Wall-clock used to stamp `last_accessed_at` in the cache.
+/// Injectable monotonic-ish clock returning the value the cache
+/// will stamp into `last_accessed_at`.
 ///
-/// Returns milliseconds since the Unix epoch. We deliberately
-/// pick millisecond precision (not whole seconds) so that two
-/// `put`s issued back-to-back from the same thread within the
-/// same wall-clock second still produce strictly increasing
-/// timestamps. Whole-second precision would let two entries
-/// share a `last_accessed_at`, and the `ORDER BY last_accessed_at
-/// ASC` candidate-selection query in `put`'s eviction sweep
-/// would then fall back to SQLite's implementation-defined row
-/// order — effectively non-deterministic LRU.
+/// **Production.** `wall_clock_ms` returns wall-clock
+/// milliseconds since the Unix epoch. Millisecond precision (not
+/// whole seconds) prevents two `put`s issued back-to-back from
+/// sharing a timestamp, which would let the `ORDER BY
+/// last_accessed_at ASC` eviction query fall back to SQLite's
+/// implementation-defined row order — i.e. non-deterministic
+/// LRU. `i64` covers us until year 292,277,026.
 ///
-/// `i64` is fine for the foreseeable future: milliseconds since
-/// epoch fits in 63 bits until year 292,277,026.
-fn now_ms() -> i64 {
+/// **Tests.** The cache is constructed with
+/// [`AttachmentCache::with_clock`] passing a strictly
+/// monotonically increasing counter (e.g. `AtomicI64::fetch_add`).
+/// That removes the need for `std::thread::sleep` calls between
+/// `put`s to enforce eviction order — the wall-clock sleep
+/// approach is fragile on slow CI runners where scheduler stalls
+/// can compress two timestamps into the same millisecond.
+pub type ClockMs = Arc<dyn Fn() -> i64 + Send + Sync>;
+
+/// Default wall-clock used when no explicit clock is supplied to
+/// [`AttachmentCache::new`].
+pub fn wall_clock_ms() -> i64 {
     Utc::now().timestamp_millis()
 }
 
@@ -42,11 +51,45 @@ pub struct AttachmentCache {
     /// entries by `last_accessed_at` are evicted until the cache
     /// fits.
     max_bytes: u64,
+    /// Clock used to stamp `last_accessed_at`. Production uses
+    /// `wall_clock_ms`; tests inject a monotonic counter via
+    /// `with_clock` so eviction ordering is deterministic
+    /// without `thread::sleep`.
+    clock: ClockMs,
 }
 
 impl AttachmentCache {
+    /// Construct a cache backed by the system wall clock. Use
+    /// [`AttachmentCache::with_clock`] from tests to inject a
+    /// deterministic monotonic counter instead.
     pub fn new(store: Store, max_bytes: u64) -> Self {
-        Self { store, max_bytes }
+        Self {
+            store,
+            max_bytes,
+            clock: Arc::new(wall_clock_ms),
+        }
+    }
+
+    /// Construct a cache with a caller-supplied clock. The clock
+    /// MUST return strictly monotonically increasing values
+    /// across the lifetime of the cache, otherwise LRU eviction
+    /// ordering becomes ambiguous. The production constructor
+    /// (`new`) uses `wall_clock_ms`; tests use this entry point
+    /// with an `AtomicI64::fetch_add(1, Relaxed)` counter to
+    /// avoid wall-clock dependence (which is fragile on slow CI
+    /// runners where the OS scheduler can stall longer than the
+    /// sleep interval and collapse two timestamps onto the same
+    /// millisecond).
+    pub fn with_clock(store: Store, max_bytes: u64, clock: ClockMs) -> Self {
+        Self {
+            store,
+            max_bytes,
+            clock,
+        }
+    }
+
+    fn now_ms(&self) -> i64 {
+        (self.clock)()
     }
 
     /// Insert or refresh a blob in the cache, evicting LRU entries
@@ -73,7 +116,7 @@ impl AttachmentCache {
                 self.max_bytes,
             )));
         }
-        let now = now_ms();
+        let now = self.now_ms();
         let max_bytes = self.max_bytes;
         self.store.with_conn(|conn| {
             let tx = conn.transaction()?;
@@ -151,7 +194,7 @@ impl AttachmentCache {
             if payload.is_some() {
                 tx.execute(
                     "UPDATE blob_cache SET last_accessed_at = ?1 WHERE blob_id = ?2",
-                    rusqlite::params![now_ms(), blob_id],
+                    rusqlite::params![self.now_ms(), blob_id],
                 )?;
             }
             tx.commit()?;
@@ -263,6 +306,24 @@ mod tests {
         StoreEnv::new()
     }
 
+    /// Build a strictly-monotonic injected clock for the
+    /// LRU-ordering tests. Production uses wall-clock
+    /// milliseconds via `AttachmentCache::new`, but the tests
+    /// need every `put`/`get` to observe a value strictly greater
+    /// than every previous one without relying on
+    /// `std::thread::sleep` to elapse real time. Wall-clock-based
+    /// timing is fragile on slow CI runners where scheduler
+    /// stalls can compress two timestamps onto the same
+    /// millisecond, making LRU ordering ambiguous (the
+    /// `ORDER BY last_accessed_at` query then falls back to
+    /// SQLite's implementation-defined row order). The atomic
+    /// counter avoids the issue entirely.
+    fn monotonic_clock() -> ClockMs {
+        use std::sync::atomic::{AtomicI64, Ordering};
+        let counter = Arc::new(AtomicI64::new(1));
+        Arc::new(move || counter.fetch_add(1, Ordering::Relaxed))
+    }
+
     #[test]
     fn put_get_roundtrip_updates_lru() {
         let env = fresh_env();
@@ -281,20 +342,23 @@ mod tests {
 
     /// When `max_bytes` is exceeded, eviction must drop the LRU
     /// entry — never the just-inserted one.
+    ///
+    /// Uses an injected monotonic clock so ordering is
+    /// deterministic on CI — the previous `thread::sleep`-based
+    /// approach could intermittently produce the same
+    /// `last_accessed_at` for two `put`s if the scheduler stalled
+    /// the test runner past the sleep interval, making the LRU
+    /// query order ambiguous.
     #[test]
     fn eviction_respects_lru_order() {
         let env = fresh_env();
         let store = env.store().clone();
-        let cache = AttachmentCache::new(store, 20); // hold ~2 small blobs
+        let cache = AttachmentCache::with_clock(store, 20, monotonic_clock()); // hold ~2 small blobs
 
         cache.put("a", None, &[1u8; 8]).unwrap();
-        // Sleep so `last_accessed_at` strictly orders the entries.
-        // Millisecond precision means a handful of ms is enough; we
-        // pick 10ms to absorb scheduler jitter on slow CI runners.
-        std::thread::sleep(std::time::Duration::from_millis(10));
         cache.put("b", None, &[2u8; 8]).unwrap();
-        // Now `a` is older. Inserting `c` should evict `a`.
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        // `a` is older (lower counter). Inserting `c` should
+        // evict `a` because total bytes 24 > cap 20.
         cache.put("c", None, &[3u8; 8]).unwrap();
 
         assert!(
@@ -347,17 +411,20 @@ mod tests {
     /// new blob right at the capacity boundary must keep the new blob
     /// retrievable (eviction targets older entries, not the row we
     /// just wrote).
+    ///
+    /// Uses an injected monotonic clock for the same reason as
+    /// `eviction_respects_lru_order` — the boundary case depends
+    /// on the strict `old-1 < old-2 < new` ordering, which
+    /// `thread::sleep` cannot guarantee under CI scheduler stalls.
     #[test]
     fn just_inserted_blob_survives_eviction_at_boundary() {
         let env = fresh_env();
         let store = env.store().clone();
         // Capacity holds exactly two 8-byte entries.
-        let cache = AttachmentCache::new(store, 16);
+        let cache = AttachmentCache::with_clock(store, 16, monotonic_clock());
 
         cache.put("old-1", None, &[0u8; 8]).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(10));
         cache.put("old-2", None, &[0u8; 8]).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(10));
         // Inserting a third 8-byte blob would push total to 24, so
         // the cache must evict the oldest (`old-1`) — and must NOT
         // evict `new` itself.

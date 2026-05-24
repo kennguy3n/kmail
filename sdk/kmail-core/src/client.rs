@@ -833,11 +833,19 @@ impl KMailClient {
         token: &str,
         web_push_keys: Option<WebPushKeys>,
     ) -> Result<()> {
+        // The wire `PushSubscriptionRequest` matches the BFF's
+        // flat `Subscription` struct (internal/push/push.go:47-56),
+        // so flatten the ergonomic `WebPushKeys { p256dh, auth }`
+        // input into top-level `p256dh_key` / `auth_key` here.
+        let (p256dh_key, auth_key) = match web_push_keys {
+            Some(k) => (Some(k.p256dh), Some(k.auth)),
+            None => (None, None),
+        };
         let req = PushSubscriptionRequest {
             transport,
             token: token.to_string(),
-            web_push_keys,
-            types: Vec::new(),
+            p256dh_key,
+            auth_key,
         };
         let resp: serde_json::Value = self.jmap.post_json("/api/v1/push/subscribe", &req).await?;
         // BFF returns `{"id": "...", "transport": "..."}` on success;
@@ -1799,7 +1807,11 @@ mod tests {
             .and(header("authorization", "Bearer refreshed-token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "id": "sub-1",
-                "transport": "apns"
+                "tenant_id": "t-1",
+                "user_id": "u-1",
+                "device_type": "ios",
+                "push_endpoint": "apns-device-token",
+                "created_at": "2024-01-01T00:00:00Z"
             })))
             .expect(1)
             .mount(&server)

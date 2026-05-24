@@ -306,7 +306,18 @@ impl KMailClientHandle {
     /// Drop the cached JMAP session. The next `sync()` call will
     /// re-fetch `/jmap/session`. Use when the shell observes a
     /// reauth-required 401 or a tenant-rebalanced push.
-    pub async fn invalidate_session(&self) {
+    ///
+    /// Returns `Result<(), KMailError>` (rather than panicking) so
+    /// a `JoinError` from the owned runtime — vanishingly unlikely
+    /// here because the spawned future just clears an `Option`,
+    /// but possible if the runtime is shutting down — surfaces to
+    /// the foreign caller as `KMailError::Cancelled` /
+    /// `KMailError::Transport` via the `From<JoinError>` impl,
+    /// matching how `sync()` handles the same edge case. Letting
+    /// the spawned task panic would have aborted the Swift /
+    /// Kotlin host process; surfacing the error lets the platform
+    /// shell reopen the client cleanly.
+    pub async fn invalidate_session(&self) -> Result<(), KMailError> {
         let inner = self.inner.clone();
         // Spawn through our owned runtime so the session lock lives
         // there — matches the pattern used by `sync()` above and
@@ -314,8 +325,8 @@ impl KMailClientHandle {
         // ambiguous.
         runtime()
             .spawn(async move { inner.invalidate_session().await })
-            .await
-            .expect("invalidate_session task panicked");
+            .await?;
+        Ok(())
     }
 
     pub fn cached_mailboxes(&self) -> Result<Vec<FfiMailbox>, KMailError> {
