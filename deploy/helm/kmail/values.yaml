@@ -49,6 +49,19 @@ kmailApi:
     minAvailable: 1
   config:
     KMAIL_LOG_FORMAT: "json"
+    # The BFF's :8088 source-code default exists so a host-run BFF
+    # (`go run ./cmd/kmail-api` next to `docker compose up`) doesn't
+    # collide with Stalwart's matched 8080:8080 host publish in
+    # docker-compose.yml. In Kubernetes Stalwart is a SEPARATE
+    # StatefulSet (see kmailStalwart.containerPort 8080) so the BFF
+    # is free to bind :8080 inside its own pod. We override here so
+    # the Service `targetPort: 8080`, the `containerPort: 8080` on
+    # deployment-api.yaml, and the readiness/liveness probes (which
+    # target the named `http` port) all line up with where the BFF
+    # is actually listening. Without this override the binary would
+    # bind :8088, the probes would fail on :8080, and every Helm
+    # rollout would crash-loop.
+    KMAIL_API_ADDR: ":8080"
     KMAIL_STALWART_URL: "http://kmail-stalwart-0.kmail-stalwart.svc:8080"
     KMAIL_RETENTION_DRY_RUN: "false"
     KMAIL_TRACING_OTLP_ENDPOINT: ""

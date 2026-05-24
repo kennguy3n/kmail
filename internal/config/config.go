@@ -336,7 +336,15 @@ func Load() (*Config, error) {
 		// `STALWART_URL=http://stalwart:8080` (the service name,
 		// not the published host port).
 		StalwartURL:     getenv("STALWART_URL", "http://localhost:8080"),
-		ValkeyURL:       getenv("VALKEY_URL", "valkey:6379"),
+		// `redis://localhost:6379` (full DSN with scheme) so a
+		// host-run BFF reaches the compose-published valkey on
+		// `6379:6379`. Inside compose, override with
+		// `VALKEY_URL=redis://valkey:6379` (the service name) —
+		// which docker-compose.yml already does. Both forms route
+		// through `middleware.ParseValkeyURL` so a bare
+		// `host:port` continues to work for callers that still
+		// hand-craft one.
+		ValkeyURL:       getenv("VALKEY_URL", "redis://localhost:6379"),
 		KChatOIDCIssuer:   getenv("KCHAT_OIDC_ISSUER", ""),
 		KChatOIDCAudience: getenv("KCHAT_OIDC_AUDIENCE", ""),
 		DevBypassToken:    getenv("KMAIL_DEV_BYPASS_TOKEN", ""),

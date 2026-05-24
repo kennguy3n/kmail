@@ -261,9 +261,21 @@ func main() {
 	// Valkey is consumed by deliverability, push, calendar reminders,
 	// and the SLO tracker. Stand it up early so every downstream
 	// service can share the same client.
+	//
+	// Route through `middleware.ParseValkeyURL` so both bare
+	// `host:port` (the legacy in-source default) AND full DSN
+	// (`redis://valkey:6379` — the compose override format) are
+	// accepted. Without this, `redis.NewClient(&redis.Options{Addr:
+	// "redis://valkey:6379"})` stores the literal URL as the dial
+	// target and fails at first use, since `redis.Options.Addr`
+	// requires a bare `host:port`.
 	var valkeyClient *redis.Client
 	if cfg.ValkeyURL != "" {
-		valkeyClient = redis.NewClient(&redis.Options{Addr: cfg.ValkeyURL})
+		opts, err := middleware.ParseValkeyURL(cfg.ValkeyURL)
+		if err != nil {
+			logger.Fatalf("middleware.ParseValkeyURL: %v", err)
+		}
+		valkeyClient = redis.NewClient(opts)
 	}
 
 	chatbridgeSvc := chatbridge.NewService(chatbridge.Config{

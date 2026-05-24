@@ -108,9 +108,20 @@ make chaos
 
 ## Wiring into CI
 
-The chaos suite is intentionally **not** wired to CI today — the
-failure modes need a real compose stack and the run takes 5+
-minutes. For Phase 7 the harness is run on demand by the SRE team
-on the staging cluster. A future phase can promote it to a
-nightly job once the chaos toolkit is integrated with the CI
-runner pool.
+The chaos suite runs as a nightly cron in
+[`.github/workflows/chaos.yml`](../.github/workflows/chaos.yml)
+(item #11 in `docs/PHASES.md`). The workflow spins up the
+compose stack, exercises each fault injector (Stalwart restart,
+Postgres pause/unpause, Valkey kill, Stalwart kill/restart, and
+the deliverability-quarantine + push-fanout chaos jobs), and
+fails if a recovery SLO is breached. On-demand runs are still
+supported via the `workflow_dispatch` trigger so the SRE team
+can replay a specific scenario without waiting for the cron
+slot.
+
+The suite is deliberately **not** wired to the PR-blocking
+`ci.yml` because individual chaos scenarios take 5+ minutes and
+need a full compose stack that pull-request runners cannot
+reliably provision under contention. Phase 7 keeps PR latency
+short by keeping chaos on the nightly track; daytime regressions
+surface through the SLO/runbook dashboards.

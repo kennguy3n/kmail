@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -165,20 +166,30 @@ type RedisStore struct {
 // already own a *redis.Client should assign it to the struct field
 // directly.
 func NewRedisStore(url string) (*RedisStore, error) {
-	opts, err := parseValkeyURL(url)
+	opts, err := ParseValkeyURL(url)
 	if err != nil {
 		return nil, err
 	}
 	return &RedisStore{Client: redis.NewClient(opts)}, nil
 }
 
-func parseValkeyURL(url string) (*redis.Options, error) {
+// ParseValkeyURL accepts either a full Redis/Valkey DSN
+// (`redis://...` or `rediss://...`) OR a bare `host:port` and
+// returns a `*redis.Options` suitable for `redis.NewClient`. We
+// expose this so every consumer of `config.ValkeyURL` (the
+// rate limiter, the reminder worker, the SLO tracker, the
+// confidential-send handler) routes through the same parser —
+// `redis.NewClient(&redis.Options{Addr: cfg.ValkeyURL})` would
+// otherwise silently store the literal `redis://valkey:6379` as
+// the dial address and fail at first request, because
+// `redis.Options.Addr` requires the bare host:port form. Using
+// this helper means a configured `VALKEY_URL=redis://...` (the
+// compose default) works for every consumer.
+func ParseValkeyURL(url string) (*redis.Options, error) {
 	if url == "" {
 		return nil, errors.New("valkey url is empty")
 	}
-	// Accept both full-DSN (redis://host:port) and bare host:port
-	// for convenience — the compose stack exposes the latter.
-	if len(url) > 8 && url[:8] == "redis://" || len(url) > 9 && url[:9] == "rediss://" {
+	if strings.HasPrefix(url, "redis://") || strings.HasPrefix(url, "rediss://") {
 		return redis.ParseURL(url)
 	}
 	return &redis.Options{Addr: url}, nil
