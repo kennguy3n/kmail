@@ -194,11 +194,45 @@ func randomCSRFNonce() (string, error) {
 // prefix — without this, the approve POST hardcoded to
 // `/oauth/authorize/approve` would 404 when the BFF mounted
 // these routes under e.g. `/api/v1/oauth`.
-func (h *Handlers) RegisterRoutes(mux *http.ServeMux, prefix string) {
+//
+// `browserAuthMW`, when non-nil, is applied to the two
+// browser-facing endpoints (`/authorize` and `/authorize/approve`)
+// but NOT to the two machine-facing endpoints (`/token` and
+// `/revoke`). The split is mandatory:
+//
+//   - `/authorize` + `/approve` are consent-flow endpoints driven
+//     by a *user* in a browser. Authorize.UserResolver pulls the
+//     (tenant_id, kchat_user_id) tuple out of `r.Context()` — which
+//     only gets populated by the OIDC middleware. Without that
+//     middleware the resolver returns ("", "", false) and both
+//     handlers short-circuit to HTTP 401 ("authentication required").
+//     The end result is a dead-on-arrival consent flow: every
+//     browser request 401s, no access token is ever issued, no
+//     integration can be wired. This was the critical Devin-Review
+//     finding on PR #36 round-1.
+//   - `/token` + `/revoke` are RFC 6749 §4.1.3 / RFC 7009
+//     client-credentialed machine endpoints. They MUST NOT be
+//     wrapped with OIDC because the caller is an OAuth2 *client*
+//     (Zapier, n8n, …) authenticating with `client_id + client_secret`
+//     or Basic auth — there is no end-user JWT to validate. Wrapping
+//     them with OIDC would 401 every token exchange and break every
+//     integration on the wire.
+//
+// Callers that don't need a middleware (pure-unit-test paths) can
+// pass `nil` for `browserAuthMW`; in that case the four endpoints
+// are registered without wrapping and the in-handler 401 acts as
+// the safety net.
+func (h *Handlers) RegisterRoutes(mux *http.ServeMux, prefix string, browserAuthMW func(http.Handler) http.Handler) {
 	prefix = strings.TrimRight(prefix, "/")
 	h.routePrefix = prefix
-	mux.HandleFunc(prefix+"/authorize", h.Authorize)
-	mux.HandleFunc(prefix+"/authorize/approve", h.Approve)
+	authorize := http.Handler(http.HandlerFunc(h.Authorize))
+	approve := http.Handler(http.HandlerFunc(h.Approve))
+	if browserAuthMW != nil {
+		authorize = browserAuthMW(authorize)
+		approve = browserAuthMW(approve)
+	}
+	mux.Handle(prefix+"/authorize", authorize)
+	mux.Handle(prefix+"/authorize/approve", approve)
 	mux.HandleFunc(prefix+"/token", h.Token)
 	mux.HandleFunc(prefix+"/revoke", h.Revoke)
 }

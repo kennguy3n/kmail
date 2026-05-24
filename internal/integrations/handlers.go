@@ -148,6 +148,11 @@ func (h *Handlers) register(w http.ResponseWriter, r *http.Request) {
 		r.Context(),
 		tokenCtx.TenantID,
 		tokenCtx.ClientID,
+		// The consenting user, threaded from the OAuth2 access
+		// token, is the link the dispatcher needs to source
+		// per-user granted scopes (instead of static client
+		// allowed_scopes) when this user later revokes consent.
+		tokenCtx.UserID,
 		tokenCtx.Scopes,
 		req.URL,
 		req.Events,

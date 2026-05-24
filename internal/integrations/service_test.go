@@ -205,18 +205,21 @@ func TestRegisterWebhookForClient_InputValidation(t *testing.T) {
 		name      string
 		tenant    string
 		client    string
+		user      string
 		url       string
 		wantError string
 	}{
-		{"empty tenant", "", "client-1", "https://example.com", "tenantID required"},
-		{"whitespace tenant", "   ", "client-1", "https://example.com", "tenantID required"},
-		{"empty client", "tenant-1", "", "https://example.com", "oauthClientID required"},
-		{"empty url", "tenant-1", "client-1", "", "url required"},
-		{"whitespace url", "tenant-1", "client-1", "   ", "url required"},
+		{"empty tenant", "", "client-1", "user-1", "https://example.com", "tenantID required"},
+		{"whitespace tenant", "   ", "client-1", "user-1", "https://example.com", "tenantID required"},
+		{"empty client", "tenant-1", "", "user-1", "https://example.com", "oauthClientID required"},
+		{"empty user", "tenant-1", "client-1", "", "https://example.com", "userID required"},
+		{"whitespace user", "tenant-1", "client-1", "   ", "https://example.com", "userID required"},
+		{"empty url", "tenant-1", "client-1", "user-1", "", "url required"},
+		{"whitespace url", "tenant-1", "client-1", "user-1", "   ", "url required"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := svc.RegisterWebhookForClient(context.Background(), tc.tenant, tc.client, []string{"read:mail"}, tc.url, []string{"email.received"}, "v2")
+			_, err := svc.RegisterWebhookForClient(context.Background(), tc.tenant, tc.client, tc.user, []string{"read:mail"}, tc.url, []string{"email.received"}, "v2")
 			if err == nil {
 				t.Fatalf("expected error containing %q, got nil", tc.wantError)
 			}
@@ -237,6 +240,7 @@ func TestRegisterWebhookForClient_AllEventsDenied(t *testing.T) {
 		context.Background(),
 		"tenant-1",
 		"client-1",
+		"user-1",
 		[]string{"read:contacts"}, // only contacts scope
 		"https://example.com",
 		[]string{"email.received", "calendar.event_created"}, // none match

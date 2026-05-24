@@ -186,6 +186,22 @@ func (s *Service) RegisterClient(
 // both unknown and deactivated rows so callers cannot distinguish
 // the two cases (deactivation should look identical to deletion
 // to anyone outside the admin surface).
+//
+// Defence in depth: although SetTenantGUC already restricts the
+// row set via Postgres RLS (`migrations/046_oauth_clients.sql`
+// `rls_oauth_clients USING (tenant_id = current_setting(
+// 'app.tenant_id', true)::uuid)`), the WHERE clause ALSO carries
+// an explicit `tenant_id = $1::uuid` predicate. Two reasons:
+//
+//  1. If a future migration ever drops the RLS policy or toggles
+//     `FORCE ROW LEVEL SECURITY` off, the explicit predicate
+//     still pins the read to the caller's tenant. RLS is the
+//     primary guard; the WHERE clause is the seatbelt.
+//  2. The query planner reads the explicit predicate before
+//     applying the RLS rewrite, so when `tenant_id` is part of
+//     the WHERE the planner can prune partitions / pick the
+//     `(tenant_id, client_id)` index directly. The RLS-only
+//     formulation works but is slightly more opaque to EXPLAIN.
 func (s *Service) GetClient(ctx context.Context, tenantID, clientID string) (*Client, error) {
 	if tenantID == "" || clientID == "" {
 		return nil, ErrClientNotFound
@@ -201,8 +217,8 @@ func (s *Service) GetClient(ctx context.Context, tenantID, clientID string) (*Cl
 			       COALESCE(homepage_url, ''), COALESCE(logo_url, ''),
 			       redirect_uris, allowed_scopes, active, created_at, updated_at
 			FROM oauth_clients
-			WHERE client_id = $1 AND active = true
-		`, clientID).Scan(
+			WHERE tenant_id = $1::uuid AND client_id = $2 AND active = true
+		`, tenantID, clientID).Scan(
 			&c.ID, &c.TenantID, &c.ClientID, &c.ClientType, &c.Name,
 			&c.HomepageURL, &c.LogoURL, &redirectRaw, &scopesRaw,
 			&c.Active, &c.CreatedAt, &c.UpdatedAt,

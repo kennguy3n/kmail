@@ -89,18 +89,36 @@ func main() {
 		logger.Fatalf("middleware.NewOIDC: %v", err)
 	}
 
+	// Shared Valkey-backed rate-limit store. ONE underlying
+	// `*RedisStore` is built here and reused by every package
+	// that needs a rate-limit counter:
+	//   * `middleware.RateLimiter` (auth/JMAP request limiter)
+	//   * `integrations.Service` (per-OAuth2-client outbound
+	//     dispatch quota, plumbed below)
+	//
+	// Reusing one store is mandatory in production — each
+	// `middleware.NewRedisStore` call opens its own
+	// `go-redis.Client` with its own pool, so building a second
+	// one here would double the open file descriptors / Valkey
+	// connection budget without any functional benefit. The
+	// store is built unconditionally (even when
+	// `cfg.RateLimit.Enabled = false` for the auth limiter)
+	// because the integrations dispatcher quota is governed by
+	// its own per-client `dispatch_quota_per_hour` setting and
+	// is enabled independently of `cfg.RateLimit`.
+	limiterStore, err := middleware.NewRedisStore(cfg.ValkeyURL)
+	if err != nil {
+		logger.Fatalf("middleware.NewRedisStore: %v", err)
+	}
+
 	// Valkey-backed rate limiter. Enabled via config; when
 	// disabled the limiter is a no-op and the middleware passes
 	// the request through untouched. Plumbed in between the OIDC
 	// gate (needs identity) and the JMAP + tenant handlers.
 	var rateLimiter *middleware.RateLimiter
 	if cfg.RateLimit.Enabled {
-		store, err := middleware.NewRedisStore(cfg.ValkeyURL)
-		if err != nil {
-			logger.Fatalf("middleware.NewRedisStore: %v", err)
-		}
 		rateLimiter = middleware.NewRateLimiter(middleware.RateLimiterConfig{
-			Client:    store,
+			Client:    limiterStore,
 			TenantRPM: cfg.RateLimit.TenantRPM,
 			UserRPM:   cfg.RateLimit.UserRPM,
 			Window:    cfg.RateLimit.Window,
@@ -827,7 +845,17 @@ func main() {
 	// HTTP so the Secure flag would suppress the cookie on the
 	// redirect.
 	oauthHandlers.SetSecureCookies(strings.ToLower(strings.TrimSpace(os.Getenv("KMAIL_ENV"))) != "development")
-	oauthHandlers.RegisterRoutes(mux, "/api/v1/oauth")
+	// `RegisterRoutes` selectively wraps the two browser-facing
+	// endpoints (`/authorize`, `/authorize/approve`) with the OIDC
+	// middleware so the kchat-user context is populated before the
+	// consent handlers read it via UserResolver. The two
+	// machine-facing endpoints (`/token`, `/revoke`) are LEFT
+	// UNWRAPPED because their callers authenticate as OAuth2
+	// clients (client_id + client_secret), not as end users —
+	// applying OIDC there would 401 every token exchange. See the
+	// RegisterRoutes doc comment in internal/oauth/handlers.go for
+	// the full split rationale.
+	oauthHandlers.RegisterRoutes(mux, "/api/v1/oauth", authMW.Wrap)
 
 	// Phase E #15-17 — Integration framework. Wraps webhookSvc
 	// with OAuth2-client scope filtering and per-client rate-
@@ -835,15 +863,17 @@ func main() {
 	// the oauth package (verifies Bearer token against
 	// oauth_access_tokens, attaches AccessTokenContext).
 	oauthAuthMW := oauth.NewAuthMiddleware(oauthSvc)
-	integLimiterStore, err := middleware.NewRedisStore(cfg.ValkeyURL)
-	if err != nil {
-		log.Fatalf("integrations: build rate limiter store from KMAIL_VALKEY_URL: %v", err)
-	}
+	// `limiterStore` is the SAME *RedisStore built once at the
+	// top of main() for the auth rate limiter. Threading it
+	// here (instead of calling NewRedisStore again) keeps the
+	// process's Valkey connection budget bounded to a single
+	// go-redis pool — see the limiterStore declaration for the
+	// full rationale.
 	integSvc, err := integrations.NewService(integrations.ServiceConfig{
 		Pool:         pool,
 		Webhooks:     webhookSvc,
 		OAuth:        oauthSvc,
-		LimiterStore: integLimiterStore,
+		LimiterStore: limiterStore,
 		Logger:       logger,
 	})
 	if err != nil {

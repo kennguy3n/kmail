@@ -142,7 +142,8 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 // RegisterWebhookForClient is the subscribe-time entry point.
 // It:
 //
-//  1. Validates the input (non-empty URL, tenant + client IDs).
+//  1. Validates the input (non-empty URL, tenant + client + user
+//     IDs).
 //  2. Filters the requested event list through
 //     FilterEventsForClient. If every event was denied, returns
 //     ErrInsufficientScope so the handler can answer 422 with
@@ -150,20 +151,31 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 //     ask the user for).
 //  3. Delegates to webhooks.Service.RegisterWebhook to create
 //     the row and mint the plaintext secret.
-//  4. UPDATES the freshly-created row to stamp
-//     `oauth_client_id` so subsequent list/delete/dispatch
-//     queries scope to this client. The update is done with an
-//     INSERT-then-UPDATE pattern (rather than threading a new
-//     parameter through webhooks.Service) so the underlying
-//     package stays unaware of OAuth2 — a deliberate decoupling
-//     choice documented in doc.go.
+//  4. INSERTS the row via webhooks.Service.RegisterWebhook with
+//     the optional Owner argument carrying both
+//     `oauth_client_id` AND `user_id`, so the owner columns
+//     land in the SAME SQL statement as the rest of the row.
+//     There is no transient "row exists with oauth_client_id =
+//     NULL" window — that was the round-1 PR #36 finding the
+//     atomicity-on-INSERT fix here closes.
+//
+// `userID` is the consenting user from the OAuth2 access token
+// presented at subscribe time (oauth.AccessTokenContext.UserID).
+// Tracking it here is what lets the dispatcher source
+// granted-scopes per-user (instead of from the static client
+// `allowed_scopes`): when the user later revokes via
+// /oauth/revoke, every access token they held flips
+// `revoked_at`, the dispatcher's per-event join produces no
+// surviving scope set, and delivery stops — without the
+// integration having to call us to unsubscribe. This closes the
+// PR #36 round-1 architectural finding.
 //
 // Returns SubscribeResult with the final endpoint, the
 // plaintext secret (only available here once), and the list of
 // denied event types so the caller can surface them.
 func (s *Service) RegisterWebhookForClient(
 	ctx context.Context,
-	tenantID, oauthClientID string,
+	tenantID, oauthClientID, userID string,
 	grantedScopes []string,
 	url string,
 	requestedEvents []string,
@@ -174,6 +186,9 @@ func (s *Service) RegisterWebhookForClient(
 	}
 	if strings.TrimSpace(oauthClientID) == "" {
 		return nil, errors.New("integrations: oauthClientID required")
+	}
+	if strings.TrimSpace(userID) == "" {
+		return nil, errors.New("integrations: userID required (the consenting user)")
 	}
 	if strings.TrimSpace(url) == "" {
 		return nil, errors.New("integrations: url required")
@@ -187,43 +202,23 @@ func (s *Service) RegisterWebhookForClient(
 		return &SubscribeResult{Denied: denied}, ErrInsufficientScope
 	}
 
-	ep, secret, err := s.cfg.Webhooks.RegisterWebhook(ctx, tenantID, url, allowed, signingVersion)
+	// Single INSERT with the owner columns stamped in the same
+	// SQL statement — webhooks.Service.RegisterWebhook's
+	// optional Owner argument carries (oauth_client_id, user_id)
+	// into the row's INSERT, so there is NO transient window
+	// where the row exists with oauth_client_id IS NULL. The
+	// previous two-phase INSERT + UPDATE was the round-1 PR #36
+	// finding: a concurrent dispatch firing between the two
+	// transactions would observe a row that looked admin-owned,
+	// skip the per-client scope check, and deliver events the
+	// integration hadn't been scoped for. The single INSERT
+	// makes the (insert-then-visible) state atomic.
+	ep, secret, err := s.cfg.Webhooks.RegisterWebhook(
+		ctx, tenantID, url, allowed, signingVersion,
+		webhooks.Owner{OAuthClientID: oauthClientID, UserID: userID},
+	)
 	if err != nil {
 		return nil, fmt.Errorf("integrations: register webhook: %w", err)
-	}
-
-	// Stamp the oauth_client_id on the freshly-created row.
-	// Done in a separate transaction (rather than inside the
-	// webhooks.Service insert) so the loose coupling holds.
-	// The row is guaranteed to exist at this point — the INSERT
-	// above ran inside its own transaction and committed.
-	err = pgx.BeginFunc(ctx, s.cfg.Pool, func(tx pgx.Tx) error {
-		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
-			return err
-		}
-		cmdTag, err := tx.Exec(ctx, `
-			UPDATE webhook_endpoints
-			SET oauth_client_id = $3::uuid, updated_at = now()
-			WHERE id = $1::uuid AND tenant_id = $2::uuid
-		`, ep.ID, tenantID, oauthClientID)
-		if err != nil {
-			return err
-		}
-		if cmdTag.RowsAffected() == 0 {
-			return fmt.Errorf("integrations: stamp oauth_client_id: 0 rows affected (id=%s tenant=%s)", ep.ID, tenantID)
-		}
-		return nil
-	})
-	if err != nil {
-		// Best-effort rollback: delete the orphan row so the
-		// subsequent retry doesn't see a half-created webhook.
-		// Errors here are logged but don't override the original
-		// failure — the operator's primary signal is the
-		// stamp-failed error.
-		if delErr := s.cfg.Webhooks.DeleteWebhook(ctx, tenantID, ep.ID); delErr != nil {
-			s.cfg.Logger.Printf("integrations: failed to clean up orphan webhook %s after stamp failure: %v", ep.ID, delErr)
-		}
-		return nil, fmt.Errorf("integrations: stamp oauth_client_id: %w", err)
 	}
 
 	return &SubscribeResult{Endpoint: ep, Secret: secret, Denied: denied}, nil
@@ -401,6 +396,17 @@ func (s *Service) dispatchAdminOwned(ctx context.Context, tenantID, eventType st
 			}
 			ids = append(ids, id)
 		}
+		// pgx surfaces driver-level iteration errors (network
+		// reset, partial result) on rows.Err() AFTER Close().
+		// Without this check a transport-level failure mid-scan
+		// silently truncates the subscriber list and the
+		// dispatcher under-delivers — a silent at-least-once
+		// violation. Treat the iteration error as fatal: the
+		// caller retries the whole dispatch.
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return fmt.Errorf("integrations: scan admin-owned subscribers: %w", err)
+		}
 		rows.Close()
 		for _, id := range ids {
 			if _, err := tx.Exec(ctx, `
@@ -421,8 +427,9 @@ func (s *Service) dispatchAdminOwned(ctx context.Context, tenantID, eventType st
 type integrationSubscriber struct {
 	EndpointID    string
 	OAuthClientID string
+	UserID        string   // consenting user; used to look up per-user grants
 	QuotaPerHour  *int     // nil means use service default
-	GrantedScopes []string // resolved from oauth_clients table
+	GrantedScopes []string // UNION of scopes across the user's live, non-revoked access tokens for this client
 }
 
 // dispatchIntegrationOwned enumerates integration-owned
@@ -466,20 +473,37 @@ func (s *Service) dispatchIntegrationOwned(ctx context.Context, tenantID, eventT
 // loadIntegrationSubscribers reads all integration-owned
 // webhook_endpoints rows subscribed to the given event_type for
 // the given tenant, joined to oauth_clients for the per-client
-// quota override and the granted-scopes snapshot.
+// quota override AND to oauth_access_tokens for the consenting
+// user's CURRENT granted-scopes set.
 //
-// `granted_scopes` is read from the oauth_clients row's
-// allowed_scopes column (set at client creation / consent
-// time). NOTE: this is a deliberate simplification — the strict
-// reading of the OAuth2 spec is that scope enforcement at
-// DISPATCH time should consult the user's current grant set,
-// not the client's allowed-scopes-set; the two diverge if the
-// user re-consented after the client was created and chose to
-// grant fewer scopes than the client requested. The current
-// schema does not have a per-user-grant row, so we use the
-// client's allowed-scopes as a defensive upper bound. The
-// follow-up PR that introduces per-user grants will swap the
-// source here without changing the dispatcher contract.
+// Per-user grants (the PR #36 round-1 architectural fix):
+// granted_scopes is the UNION of `scopes` over all non-revoked,
+// non-expired access tokens for (tenant, oauth_client_id,
+// user_id). This is the canonical view of "what scopes does the
+// user currently grant this integration": when the user revokes
+// via /oauth/revoke or the consent UI, all relevant rows flip
+// `revoked_at IS NOT NULL`, the LATERAL join below shrinks the
+// result accordingly, and the dispatcher's EventAllowedForClient
+// check filters the now-unauthorised events out. The static
+// `oauth_clients.allowed_scopes` column is NOT consulted here —
+// it represents what the client *may request*, not what the
+// user actually *granted*, and using it (as round-1 did) leaks
+// events after consent revocation.
+//
+// Rows whose user_id has been deleted (user offboarded) yield
+// no token row in the join and are therefore skipped — exactly
+// the desired behaviour, because there is no live user to
+// re-consent.
+//
+// Legacy / round-1 rows that were registered before migration
+// 048 carry user_id = NULL; the LEFT JOIN preserves them but
+// the COALESCE leaves granted_scopes as an empty array, so
+// EventAllowedForClient returns false for every event and they
+// stop delivering until the integration re-subscribes. This is
+// the intentional fail-closed migration semantics — the
+// alternative (falling back to `oauth_clients.allowed_scopes`
+// when user_id IS NULL) re-introduces the privacy gap this
+// schema change was meant to close.
 func (s *Service) loadIntegrationSubscribers(ctx context.Context, tenantID, eventType string) ([]integrationSubscriber, error) {
 	var subs []integrationSubscriber
 	err := pgx.BeginFunc(ctx, s.cfg.Pool, func(tx pgx.Tx) error {
@@ -487,8 +511,24 @@ func (s *Service) loadIntegrationSubscribers(ctx context.Context, tenantID, even
 			return err
 		}
 		rows, err := tx.Query(ctx, `
-			SELECT we.id::text, we.oauth_client_id::text,
-			       oc.dispatch_quota_per_hour, oc.allowed_scopes
+			SELECT
+			    we.id::text,
+			    we.oauth_client_id::text,
+			    COALESCE(we.user_id::text, ''),
+			    oc.dispatch_quota_per_hour,
+			    COALESCE(
+			        (
+			            SELECT to_jsonb(array_agg(DISTINCT s))
+			            FROM oauth_access_tokens t,
+			                 LATERAL jsonb_array_elements_text(t.scopes) AS s
+			            WHERE t.tenant_id = we.tenant_id
+			              AND t.client_id = we.oauth_client_id
+			              AND t.user_id   = we.user_id
+			              AND t.revoked_at IS NULL
+			              AND t.expires_at > now()
+			        ),
+			        '[]'::jsonb
+			    ) AS granted_scopes
 			FROM webhook_endpoints we
 			JOIN oauth_clients oc ON oc.id = we.oauth_client_id
 			WHERE we.tenant_id = $1::uuid
@@ -504,16 +544,16 @@ func (s *Service) loadIntegrationSubscribers(ctx context.Context, tenantID, even
 			var sub integrationSubscriber
 			var quota *int
 			var rawScopes []byte
-			if err := rows.Scan(&sub.EndpointID, &sub.OAuthClientID, &quota, &rawScopes); err != nil {
+			if err := rows.Scan(&sub.EndpointID, &sub.OAuthClientID, &sub.UserID, &quota, &rawScopes); err != nil {
 				return err
 			}
 			sub.QuotaPerHour = quota
 			if len(rawScopes) > 0 {
 				if err := json.Unmarshal(rawScopes, &sub.GrantedScopes); err != nil {
-					// Malformed scope JSON in oauth_clients
-					// is treated as "no scopes" (deny by
-					// default) rather than skipped — caller
-					// will hit the scope check and skip.
+					// Malformed JSON from a programmatic
+					// error — fail closed (no live grant)
+					// rather than reading the static
+					// client allowed_scopes.
 					sub.GrantedScopes = nil
 				}
 			}

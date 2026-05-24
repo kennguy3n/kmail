@@ -106,11 +106,40 @@ func (s *Service) AddListener(l EventListener) {
 	s.listeners = append(s.listeners, l)
 }
 
+// Owner is the optional (OAuth2-client, user) pair that
+// integration-framework subscribers carry on
+// `webhook_endpoints.oauth_client_id` / `.user_id`. Both fields
+// are written in the SAME INSERT as the rest of the row when
+// non-empty, so a subscribe never observes a half-stamped
+// (oauth_client_id IS NULL during the transient window) row.
+// Admin-owned / legacy callers pass the zero-value Owner and the
+// columns stay NULL.
+type Owner struct {
+	OAuthClientID string
+	UserID        string
+}
+
 // RegisterWebhook inserts a new endpoint, returning the plaintext
-// secret (only available once).
-func (s *Service) RegisterWebhook(ctx context.Context, tenantID, urlStr string, events []string, signingVersion string) (*Endpoint, string, error) {
+// secret (only available once). The variadic `owner` argument
+// preserves backward compatibility for callers that don't care
+// about ownership (`RegisterWebhook(ctx, tenantID, url, events,
+// signingVersion)` still compiles), while integration-framework
+// callers may pass a single non-zero Owner to atomically stamp
+// the row with its OAuth2-client + user ownership.
+//
+// Why the variadic / optional Owner rather than two methods:
+// callers consistently route through `RegisterWebhook` for the
+// secret-minting + INSERT logic; carving out a second method
+// would duplicate that code and let the two paths drift on
+// e.g. signing-version validation. The variadic keeps the
+// single-source-of-truth INSERT and lets the test suite cover
+// both modes through one method.
+func (s *Service) RegisterWebhook(ctx context.Context, tenantID, urlStr string, events []string, signingVersion string, owner ...Owner) (*Endpoint, string, error) {
 	if tenantID == "" || urlStr == "" {
 		return nil, "", errors.New("webhooks: tenant + url required")
+	}
+	if len(owner) > 1 {
+		return nil, "", errors.New("webhooks: at most one Owner is allowed")
 	}
 	if signingVersion == "" {
 		signingVersion = SigningV1
@@ -128,16 +157,38 @@ func (s *Service) RegisterWebhook(ctx context.Context, tenantID, urlStr string, 
 	}
 	eventsJSON, _ := json.Marshal(events)
 	var ep Endpoint
+	// `oauthClientArg` and `userArg` carry the optional owner
+	// columns; nil pgtype values render as SQL NULL so the
+	// admin-owned path keeps emitting the same INSERT shape it
+	// did before the integrations framework existed.
+	var oauthClientArg, userArg any
+	if len(owner) == 1 {
+		o := owner[0]
+		if s := o.OAuthClientID; s != "" {
+			oauthClientArg = s
+		}
+		if s := o.UserID; s != "" {
+			userArg = s
+		}
+	}
 	err = pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
 			return err
 		}
 		var rawEvents []byte
 		err := tx.QueryRow(ctx, `
-			INSERT INTO webhook_endpoints (tenant_id, url, events, secret_hash, signing_version)
-			VALUES ($1::uuid, $2, $3::jsonb, $4, $5)
+			INSERT INTO webhook_endpoints (
+			    tenant_id, url, events, secret_hash, signing_version,
+			    oauth_client_id, user_id
+			)
+			VALUES (
+			    $1::uuid, $2, $3::jsonb, $4, $5,
+			    NULLIF($6, '')::uuid, NULLIF($7, '')::uuid
+			)
 			RETURNING id::text, tenant_id::text, url, events, active, signing_version, created_at, updated_at
-		`, tenantID, urlStr, string(eventsJSON), hash, signingVersion).Scan(
+		`, tenantID, urlStr, string(eventsJSON), hash, signingVersion,
+			coerceStr(oauthClientArg), coerceStr(userArg),
+		).Scan(
 			&ep.ID, &ep.TenantID, &ep.URL, &rawEvents, &ep.Active, &ep.SigningVersion, &ep.CreatedAt, &ep.UpdatedAt,
 		)
 		if err != nil {
@@ -150,6 +201,21 @@ func (s *Service) RegisterWebhook(ctx context.Context, tenantID, urlStr string, 
 		return nil, "", err
 	}
 	return &ep, secret, nil
+}
+
+// coerceStr returns the underlying string for `any` values that
+// the optional-Owner path uses to pass to pgx. `nil` becomes the
+// empty string, which the INSERT's NULLIF($6, '')::uuid wraps
+// renders as SQL NULL — so the admin-owned (zero-value Owner)
+// path stays semantically identical to the pre-Owner schema.
+func coerceStr(v any) string {
+	if v == nil {
+		return ""
+	}
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return ""
 }
 
 // UpdateSigningVersion flips the signing version on an endpoint.
