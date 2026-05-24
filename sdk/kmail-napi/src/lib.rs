@@ -24,7 +24,7 @@ use std::time::Duration;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
-use kmail_core::{ClientConfig, EmailDraft, KMailClient};
+use kmail_core::{AeadEnvelope, ClientConfig, ConfidentialEnvelope, EmailDraft, KMailClient};
 
 // ---------------------------------------------------------------
 // Error mapping
@@ -123,6 +123,119 @@ pub struct JsSyncSummary {
     pub pending_actions_failed: BigInt,
     pub pending_actions_deferred: BigInt,
 }
+
+/// AEAD envelope at the napi boundary.
+///
+/// JS-side fields use `Buffer` for byte arrays. `nonce` is a
+/// variable-length `Vec<u8>` because napi-rs cannot represent
+/// fixed-size byte arrays directly; the `try_into` impl below
+/// enforces the `NONCE_LEN == 12` invariant, surfacing a wrong-
+/// length nonce as a `[ARG]`-tagged error.
+#[napi(object)]
+pub struct JsAeadEnvelope {
+    pub nonce: Buffer,
+    pub ciphertext: Buffer,
+    pub aad: Buffer,
+}
+
+impl From<AeadEnvelope> for JsAeadEnvelope {
+    fn from(env: AeadEnvelope) -> Self {
+        Self {
+            nonce: env.nonce.to_vec().into(),
+            ciphertext: env.ciphertext.into(),
+            aad: env.aad.into(),
+        }
+    }
+}
+
+impl TryFrom<JsAeadEnvelope> for AeadEnvelope {
+    type Error = Error;
+    fn try_from(env: JsAeadEnvelope) -> Result<Self> {
+        let nonce_vec = env.nonce.to_vec();
+        if nonce_vec.len() != kmail_core::crypto::NONCE_LEN {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!(
+                    "[ARG] AEAD nonce must be {} bytes, got {}",
+                    kmail_core::crypto::NONCE_LEN,
+                    nonce_vec.len()
+                ),
+            ));
+        }
+        let mut nonce = [0u8; kmail_core::crypto::NONCE_LEN];
+        nonce.copy_from_slice(&nonce_vec);
+        Ok(AeadEnvelope {
+            nonce,
+            ciphertext: env.ciphertext.to_vec(),
+            aad: env.aad.to_vec(),
+        })
+    }
+}
+
+/// Confidential Send envelope at the napi boundary.
+#[napi(object)]
+pub struct JsConfidentialEnvelope {
+    pub kek_salt: Buffer,
+    pub wrapped_dek: JsAeadEnvelope,
+    pub payload: JsAeadEnvelope,
+}
+
+impl From<ConfidentialEnvelope> for JsConfidentialEnvelope {
+    fn from(env: ConfidentialEnvelope) -> Self {
+        Self {
+            kek_salt: env.kek_salt.to_vec().into(),
+            wrapped_dek: env.wrapped_dek.into(),
+            payload: env.payload.into(),
+        }
+    }
+}
+
+impl TryFrom<JsConfidentialEnvelope> for ConfidentialEnvelope {
+    type Error = Error;
+    fn try_from(env: JsConfidentialEnvelope) -> Result<Self> {
+        let salt_vec = env.kek_salt.to_vec();
+        if salt_vec.len() != kmail_core::crypto::KEK_SALT_LEN {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!(
+                    "[ARG] Confidential KEK salt must be {} bytes, got {}",
+                    kmail_core::crypto::KEK_SALT_LEN,
+                    salt_vec.len()
+                ),
+            ));
+        }
+        let mut kek_salt = [0u8; kmail_core::crypto::KEK_SALT_LEN];
+        kek_salt.copy_from_slice(&salt_vec);
+        Ok(ConfidentialEnvelope {
+            kek_salt,
+            wrapped_dek: env.wrapped_dek.try_into()?,
+            payload: env.payload.try_into()?,
+        })
+    }
+}
+
+// ---------------------------------------------------------------
+// MLS provider plumbing — napi surface
+// ---------------------------------------------------------------
+//
+// The Electron renderer manages its own provider in JS-land:
+// the renderer looks up the relevant MLS-derived secret via the
+// KChat MLS SDK and threads it through the raw-key surface
+// (`seal_vault_envelope` / `decrypt_vault_envelope` /
+// `seal_confidential_envelope` / `open_confidential_envelope`).
+// This keeps the napi binding free of the sync-to-async bridge
+// (`ThreadsafeFunction` + `block_in_place`) that would otherwise
+// be required to surface the sync `MlsKeyProvider` trait through
+// an async JS callback.
+//
+// The iOS / Android shells get the richer `set_mls_provider` /
+// `*_message` convenience surface via the UniFFI binding
+// (`kmail-ffi`) because UniFFI's `#[uniffi::export(with_foreign)]`
+// handles foreign-implemented sync traits natively. The full
+// provider bridge can be added to napi in a follow-up once we
+// make the SDK-internal `MlsKeyProvider` trait async (which is
+// a wider change touching the FFI binding and every consumer
+// inside `KMailClient`).
 
 // ---------------------------------------------------------------
 // Conversions
@@ -335,6 +448,75 @@ impl KMailClientJs {
             .register_push_token(kmail_core::push::PushTransport::Fcm, &token, None)
             .await
             .map_err(napi_err)
+    }
+
+    // ---------------------------------------------------------
+    // Crypto surface (Confidential Send + Zero-Access Vault)
+    // ---------------------------------------------------------
+
+    /// Seal `plaintext` into a Zero-Access Vault envelope under a
+    /// caller-supplied 32-byte per-folder master key.
+    #[napi]
+    pub fn seal_vault_envelope(
+        &self,
+        folder_master_key: Buffer,
+        plaintext: Buffer,
+        aad: Buffer,
+    ) -> Result<JsAeadEnvelope> {
+        let env = self
+            .inner
+            .seal_vault_envelope(&folder_master_key, &plaintext, &aad)
+            .map_err(napi_err)?;
+        Ok(env.into())
+    }
+
+    /// Decrypt a Zero-Access Vault envelope. Symmetric inverse
+    /// of [`seal_vault_envelope`].
+    #[napi]
+    pub fn decrypt_vault_envelope(
+        &self,
+        folder_master_key: Buffer,
+        envelope: JsAeadEnvelope,
+    ) -> Result<Buffer> {
+        let env: AeadEnvelope = envelope.try_into()?;
+        let pt = self
+            .inner
+            .decrypt_vault_envelope(&folder_master_key, &env)
+            .map_err(napi_err)?;
+        Ok(pt.into())
+    }
+
+    /// Seal `plaintext` into a Confidential Send envelope under
+    /// a caller-supplied 32-byte MLS leaf secret.
+    #[napi]
+    pub fn seal_confidential_envelope(
+        &self,
+        mls_leaf_secret: Buffer,
+        plaintext: Buffer,
+        payload_aad: Buffer,
+        wrap_aad: Buffer,
+    ) -> Result<JsConfidentialEnvelope> {
+        let env = self
+            .inner
+            .seal_confidential_envelope(&mls_leaf_secret, &plaintext, &payload_aad, &wrap_aad)
+            .map_err(napi_err)?;
+        Ok(env.into())
+    }
+
+    /// Open a Confidential Send envelope. Symmetric inverse of
+    /// [`seal_confidential_envelope`].
+    #[napi]
+    pub fn open_confidential_envelope(
+        &self,
+        mls_leaf_secret: Buffer,
+        envelope: JsConfidentialEnvelope,
+    ) -> Result<Buffer> {
+        let env: ConfidentialEnvelope = envelope.try_into()?;
+        let pt = self
+            .inner
+            .open_confidential_envelope(&mls_leaf_secret, &env)
+            .map_err(napi_err)?;
+        Ok(pt.into())
     }
 }
 
