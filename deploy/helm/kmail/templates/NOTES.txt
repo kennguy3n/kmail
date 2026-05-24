@@ -65,8 +65,14 @@ phantom URL. See values.yaml lines 125-137.
 -----------------------------------------------------------
 
 KMAIL_ENV is deliberately NOT set in the ConfigMap. The Go binary's
-default for KMAIL_ENV is `""` (empty), which the auth middleware
-maps to "production" semantics — the fail-closed default. If you
+default for KMAIL_ENV is the string "production" (see
+internal/config/config.go: `Env: getenv("KMAIL_ENV", "production")`),
+which the auth middleware treats as fail-closed production
+semantics — no JWKS fallback, no DevBypassToken, no IP-literal
+SNI carve-out. The empty string also resolves to non-dev (via
+isDevEnv() / isKnownEnv() returning false), so both "production"
+and "" land on the same behaviour by design, but the binary
+default is the literal "production" rather than empty. If you
 ever want this chart to run in development mode (NOT recommended
 for any reachable-from-public-internet install), explicitly set:
 
