@@ -146,6 +146,58 @@ func (o *OpenSearchBackend) MigrateIndex(ctx context.Context, tenantID string, m
 	return nil
 }
 
+// ExportMessages scrolls every document in the tenant index. Uses
+// OpenSearch's classic `_search?scroll=` API which is supported by
+// every OpenSearch / Elasticsearch version KMail targets. The scroll
+// keeps a server-side cursor open for `scroll` minutes so a large
+// export doesn't have to fit in one HTTP response.
+func (o *OpenSearchBackend) ExportMessages(ctx context.Context, tenantID string) ([]Message, error) {
+	const pageSize = 1000
+	scrollEndpoint := o.BaseURL + "/" + indexNameFor(tenantID) + "/_search?scroll=1m"
+	body := map[string]any{
+		"size":  pageSize,
+		"query": map[string]any{"match_all": map[string]any{}},
+	}
+	type hit struct {
+		Source Message `json:"_source"`
+	}
+	var resp struct {
+		ScrollID string `json:"_scroll_id"`
+		Hits     struct {
+			Hits []hit `json:"hits"`
+		} `json:"hits"`
+	}
+	if err := o.do(ctx, http.MethodPost, scrollEndpoint, body, &resp); err != nil {
+		if isNotFound(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var out []Message
+	for _, h := range resp.Hits.Hits {
+		out = append(out, h.Source)
+	}
+	// Keep scrolling until a page returns zero hits.
+	for len(resp.Hits.Hits) == pageSize {
+		nextBody := map[string]any{"scroll": "1m", "scroll_id": resp.ScrollID}
+		resp.Hits.Hits = nil
+		if err := o.do(ctx, http.MethodPost, o.BaseURL+"/_search/scroll", nextBody, &resp); err != nil {
+			// Best-effort cleanup, then surface the error.
+			_ = o.do(ctx, http.MethodDelete, o.BaseURL+"/_search/scroll", map[string]any{"scroll_id": resp.ScrollID}, nil)
+			return nil, err
+		}
+		for _, h := range resp.Hits.Hits {
+			out = append(out, h.Source)
+		}
+	}
+	// Always close the cursor so the cluster doesn't hold an open
+	// PIT for the full `scroll=1m` window after we're done.
+	if resp.ScrollID != "" {
+		_ = o.do(ctx, http.MethodDelete, o.BaseURL+"/_search/scroll", map[string]any{"scroll_id": resp.ScrollID}, nil)
+	}
+	return out, nil
+}
+
 // do is a thin wrapper around httpJSON that injects basic auth.
 func (o *OpenSearchBackend) do(ctx context.Context, method, endpoint string, body any, out any) error {
 	headers := http.Header{}

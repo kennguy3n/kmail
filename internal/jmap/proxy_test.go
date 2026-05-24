@@ -300,7 +300,7 @@ func TestShardFailoverTransport_LastShardBreaker(t *testing.T) {
 	}
 
 	srvURL, _ := url.Parse(srv.URL)
-	if !p.breakerOpen(srvURL.Host, 3) {
+	if !p.breaker.Open(context.Background(), srvURL.Host) {
 		t.Errorf("breaker for %s did not open after 3 consecutive 5xx", srvURL.Host)
 	}
 }

@@ -39,3 +39,61 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- printf "%s-secrets" (include "kmail.fullname" .) -}}
 {{- end -}}
 {{- end -}}
+
+{{/*
+kmail.multiregionIngressAnnotations renders provider-specific
+ExternalDNS annotations so a single chart install can publish both
+the regional hostname (mail-<region>.<domain>) AND participate in
+the global DNS-failover record (<globalHost>). The helper is a
+no-op when `multiregion.enabled=false`, no provider is selected,
+the region is empty, the base `domain` is empty, or `globalHost`
+is empty — all four are required to produce well-formed annotations.
+
+The regional hostname is constructed as `mail-<region>.<domain>`,
+so a `domain` of `kmail.example.com` and region `us-west-2`
+yields `mail-us-west-2.kmail.example.com`. `globalHost` is a
+SEPARATE FQDN that points at the global failover record (e.g.
+`mail.kmail.example.com`); ExternalDNS publishes both as a
+comma-separated list because each provider supports multi-host
+annotations natively. Using `globalHost` as the `domain` would
+produce `mail-us-west-2.mail.kmail.example.com`, which is wrong.
+
+Supported providers:
+  - aws        Route 53 weighted + active-passive failover.
+               Pairs with the `external-dns` chart's `--provider=aws`
+               and a Hosted Zone shared across regions.
+  - google     Cloud DNS weighted records.
+  - cloudflare Cloudflare DNS load balancer (weighted pools).
+
+All providers also receive a deterministic `set-identifier` so
+weighted/failover groupings stay stable across helm upgrades.
+*/}}
+{{- define "kmail.multiregionIngressAnnotations" -}}
+{{- $mr := .Values.multiregion -}}
+{{- if and $mr.enabled $mr.externalDNSProvider $mr.region $mr.domain $mr.globalHost -}}
+{{/*
+  dnsWeight handling: Go templates' `default` returns the fallback
+  for ANY zero value, including the integer 0. That collides with
+  `dnsWeight: 0` (the documented region-drain knob — see
+  `values.yaml`), so we resolve the value with an explicit
+  nil-check that preserves an explicit zero. The chart's default
+  weight (100) is applied only when dnsWeight is genuinely unset.
+*/}}
+{{- $weight := 100 -}}
+{{- if hasKey $mr "dnsWeight" -}}
+{{- $weight = $mr.dnsWeight -}}
+{{- end -}}
+external-dns.alpha.kubernetes.io/hostname: {{ printf "mail-%s.%s,%s" $mr.region $mr.domain $mr.globalHost | quote }}
+external-dns.alpha.kubernetes.io/set-identifier: {{ $mr.region | quote }}
+{{- if eq $mr.externalDNSProvider "aws" }}
+external-dns.alpha.kubernetes.io/aws-weight: {{ $weight | quote }}
+{{- with $mr.failoverRole }}
+external-dns.alpha.kubernetes.io/aws-failover-type: {{ . | quote }}
+{{- end }}
+{{- else if eq $mr.externalDNSProvider "google" }}
+external-dns.alpha.kubernetes.io/google-weight: {{ $weight | quote }}
+{{- else if eq $mr.externalDNSProvider "cloudflare" }}
+external-dns.alpha.kubernetes.io/cloudflare-load-balancer-weight: {{ $weight | quote }}
+{{- end }}
+{{- end -}}
+{{- end -}}
