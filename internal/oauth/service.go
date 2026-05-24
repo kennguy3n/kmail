@@ -937,7 +937,6 @@ func (s *Service) ValidateAccessToken(ctx context.Context, plaintextToken string
 		tokenID, tenantID, userID, clientID string
 		scopesRaw                           []byte
 		expiresAt                           time.Time
-		revokedAt                           *time.Time
 	)
 	// No tenant scoping on the lookup — we don't know the tenant
 	// yet. The token_hash is globally unique (UNIQUE constraint
@@ -951,23 +950,35 @@ func (s *Service) ValidateAccessToken(ctx context.Context, plaintextToken string
 	// already-issued bearer token presented after deactivation
 	// looks identical to a revoked token from the caller's
 	// perspective.
+	//
+	// Revocation and expiry are filtered in the WHERE clause
+	// rather than re-checked in application code after the SELECT:
+	// (a) avoids transferring rows the application would just
+	// discard (one round trip's worth of bytes on every
+	// authenticated request — this path is hot); (b) makes the
+	// SQL the single source of truth on which rows are "valid",
+	// so a future refactor that drops a post-fetch check cannot
+	// silently let a revoked/expired token slip through. Both
+	// failure modes (revoked, expired) collapse to ErrAccessToken-
+	// NotFound — RFC 6750 §3.1 requires `invalid_token` for both,
+	// and the caller cannot distinguish them anyway.
 	err := s.pool.QueryRow(ctx, `
 		SELECT t.id::text, t.tenant_id::text, t.user_id::text, c.client_id,
-		       t.scopes, t.expires_at, t.revoked_at
+		       t.scopes, t.expires_at
 		FROM oauth_access_tokens t
 		JOIN oauth_clients c ON c.id = t.client_id
-		WHERE t.token_hash = $1 AND c.active = true
-	`, tokenHash).Scan(
-		&tokenID, &tenantID, &userID, &clientID, &scopesRaw, &expiresAt, &revokedAt,
+		WHERE t.token_hash = $1
+		  AND c.active = true
+		  AND t.revoked_at IS NULL
+		  AND t.expires_at > $2
+	`, tokenHash, now).Scan(
+		&tokenID, &tenantID, &userID, &clientID, &scopesRaw, &expiresAt,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrAccessTokenNotFound
 		}
 		return nil, err
-	}
-	if revokedAt != nil || now.After(expiresAt) {
-		return nil, ErrAccessTokenNotFound
 	}
 	var scopes []string
 	_ = json.Unmarshal(scopesRaw, &scopes)
