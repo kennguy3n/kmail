@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	lru "github.com/hashicorp/golang-lru/v2/expirable"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -140,7 +141,12 @@ func NewProxy(cfg ProxyConfig) (*Proxy, error) {
 	}
 	ttl := cfg.AccountCacheTTL
 	if ttl <= 0 {
-		ttl = 5 * time.Minute
+		// Single source of truth lives next to the cache itself
+		// (see `accountCacheDefaultTTL`). `newAccountCache`
+		// applies the same default on ttl<=0, so this is
+		// belt-and-braces — but referencing the constant keeps
+		// the two defaults in lockstep if someone tunes one.
+		ttl = accountCacheDefaultTTL
 	}
 	p := &Proxy{
 		cfg:      cfg,
@@ -334,12 +340,29 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	//     are the only methods that submit (or stage for
 	//     submission) a message.
 	if p.cfg.PreDeliverHook != nil && (r.Method == http.MethodPost || r.Method == http.MethodPut) && r.Body != nil && requestCarriesMessageContent(r) {
+		// Buffer up to 33 MiB (32 MiB cap + 1 byte sentinel) into
+		// the scan buffer. We deliberately do NOT stream-pipe to
+		// ClamAV in parallel with the upstream: ClamAV INSTREAM can
+		// return a FOUND verdict mid-body, but anything already
+		// forwarded to Stalwart would have leaked past the
+		// quarantine. The double-buffer that previously existed in
+		// the shard round tripper is eliminated by setting
+		// `r.GetBody` after the scan: the round tripper detects
+		// GetBody and reuses the same scan buffer for every retry
+		// instead of draining `r.Body` into a fresh allocation.
 		const maxScanBytes = 32 * 1024 * 1024
-		body, err := io.ReadAll(io.LimitReader(r.Body, maxScanBytes))
+		body, err := io.ReadAll(io.LimitReader(r.Body, maxScanBytes+1))
 		_ = r.Body.Close()
 		if err != nil {
 			p.logger.Printf("jmap proxy: read body for malware scan: %v", err)
 			http.Error(w, `{"type":"urn:ietf:params:jmap:error:serverFail","title":"read body"}`, http.StatusBadGateway)
+			return
+		}
+		if len(body) > maxScanBytes {
+			p.logger.Printf("jmap proxy: pre-deliver scan rejected tenant=%s reason=body-too-large bytes>%d", tenantID, maxScanBytes)
+			w.Header().Set("Content-Type", "application/problem+json")
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_, _ = w.Write([]byte(`{"type":"urn:ietf:params:jmap:error:tooLarge","title":"message exceeds malware-scan size limit"}` + "\n"))
 			return
 		}
 		if shouldScanBody(r, body) {
@@ -353,6 +376,15 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		r.Body = io.NopCloser(bytes.NewReader(body))
 		r.ContentLength = int64(len(body))
+		// Hand the same byte slice to the round tripper so it can
+		// retry across shards without re-buffering. Each call to
+		// GetBody returns a fresh reader over the SAME backing
+		// array (`bytes.NewReader` is a zero-copy wrapper), which
+		// is what eliminates the second allocation that the
+		// failover path used to make.
+		r.GetBody = func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(body)), nil
+		}
 	}
 	p.rp.ServeHTTP(w, r.WithContext(ctx))
 }
@@ -504,24 +536,36 @@ func (p *Proxy) resolveAccount(ctx context.Context, tenantID, kchatUserID string
 	return accountID, nil
 }
 
-// accountCache is a TTL'd in-process cache for the
-// `(tenant_id, kchat_user_id) → stalwart_account_id` mapping. It is
-// deliberately simple; the Valkey-backed shared cache (10 000 entries,
-// 5 min TTL) documented in `docs/JMAP-CONTRACT.md` §3.3 lands in
-// Phase 2.
-type accountCache struct {
-	ttl time.Duration
-	mu  sync.RWMutex
-	m   map[string]accountCacheEntry
-}
+// accountCacheMaxEntries bounds the in-process
+// `(tenant_id, kchat_user_id) → stalwart_account_id` cache. 50,000
+// entries at ~150 B per entry keeps the cache under ~8 MiB even on
+// a fully-warm shard while still comfortably exceeding the
+// typical concurrent-active-user count per pod (which is bound by
+// the BFF's outbound connection budget to Stalwart). Pair with a
+// 5-minute TTL so the Valkey-backed shared cache (Phase 3) sees
+// every key turn over within a session.
+const (
+	accountCacheMaxEntries = 50_000
+	accountCacheDefaultTTL = 5 * time.Minute
+)
 
-type accountCacheEntry struct {
-	accountID string
-	expiresAt time.Time
+// accountCache is the bounded, TTL'd in-process cache for the
+// `(tenant_id, kchat_user_id) → stalwart_account_id` mapping. The
+// hashicorp/golang-lru `expirable` LRU gives us bounded size + TTL
+// in one structure and is internally locked, so the public
+// `get` / `set` methods stay as thin pass-throughs that the proxy
+// already uses everywhere.
+type accountCache struct {
+	inner *lru.LRU[string, string]
 }
 
 func newAccountCache(ttl time.Duration) *accountCache {
-	return &accountCache{ttl: ttl, m: map[string]accountCacheEntry{}}
+	if ttl <= 0 {
+		ttl = accountCacheDefaultTTL
+	}
+	return &accountCache{
+		inner: lru.NewLRU[string, string](accountCacheMaxEntries, nil, ttl),
+	}
 }
 
 func (c *accountCache) key(tenantID, kchatUserID string) string {
@@ -529,31 +573,9 @@ func (c *accountCache) key(tenantID, kchatUserID string) string {
 }
 
 func (c *accountCache) get(tenantID, kchatUserID string) (string, bool) {
-	k := c.key(tenantID, kchatUserID)
-	c.mu.RLock()
-	entry, ok := c.m[k]
-	c.mu.RUnlock()
-	if !ok {
-		return "", false
-	}
-	if time.Now().After(entry.expiresAt) {
-		// Drop the expired entry eagerly so callers that only hit
-		// stale keys don't accumulate map entries forever.
-		c.mu.Lock()
-		if cur, still := c.m[k]; still && !time.Now().Before(cur.expiresAt) {
-			delete(c.m, k)
-		}
-		c.mu.Unlock()
-		return "", false
-	}
-	return entry.accountID, true
+	return c.inner.Get(c.key(tenantID, kchatUserID))
 }
 
 func (c *accountCache) set(tenantID, kchatUserID, accountID string) {
-	c.mu.Lock()
-	c.m[c.key(tenantID, kchatUserID)] = accountCacheEntry{
-		accountID: accountID,
-		expiresAt: time.Now().Add(c.ttl),
-	}
-	c.mu.Unlock()
+	c.inner.Add(c.key(tenantID, kchatUserID), accountID)
 }

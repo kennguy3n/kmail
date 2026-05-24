@@ -11,7 +11,7 @@ import (
 func TestShardServiceCache(t *testing.T) {
 	t.Parallel()
 	svc := NewShardService(nil, nil)
-	svc.cache["tenant-1"] = "http://cached-shard"
+	svc.cache.Add("tenant-1", "http://cached-shard")
 	got, err := svc.GetTenantShard(context.Background(), "tenant-1")
 	if err != nil {
 		t.Fatalf("cache hit failed: %v", err)
@@ -20,7 +20,7 @@ func TestShardServiceCache(t *testing.T) {
 		t.Errorf("got %q, want http://cached-shard", got)
 	}
 	svc.invalidate("tenant-1")
-	if _, ok := svc.cache["tenant-1"]; ok {
+	if _, ok := svc.cache.Get("tenant-1"); ok {
 		t.Errorf("invalidate did not clear cache")
 	}
 }
