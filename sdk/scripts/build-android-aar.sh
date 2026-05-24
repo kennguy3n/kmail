@@ -73,12 +73,36 @@ declare -ra ANDROID_TARGETS=(
 # triples and Android ABIs do NOT correspond 1:1 (e.g.
 # `armv7-linux-androideabi` -> `armeabi-v7a`), so the mapping is
 # encoded here explicitly rather than derived by string mangling.
-declare -rA ABI_FOR_TRIPLE=(
-    ["aarch64-linux-android"]="arm64-v8a"
-    ["armv7-linux-androideabi"]="armeabi-v7a"
-    ["x86_64-linux-android"]="x86_64"
-    ["i686-linux-android"]="x86"
-)
+#
+# Implemented as a function with a `case` statement rather than
+# `declare -rA ABI_FOR_TRIPLE=(...)` for two reasons:
+#
+#   1. macOS's stock `/bin/bash` is 3.2 (Apple's last bash release
+#      before the GPLv3 switch). Bash 3.2 does NOT support
+#      associative arrays — `declare -A` is bash-4+. A homebrew
+#      bash is the workaround, but requiring that for a one-off
+#      build script is the kind of friction we promised to spare
+#      Android-curious iOS developers in `docs/SDK.md`.
+#   2. The case statement is a single source of truth in the same
+#      number of lines, with built-in unknown-input handling that
+#      fails loudly instead of returning an empty string (which
+#      bash 4's `${assoc_array[unknown_key]}` does silently).
+#
+# The bash shebang (`#!/usr/bin/env bash`) is intentionally kept
+# — POSIX `sh` lacks `local`, `[[`, and process substitution
+# elsewhere in this script. Bash 3.2 supports everything we use.
+abi_for_triple() {
+    case "$1" in
+        aarch64-linux-android)   echo "arm64-v8a"   ;;
+        armv7-linux-androideabi) echo "armeabi-v7a" ;;
+        x86_64-linux-android)    echo "x86_64"      ;;
+        i686-linux-android)      echo "x86"         ;;
+        *)
+            echo "abi_for_triple: unknown Rust target triple '$1'" >&2
+            return 1
+            ;;
+    esac
+}
 
 # Custom profile defined in sdk/Cargo.toml. MUST retain symbols
 # for both bindgen metadata extraction AND staticlib linking.
@@ -314,7 +338,7 @@ if [[ -z "${LLVM_STRIP}" ]]; then
 fi
 
 for triple in "${ANDROID_TARGETS[@]}"; do
-    abi="${ABI_FOR_TRIPLE[${triple}]}"
+    abi="$(abi_for_triple "${triple}")"
     src="${SDK_DIR}/target/${triple}/${PROFILE}/libkmail_ffi.so"
     dst_dir="${JNILIBS_OUT}/${abi}"
     dst="${dst_dir}/libkmail_ffi.so"
