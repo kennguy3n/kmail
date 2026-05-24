@@ -17,12 +17,14 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
+#[cfg(test)]
 use std::time::Duration;
 
 use kmail_core::{
     AeadEnvelope, ClientConfig, ConfidentialEnvelope, EmailAddress, EmailDraft, EmailSummary,
     KMailClient, KeyMaterial, Mailbox, MlsKeyProvider,
 };
+use zeroize::Zeroize;
 
 uniffi::setup_scaffolding!();
 
@@ -399,32 +401,40 @@ impl MlsKeyProvider for ForeignMlsKeyProvider {
         &self,
         recipient_user_id: &str,
     ) -> kmail_core::Result<KeyMaterial> {
-        let bytes = self
+        let mut bytes = self
             .foreign
             .confidential_send_leaf_secret(recipient_user_id.to_string())
             .map_err(|e| {
                 kmail_core::Error::KeyStore(format!("foreign MlsKeyProvider returned error: {e}"))
             })?;
         if bytes.len() != 32 {
+            // Zeroize the wrong-length buffer before dropping it.
+            // A misconfigured caller that returns e.g. 33 bytes may
+            // still have included 32 bytes of real key material
+            // (with a stray trailing byte); we don't want those
+            // bytes lingering in freed heap. See Devin Review
+            // finding 3294898657 on PR #39.
+            let len = bytes.len();
+            bytes.zeroize();
             return Err(kmail_core::Error::KeyStore(format!(
-                "foreign MlsKeyProvider returned {}-byte Confidential Send secret, expected 32",
-                bytes.len()
+                "foreign MlsKeyProvider returned {len}-byte Confidential Send secret, expected 32"
             )));
         }
         Ok(KeyMaterial::new(bytes))
     }
 
     fn vault_folder_master_secret(&self, folder_id: &str) -> kmail_core::Result<KeyMaterial> {
-        let bytes = self
+        let mut bytes = self
             .foreign
             .vault_folder_master_secret(folder_id.to_string())
             .map_err(|e| {
                 kmail_core::Error::KeyStore(format!("foreign MlsKeyProvider returned error: {e}"))
             })?;
         if bytes.len() != 32 {
+            let len = bytes.len();
+            bytes.zeroize();
             return Err(kmail_core::Error::KeyStore(format!(
-                "foreign MlsKeyProvider returned {}-byte Vault secret, expected 32",
-                bytes.len()
+                "foreign MlsKeyProvider returned {len}-byte Vault secret, expected 32"
             )));
         }
         Ok(KeyMaterial::new(bytes))
@@ -600,20 +610,28 @@ fn lower_kmail_config_to_core(config: &KMailClientConfig) -> ClientConfig {
         config.bearer_token.clone(),
         PathBuf::from(config.database_path.clone()),
     );
-    if let Some(b) = config.attachment_cache_bytes {
-        core_cfg.attachment_cache_bytes = b;
-    }
-    if let Some(t) = config.request_timeout_secs {
-        core_cfg.request_timeout = Duration::from_secs(u64::from(t));
-    }
-    if let Some(t) = config.retry_budget_secs {
-        core_cfg.retry_budget = Duration::from_secs(u64::from(t));
-    }
-    if let Some(w) = config.initial_sync_email_window {
-        core_cfg.initial_sync_email_window = w;
-    }
-    core_cfg.account_id = config.account_id.clone();
-    core_cfg.bootstrap_mailbox_role = config.bootstrap_mailbox_role.clone();
+    // Delegate the two-tier optional-override lowering to the shared
+    // helper in `kmail-core`. This is the canonical lowering ladder
+    // used by both the UniFFI binding here and the napi binding in
+    // `kmail-napi`, so the two FFI surfaces cannot drift in their
+    // default-handling semantics — adding a new optional field to
+    // `apply_optional_overrides` will fail to compile in both call
+    // sites until they're updated together. See the function's doc
+    // comment for the tier-1 vs tier-2 contract.
+    //
+    // The `.clone()` calls on the two `Option<String>` fields are
+    // load-bearing: this function takes `config` by reference (so
+    // unit tests can call it without consuming the record), and
+    // `apply_optional_overrides` takes ownership of the tier-2
+    // strings to avoid forcing the production call site to clone.
+    core_cfg.apply_optional_overrides(
+        config.attachment_cache_bytes,
+        config.request_timeout_secs,
+        config.retry_budget_secs,
+        config.initial_sync_email_window,
+        config.account_id.clone(),
+        config.bootstrap_mailbox_role.clone(),
+    );
     core_cfg
 }
 
@@ -1068,11 +1086,17 @@ mod tests {
 
     /// Thin wrapper around the production lowering helper for use
     /// in unit tests. Calls `super::lower_kmail_config_to_core`
-    /// directly — there is no parallel re-implementation here. If
-    /// you find yourself tempted to inline the ladder here for
+    /// directly — which itself delegates to the shared
+    /// `ClientConfig::apply_optional_overrides` in `kmail-core` — so
+    /// there is no parallel re-implementation here. If you find
+    /// yourself tempted to inline the ladder here for
     /// "testability", resist: the entire point of extracting the
     /// helper is that the tests exercise the same code path
-    /// `client_open` does.
+    /// `client_open` does. Per-field lowering drift between this
+    /// test path and production is structurally impossible because
+    /// `lower_kmail_config_to_core` is the ONLY ladder; the
+    /// compiler enforces parameter-list parity with
+    /// `apply_optional_overrides`.
     fn lower_client_open_test(config: &KMailClientConfig) -> ClientConfig {
         super::lower_kmail_config_to_core(config)
     }
@@ -1185,13 +1209,22 @@ mod tests {
         assert_eq!(core_cfg.bootstrap_mailbox_role.as_deref(), Some("archive"));
     }
 
-    /// Cross-binding parity: the FFI lowering ladder must produce the
-    /// same observable `ClientConfig` as the napi binding's lowering
-    /// ladder (`sdk/kmail-napi/src/lib.rs::client_open`) when given
-    /// equivalent input. The napi side uses verbatim assignment for
-    /// both `account_id` and `bootstrap_mailbox_role`; this test
-    /// re-implements that ladder inline and asserts equivalence on
-    /// every field for both the all-None and the all-Some inputs.
+    /// Cross-binding parity: both UniFFI (`client_open`) and napi
+    /// (`KMailClientJs::open`) must produce the same observable
+    /// `ClientConfig` for the same optional inputs.
+    ///
+    /// This invariant is now structurally enforced — both bindings
+    /// call `ClientConfig::apply_optional_overrides` (in
+    /// `kmail-core`), so divergence is impossible as long as both
+    /// keep calling the shared helper. This test asserts the
+    /// invariant as a regression net: if a future refactor inlines
+    /// the lowering back into one binding (re-introducing the
+    /// drift risk the previous reviewer flagged), the test still
+    /// passes here because both paths run through the shared
+    /// helper, but the same test in the napi crate
+    /// (`sdk/kmail-napi/src/lib.rs` test module) would diverge.
+    /// The pair of tests, one per binding crate, is the actual
+    /// guard rail.
     ///
     /// **This test also covers the Kotlin/Android binding parity by
     /// extension**: the Kotlin foreign code generated by UniFFI calls
@@ -1199,7 +1232,7 @@ mod tests {
     /// the lowering ladder this test exercises is the ONE ladder
     /// shared by every UniFFI consumer. A separate
     /// `client_open_matches_kotlin_lowering_for_string_tier` would
-    /// just rename this test; the load-bearing Kotlin-specific
+    /// just rename this test. The load-bearing Kotlin-specific
     /// drift-prevention test lives on the Kotlin side at
     /// `apps/android/kmail-sdk/src/test/.../KMailIntegrationTests.kt`
     /// (`kotlinDefaultsMatchRustDefaults`), which checks that the
@@ -1207,33 +1240,7 @@ mod tests {
     /// from `defaultClientConfig(...)` rather than hardcoded Kotlin
     /// literals.
     #[test]
-    fn client_open_matches_napi_lowering_for_string_tier() {
-        // Re-implement the napi `client_open` lowering ladder (minus
-        // the BigInt coercion and `KMailClient::open` step) so the
-        // tests catch any future divergence between the two bindings.
-        fn lower_napi_test(config: &KMailClientConfig) -> ClientConfig {
-            let mut core_cfg = ClientConfig::new(
-                config.bff_url.clone(),
-                config.bearer_token.clone(),
-                PathBuf::from(config.database_path.clone()),
-            );
-            if let Some(b) = config.attachment_cache_bytes {
-                core_cfg.attachment_cache_bytes = b;
-            }
-            if let Some(t) = config.request_timeout_secs {
-                core_cfg.request_timeout = Duration::from_secs(u64::from(t));
-            }
-            if let Some(t) = config.retry_budget_secs {
-                core_cfg.retry_budget = Duration::from_secs(u64::from(t));
-            }
-            if let Some(w) = config.initial_sync_email_window {
-                core_cfg.initial_sync_email_window = w;
-            }
-            core_cfg.account_id = config.account_id.clone();
-            core_cfg.bootstrap_mailbox_role = config.bootstrap_mailbox_role.clone();
-            core_cfg
-        }
-
+    fn client_open_lowering_matches_shared_helper() {
         for case in [
             KMailClientConfig {
                 bff_url: "https://kmail.test".into(),
@@ -1258,23 +1265,103 @@ mod tests {
                 bootstrap_mailbox_role: Some("sent".into()),
             },
         ] {
-            let ffi_lowered = lower_client_open_test(&case);
-            let napi_lowered = lower_napi_test(&case);
-            assert_eq!(
-                ffi_lowered.attachment_cache_bytes,
-                napi_lowered.attachment_cache_bytes
+            let via_helper = lower_client_open_test(&case);
+
+            // Build the reference by calling the shared
+            // `apply_optional_overrides` directly — the same code
+            // path the napi binding takes. Since both bindings now
+            // funnel through this helper, the two are equivalent by
+            // construction.
+            let mut via_shared = ClientConfig::new(
+                case.bff_url.clone(),
+                case.bearer_token.clone(),
+                PathBuf::from(case.database_path.clone()),
             );
-            assert_eq!(ffi_lowered.request_timeout, napi_lowered.request_timeout);
-            assert_eq!(ffi_lowered.retry_budget, napi_lowered.retry_budget);
-            assert_eq!(
-                ffi_lowered.initial_sync_email_window,
-                napi_lowered.initial_sync_email_window
+            via_shared.apply_optional_overrides(
+                case.attachment_cache_bytes,
+                case.request_timeout_secs,
+                case.retry_budget_secs,
+                case.initial_sync_email_window,
+                case.account_id.clone(),
+                case.bootstrap_mailbox_role.clone(),
             );
-            assert_eq!(ffi_lowered.account_id, napi_lowered.account_id);
+
             assert_eq!(
-                ffi_lowered.bootstrap_mailbox_role, napi_lowered.bootstrap_mailbox_role,
-                "UniFFI and napi must agree on bootstrap_mailbox_role lowering"
+                via_helper.attachment_cache_bytes,
+                via_shared.attachment_cache_bytes
             );
+            assert_eq!(via_helper.request_timeout, via_shared.request_timeout);
+            assert_eq!(via_helper.retry_budget, via_shared.retry_budget);
+            assert_eq!(
+                via_helper.initial_sync_email_window,
+                via_shared.initial_sync_email_window
+            );
+            assert_eq!(via_helper.account_id, via_shared.account_id);
+            assert_eq!(
+                via_helper.bootstrap_mailbox_role,
+                via_shared.bootstrap_mailbox_role,
+            );
+        }
+    }
+
+    /// `ForeignMlsKeyProvider` surfaces a wrong-length foreign
+    /// callback return as `Error::KeyStore`, with the foreign
+    /// length echoed in the error message so the iOS / Android
+    /// developer can debug their impl. The companion code path
+    /// also zeroizes the wrong-length buffer before drop; we
+    /// can't observe freed heap from safe Rust to test that
+    /// directly, but the error-message path proves the branch
+    /// is taken.
+    #[test]
+    fn foreign_mls_provider_rejects_wrong_length_secret() {
+        struct OffByOneProvider;
+        impl FfiMlsKeyProvider for OffByOneProvider {
+            fn confidential_send_leaf_secret(
+                &self,
+                _recipient_user_id: String,
+            ) -> Result<Vec<u8>, KMailError> {
+                // 33 bytes simulates a miscompiled MLS exporter
+                // that emits one trailing byte beyond the 32-byte
+                // KDF output. The first 32 bytes might be real
+                // key material, which is precisely why we
+                // zeroize before dropping.
+                Ok(vec![0xAB; 33])
+            }
+            fn vault_folder_master_secret(
+                &self,
+                _folder_id: String,
+            ) -> Result<Vec<u8>, KMailError> {
+                Ok(vec![0xCD; 31])
+            }
+        }
+
+        let provider = ForeignMlsKeyProvider {
+            foreign: Arc::new(OffByOneProvider),
+        };
+        let err = provider
+            .confidential_send_leaf_secret("alice@kmail.test")
+            .unwrap_err();
+        match err {
+            kmail_core::Error::KeyStore(msg) => {
+                assert!(msg.contains("33"), "error msg should include length: {msg}");
+                assert!(
+                    msg.contains("Confidential Send"),
+                    "error msg should identify scope: {msg}"
+                );
+            }
+            other => panic!("expected KeyStore error, got {other:?}"),
+        }
+
+        let err = provider.vault_folder_master_secret("folder-1").unwrap_err();
+        match err {
+            kmail_core::Error::KeyStore(msg) => {
+                assert!(msg.contains("31"), "error msg should include length: {msg}");
+                assert!(
+                    msg.contains("Vault"),
+                    "error msg should identify scope: {msg}"
+                );
+            }
+            other => panic!("expected KeyStore error, got {other:?}"),
         }
     }
 
