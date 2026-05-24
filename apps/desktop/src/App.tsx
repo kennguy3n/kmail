@@ -7,10 +7,17 @@ import type { JsMailbox } from './kmail/preload';
 
 // Top-level app shell.
 //
-// On mount it kicks off a single `sync()` call to refresh the
-// local SQLite cache from JMAP. The sidebar reads from the cache
-// regardless of whether sync succeeded, so the UI remains usable
-// offline.
+// On mount it opens the SDK session against the launch-supplied
+// BFF URL / bearer token / database path, then renders the sidebar
+// straight from the local SQLite cache via `cachedMailboxes()`.
+// A network sync is *not* triggered on mount — the user clicks the
+// "Sync" button in the header (or hits the tray "Sync now" action)
+// to refresh from JMAP. Rationale: launching cold should paint the
+// cache instantly even on slow / offline networks, and we don't
+// want to silently consume mobile data on a flaky connection just
+// because the user opened the app. The sidebar therefore reflects
+// the last-known state until the user (or a push notification) asks
+// to refresh.
 //
 // Authentication, BFF URL, and the database path are read from
 // query parameters on the `file://` URL — the parent product

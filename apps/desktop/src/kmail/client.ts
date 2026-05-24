@@ -91,7 +91,20 @@ export class KMailDesktopClient {
   }
 
   async close(): Promise<void> {
-    await this.bridge.close();
+    // The `kmail:close` IPC handler today only nulls the session
+    // reference and cannot throw, but we still wrap the call in
+    // `parseKMailError` for pattern consistency with every other
+    // method on this class. If the main-process handler ever gains
+    // teardown logic that could fail (e.g. an explicit SQLite WAL
+    // checkpoint or a synchronous JMAP push unsubscribe), the
+    // error will surface as a typed `KMailError` for consumers
+    // that rely on `instanceof KMailError` checks rather than
+    // arriving as an untagged raw `Error`.
+    try {
+      await this.bridge.close();
+    } catch (err) {
+      throw parseKMailError(err);
+    }
   }
 
   async sync(): Promise<JsSyncSummary> {

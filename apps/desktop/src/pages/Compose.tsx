@@ -79,7 +79,11 @@ export function Compose(): JSX.Element {
         setError(
           'No Drafts mailbox in the local cache — run Sync from the header first.',
         );
-        setSending(false);
+        // The `finally` block below resets `sending`; an explicit
+        // reset here would be a double-update (harmless because
+        // React batches identical writes, but it muddies the
+        // control flow — every `return` in this try block is
+        // assumed to land in `finally`).
         return;
       }
       // Parse the To: field as a simple comma-separated list of
