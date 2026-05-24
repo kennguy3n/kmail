@@ -842,46 +842,29 @@ func (s *Service) RefreshAccessToken(
 	return resp, nil
 }
 
-// mintTokens generates a fresh access + refresh token pair tied
-// to the given client/user/scopes and persists them. parentID is
-// the previous refresh token's row id (empty string for a brand
-// new chain from /authorize; non-empty for /refresh).
+// mintTokensTx generates a fresh access + refresh token pair tied
+// to the given client/user/scopes and persists them inside the
+// caller's transaction. parentRefreshID is the previous refresh
+// token's row id (empty string for a brand-new chain from
+// /authorize; non-empty for /refresh).
 //
-// Opens its own transaction. Callers that need the mint to share
-// a transaction with an outer atomic claim should call
-// mintTokensTx instead.
-func (s *Service) mintTokens(
-	ctx context.Context,
-	client *Client,
-	userID string,
-	scopes []string,
-	parentRefreshID string,
-) (*TokenResponse, error) {
-	now := s.now()
-	var resp *TokenResponse
-	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		if err := middleware.SetTenantGUC(ctx, tx, client.TenantID); err != nil {
-			return err
-		}
-		r, _, err := s.mintTokensTx(ctx, tx, client, userID, scopes, parentRefreshID, now)
-		if err != nil {
-			return err
-		}
-		resp = r
-		return nil
-	})
-	if err != nil {
-		return nil, fmt.Errorf("oauth: persist tokens: %w", err)
-	}
-	return resp, nil
-}
-
-// mintTokensTx is the transaction-bound core of mintTokens. The
-// caller MUST have already opened a transaction AND called
-// middleware.SetTenantGUC on it before invoking this helper. The
-// extra returned string is the new refresh token's row id, useful
-// for callers that want to chain further work (e.g. update related
-// rows in the same transaction).
+// The caller MUST have already opened a transaction AND called
+// middleware.SetTenantGUC on it before invoking this helper — that
+// invariant is what makes the mint atomic with the surrounding
+// claim (auth-code consume or refresh-token rotate). The extra
+// returned string is the new refresh token's row id, useful for
+// callers that want to chain further work (e.g. update related rows
+// in the same transaction).
+//
+// There used to be a standalone `mintTokens(ctx, ...)` wrapper here
+// that opened its own transaction and called this helper, used
+// during the two-tx era when /authorize and /refresh minted outside
+// their claim transactions. After both call sites were collapsed
+// into single-transaction flows (so a mint failure rolls back the
+// claim too, preventing orphaned tokens whose plaintext was never
+// returned to a caller), the wrapper became dead code and was
+// removed — there is no remaining callsite that wants to mint in
+// its own short-lived transaction.
 func (s *Service) mintTokensTx(
 	ctx context.Context,
 	tx pgx.Tx,

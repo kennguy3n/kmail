@@ -110,7 +110,7 @@ func (f *fakeService) ExchangeAuthorizationCode(
 		TokenType:    "Bearer",
 		ExpiresIn:    3600,
 		RefreshToken: "fake-refresh",
-		Scope:        "kmail.read",
+		Scope:        "read:mail",
 	}, nil
 }
 
@@ -129,7 +129,7 @@ func (f *fakeService) RefreshAccessToken(
 		TokenType:    "Bearer",
 		ExpiresIn:    3600,
 		RefreshToken: "fake-refresh-2",
-		Scope:        "kmail.read",
+		Scope:        "read:mail",
 	}, nil
 }
 
@@ -171,7 +171,7 @@ func makeConfidentialClient() *Client {
 		ClientType:    ClientTypeConfidential,
 		Name:          "Test Confidential App",
 		RedirectURIs:  []string{"https://app.example.com/cb"},
-		AllowedScopes: []string{"kmail.read", "kmail.write"},
+		AllowedScopes: []string{"read:mail", "write:mail"},
 		HomepageURL:   "https://app.example.com",
 	}
 }
@@ -183,7 +183,7 @@ func makePublicClient() *Client {
 		ClientType:    ClientTypePublic,
 		Name:          "Test Public App",
 		RedirectURIs:  []string{"https://spa.example.com/cb"},
-		AllowedScopes: []string{"kmail.read"},
+		AllowedScopes: []string{"read:mail"},
 	}
 }
 
@@ -282,7 +282,7 @@ func TestAuthorize_RejectsScopeOutsideAllowList(t *testing.T) {
 	q.Set("response_type", "code")
 	q.Set("client_id", "client-conf-1")
 	q.Set("redirect_uri", "https://app.example.com/cb")
-	q.Set("scope", "kmail.read kmail.admin") // admin not in allow-list
+	q.Set("scope", "read:mail admin:all") // admin:all not in client's allow-list
 	q.Set("state", "xyz")
 	req := httptest.NewRequest(http.MethodGet, "/oauth/authorize?"+q.Encode(), nil)
 	h.Authorize(rr, req)
@@ -310,7 +310,7 @@ func TestAuthorize_RejectsPublicClientWithoutPKCE(t *testing.T) {
 	q.Set("response_type", "code")
 	q.Set("client_id", "client-pub-1")
 	q.Set("redirect_uri", "https://spa.example.com/cb")
-	q.Set("scope", "kmail.read")
+	q.Set("scope", "read:mail")
 	q.Set("state", "s1")
 	// No code_challenge.
 	req := httptest.NewRequest(http.MethodGet, "/oauth/authorize?"+q.Encode(), nil)
@@ -333,7 +333,7 @@ func TestAuthorize_RendersConsentHTMLOnHappyPath(t *testing.T) {
 	q.Set("response_type", "code")
 	q.Set("client_id", "client-conf-1")
 	q.Set("redirect_uri", "https://app.example.com/cb")
-	q.Set("scope", "kmail.read")
+	q.Set("scope", "read:mail")
 	q.Set("state", "xyz")
 	req := httptest.NewRequest(http.MethodGet, "/oauth/authorize?"+q.Encode(), nil)
 	h.Authorize(rr, req)
@@ -348,7 +348,7 @@ func TestAuthorize_RendersConsentHTMLOnHappyPath(t *testing.T) {
 	if !strings.Contains(body, "Test Confidential App") {
 		t.Errorf("expected client name in body, got %q", body)
 	}
-	if !strings.Contains(body, "kmail.read") {
+	if !strings.Contains(body, "read:mail") {
 		t.Errorf("expected requested scope in body, got %q", body)
 	}
 }
@@ -429,7 +429,7 @@ func TestApprove_DenialRedirectsWithAccessDenied(t *testing.T) {
 	form.Set("redirect_uri", "https://app.example.com/cb")
 	form.Set("state", "s1")
 	form.Set("decision", "deny")
-	form.Set("scope", "kmail.read")
+	form.Set("scope", "read:mail")
 	rr := httptest.NewRecorder()
 	h.Approve(rr, newApproveRequest(form))
 	if rr.Code != http.StatusFound {
@@ -457,7 +457,7 @@ func TestApprove_ApprovalRedirectsWithCode(t *testing.T) {
 	form.Set("redirect_uri", "https://app.example.com/cb")
 	form.Set("state", "s1")
 	form.Set("decision", "approve")
-	form.Set("scope", "kmail.read")
+	form.Set("scope", "read:mail")
 	form.Set("code_challenge", "abc")
 	form.Set("code_challenge_method", "S256")
 	rr := httptest.NewRecorder()
@@ -560,7 +560,7 @@ func TestApprove_ClearsCSRFCookieAfterSuccess(t *testing.T) {
 	form.Set("client_id", "client-conf-1")
 	form.Set("redirect_uri", "https://app.example.com/cb")
 	form.Set("decision", "approve")
-	form.Set("scope", "kmail.read")
+	form.Set("scope", "read:mail")
 	rr := httptest.NewRecorder()
 	h.Approve(rr, newApproveRequest(form))
 	if rr.Code != http.StatusFound {
@@ -589,7 +589,7 @@ func TestAuthorize_PlantsCSRFCookieAndFormField(t *testing.T) {
 	q.Set("response_type", "code")
 	q.Set("client_id", "client-conf-1")
 	q.Set("redirect_uri", "https://app.example.com/cb")
-	q.Set("scope", "kmail.read")
+	q.Set("scope", "read:mail")
 	q.Set("state", "s1")
 	req := httptest.NewRequest(http.MethodGet, "/oauth/authorize?"+q.Encode(), nil)
 	rr := httptest.NewRecorder()
@@ -636,7 +636,7 @@ func TestAuthorize_FormActionRespectsRoutePrefix(t *testing.T) {
 	q.Set("response_type", "code")
 	q.Set("client_id", "client-conf-1")
 	q.Set("redirect_uri", "https://app.example.com/cb")
-	q.Set("scope", "kmail.read")
+	q.Set("scope", "read:mail")
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/oauth/authorize?"+q.Encode(), nil)
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, req)
