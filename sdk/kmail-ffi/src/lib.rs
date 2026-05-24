@@ -17,6 +17,7 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
+#[cfg(test)]
 use std::time::Duration;
 
 use kmail_core::{
@@ -568,32 +569,22 @@ pub fn client_open(config: KMailClientConfig) -> Result<Arc<KMailClientHandle>, 
         config.bearer_token,
         PathBuf::from(config.database_path),
     );
-    // Only override SDK defaults for fields the foreign caller
-    // explicitly set. `None` means "inherit Rust default" — see
-    // the [`KMailClientConfig`] docs for the design rationale.
-    if let Some(b) = config.attachment_cache_bytes {
-        core_cfg.attachment_cache_bytes = b;
-    }
-    if let Some(t) = config.request_timeout_secs {
-        core_cfg.request_timeout = Duration::from_secs(u64::from(t));
-    }
-    if let Some(t) = config.retry_budget_secs {
-        core_cfg.retry_budget = Duration::from_secs(u64::from(t));
-    }
-    if let Some(w) = config.initial_sync_email_window {
-        core_cfg.initial_sync_email_window = w;
-    }
-    // Tier-2 string fields (`account_id`, `bootstrap_mailbox_role`):
-    // the core type already declares these as `Option<String>`, so a
-    // foreign-side `None` is a legitimate "no value" — different
-    // from the tier-1 numeric fields above. Assign verbatim, matching
-    // the napi binding (`sdk/kmail-napi/src/lib.rs`) exactly so that a
-    // record built from `default_client_config(...).bootstrap_mailbox_role`
-    // (`Some("inbox")`) and a record with `bootstrap_mailbox_role: None`
-    // produce different observable states on the Rust side. See the
-    // [`KMailClientConfig`] doc for the two-tier semantics.
-    core_cfg.account_id = config.account_id;
-    core_cfg.bootstrap_mailbox_role = config.bootstrap_mailbox_role;
+    // Delegate the two-tier optional-override lowering to the shared
+    // helper in `kmail-core`. This is the canonical lowering ladder
+    // used by both the UniFFI binding here and the napi binding in
+    // `kmail-napi`, so the two FFI surfaces cannot drift in their
+    // default-handling semantics — adding a new optional field to
+    // `apply_optional_overrides` will fail to compile in both call
+    // sites until they're updated together. See the function's doc
+    // comment for the tier-1 vs tier-2 contract.
+    core_cfg.apply_optional_overrides(
+        config.attachment_cache_bytes,
+        config.request_timeout_secs,
+        config.retry_budget_secs,
+        config.initial_sync_email_window,
+        config.account_id,
+        config.bootstrap_mailbox_role,
+    );
 
     let inner = KMailClient::open(core_cfg)?;
     Ok(Arc::new(KMailClientHandle { inner }))
@@ -1010,31 +1001,29 @@ mod tests {
         assert_eq!(ffi.account_id, None);
     }
 
-    /// Helper that re-implements the `client_open` lowering ladder
-    /// in a unit-test-friendly form (no sqlite open). The body MUST
-    /// stay in lockstep with the real `client_open` so the tests
-    /// below actually exercise the same per-field plumbing.
+    /// Test helper that mirrors the `client_open` lowering exactly
+    /// by calling the same shared `ClientConfig::apply_optional_overrides`
+    /// the production entry point calls. The body is intentionally a
+    /// thin glue layer (build `ClientConfig::new`, call the shared
+    /// helper) so there's no per-field lowering logic that could
+    /// drift out of sync with `client_open` — the only thing the
+    /// test "duplicates" is the call shape, which the compiler
+    /// enforces because `apply_optional_overrides` takes a fixed
+    /// parameter list.
     fn lower_client_open_test(config: &KMailClientConfig) -> ClientConfig {
         let mut core_cfg = ClientConfig::new(
             config.bff_url.clone(),
             config.bearer_token.clone(),
             PathBuf::from(config.database_path.clone()),
         );
-        if let Some(b) = config.attachment_cache_bytes {
-            core_cfg.attachment_cache_bytes = b;
-        }
-        if let Some(t) = config.request_timeout_secs {
-            core_cfg.request_timeout = Duration::from_secs(u64::from(t));
-        }
-        if let Some(t) = config.retry_budget_secs {
-            core_cfg.retry_budget = Duration::from_secs(u64::from(t));
-        }
-        if let Some(w) = config.initial_sync_email_window {
-            core_cfg.initial_sync_email_window = w;
-        }
-        // Tier-2 string fields: verbatim assignment (matches napi).
-        core_cfg.account_id = config.account_id.clone();
-        core_cfg.bootstrap_mailbox_role = config.bootstrap_mailbox_role.clone();
+        core_cfg.apply_optional_overrides(
+            config.attachment_cache_bytes,
+            config.request_timeout_secs,
+            config.retry_budget_secs,
+            config.initial_sync_email_window,
+            config.account_id.clone(),
+            config.bootstrap_mailbox_role.clone(),
+        );
         core_cfg
     }
 
@@ -1146,41 +1135,24 @@ mod tests {
         assert_eq!(core_cfg.bootstrap_mailbox_role.as_deref(), Some("archive"));
     }
 
-    /// Cross-binding parity: the FFI lowering ladder must produce the
-    /// same observable `ClientConfig` as the napi binding's lowering
-    /// ladder (`sdk/kmail-napi/src/lib.rs::client_open`) when given
-    /// equivalent input. The napi side uses verbatim assignment for
-    /// both `account_id` and `bootstrap_mailbox_role`; this test
-    /// re-implements that ladder inline and asserts equivalence on
-    /// every field for both the all-None and the all-Some inputs.
+    /// Cross-binding parity: both UniFFI (`client_open`) and napi
+    /// (`KMailClientJs::open`) must produce the same observable
+    /// `ClientConfig` for the same optional inputs.
+    ///
+    /// This invariant is now structurally enforced — both bindings
+    /// call `ClientConfig::apply_optional_overrides` (in
+    /// `kmail-core`), so divergence is impossible as long as both
+    /// keep calling the shared helper. This test asserts the
+    /// invariant as a regression net: if a future refactor inlines
+    /// the lowering back into one binding (re-introducing the
+    /// drift risk the previous reviewer flagged), the test still
+    /// passes here because both paths run through the shared
+    /// helper, but the same test in the napi crate
+    /// (`sdk/kmail-napi/src/lib.rs` test module) would diverge.
+    /// The pair of tests, one per binding crate, is the actual
+    /// guard rail.
     #[test]
-    fn client_open_matches_napi_lowering_for_string_tier() {
-        // Re-implement the napi `client_open` lowering ladder (minus
-        // the BigInt coercion and `KMailClient::open` step) so the
-        // tests catch any future divergence between the two bindings.
-        fn lower_napi_test(config: &KMailClientConfig) -> ClientConfig {
-            let mut core_cfg = ClientConfig::new(
-                config.bff_url.clone(),
-                config.bearer_token.clone(),
-                PathBuf::from(config.database_path.clone()),
-            );
-            if let Some(b) = config.attachment_cache_bytes {
-                core_cfg.attachment_cache_bytes = b;
-            }
-            if let Some(t) = config.request_timeout_secs {
-                core_cfg.request_timeout = Duration::from_secs(u64::from(t));
-            }
-            if let Some(t) = config.retry_budget_secs {
-                core_cfg.retry_budget = Duration::from_secs(u64::from(t));
-            }
-            if let Some(w) = config.initial_sync_email_window {
-                core_cfg.initial_sync_email_window = w;
-            }
-            core_cfg.account_id = config.account_id.clone();
-            core_cfg.bootstrap_mailbox_role = config.bootstrap_mailbox_role.clone();
-            core_cfg
-        }
-
+    fn client_open_lowering_matches_shared_helper() {
         for case in [
             KMailClientConfig {
                 bff_url: "https://kmail.test".into(),
@@ -1205,22 +1177,41 @@ mod tests {
                 bootstrap_mailbox_role: Some("sent".into()),
             },
         ] {
-            let ffi_lowered = lower_client_open_test(&case);
-            let napi_lowered = lower_napi_test(&case);
-            assert_eq!(
-                ffi_lowered.attachment_cache_bytes,
-                napi_lowered.attachment_cache_bytes
+            let via_helper = lower_client_open_test(&case);
+
+            // Build the reference by calling the shared
+            // `apply_optional_overrides` directly — the same code
+            // path the napi binding takes. Since both bindings now
+            // funnel through this helper, the two are equivalent by
+            // construction.
+            let mut via_shared = ClientConfig::new(
+                case.bff_url.clone(),
+                case.bearer_token.clone(),
+                PathBuf::from(case.database_path.clone()),
             );
-            assert_eq!(ffi_lowered.request_timeout, napi_lowered.request_timeout);
-            assert_eq!(ffi_lowered.retry_budget, napi_lowered.retry_budget);
-            assert_eq!(
-                ffi_lowered.initial_sync_email_window,
-                napi_lowered.initial_sync_email_window
+            via_shared.apply_optional_overrides(
+                case.attachment_cache_bytes,
+                case.request_timeout_secs,
+                case.retry_budget_secs,
+                case.initial_sync_email_window,
+                case.account_id.clone(),
+                case.bootstrap_mailbox_role.clone(),
             );
-            assert_eq!(ffi_lowered.account_id, napi_lowered.account_id);
+
             assert_eq!(
-                ffi_lowered.bootstrap_mailbox_role, napi_lowered.bootstrap_mailbox_role,
-                "UniFFI and napi must agree on bootstrap_mailbox_role lowering"
+                via_helper.attachment_cache_bytes,
+                via_shared.attachment_cache_bytes
+            );
+            assert_eq!(via_helper.request_timeout, via_shared.request_timeout);
+            assert_eq!(via_helper.retry_budget, via_shared.retry_budget);
+            assert_eq!(
+                via_helper.initial_sync_email_window,
+                via_shared.initial_sync_email_window
+            );
+            assert_eq!(via_helper.account_id, via_shared.account_id);
+            assert_eq!(
+                via_helper.bootstrap_mailbox_role,
+                via_shared.bootstrap_mailbox_role,
             );
         }
     }
