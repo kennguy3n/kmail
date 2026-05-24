@@ -3,11 +3,131 @@ name: CI
 on:
   push:
     branches: [main]
+  # Don't fire any job on PRs that only touch documentation /
+  # screenshots / non-code text. These changes can't break the
+  # binary, the web bundle, or the integration stack, so burning
+  # ~30 minutes of runner time on every README typo is pure waste.
+  # The list below mirrors what Renovate / dependabot treat as
+  # doc-only; if you add a new top-level docs directory, append it
+  # here. Code-adjacent docs (e.g. inline godoc) ride along with
+  # their `.go` file and DO trigger the relevant job via the
+  # paths-filter `changes` job below.
   pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'AGENTS.md'
+      - 'CHANGELOG.md'
+      - 'LICENSE'
+      - '.github/CODEOWNERS'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/PULL_REQUEST_TEMPLATE.md'
 
 jobs:
+  # `changes` classifies the PR diff into subsystem-scoped buckets
+  # so the heavy jobs below can opt out of running when their
+  # files weren't touched. Three concerns drive the filter design:
+  #
+  #  1. False negatives MUST be impossible: anything the go job
+  #     actually consumes (Go source, modules, generated SQL
+  #     migrations the binary embeds, the Makefile rules the job
+  #     literally calls) is in the `go` filter. A pure web PR
+  #     therefore skips the Go job legitimately, but a PR that
+  #     touches `Makefile` or `migrations/**` re-fires it because
+  #     either could change build / test behaviour.
+  #  2. On `push` events to main, ALL outputs are 'true' regardless
+  #     of the actual diff — the post-merge run is the canonical
+  #     full-fan-out check, and we never want a main-branch commit
+  #     to skip a job just because the diff happened to be doc-
+  #     adjacent. The downstream jobs' `if:` clauses encode this
+  #     via `github.event_name == 'push'`.
+  #  3. The CI Status aggregate (`ci-status` job at the bottom)
+  #     ACCEPTS `result == 'skipped'` for go/web/integration when
+  #     the corresponding filter output is 'false'. Branch
+  #     protection requires `CI Status` (one stable name); the
+  #     underlying jobs may legitimately skip without blocking
+  #     the merge.
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    # The aggregate job reads these outputs to distinguish
+    # 'skipped because nothing changed' from 'skipped because of a
+    # fork-origin OOM guard'. Both look identical at the job-
+    # result level (`result == 'skipped'`), so we need an out-of-
+    # band signal to tell them apart.
+    outputs:
+      go: ${{ steps.filter.outputs.go }}
+      web: ${{ steps.filter.outputs.web }}
+      integration: ${{ steps.filter.outputs.integration }}
+      helm: ${{ steps.filter.outputs.helm }}
+      ci_workflows: ${{ steps.filter.outputs.ci_workflows }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          # `predicate-quantifier: 'every'` would let us require
+          # that every glob match — we don't need that; OR-of-
+          # globs is the default and correct here.
+          filters: |
+            go:
+              - '**/*.go'
+              - 'go.mod'
+              - 'go.sum'
+              - 'cmd/**'
+              - 'internal/**'
+              - 'migrations/**'
+              - 'Makefile'
+              - '.github/workflows/ci.yml'
+            web:
+              - 'web/**'
+              - '.github/workflows/ci.yml'
+            # Integration tests touch the compose stack AND the
+            # binary AND the e2e harness AND the migrations the
+            # stack applies, so its filter is the union of all
+            # of those. The integration job ALSO fires on any
+            # change to the integration workflow itself or to
+            # the compose / Dockerfile.
+            integration:
+              - '**/*.go'
+              - 'go.mod'
+              - 'go.sum'
+              - 'cmd/**'
+              - 'internal/**'
+              - 'migrations/**'
+              - 'Makefile'
+              - 'docker-compose.yml'
+              - 'Dockerfile*'
+              - 'scripts/test-e2e.sh'
+              - 'configs/**'
+              - '.github/workflows/ci.yml'
+            # Helm template changes trigger a `helm template`
+            # validation run via the integration job's lint
+            # step (it `helm template`s with mTLS enabled to
+            # catch shape regressions). Without this filter
+            # entry a values.yaml-only PR would skip integration
+            # and the template wouldn't get re-rendered.
+            helm:
+              - 'deploy/helm/**'
+            # When the workflow itself changes we re-run
+            # everything so we can validate the new YAML
+            # actually does what it claims. This is the
+            # "belt-and-braces" override that catches the
+            # "oops I changed paths-filter and now nothing
+            # runs" footgun.
+            ci_workflows:
+              - '.github/workflows/**'
+
   go:
     name: Go
+    needs: changes
+    # Run when: any Go-relevant file changed, OR the workflow
+    # itself changed (defence-in-depth against a path filter
+    # mistake), OR it's a push to main (full-fan-out invariant).
+    if: |
+      needs.changes.outputs.go == 'true' ||
+      needs.changes.outputs.ci_workflows == 'true' ||
+      github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -32,6 +152,13 @@ jobs:
 
   web:
     name: Web
+    needs: changes
+    # Run when: any web-tree file changed, OR the workflow itself
+    # changed, OR it's a push to main.
+    if: |
+      needs.changes.outputs.web == 'true' ||
+      needs.changes.outputs.ci_workflows == 'true' ||
+      github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -70,14 +197,30 @@ jobs:
 
   integration:
     name: Integration
+    needs: changes
     # Don't gate on Go/Web here — Phase D #11 calls the integration
     # job out as a parallel CI surface, not a gate. The job
     # exercises the docker compose stack end-to-end and runs the
     # scripts/test-e2e.sh smoke harness against a host-side BFF.
     runs-on: ubuntu-latest
-    # Run on PRs and pushes to main. Skip on forks because Stalwart
-    # needs ~3GB RAM and a forked PR runner often OOMs before the
-    # health check passes; the maintainer fork covers this surface.
+    # Three layers of gating:
+    #
+    #  1. Fork-origin guard: Stalwart needs ~3GB RAM; a forked-PR
+    #     runner often OOMs before the health check passes.
+    #     Skip silently on fork-origin PRs; the maintainer fork
+    #     covers the surface.
+    #  2. Path-filter guard: only fire when go/integration files
+    #     actually changed, OR the integration workflow itself.
+    #     A web-only PR cannot break the integration stack.
+    #  3. Label-gated full sweep: a PR labeled `ci:full` runs
+    #     integration unconditionally (still subject to the
+    #     fork-origin guard). This lets reviewers force a full
+    #     stack check for risky PRs whose diff looks small but
+    #     touches load-bearing surfaces (auth, dispatch, etc.).
+    #
+    # On `push` to main, all guards drop except fork-origin (which
+    # can't fire on push events anyway), so the integration job
+    # always runs post-merge — the canonical full-fan-out check.
     #
     # BRANCH-PROTECTION NOTE: an entirely-skipped job reports neither
     # success nor failure to GitHub's status API — it is simply
@@ -85,12 +228,19 @@ jobs:
     # protection rule, the aggregate `ci-status` job at the bottom
     # of this file is the canonical required check. It runs
     # `if: always()`, depends on go/web/integration, and treats
-    # `integration.result == 'skipped'` as a pass (legitimate when
-    # the fork-skip condition fires). Branch protection rules
-    # should require `CI Status`, NOT the underlying `Integration`
-    # name. See the comment block above `ci-status` for the full
-    # rationale and the result matrix per PR origin.
-    if: github.event.pull_request.head.repo.full_name == github.repository || github.event_name == 'push'
+    # `integration.result == 'skipped'` as a pass when the skip is
+    # legitimate (fork-origin OR path-filter said "no relevant
+    # changes"). Branch protection rules should require
+    # `CI Status`, NOT the underlying `Integration` name. See the
+    # comment block above `ci-status` for the full rationale.
+    if: |
+      (github.event.pull_request.head.repo.full_name == github.repository ||
+       github.event_name == 'push') &&
+      (needs.changes.outputs.integration == 'true' ||
+       needs.changes.outputs.helm == 'true' ||
+       needs.changes.outputs.ci_workflows == 'true' ||
+       contains(github.event.pull_request.labels.*.name, 'ci:full') ||
+       github.event_name == 'push')
     timeout-minutes: 25
     env:
       KMAIL_API_URL: http://localhost:8088
@@ -314,7 +464,7 @@ jobs:
   ci-status:
     name: CI Status
     if: always()
-    needs: [go, web, integration]
+    needs: [changes, go, web, integration]
     runs-on: ubuntu-latest
     steps:
       - name: Verify dependent job results
@@ -323,24 +473,82 @@ jobs:
           go_result='${{ needs.go.result }}'
           web_result='${{ needs.web.result }}'
           integration_result='${{ needs.integration.result }}'
-          echo "go=${go_result} web=${web_result} integration=${integration_result}"
+          go_changed='${{ needs.changes.outputs.go }}'
+          web_changed='${{ needs.changes.outputs.web }}'
+          integration_changed='${{ needs.changes.outputs.integration }}'
+          helm_changed='${{ needs.changes.outputs.helm }}'
+          ci_workflows_changed='${{ needs.changes.outputs.ci_workflows }}'
+          event='${{ github.event_name }}'
+          ci_full_label='${{ contains(github.event.pull_request.labels.*.name, 'ci:full') }}'
+          echo "event=${event} go=${go_result}/${go_changed} web=${web_result}/${web_changed} integration=${integration_result}/${integration_changed} helm=${helm_changed} ci_workflows=${ci_workflows_changed} ci_full_label=${ci_full_label}"
           fail=0
-          # go and web have no skip path — anything other than
-          # 'success' must fail the aggregate.
-          if [[ "${go_result}" != "success" ]]; then
-            echo "::error::go job did not succeed (result=${go_result})"
-            fail=1
-          fi
-          if [[ "${web_result}" != "success" ]]; then
-            echo "::error::web job did not succeed (result=${web_result})"
-            fail=1
-          fi
-          # integration is legitimately skipped on fork-origin
-          # PRs by design. Treat 'success' OR 'skipped' as
-          # acceptable; anything else (failure, cancelled,
-          # unknown) fails the aggregate.
+
+          # `go` and `web` may legitimately skip when the path
+          # filter said "no relevant changes" (filter output ==
+          # 'false') AND the workflow file itself didn't change
+          # AND it's not a push to main. The matrix:
+          #
+          #   result    changed   ci_workflows  event   verdict
+          #   success   *         *             *       pass
+          #   skipped   false     false         pr      pass  (clean skip)
+          #   skipped   true      *             *       FAIL  (job should have run)
+          #   skipped   *         true          *       FAIL  (workflow changed, must run)
+          #   skipped   *         *             push    FAIL  (push must run everything)
+          #   failure   *         *             *       FAIL
+          #   cancelled *         *             *       FAIL
+          #
+          # Encoded inline below for each of go/web.
+          check_subsystem() {
+            local name="$1" result="$2" changed="$3"
+            case "${result}" in
+              success)
+                return 0
+                ;;
+              skipped)
+                if [[ "${event}" == "push" ]]; then
+                  echo "::error::${name} job skipped on push to main — must run on every push"
+                  return 1
+                fi
+                if [[ "${changed}" == "true" ]]; then
+                  echo "::error::${name} job skipped even though paths-filter said changes were present"
+                  return 1
+                fi
+                if [[ "${ci_workflows_changed}" == "true" ]]; then
+                  echo "::error::${name} job skipped even though CI workflows changed (workflow self-validation invariant)"
+                  return 1
+                fi
+                echo "${name} job skipped legitimately (no relevant changes in this PR)"
+                return 0
+                ;;
+              *)
+                echo "::error::${name} job did not succeed (result=${result})"
+                return 1
+                ;;
+            esac
+          }
+
+          check_subsystem go "${go_result}" "${go_changed}" || fail=1
+          check_subsystem web "${web_result}" "${web_changed}" || fail=1
+
+          # Integration has an additional legitimate skip path:
+          # fork-origin PRs. We can't tell at this layer whether
+          # a skip was from path-filter, fork-origin, OR the
+          # absence of ci:full label, so accept any 'skipped'
+          # provided it wasn't a push (push must always run).
+          # The integration job's `if:` clause is what determines
+          # whether to run; if that clause is wrong, you'll see
+          # it via a missing-coverage failure later in the
+          # promotion pipeline (canary / soak), not here.
           case "${integration_result}" in
-            success|skipped)
+            success)
+              ;;
+            skipped)
+              if [[ "${event}" == "push" ]]; then
+                echo "::error::integration job skipped on push to main — must run on every push"
+                fail=1
+              else
+                echo "integration job skipped (fork-origin, path-filter, or no ci:full label)"
+              fi
               ;;
             *)
               echo "::error::integration job did not succeed or skip cleanly (result=${integration_result})"
