@@ -268,6 +268,108 @@ func TestConfigString_RedactsPassword(t *testing.T) {
 	}
 }
 
+// TestStalwartMTLSConfig_Validate pins the partial-config detector
+// added so the proxy doesn't silently fall through to plain HTTP
+// when an operator sets KMAIL_STALWART_TLS_CERT without KEY (or
+// vice-versa, or CAFile/ServerName alone). All four-knob combos
+// are exercised; the table-driven layout makes it obvious which
+// state maps to which classification.
+func TestStalwartMTLSConfig_Validate(t *testing.T) {
+	tests := []struct {
+		name     string
+		cfg      StalwartMTLSConfig
+		wantErr  bool
+		errMatch string // substring assertion; empty means "any non-nil error"
+	}{
+		{
+			name:    "all empty -> mTLS disabled (no error)",
+			cfg:     StalwartMTLSConfig{},
+			wantErr: false,
+		},
+		{
+			name: "cert + key -> mTLS enabled (no error)",
+			cfg: StalwartMTLSConfig{
+				CertFile: "/etc/tls/tls.crt",
+				KeyFile:  "/etc/tls/tls.key",
+			},
+			wantErr: false,
+		},
+		{
+			name: "cert + key + ca -> mTLS enabled with custom roots (no error)",
+			cfg: StalwartMTLSConfig{
+				CertFile: "/etc/tls/tls.crt",
+				KeyFile:  "/etc/tls/tls.key",
+				CAFile:   "/etc/tls/ca.crt",
+			},
+			wantErr: false,
+		},
+		{
+			name: "cert + key + ca + serverName -> fully wired (no error)",
+			cfg: StalwartMTLSConfig{
+				CertFile:   "/etc/tls/tls.crt",
+				KeyFile:    "/etc/tls/tls.key",
+				CAFile:     "/etc/tls/ca.crt",
+				ServerName: "kmail-stalwart-0.kmail-stalwart.kmail.svc.cluster.local",
+			},
+			wantErr: false,
+		},
+		{
+			name: "cert without key -> partial (warn)",
+			cfg: StalwartMTLSConfig{
+				CertFile: "/etc/tls/tls.crt",
+			},
+			wantErr:  true,
+			errMatch: "KMAIL_STALWART_TLS_CERT is set but KMAIL_STALWART_TLS_KEY is empty",
+		},
+		{
+			name: "key without cert -> partial (warn)",
+			cfg: StalwartMTLSConfig{
+				KeyFile: "/etc/tls/tls.key",
+			},
+			wantErr:  true,
+			errMatch: "KMAIL_STALWART_TLS_KEY is set but KMAIL_STALWART_TLS_CERT is empty",
+		},
+		{
+			name: "ca without keypair -> partial (warn)",
+			cfg: StalwartMTLSConfig{
+				CAFile: "/etc/tls/ca.crt",
+			},
+			wantErr:  true,
+			errMatch: "KMAIL_STALWART_TLS_CA or KMAIL_STALWART_TLS_SERVER_NAME is set without",
+		},
+		{
+			name: "serverName without keypair -> partial (warn)",
+			cfg: StalwartMTLSConfig{
+				ServerName: "stalwart-0.kmail.svc.cluster.local",
+			},
+			wantErr:  true,
+			errMatch: "KMAIL_STALWART_TLS_CA or KMAIL_STALWART_TLS_SERVER_NAME is set without",
+		},
+		{
+			name: "whitespace-only cert -> treated as empty -> partial (warn)",
+			cfg: StalwartMTLSConfig{
+				CertFile: "   ",
+				KeyFile:  "/etc/tls/tls.key",
+			},
+			wantErr:  true,
+			errMatch: "KMAIL_STALWART_TLS_KEY is set but KMAIL_STALWART_TLS_CERT is empty",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.cfg.Validate()
+			switch {
+			case tc.wantErr && err == nil:
+				t.Fatalf("Validate(%+v): want error, got nil", tc.cfg)
+			case !tc.wantErr && err != nil:
+				t.Fatalf("Validate(%+v): want no error, got %v", tc.cfg, err)
+			case tc.wantErr && tc.errMatch != "" && !containsSubstring(err.Error(), tc.errMatch):
+				t.Fatalf("Validate(%+v): err = %q; want substring %q", tc.cfg, err.Error(), tc.errMatch)
+			}
+		})
+	}
+}
+
 func containsSubstring(s, sub string) bool {
 	if sub == "" {
 		return true

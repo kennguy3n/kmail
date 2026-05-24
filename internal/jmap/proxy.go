@@ -137,6 +137,26 @@ func (c *ClientTLSConfig) validate() error {
 	return nil
 }
 
+// clientTLSBuild bundles a base *tls.Config with the trust-root
+// loader and pinned ServerName so the transport can mint a fresh
+// per-connection config from the dial target. The per-connection
+// path exists specifically to keep hostname verification correct
+// when the upstream URL is an IP literal — Go's TLS stack strips
+// SNI for IP literals per RFC 6066, so `state.ServerName` in a
+// shared VerifyConnection callback would be empty and `DNSName: ""`
+// in `x509.VerifyOptions` would silently skip the hostname check
+// entirely. The mitigation: build VerifyConnection per dial, with
+// the dial host (which may be an IP literal) closed over so it
+// becomes the `DNSName` passed to `x509.Certificate.Verify` — Go's
+// verifier then enforces the cert's `IPAddresses` SAN list against
+// that value instead of falling through to chain-only verification.
+type clientTLSBuild struct {
+	base           *tls.Config
+	caLoader       *caPoolLoader
+	pinnedSrvName  string
+	customVerifier bool // true when CAFile was set; otherwise the stdlib verifier is fine
+}
+
 // build assembles the *tls.Config that the BFF transport presents
 // to Stalwart. The initial keypair and CA bundle loads run at
 // startup so a misconfigured deployment fails fast on boot;
@@ -146,7 +166,7 @@ func (c *ClientTLSConfig) validate() error {
 // rotation — of either the BFF leaf certificate OR the trust
 // root — continues to work even in clusters where the Reloader
 // controller is not installed.
-func (c *ClientTLSConfig) build(logger *log.Logger) (*tls.Config, error) {
+func (c *ClientTLSConfig) build(logger *log.Logger) (*clientTLSBuild, error) {
 	if err := c.validate(); err != nil {
 		return nil, err
 	}
@@ -165,53 +185,117 @@ func (c *ClientTLSConfig) build(logger *log.Logger) (*tls.Config, error) {
 	if min == 0 {
 		min = tls.VersionTLS12
 	}
-	cfg := &tls.Config{
-		GetClientCertificate: kpLoader.get,
-		MinVersion:           min,
-		ServerName:           c.ServerName,
+	b := &clientTLSBuild{
+		base: &tls.Config{
+			GetClientCertificate: kpLoader.get,
+			MinVersion:           min,
+			ServerName:           c.ServerName,
+		},
+		pinnedSrvName: c.ServerName,
 	}
 	if strings.TrimSpace(c.CAFile) != "" {
-		caLoader := &caPoolLoader{
+		b.caLoader = &caPoolLoader{
 			caFile: c.CAFile,
 			logger: logger,
 		}
 		// Validate the trust root at startup for the same fail-fast
 		// reason as the keypair. The pool is cached and re-loaded on
 		// the next handshake whenever the file's mtime changes.
-		if _, err := caLoader.load(); err != nil {
+		if _, err := b.caLoader.load(); err != nil {
 			return nil, fmt.Errorf("jmap.ClientTLSConfig: load CA bundle: %w", err)
 		}
-		// `InsecureSkipVerify=true` *combined with* `VerifyConnection`
-		// is the documented Go stdlib pattern for swapping in a
-		// custom verifier — it disables the built-in cert chain
-		// check so we can do it ourselves against a freshly-loaded
-		// pool. The verification logic below is otherwise identical
-		// to the default behaviour: it pins the chain to our CA
-		// roots and enforces the SNI hostname matches a SAN.
-		cfg.InsecureSkipVerify = true
-		cfg.VerifyConnection = func(state tls.ConnectionState) error {
-			if len(state.PeerCertificates) == 0 {
-				return errors.New("jmap.ClientTLSConfig: peer presented no certificate")
-			}
-			pool, err := caLoader.load()
-			if err != nil {
-				return fmt.Errorf("jmap.ClientTLSConfig: load CA bundle: %w", err)
-			}
-			opts := x509.VerifyOptions{
-				Roots:         pool,
-				Intermediates: x509.NewCertPool(),
-				DNSName:       state.ServerName,
-			}
-			for _, ic := range state.PeerCertificates[1:] {
-				opts.Intermediates.AddCert(ic)
-			}
-			if _, err := state.PeerCertificates[0].Verify(opts); err != nil {
-				return fmt.Errorf("jmap.ClientTLSConfig: verify peer: %w", err)
-			}
-			return nil
-		}
+		b.customVerifier = true
 	}
-	return cfg, nil
+	return b, nil
+}
+
+// perConnConfig clones the base config and stamps in the dial host
+// so VerifyConnection has correct DNSName / IPAddresses verification
+// even when SNI is suppressed (IP-literal URLs). The returned config
+// is safe for `tls.Client` — every connection gets its own clone.
+//
+// `dialHost` is the host portion of the dial address (no port). It
+// may be a hostname, an IPv4 / IPv6 literal, or — in the unusual
+// case of a malformed dial — empty. An empty `dialHost` combined
+// with an empty `pinnedSrvName` is the failure case that motivated
+// this refactor: previously it slipped through as chain-only
+// verification; now it produces a hard handshake error.
+func (b *clientTLSBuild) perConnConfig(dialHost string) *tls.Config {
+	cfg := b.base.Clone()
+	// Prefer the operator's explicit ServerName pin if one is set
+	// — this is the documented escape hatch when the upstream URL
+	// host doesn't match the SAN on Stalwart's server cert (e.g.
+	// going through a pod-local sidecar). Otherwise, fall back to
+	// the dial host. Setting `ServerName` here drives BOTH Go's
+	// per-connection SNI emission and `state.ServerName` in the
+	// VerifyConnection callback below.
+	if cfg.ServerName == "" {
+		cfg.ServerName = dialHost
+	}
+	if !b.customVerifier {
+		return cfg
+	}
+	// `InsecureSkipVerify=true` *combined with* `VerifyConnection`
+	// is the documented Go stdlib pattern for swapping in a custom
+	// verifier — it disables the built-in cert chain check so we
+	// can do it ourselves against a freshly-loaded pool. The logic
+	// below is otherwise identical to the default behavior: it
+	// pins the chain to our CA roots AND enforces the dial host
+	// matches a SAN (DNS name OR IPAddresses entry, depending on
+	// whether dialHost parses as an IP literal).
+	cfg.InsecureSkipVerify = true
+	pinned := b.pinnedSrvName
+	loader := b.caLoader
+	cfg.VerifyConnection = func(state tls.ConnectionState) error {
+		if len(state.PeerCertificates) == 0 {
+			return errors.New("jmap.ClientTLSConfig: peer presented no certificate")
+		}
+		pool, err := loader.load()
+		if err != nil {
+			return fmt.Errorf("jmap.ClientTLSConfig: load CA bundle: %w", err)
+		}
+		// Resolve the name that must appear in the SAN list, in
+		// priority order:
+		//
+		//   1. The operator's explicit `ServerName` pin (overrides
+		//      everything; intentional for sidecar / proxy cases).
+		//   2. `state.ServerName` — populated by Go when SNI was
+		//      sent (the common hostname case).
+		//   3. The dial host — used when SNI was suppressed because
+		//      the URL host is an IP literal (RFC 6066). Go's x509
+		//      verifier treats `DNSName` that parses as an IP as a
+		//      check against the cert's `IPAddresses` SAN, so this
+		//      is the correct value to pass even though the field
+		//      is named `DNSName`.
+		verifyName := pinned
+		if verifyName == "" {
+			verifyName = state.ServerName
+		}
+		if verifyName == "" {
+			verifyName = dialHost
+		}
+		if verifyName == "" {
+			// Should be impossible — the transport's DialTLSContext
+			// always passes a non-empty host. Treat as a hard error
+			// rather than silently falling through to chain-only
+			// verification, which would let a server impersonating
+			// any other Stalwart on the same root authenticate.
+			return errors.New("jmap.ClientTLSConfig: no name available for hostname verification (empty SNI and empty dial host); refusing chain-only verification")
+		}
+		opts := x509.VerifyOptions{
+			Roots:         pool,
+			Intermediates: x509.NewCertPool(),
+			DNSName:       verifyName,
+		}
+		for _, ic := range state.PeerCertificates[1:] {
+			opts.Intermediates.AddCert(ic)
+		}
+		if _, err := state.PeerCertificates[0].Verify(opts); err != nil {
+			return fmt.Errorf("jmap.ClientTLSConfig: verify peer: %w", err)
+		}
+		return nil
+	}
+	return cfg
 }
 
 // keypairLoader is the `GetClientCertificate` provider used by
@@ -455,21 +539,66 @@ func isBareSvcHostname(host string) bool {
 // mTLS to Stalwart. The dialer and timeout values match the
 // stdlib defaults (`http.DefaultTransport`) so retry / dial
 // behaviour is unchanged when the only addition is a client cert.
-func newClientTLSTransport(tlsCfg *tls.Config) *http.Transport {
-	return &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		DialContext: (&net.Dialer{
-			Timeout:   30 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
+//
+// The transport installs a `DialTLSContext` wrapper rather than
+// relying on `TLSClientConfig` + Go's auto-promotion, because the
+// auto-promoted config does not give us the dial host before the
+// handshake. We need it to keep hostname verification correct for
+// IP-literal upstream URLs — see clientTLSBuild.perConnConfig for
+// the full rationale. The wrapper:
+//
+//  1. Dials TCP exactly like the stdlib default.
+//  2. Splits the dial address into host:port and uses the host
+//     (an FQDN, an IPv4 literal, or `[IPv6]`-stripped) to build a
+//     per-connection *tls.Config.
+//  3. Performs the TLS handshake explicitly with HandshakeContext
+//     so cancellation propagates and the handshake-deadline
+//     observance matches `TLSHandshakeTimeout`.
+func newClientTLSTransport(b *clientTLSBuild) *http.Transport {
+	dialer := &net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+	tr := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           dialer.DialContext,
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          100,
 		MaxIdleConnsPerHost:   10,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
-		TLSClientConfig:       tlsCfg,
+		// Provide a base TLSClientConfig too so http.Transport
+		// internals (HTTP/2 negotiation, protocols, ALPN) that
+		// peek at NextProtos / MinVersion still see consistent
+		// values. The actual handshake runs in DialTLSContext.
+		TLSClientConfig: b.base,
 	}
+	tr.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host, _, err := net.SplitHostPort(addr)
+		if err != nil {
+			// Fall back to the raw addr; if it's malformed the
+			// dial below will surface a clearer error.
+			host = addr
+		}
+		raw, err := dialer.DialContext(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		perConn := b.perConnConfig(host)
+		// Match the transport's TLSHandshakeTimeout so an
+		// unresponsive server fails the dial promptly rather than
+		// hanging the whole HTTP request.
+		hsCtx, cancel := context.WithTimeout(ctx, tr.TLSHandshakeTimeout)
+		defer cancel()
+		tlsConn := tls.Client(raw, perConn)
+		if err := tlsConn.HandshakeContext(hsCtx); err != nil {
+			_ = raw.Close()
+			return nil, err
+		}
+		return tlsConn, nil
+	}
+	return tr
 }
 
 // Proxy forwards authenticated JMAP requests from the React client

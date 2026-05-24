@@ -233,7 +233,10 @@ func (s *CMKService) EncryptDEK(ctx context.Context, tenantID, configID, keyLabe
 		client.Password = string(creds)
 		ciphertext, iv, err = client.Encrypt(keyLabel, plaintext)
 	case HSMPKCS11:
-		ciphertext, iv, err = pkcs11Encrypt(ctx, *cfg, keyLabel, plaintext)
+		// `creds` carries the unwrapped PKCS#11 PIN — the cgo
+		// build needs it for `C_Login`. The no-cgo shim ignores
+		// the slice and returns errPKCS11NotBuilt.
+		ciphertext, iv, err = pkcs11Encrypt(ctx, *cfg, creds, keyLabel, plaintext)
 	default:
 		return nil, nil, fmt.Errorf("cmk: unsupported provider_type %q", cfg.Provider)
 	}
@@ -260,7 +263,7 @@ func (s *CMKService) DecryptDEK(ctx context.Context, tenantID, configID, keyLabe
 		client.Password = string(creds)
 		out, err = client.Decrypt(keyLabel, ciphertext, iv)
 	case HSMPKCS11:
-		out, err = pkcs11Decrypt(ctx, *cfg, keyLabel, ciphertext, iv)
+		out, err = pkcs11Decrypt(ctx, *cfg, creds, keyLabel, ciphertext, iv)
 	default:
 		return nil, fmt.Errorf("cmk: unsupported provider_type %q", cfg.Provider)
 	}

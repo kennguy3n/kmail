@@ -46,11 +46,20 @@ var errPKCS11NotBuilt = errors.New("cmk.pkcs11: KMail was built without the `pkc
 // cgo-backed encrypt operation. It always returns
 // errPKCS11NotBuilt so an admin sees a useful message rather
 // than a silent fallback to the in-process AEAD.
-func pkcs11Encrypt(_ context.Context, _ HSMConfig, _ string, _ []byte) (ciphertext, iv []byte, err error) {
+//
+// The `creds` parameter is the unwrapped PKCS#11 PIN bytes
+// (loaded from `kmail-secrets`-envelope storage by the caller).
+// The no-cgo shim does not use it, but the parameter is retained
+// in the signature so the cgo build (`pkcs11_cgo.go`) can pass
+// the PIN to `C_Login` without a future signature change rippling
+// through every caller in `hsm.go`. Callers MUST zero the slice
+// after the call returns to keep the PIN out of the heap.
+func pkcs11Encrypt(_ context.Context, _ HSMConfig, _ []byte, _ string, _ []byte) (ciphertext, iv []byte, err error) {
 	return nil, nil, errPKCS11NotBuilt
 }
 
-// pkcs11Decrypt mirrors pkcs11Encrypt.
-func pkcs11Decrypt(_ context.Context, _ HSMConfig, _ string, _, _ []byte) ([]byte, error) {
+// pkcs11Decrypt mirrors pkcs11Encrypt. The PIN credential
+// argument is documented on pkcs11Encrypt.
+func pkcs11Decrypt(_ context.Context, _ HSMConfig, _ []byte, _ string, _, _ []byte) ([]byte, error) {
 	return nil, errPKCS11NotBuilt
 }

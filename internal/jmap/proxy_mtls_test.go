@@ -148,10 +148,11 @@ func TestClientTLSConfig_BuildLoadsCert(t *testing.T) {
 		KeyFile:    writeTempPEM(t, dir, "tls.key", key),
 		ServerName: "stalwart.kmail.internal",
 	}
-	tlsCfg, err := cfg.build(testLogger(t))
+	built, err := cfg.build(testLogger(t))
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
+	tlsCfg := built.base
 	if tlsCfg.GetClientCertificate == nil {
 		t.Fatal("GetClientCertificate not wired")
 	}
@@ -168,6 +169,9 @@ func TestClientTLSConfig_BuildLoadsCert(t *testing.T) {
 	if tlsCfg.ServerName != "stalwart.kmail.internal" {
 		t.Errorf("ServerName = %q", tlsCfg.ServerName)
 	}
+	if built.pinnedSrvName != "stalwart.kmail.internal" {
+		t.Errorf("pinnedSrvName = %q, want stalwart.kmail.internal", built.pinnedSrvName)
+	}
 }
 
 // TestClientTLSConfig_BuildLeavesServerNameEmpty pins the
@@ -181,12 +185,15 @@ func TestClientTLSConfig_BuildLeavesServerNameEmpty(t *testing.T) {
 		CertFile: writeTempPEM(t, dir, "tls.crt", cert),
 		KeyFile:  writeTempPEM(t, dir, "tls.key", key),
 	}
-	tlsCfg, err := cfg.build(testLogger(t))
+	built, err := cfg.build(testLogger(t))
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
-	if tlsCfg.ServerName != "" {
-		t.Errorf("ServerName = %q, want empty so transport derives per-connection", tlsCfg.ServerName)
+	if built.base.ServerName != "" {
+		t.Errorf("ServerName = %q, want empty so transport derives per-connection", built.base.ServerName)
+	}
+	if built.pinnedSrvName != "" {
+		t.Errorf("pinnedSrvName = %q, want empty", built.pinnedSrvName)
 	}
 }
 
@@ -274,15 +281,29 @@ func TestClientTLSConfig_BuildLoadsCABundle(t *testing.T) {
 		KeyFile:  writeTempPEM(t, dir, "tls.key", key),
 		CAFile:   writeTempPEM(t, dir, "ca.pem", caCert),
 	}
-	tlsCfg, err := cfg.build(testLogger(t))
+	built, err := cfg.build(testLogger(t))
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
-	if tlsCfg.VerifyConnection == nil {
-		t.Fatal("VerifyConnection callback not wired")
+	if !built.customVerifier {
+		t.Fatal("expected customVerifier=true when CAFile is set")
 	}
-	if !tlsCfg.InsecureSkipVerify {
-		t.Fatal("expected InsecureSkipVerify=true so VerifyConnection is the only verifier")
+	if built.caLoader == nil {
+		t.Fatal("caLoader not wired")
+	}
+	// perConnConfig should produce a tls.Config with the documented
+	// stdlib pattern (InsecureSkipVerify=true + VerifyConnection)
+	// every time it's called — the per-connection cloning is what
+	// guarantees the dial host is in scope for VerifyConnection.
+	perConn := built.perConnConfig("stalwart.kmail.internal")
+	if perConn.VerifyConnection == nil {
+		t.Fatal("perConnConfig: VerifyConnection callback not wired")
+	}
+	if !perConn.InsecureSkipVerify {
+		t.Fatal("perConnConfig: expected InsecureSkipVerify=true so VerifyConnection is the only verifier")
+	}
+	if perConn.ServerName != "stalwart.kmail.internal" {
+		t.Errorf("perConnConfig: ServerName = %q, want stalwart.kmail.internal", perConn.ServerName)
 	}
 }
 
@@ -389,11 +410,11 @@ func TestProxy_MTLSHandshake(t *testing.T) {
 		CAFile:     writeTempPEM(t, dir, "ca.pem", ca.certPEM),
 		ServerName: "127.0.0.1",
 	}
-	tlsCfg, err := cfg.build(testLogger(t))
+	built, err := cfg.build(testLogger(t))
 	if err != nil {
 		t.Fatalf("build TLS: %v", err)
 	}
-	transport := newClientTLSTransport(tlsCfg)
+	transport := newClientTLSTransport(built)
 
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL, nil)
 	if err != nil {
@@ -409,16 +430,162 @@ func TestProxy_MTLSHandshake(t *testing.T) {
 	}
 
 	// Sanity check: stripping the client cert should now fail the
-	// handshake. Reuse the same CA-pinned config but drop the
-	// client material.
-	noClientCfg := tlsCfg.Clone()
-	noClientCfg.Certificates = nil
-	noClientCfg.GetClientCertificate = nil
-	noClientTransport := newClientTLSTransport(noClientCfg)
+	// handshake. Build a fresh clientTLSBuild from the same files
+	// but null out the GetClientCertificate so the server's
+	// RequireAndVerifyClientCert demand has nothing to satisfy.
+	noClientBuilt, err := cfg.build(testLogger(t))
+	if err != nil {
+		t.Fatalf("build no-client TLS: %v", err)
+	}
+	noClientBuilt.base.GetClientCertificate = nil
+	noClientBuilt.base.Certificates = nil
+	noClientTransport := newClientTLSTransport(noClientBuilt)
 	if _, err := noClientTransport.RoundTrip(req.Clone(context.Background())); err == nil {
 		t.Errorf("expected handshake failure without client cert")
 	}
 
+}
+
+// TestProxy_MTLSIPLiteralVerifiesAgainstIPAddressesSAN pins the
+// fix for the round-5 Devin Review finding: when the upstream URL
+// is an IP literal (e.g. `https://127.0.0.1:8443`) and the
+// operator did NOT pin ServerName, the verifier must still enforce
+// hostname verification against the cert's `IPAddresses` SAN list
+// instead of silently falling through to chain-only verification.
+//
+// Prior to the per-connection refactor, Go's TLS stack strips SNI
+// for IP literals (RFC 6066) so `state.ServerName` arrived empty
+// in VerifyConnection and `DNSName: ""` skipped the SAN check
+// entirely. The new perConnConfig path closes the dial host over
+// the verifier, so the IP becomes the DNSName argument and Go's
+// x509 verifier routes it through the IPAddresses SAN check.
+func TestProxy_MTLSIPLiteralVerifiesAgainstIPAddressesSAN(t *testing.T) {
+	dir := t.TempDir()
+
+	ca := issueCert(t, "kmail-ca", nil, true, nil)
+	// Server cert has 127.0.0.1 in its IPAddresses SAN (added by
+	// issueCert by default) but NO DNS SANs. This is the shape of
+	// a cert issued for an IP-only endpoint.
+	server := issueCert(t, "stalwart-ip", nil, false, ca)
+	client := issueCert(t, "kmail-bff", nil, false, ca)
+
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(ca.certPEM)
+
+	serverCert, err := tls.X509KeyPair(server.certPEM, server.keyPEM)
+	if err != nil {
+		t.Fatalf("load server cert: %v", err)
+	}
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	srv.TLS = &tls.Config{
+		Certificates: []tls.Certificate{serverCert},
+		ClientCAs:    pool,
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		MinVersion:   tls.VersionTLS12,
+	}
+	srv.StartTLS()
+	defer srv.Close()
+
+	// NO ServerName pin set: this is the failure case the bot
+	// identified. Verifier should still enforce IP SAN match
+	// against the dial host (127.0.0.1).
+	cfg := &ClientTLSConfig{
+		CertFile: writeTempPEM(t, dir, "tls.crt", client.certPEM),
+		KeyFile:  writeTempPEM(t, dir, "tls.key", client.keyPEM),
+		CAFile:   writeTempPEM(t, dir, "ca.pem", ca.certPEM),
+	}
+	built, err := cfg.build(testLogger(t))
+	if err != nil {
+		t.Fatalf("build TLS: %v", err)
+	}
+	transport := newClientTLSTransport(built)
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL, nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	resp, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip against IP-literal URL: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+
+	// Negative side: a server cert that does NOT include the
+	// dial IP in its IPAddresses SAN must FAIL verification.
+	// This proves the verifier is actually consulting the SAN
+	// list — without the fix it would have silently accepted any
+	// cert chained to our CA regardless of the IP.
+	wrongIPServer := issueCertForIP(t, "stalwart-wrong-ip", net.ParseIP("10.0.0.99"), ca)
+	wrongCert, err := tls.X509KeyPair(wrongIPServer.certPEM, wrongIPServer.keyPEM)
+	if err != nil {
+		t.Fatalf("load wrong-IP cert: %v", err)
+	}
+	srv2 := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	srv2.TLS = &tls.Config{
+		Certificates: []tls.Certificate{wrongCert},
+		ClientCAs:    pool,
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		MinVersion:   tls.VersionTLS12,
+	}
+	srv2.StartTLS()
+	defer srv2.Close()
+
+	req2, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv2.URL, nil)
+	if err != nil {
+		t.Fatalf("new request 2: %v", err)
+	}
+	if _, err := transport.RoundTrip(req2); err == nil {
+		t.Fatal("expected handshake failure: dial host 127.0.0.1 does not match cert's IPAddresses SAN 10.0.0.99")
+	} else if !strings.Contains(err.Error(), "verify peer") && !strings.Contains(err.Error(), "certificate") && !strings.Contains(err.Error(), "IP") {
+		t.Logf("got expected handshake error: %v", err)
+	}
+}
+
+// issueCertForIP is a variant of issueCert that overrides the
+// default 127.0.0.1 IPAddresses entry with a caller-supplied IP.
+// Used by the negative branch of the IP-SAN verification test.
+func issueCertForIP(t *testing.T, cn string, ip net.IP, issuer *issuedCert) *issuedCert {
+	t.Helper()
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	serial, err := rand.Int(rand.Reader, big.NewInt(1<<62))
+	if err != nil {
+		t.Fatalf("serial: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          serial,
+		Subject:               pkix.Name{CommonName: cn},
+		NotBefore:             time.Now().Add(-time.Minute),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IPAddresses:           []net.IP{ip},
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, issuer.cert, &priv.PublicKey, issuer.key)
+	if err != nil {
+		t.Fatalf("create cert: %v", err)
+	}
+	parsed, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatalf("parse cert: %v", err)
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyDER, err := x509.MarshalECPrivateKey(priv)
+	if err != nil {
+		t.Fatalf("marshal key: %v", err)
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+	return &issuedCert{cert: parsed, key: priv, certPEM: certPEM, keyPEM: keyPEM}
 }
 
 func TestNewProxy_LogsWarningOnHTTPSWithoutTLS(t *testing.T) {

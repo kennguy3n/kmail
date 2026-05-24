@@ -146,6 +146,14 @@ func main() {
 		malware.NewHandlers(malware.NewNoopScanner(), logger).Register(mux, authMW.Wrap)
 	}
 
+	// Surface partial mTLS configuration loudly. `Enabled()` only
+	// returns true when BOTH cert+key are set, so an operator that
+	// sets only one (or only CAFile / ServerName) would otherwise
+	// see the proxy silently fall through to plain HTTP with no
+	// hint at boot. `Validate()` reports the specific mismatch.
+	if err := cfg.StalwartMTLS.Validate(); err != nil {
+		logger.Printf("jmap proxy: WARNING %v", err)
+	}
 	var stalwartTLS *jmap.ClientTLSConfig
 	if cfg.StalwartMTLS.Enabled() {
 		stalwartTLS = &jmap.ClientTLSConfig{

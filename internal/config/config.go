@@ -10,6 +10,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -295,6 +296,50 @@ type StalwartMTLSConfig struct {
 // itself catches partial configuration with a clearer error.
 func (c StalwartMTLSConfig) Enabled() bool {
 	return strings.TrimSpace(c.CertFile) != "" && strings.TrimSpace(c.KeyFile) != ""
+}
+
+// Validate inspects the four mTLS knobs and returns a descriptive
+// error when the combination is internally inconsistent (e.g. one
+// of CertFile/KeyFile set without the other, or CAFile/ServerName
+// set without a usable keypair). Returns nil for the two
+// legitimate states:
+//
+//   - all four empty: mTLS fully disabled. The proxy talks plain
+//     HTTP (or hits the StalwartURL HTTPS-without-cert warning).
+//   - CertFile + KeyFile both set: mTLS enabled. CAFile and
+//     ServerName remain optional refinements.
+//
+// Callers (main.go) surface the error as a startup WARN rather
+// than fatal — a misconfigured local dev environment shouldn't
+// refuse to boot, but the operator MUST see the message so they
+// can fix it before the silent fall-through to plain HTTP. The
+// proxy's `ClientTLSConfig.validate` returns a hard error on the
+// same condition, but that path is only reached when `Enabled()`
+// is true, so partial-config (where one of cert/key is empty)
+// otherwise slips through silently.
+func (c StalwartMTLSConfig) Validate() error {
+	cert := strings.TrimSpace(c.CertFile) != ""
+	key := strings.TrimSpace(c.KeyFile) != ""
+	ca := strings.TrimSpace(c.CAFile) != ""
+	sn := strings.TrimSpace(c.ServerName) != ""
+	switch {
+	case !cert && !key && !ca && !sn:
+		return nil
+	case cert && key:
+		return nil
+	case cert && !key:
+		return errors.New("config.StalwartMTLS: KMAIL_STALWART_TLS_CERT is set but KMAIL_STALWART_TLS_KEY is empty; mTLS will be silently disabled")
+	case !cert && key:
+		return errors.New("config.StalwartMTLS: KMAIL_STALWART_TLS_KEY is set but KMAIL_STALWART_TLS_CERT is empty; mTLS will be silently disabled")
+	case (ca || sn) && !cert && !key:
+		// CAFile or ServerName without a client keypair is a
+		// half-configured deployment that produces no TLS
+		// handshake at all — almost certainly an operator
+		// typo (forgot the cert/key vars).
+		return errors.New("config.StalwartMTLS: KMAIL_STALWART_TLS_CA or KMAIL_STALWART_TLS_SERVER_NAME is set without KMAIL_STALWART_TLS_CERT and KMAIL_STALWART_TLS_KEY; mTLS will be silently disabled")
+	default:
+		return nil
+	}
 }
 
 // DNSConfig wires the DNS Onboarding Service. The defaults target
