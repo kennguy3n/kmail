@@ -23,6 +23,7 @@ use kmail_core::{
     AeadEnvelope, ClientConfig, ConfidentialEnvelope, EmailAddress, EmailDraft, EmailSummary,
     KMailClient, KeyMaterial, Mailbox, MlsKeyProvider,
 };
+use zeroize::Zeroize;
 
 uniffi::setup_scaffolding!();
 
@@ -385,32 +386,40 @@ impl MlsKeyProvider for ForeignMlsKeyProvider {
         &self,
         recipient_user_id: &str,
     ) -> kmail_core::Result<KeyMaterial> {
-        let bytes = self
+        let mut bytes = self
             .foreign
             .confidential_send_leaf_secret(recipient_user_id.to_string())
             .map_err(|e| {
                 kmail_core::Error::KeyStore(format!("foreign MlsKeyProvider returned error: {e}"))
             })?;
         if bytes.len() != 32 {
+            // Zeroize the wrong-length buffer before dropping it.
+            // A misconfigured caller that returns e.g. 33 bytes may
+            // still have included 32 bytes of real key material
+            // (with a stray trailing byte); we don't want those
+            // bytes lingering in freed heap. See Devin Review
+            // finding 3294898657 on PR #39.
+            let len = bytes.len();
+            bytes.zeroize();
             return Err(kmail_core::Error::KeyStore(format!(
-                "foreign MlsKeyProvider returned {}-byte Confidential Send secret, expected 32",
-                bytes.len()
+                "foreign MlsKeyProvider returned {len}-byte Confidential Send secret, expected 32"
             )));
         }
         Ok(KeyMaterial::new(bytes))
     }
 
     fn vault_folder_master_secret(&self, folder_id: &str) -> kmail_core::Result<KeyMaterial> {
-        let bytes = self
+        let mut bytes = self
             .foreign
             .vault_folder_master_secret(folder_id.to_string())
             .map_err(|e| {
                 kmail_core::Error::KeyStore(format!("foreign MlsKeyProvider returned error: {e}"))
             })?;
         if bytes.len() != 32 {
+            let len = bytes.len();
+            bytes.zeroize();
             return Err(kmail_core::Error::KeyStore(format!(
-                "foreign MlsKeyProvider returned {}-byte Vault secret, expected 32",
-                bytes.len()
+                "foreign MlsKeyProvider returned {len}-byte Vault secret, expected 32"
             )));
         }
         Ok(KeyMaterial::new(bytes))
@@ -1213,6 +1222,67 @@ mod tests {
                 ffi_lowered.bootstrap_mailbox_role, napi_lowered.bootstrap_mailbox_role,
                 "UniFFI and napi must agree on bootstrap_mailbox_role lowering"
             );
+        }
+    }
+
+    /// `ForeignMlsKeyProvider` surfaces a wrong-length foreign
+    /// callback return as `Error::KeyStore`, with the foreign
+    /// length echoed in the error message so the iOS / Android
+    /// developer can debug their impl. The companion code path
+    /// also zeroizes the wrong-length buffer before drop; we
+    /// can't observe freed heap from safe Rust to test that
+    /// directly, but the error-message path proves the branch
+    /// is taken.
+    #[test]
+    fn foreign_mls_provider_rejects_wrong_length_secret() {
+        struct OffByOneProvider;
+        impl FfiMlsKeyProvider for OffByOneProvider {
+            fn confidential_send_leaf_secret(
+                &self,
+                _recipient_user_id: String,
+            ) -> Result<Vec<u8>, KMailError> {
+                // 33 bytes simulates a miscompiled MLS exporter
+                // that emits one trailing byte beyond the 32-byte
+                // KDF output. The first 32 bytes might be real
+                // key material, which is precisely why we
+                // zeroize before dropping.
+                Ok(vec![0xAB; 33])
+            }
+            fn vault_folder_master_secret(
+                &self,
+                _folder_id: String,
+            ) -> Result<Vec<u8>, KMailError> {
+                Ok(vec![0xCD; 31])
+            }
+        }
+
+        let provider = ForeignMlsKeyProvider {
+            foreign: Arc::new(OffByOneProvider),
+        };
+        let err = provider
+            .confidential_send_leaf_secret("alice@kmail.test")
+            .unwrap_err();
+        match err {
+            kmail_core::Error::KeyStore(msg) => {
+                assert!(msg.contains("33"), "error msg should include length: {msg}");
+                assert!(
+                    msg.contains("Confidential Send"),
+                    "error msg should identify scope: {msg}"
+                );
+            }
+            other => panic!("expected KeyStore error, got {other:?}"),
+        }
+
+        let err = provider.vault_folder_master_secret("folder-1").unwrap_err();
+        match err {
+            kmail_core::Error::KeyStore(msg) => {
+                assert!(msg.contains("31"), "error msg should include length: {msg}");
+                assert!(
+                    msg.contains("Vault"),
+                    "error msg should identify scope: {msg}"
+                );
+            }
+            other => panic!("expected KeyStore error, got {other:?}"),
         }
     }
 

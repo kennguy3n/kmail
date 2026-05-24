@@ -113,10 +113,18 @@ pub trait MlsKeyProvider: Send + Sync {
 /// TypeScript. The struct is `pub` for the SDK's own integration
 /// tests in the `client.rs` module; downstream users must build
 /// their own impl that delegates to the real MLS SDK.
+///
+/// Storage uses [`KeyMaterial`] (not raw `Vec<u8>`) so that the
+/// secret bytes are zeroed on `Drop` / `HashMap::remove`. This is
+/// deliberate even though the struct is test-only — it lets the
+/// test impl demonstrate the same zeroize discipline that any
+/// production [`MlsKeyProvider`] implementation MUST follow, so
+/// a future maintainer skimming this file for reference doesn't
+/// see a misleading example.
 #[derive(Default)]
 pub struct StaticMlsKeyProvider {
-    confidential: Mutex<HashMap<String, Vec<u8>>>,
-    vault: Mutex<HashMap<String, Vec<u8>>>,
+    confidential: Mutex<HashMap<String, KeyMaterial>>,
+    vault: Mutex<HashMap<String, KeyMaterial>>,
 }
 
 impl StaticMlsKeyProvider {
@@ -134,10 +142,10 @@ impl StaticMlsKeyProvider {
             "MLS leaf secret must be 32 bytes (got {})",
             secret.len()
         );
-        self.confidential
-            .lock()
-            .unwrap()
-            .insert(recipient_user_id.to_string(), secret.to_vec());
+        self.confidential.lock().unwrap().insert(
+            recipient_user_id.to_string(),
+            KeyMaterial::new(secret.to_vec()),
+        );
         self
     }
 
@@ -153,7 +161,7 @@ impl StaticMlsKeyProvider {
         self.vault
             .lock()
             .unwrap()
-            .insert(folder_id.to_string(), secret.to_vec());
+            .insert(folder_id.to_string(), KeyMaterial::new(secret.to_vec()));
         self
     }
 }
@@ -163,28 +171,22 @@ impl MlsKeyProvider for StaticMlsKeyProvider {
         let g = self.confidential.lock().map_err(|_| {
             crate::error::Error::KeyStore("StaticMlsKeyProvider mutex poisoned".into())
         })?;
-        g.get(recipient_user_id)
-            .cloned()
-            .map(KeyMaterial::new)
-            .ok_or_else(|| {
-                crate::error::Error::KeyStore(format!(
-                    "no Confidential Send secret seeded for recipient {recipient_user_id}"
-                ))
-            })
+        g.get(recipient_user_id).cloned().ok_or_else(|| {
+            crate::error::Error::KeyStore(format!(
+                "no Confidential Send secret seeded for recipient {recipient_user_id}"
+            ))
+        })
     }
 
     fn vault_folder_master_secret(&self, folder_id: &str) -> Result<KeyMaterial> {
         let g = self.vault.lock().map_err(|_| {
             crate::error::Error::KeyStore("StaticMlsKeyProvider mutex poisoned".into())
         })?;
-        g.get(folder_id)
-            .cloned()
-            .map(KeyMaterial::new)
-            .ok_or_else(|| {
-                crate::error::Error::KeyStore(format!(
-                    "no Vault folder secret seeded for folder {folder_id}"
-                ))
-            })
+        g.get(folder_id).cloned().ok_or_else(|| {
+            crate::error::Error::KeyStore(format!(
+                "no Vault folder secret seeded for folder {folder_id}"
+            ))
+        })
     }
 }
 
