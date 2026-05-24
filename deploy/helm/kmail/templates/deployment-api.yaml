@@ -24,8 +24,27 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           ports:
             - name: http
-              containerPort: 8080
+              # Templated from `kmailApi.service.targetPort` so the
+              # container's listen port, the Service `targetPort`,
+              # and the `KMAIL_API_ADDR` env var below are all
+              # driven by ONE value in `values.yaml`. Operators can
+              # change the BFF's port by editing exactly one line.
+              containerPort: {{ .Values.kmailApi.service.targetPort }}
               protocol: TCP
+          env:
+            # `KMAIL_API_ADDR` is NOT placed in the ConfigMap
+            # (`values.yaml: kmailApi.config`) because it must
+            # be derived from the same value the deployment uses
+            # for `containerPort` above. A static ConfigMap entry
+            # would let the two drift; this per-pod env keeps
+            # them in lock-step. The binary's in-source default
+            # is `:8088` (see `internal/config/config.go`) so a
+            # host-run BFF avoids the docker-compose 8080 host
+            # publish; in Kubernetes Stalwart is its own pod, so
+            # the BFF binds whatever this value says (`:8080` by
+            # default).
+            - name: KMAIL_API_ADDR
+              value: ":{{ .Values.kmailApi.service.targetPort }}"
           envFrom:
             - configMapRef:
                 name: {{ include "kmail.fullname" . }}-config

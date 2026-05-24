@@ -21,6 +21,13 @@ kmailApi:
   service:
     type: ClusterIP
     port: 80
+    # `targetPort` is the SINGLE SOURCE OF TRUTH for the BFF's
+    # listen port in Kubernetes. The deployment templates derive
+    # `containerPort` AND the `KMAIL_API_ADDR` env var from this
+    # value, so changing it here updates every dependent surface
+    # — there is no separate hardcoded port the operator can
+    # accidentally desynchronise. The Service's external `port`
+    # is the front-door (`:80`) and is unrelated.
     targetPort: 8080
   ingress:
     enabled: true
@@ -49,19 +56,18 @@ kmailApi:
     minAvailable: 1
   config:
     KMAIL_LOG_FORMAT: "json"
-    # The BFF's :8088 source-code default exists so a host-run BFF
-    # (`go run ./cmd/kmail-api` next to `docker compose up`) doesn't
+    # NOTE: `KMAIL_API_ADDR` is NOT set here. The BFF binary's
+    # in-source default is `:8088` (so a host-run BFF doesn't
     # collide with Stalwart's matched 8080:8080 host publish in
-    # docker-compose.yml. In Kubernetes Stalwart is a SEPARATE
-    # StatefulSet (see kmailStalwart.containerPort 8080) so the BFF
-    # is free to bind :8080 inside its own pod. We override here so
-    # the Service `targetPort: 8080`, the `containerPort: 8080` on
-    # deployment-api.yaml, and the readiness/liveness probes (which
-    # target the named `http` port) all line up with where the BFF
-    # is actually listening. Without this override the binary would
-    # bind :8088, the probes would fail on :8080, and every Helm
-    # rollout would crash-loop.
-    KMAIL_API_ADDR: ":8080"
+    # docker-compose.yml); in Kubernetes Stalwart is a SEPARATE
+    # StatefulSet so the BFF is free to bind `:8080` inside its
+    # own pod. The deployment template plants `KMAIL_API_ADDR`
+    # as a per-pod `env:` entry derived from
+    # `kmailApi.service.targetPort`, so the listen address,
+    # `containerPort`, Service `targetPort`, and probe targets
+    # are all driven by the SAME value. Do not re-add it here
+    # — doing so re-introduces the three-place magic-number
+    # drift this refactor was meant to eliminate.
     KMAIL_STALWART_URL: "http://kmail-stalwart-0.kmail-stalwart.svc:8080"
     KMAIL_RETENTION_DRY_RUN: "false"
     KMAIL_TRACING_OTLP_ENDPOINT: ""
