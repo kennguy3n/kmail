@@ -74,11 +74,25 @@ pub(crate) const MIGRATIONS: &[(u32, &str)] = &[(
         CREATE INDEX IF NOT EXISTS idx_emails_thread_id
             ON emails(thread_id);
 
+        -- `email_mailboxes` carries the many-to-many membership of
+        -- emails in mailboxes. Both foreign keys are declared with
+        -- ON DELETE CASCADE so the database itself enforces the
+        -- cleanup invariant — deleting a row from `emails` OR from
+        -- `mailboxes` automatically removes the matching membership
+        -- rows. The application-level cleanup in
+        -- `MailboxRepo::delete` / `upsert_many_with_state` is kept as
+        -- defence-in-depth: it works even if a future code path
+        -- opens a connection without `PRAGMA foreign_keys = ON`, and
+        -- it short-circuits when the cascade already ran (the
+        -- DELETE just matches zero rows). Note that SQLite only
+        -- enforces foreign keys per-connection, so the
+        -- `CONNECTION_PRAGMAS` above are still mandatory.
         CREATE TABLE IF NOT EXISTS email_mailboxes (
             email_id TEXT NOT NULL,
             mailbox_id TEXT NOT NULL,
             PRIMARY KEY (email_id, mailbox_id),
-            FOREIGN KEY (email_id) REFERENCES emails(id) ON DELETE CASCADE
+            FOREIGN KEY (email_id) REFERENCES emails(id) ON DELETE CASCADE,
+            FOREIGN KEY (mailbox_id) REFERENCES mailboxes(id) ON DELETE CASCADE
         );
 
         CREATE INDEX IF NOT EXISTS idx_email_mailboxes_mailbox

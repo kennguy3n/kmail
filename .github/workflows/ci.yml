@@ -529,24 +529,33 @@ jobs:
   # be marked green.
   #
   # The canonical fix is a single aggregate job (this one) that:
-  #   1. Depends on go / web / integration.
+  #   1. Depends on every subsystem job: go / web / sdk / integration.
   #   2. Runs `if: always()` so it executes even when integration
   #      is skipped on forks (otherwise IT would inherit the
   #      skip and the problem cascades upward).
-  #   3. Treats `integration.result == 'skipped'` as a pass —
-  #      legitimate when the fork-skip condition fired — but
-  #      `success` is the only acceptable result for go / web,
-  #      because nothing skips those.
+  #   3. Treats `<subsystem>.result == 'skipped'` as a pass when
+  #      the corresponding `needs.changes.outputs.<subsystem>` is
+  #      `'false'` — i.e. the path-filter genuinely had no work
+  #      for that subsystem. `success` is required when the
+  #      subsystem was changed, OR (for `integration`) when the
+  #      fork-skip condition fired.
   #   4. Reports its own pass/fail to the status API.
   #
   # Branch protection then requires THIS job (`CI Status`), not
-  # the three underlying ones. Fork PRs report:
-  #   go: success, web: success, integration: skipped, ci-status: success
-  # main-repo PRs report:
-  #   go: success, web: success, integration: success, ci-status: success
+  # the underlying ones. Example outcomes:
+  #   fork PR, all subsystems touched:
+  #     go: success, web: success, sdk: success,
+  #     integration: skipped (fork-OOM guard), ci-status: success
+  #   main-repo PR, only the SDK changed:
+  #     go: skipped, web: skipped, sdk: success,
+  #     integration: skipped, ci-status: success
+  #   main-repo PR, every subsystem touched:
+  #     go: success, web: success, sdk: success,
+  #     integration: success, ci-status: success
   # A real failure of any job correctly fails ci-status because
   # the conditional below requires `!= 'failure'` AND
-  # `!= 'cancelled'` for every dependency.
+  # `!= 'cancelled'` for every dependency, regardless of which
+  # subsystem the change-detection step said was dirty.
   #
   # The bash arithmetic deliberately fails closed: any result
   # the conditional doesn't recognise (a new GitHub result

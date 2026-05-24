@@ -183,7 +183,7 @@ fn run_mailboxes(args: LocalDbArgs) -> Result<()> {
             serde_json::json!({
                 "id": m.id,
                 "name": m.name,
-                "role": m.role.map(|r| r.canonical_name()),
+                "role": m.role.as_ref().map(|r| r.canonical_name().to_owned()),
                 "total": m.total_emails,
                 "unread": m.unread_emails,
                 "vault": m.is_vault,

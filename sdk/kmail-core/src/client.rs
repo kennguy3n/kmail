@@ -706,7 +706,7 @@ impl KMailClient {
             .mailbox_repo
             .list()?
             .into_iter()
-            .find(|m| m.role == Some(inbox_role))
+            .find(|m| m.role.as_ref() == Some(&inbox_role))
             .ok_or_else(|| {
                 Error::Protocol(format!(
                     "no mailbox with role={role} after Mailbox/get",

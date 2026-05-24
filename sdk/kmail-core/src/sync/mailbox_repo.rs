@@ -161,7 +161,13 @@ impl MailboxRepo {
 /// via the `Deref<Target = Connection>` impl, so a single signature
 /// taking `&Connection` covers both call sites.
 fn upsert_one(c: &Connection, mbx: &Mailbox) -> Result<()> {
-    let role_str = mbx.role.map(role_to_str);
+    // `MailboxRole::canonical_name()` returns the original wire
+    // string verbatim for `Unknown(_)`, so an unrecognised JMAP role
+    // (e.g. a future RFC 8621 extension) round-trips through SQLite
+    // without being flattened to a placeholder. A later SDK build
+    // that teaches the label can promote it back to a typed variant
+    // from the cached string — no re-sync required.
+    let role_str = mbx.role.as_ref().map(|r| r.canonical_name().to_owned());
     let rights_json = match mbx.my_rights {
         Some(ref r) => Some(serde_json::to_string(r)?),
         None => None,
@@ -204,41 +210,14 @@ fn upsert_one(c: &Connection, mbx: &Mailbox) -> Result<()> {
     Ok(())
 }
 
-fn role_to_str(r: MailboxRole) -> &'static str {
-    match r {
-        MailboxRole::Inbox => "inbox",
-        MailboxRole::Archive => "archive",
-        MailboxRole::Drafts => "drafts",
-        MailboxRole::Sent => "sent",
-        MailboxRole::Trash => "trash",
-        MailboxRole::Junk => "junk",
-        MailboxRole::Important => "important",
-        MailboxRole::All => "all",
-        MailboxRole::Flagged => "flagged",
-        MailboxRole::Vault => "vault",
-        MailboxRole::Unknown => "unknown",
-    }
-}
-
-fn role_from_str(s: &str) -> MailboxRole {
-    match s {
-        "inbox" => MailboxRole::Inbox,
-        "archive" => MailboxRole::Archive,
-        "drafts" => MailboxRole::Drafts,
-        "sent" => MailboxRole::Sent,
-        "trash" => MailboxRole::Trash,
-        "junk" => MailboxRole::Junk,
-        "important" => MailboxRole::Important,
-        "all" => MailboxRole::All,
-        "flagged" => MailboxRole::Flagged,
-        "vault" => MailboxRole::Vault,
-        _ => MailboxRole::Unknown,
-    }
-}
-
 fn row_to_mailbox(row: &rusqlite::Row<'_>) -> rusqlite::Result<Mailbox> {
     let role_s: Option<String> = row.get(2)?;
-    let role = role_s.map(|s| role_from_str(&s));
+    // Lenient parse: unknown labels are preserved as
+    // `MailboxRole::Unknown(original_string)` rather than collapsed
+    // to a placeholder, so a value written by an older SDK build
+    // that didn't yet know a role can be promoted by a newer build
+    // without forcing a full re-sync.
+    let role = role_s.map(|s| MailboxRole::from_wire(&s));
     let rights_json: Option<String> = row.get(10)?;
     let rights = rights_json
         .map(|s| serde_json::from_str::<MailboxRights>(&s))
@@ -291,6 +270,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     fn sample(id: &str, name: &str, role: Option<MailboxRole>) -> Mailbox {
+        let is_vault = matches!(role, Some(MailboxRole::Vault));
         Mailbox {
             id: id.into(),
             name: name.into(),
@@ -301,7 +281,7 @@ mod tests {
             unread_emails: 0,
             total_threads: 0,
             unread_threads: 0,
-            is_vault: matches!(role, Some(MailboxRole::Vault)),
+            is_vault,
             my_rights: Some(MailboxRights {
                 may_read_items: true,
                 may_set_seen: true,

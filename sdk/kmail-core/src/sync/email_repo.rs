@@ -297,7 +297,34 @@ fn hydrate_mailbox_ids(conn: &rusqlite::Connection, summary: &mut EmailSummary) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::Mailbox;
+    use crate::sync::mailbox_repo::MailboxRepo;
     use chrono::TimeZone;
+
+    /// Seed the `mailboxes` table for the IDs the email tests
+    /// reference. Required because the schema declares
+    /// `email_mailboxes.mailbox_id REFERENCES mailboxes(id)` —
+    /// inserting an email-mailbox row pointing at a non-existent
+    /// mailbox triggers the FK constraint.
+    fn seed_mailboxes(store: &Store, ids: &[&str]) {
+        let repo = MailboxRepo::new(store.clone());
+        for id in ids {
+            repo.upsert(&Mailbox {
+                id: (*id).to_string(),
+                name: (*id).to_string(),
+                role: None,
+                parent_id: None,
+                sort_order: 0,
+                total_emails: 0,
+                unread_emails: 0,
+                total_threads: 0,
+                unread_threads: 0,
+                is_vault: false,
+                my_rights: None,
+            })
+            .unwrap();
+        }
+    }
 
     fn sample(id: &str, thread: &str, mbx_ids: &[&str]) -> EmailSummary {
         let mut mailbox_ids = BTreeMap::new();
@@ -336,11 +363,13 @@ mod tests {
     #[test]
     fn upsert_list_get() {
         let store = Store::open_in_memory().unwrap();
+        // The schema enforces email_mailboxes.mailbox_id -> mailboxes(id)
+        // with ON DELETE CASCADE, so the parent rows must exist before
+        // any membership insert. Production sync always seeds via
+        // Mailbox/get before Email/get, so the test mirrors that.
+        seed_mailboxes(&store, &["mbx-inbox", "mbx-imp", "mbx-arch"]);
         let repo = EmailRepo::new(store);
 
-        // mbx-inbox must exist for FK consistency? Actually FK is
-        // only on email_id, not mailbox_id (see schema.rs) — so we
-        // can insert directly.
         repo.upsert(&sample("e1", "t1", &["mbx-inbox"])).unwrap();
         repo.upsert(&sample("e2", "t1", &["mbx-inbox", "mbx-imp"]))
             .unwrap();
@@ -378,6 +407,7 @@ mod tests {
     #[test]
     fn batch_mutations_are_atomic() {
         let store = Store::open_in_memory().unwrap();
+        seed_mailboxes(&store, &["mbx-inbox"]);
         let repo = EmailRepo::new(store);
         repo.upsert(&sample("e1", "t1", &["mbx-inbox"])).unwrap();
         repo.apply(&[

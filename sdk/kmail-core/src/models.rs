@@ -99,8 +99,16 @@ pub struct JmapAccount {
 /// mailboxes flagged with the `vault` extension property — these
 /// have server-side search disabled (Zero-Access Vault, see
 /// docs/JMAP-CONTRACT.md §2.4 and docs/ARCHITECTURE.md §5).
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+///
+/// `Unknown(String)` is a forward-compatibility escape hatch: when
+/// the JMAP server advertises a role label this SDK build doesn't
+/// recognise (e.g. a future RFC 8621 extension like `"scheduled"`),
+/// the original wire string is preserved here instead of being
+/// silently coerced to a placeholder. That means cached mailboxes
+/// survive SDK upgrades without re-sync: when a later SDK build
+/// teaches a previously-unknown label, the SQLite cache still has
+/// the original string and the upgraded build can re-typify it.
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub enum MailboxRole {
     Inbox,
     Archive,
@@ -112,13 +120,22 @@ pub enum MailboxRole {
     All,
     Flagged,
     Vault,
-    #[serde(other)]
-    Unknown,
+    /// Catch-all for unrecognised role labels. Carries the
+    /// server-provided wire string verbatim so SDK upgrades can
+    /// promote it to a typed variant later without forcing a full
+    /// re-sync.
+    Unknown(String),
 }
 
 impl MailboxRole {
     /// Canonical lowercase identifier for this role, matching the
     /// JMAP wire spelling exactly.
+    ///
+    /// For typed variants this returns a `'static` label that pins
+    /// the RFC 8621 wire spelling. For `Unknown(s)` it returns the
+    /// borrowed original string the server sent — same value the
+    /// SDK observed on the wire, so the SQLite cache and any future
+    /// SDK build can promote it to a typed variant.
     ///
     /// This is the *only* sanctioned way for SDK / shell code to
     /// compare a role against a string — the previous habit of
@@ -126,7 +143,7 @@ impl MailboxRole {
     /// fragile coupling to the `Debug` derive's output and made
     /// substring matches (e.g. `"a".contains(inbox_role)`) silently
     /// match the wrong variant (`archive`, `all`, `flagged`, ...).
-    pub const fn canonical_name(self) -> &'static str {
+    pub fn canonical_name(&self) -> &str {
         match self {
             MailboxRole::Inbox => "inbox",
             MailboxRole::Archive => "archive",
@@ -138,15 +155,19 @@ impl MailboxRole {
             MailboxRole::All => "all",
             MailboxRole::Flagged => "flagged",
             MailboxRole::Vault => "vault",
-            MailboxRole::Unknown => "unknown",
+            MailboxRole::Unknown(s) => s.as_str(),
         }
     }
 
-    /// Inverse of `canonical_name`. Returns `None` for inputs that
-    /// don't match a known role label — callers should treat that
-    /// as a configuration error rather than silently defaulting to
-    /// `Unknown` so a typo in `ClientConfig::bootstrap_mailbox_role`
-    /// surfaces explicitly.
+    /// Strict constructor that maps **only** known role labels to
+    /// typed variants. Returns `None` for inputs that don't match a
+    /// known label — callers should treat that as a configuration
+    /// error rather than silently defaulting to `Unknown` so a typo
+    /// in `ClientConfig::bootstrap_mailbox_role` surfaces explicitly.
+    ///
+    /// Use `from_wire` instead when ingesting strings that came
+    /// from the JMAP server or the SQLite cache — those code paths
+    /// must round-trip arbitrary labels.
     pub fn from_canonical_name(s: &str) -> Option<Self> {
         match s {
             "inbox" => Some(MailboxRole::Inbox),
@@ -161,6 +182,28 @@ impl MailboxRole {
             "vault" => Some(MailboxRole::Vault),
             _ => None,
         }
+    }
+
+    /// Lenient constructor used by serde and the SQLite repo to
+    /// turn an arbitrary wire string into a `MailboxRole`. Known
+    /// labels become their typed variant; everything else is
+    /// preserved verbatim as `Unknown(s.to_owned())` so future SDK
+    /// builds can promote it.
+    pub fn from_wire(s: &str) -> Self {
+        Self::from_canonical_name(s).unwrap_or_else(|| MailboxRole::Unknown(s.to_owned()))
+    }
+}
+
+impl serde::Serialize for MailboxRole {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> std::result::Result<S::Ok, S::Error> {
+        ser.serialize_str(self.canonical_name())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for MailboxRole {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Ok(Self::from_wire(&s))
     }
 }
 
@@ -634,16 +677,32 @@ mod tests {
 
     /// Unknown roles must not fail deserialisation — the BFF can
     /// add new ones (e.g. `scheduled`) without breaking older SDK
-    /// builds.
+    /// builds. The original wire string must be preserved on the
+    /// `Unknown(_)` variant so a later SDK build that teaches the
+    /// label can pick it up from the SQLite cache without forcing
+    /// a re-sync.
     #[test]
-    fn mailbox_role_unknown_is_lenient() {
+    fn mailbox_role_unknown_preserves_original_wire_string() {
         let raw = serde_json::json!({
             "id": "mbx-1",
             "name": "Weird",
             "role": "schedulednotyetimplemented"
         });
         let mbx: Mailbox = serde_json::from_value(raw).unwrap();
-        assert_eq!(mbx.role, Some(MailboxRole::Unknown));
+        assert_eq!(
+            mbx.role,
+            Some(MailboxRole::Unknown("schedulednotyetimplemented".into()))
+        );
+
+        // canonical_name must reflect the actual string we observed
+        // on the wire — not a flattened "unknown" placeholder.
+        let role = mbx.role.as_ref().unwrap();
+        assert_eq!(role.canonical_name(), "schedulednotyetimplemented");
+
+        // Round-trip: re-serialising must produce the original label
+        // so the BFF / SQLite cache never observes a lossy rewrite.
+        let back = serde_json::to_value(&mbx).unwrap();
+        assert_eq!(back["role"], "schedulednotyetimplemented");
     }
 
     /// `canonical_name` must match the JMAP wire spelling exactly
@@ -667,10 +726,10 @@ mod tests {
             MailboxRole::Flagged,
             MailboxRole::Vault,
         ];
-        for r in all {
+        for r in &all {
             let name = r.canonical_name();
             assert_eq!(
-                MailboxRole::from_canonical_name(name),
+                MailboxRole::from_canonical_name(name).as_ref(),
                 Some(r),
                 "canonical_name round-trip failed for {r:?}"
             );
@@ -679,20 +738,28 @@ mod tests {
             // form (i.e. the on-the-wire JMAP spelling). That's the
             // whole point of using this method instead of the
             // Debug-derived string.
-            let wire = serde_json::to_string(&r).unwrap();
+            let wire = serde_json::to_string(r).unwrap();
             // serde_json wraps strings in quotes.
             assert_eq!(wire, format!("\"{}\"", name));
         }
 
-        // Unknown is the catch-all and has no wire spelling of its
-        // own, but `canonical_name` still has to return *something*
-        // distinct so it can't collide with a real role.
-        assert_eq!(MailboxRole::Unknown.canonical_name(), "unknown");
+        // `from_canonical_name` is STRICT: "unknown" is not a known
+        // wire role, so it must NOT round-trip through the strict
+        // constructor. The lenient `from_wire` constructor handles
+        // it instead, and exposes the original string verbatim.
         assert!(MailboxRole::from_canonical_name("unknown").is_none());
+        assert_eq!(
+            MailboxRole::from_wire("unknown"),
+            MailboxRole::Unknown("unknown".into())
+        );
+        assert_eq!(
+            MailboxRole::from_wire("scheduled").canonical_name(),
+            "scheduled"
+        );
 
-        // Misspellings must NOT match — the substring-collision
-        // regression that motivated this method (e.g. `"a"` matching
-        // `archive`) must stay fixed.
+        // Misspellings must NOT match the strict constructor — the
+        // substring-collision regression that motivated this method
+        // (e.g. `"a"` matching `archive`) must stay fixed.
         assert!(MailboxRole::from_canonical_name("a").is_none());
         assert!(MailboxRole::from_canonical_name("INBOX").is_none());
         assert!(MailboxRole::from_canonical_name("").is_none());

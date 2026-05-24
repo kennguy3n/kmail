@@ -460,7 +460,8 @@ mod tests {
     /// `MailboxRole` round-trips through the FFI string label.
     #[test]
     fn role_label_covers_every_variant() {
-        for r in [
+        let unknown_wire = "schedulednotyetimplemented";
+        let cases = [
             MailboxRole::Inbox,
             MailboxRole::Archive,
             MailboxRole::Drafts,
@@ -471,20 +472,25 @@ mod tests {
             MailboxRole::All,
             MailboxRole::Flagged,
             MailboxRole::Vault,
-            MailboxRole::Unknown,
-        ] {
+            MailboxRole::Unknown(unknown_wire.into()),
+        ];
+        for r in &cases {
             let s = r.canonical_name();
             assert!(!s.is_empty());
             // Round-trip via canonical name proves the FFI label
             // matches the JMAP wire form (no Debug-derive coupling).
-            // `Unknown` is the catch-all sentinel and has no real
-            // wire spelling, so it intentionally does NOT round-trip
-            // back through `from_canonical_name` — match the contract
-            // pinned in `models::tests::mailbox_role_canonical_name_matches_wire`.
-            if matches!(r, MailboxRole::Unknown) {
-                assert!(MailboxRole::from_canonical_name(s).is_none());
-            } else {
-                assert_eq!(MailboxRole::from_canonical_name(s), Some(r));
+            // `Unknown(s)` carries the server-provided wire string
+            // verbatim; the strict constructor still refuses unknown
+            // labels — promotion goes through `from_wire`.
+            match r {
+                MailboxRole::Unknown(_) => {
+                    assert_eq!(s, unknown_wire);
+                    assert!(MailboxRole::from_canonical_name(s).is_none());
+                    assert_eq!(&MailboxRole::from_wire(s), r);
+                }
+                other => {
+                    assert_eq!(MailboxRole::from_canonical_name(s).as_ref(), Some(other));
+                }
             }
         }
     }
