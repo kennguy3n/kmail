@@ -38,8 +38,11 @@
 # the init script writes over the admin API.
 #
 # zk-fabric is published on host ports 9080 (S3 API) and 9081
-# (console API) to avoid collision with the Go BFF (`kmail-api`) on
-# host 8080.
+# (console API) to avoid collision with Stalwart on host 8080. The
+# host-side Go BFF (`kmail-api`) binds `:8088` by default (see
+# `internal/config/config.go` `KMAIL_API_ADDR`) precisely so it can
+# run concurrently with Stalwart on `:8080`; vite proxies `/jmap`
+# to `http://localhost:8088`.
 
 services:
   postgres:
@@ -183,10 +186,10 @@ services:
       # built from the `hostname: localhost` + container-side
       # listener port by `HttpContext::resolve_response_url` in
       # v0.16.0) is directly reachable from a host browser. The Go
-      # BFF (`kmail-api`) historically binds host 8080 during local
-      # development — when running both concurrently, start the BFF
-      # with `--addr=127.0.0.1:8088` and update `web/vite.config.ts`
-      # to proxy `/jmap` there instead.
+      # BFF (`kmail-api`) now binds `:8088` by default (Phase D port
+      # migration in PR #34) so it runs concurrently with Stalwart
+      # without collision — no `--addr` override needed. `web/
+      # vite.config.ts` already proxies `/jmap` to `:8088`.
       - "8080:8080"
     environment:
       # Deterministic recovery admin — lets you log into the setup
