@@ -29,6 +29,32 @@ jobs:
       KMAIL_API_URL: http://localhost:8088
       KMAIL_DEV_BEARER: kmail-dev
       KMAIL_COMPOSE_PROJECT: kmail
+      # The chaos scripts read KMAIL_JMAP_URL (default
+      # http://localhost:8080 which is the Stalwart container).
+      # That default would bypass the BFF entirely and exercise
+      # Stalwart directly — useless as a chaos signal, since the
+      # whole point is to validate the BFF's circuit breaker,
+      # cache, and graceful-degradation behaviour. Pin to the
+      # BFF's host port (8088, set by KMAIL_API_ADDR below).
+      KMAIL_JMAP_URL: http://localhost:8088
+      # The chaos scripts also read KMAIL_AUTH_TOKEN (default
+      # kmail-dev). Today the default happens to match the BFF's
+      # configured bypass token, so the scripts work, but the
+      # two env vars are independent — if someone changes the
+      # bypass token they would not realise they had to update
+      # the chaos scripts too. Pin both to the same literal here.
+      KMAIL_AUTH_TOKEN: kmail-dev
+      # The chaos scripts default target containers
+      # `${KMAIL_COMPOSE_PROJECT}-<service>-1` (the docker compose
+      # auto-generated name pattern). The docker-compose.yml in
+      # this repo uses explicit `container_name:` directives that
+      # drop the `-1` suffix (kmail-stalwart, kmail-postgres,
+      # kmail-valkey). Without these overrides, every chaos
+      # scenario would fail with "No such container" before
+      # injecting any fault.
+      KMAIL_SHARD_CONTAINER: kmail-stalwart
+      KMAIL_PG_CONTAINER: kmail-postgres
+      KMAIL_VALKEY_CONTAINER: kmail-valkey
       # Loosen the chaos SLO target slightly on CI: a GitHub-hosted
       # runner's IO is significantly noisier than a production
       # cluster, so we'd see false-positive SLO violations from
