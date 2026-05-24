@@ -1,0 +1,592 @@
+package integrations
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/kennguy3n/kmail/internal/middleware"
+	"github.com/kennguy3n/kmail/internal/oauth"
+	"github.com/kennguy3n/kmail/internal/webhooks"
+)
+
+// DefaultClientDispatchPerHour is the per-OAuth2-client sliding-
+// window quota the Dispatcher enforces when an integration does
+// not have a per-client override in oauth_clients.dispatch_quota_per_hour.
+//
+// The value (3600/hour, i.e. one delivery per second) is chosen
+// to be generous for a well-behaved Zapier-style integration
+// (Zapier polling intervals are 1-15 minutes; CRMs streaming
+// inbox changes do not exceed ~one event per second per user)
+// and restrictive enough that a single rogue integration cannot
+// drown out the BFF's outbound webhook capacity. Operators tune
+// the global default via Service constructor; per-client
+// overrides take precedence (see ResolveClientQuota).
+const DefaultClientDispatchPerHour = 3600
+
+// ErrClientQuotaExceeded indicates the calling OAuth2 client
+// has consumed its outbound webhook delivery quota for the
+// current sliding-window bucket. The Dispatcher returns this
+// from Dispatch when the rate limiter declines a delivery; the
+// caller decides whether to drop the event (high-volume
+// firehose case) or persist it with `next_retry_at = next
+// window boundary` (the framework's at-least-once default).
+var ErrClientQuotaExceeded = errors.New("integrations: client outbound dispatch quota exceeded")
+
+// ErrInsufficientScope is returned when the caller's OAuth2
+// access token does not carry a scope required for the
+// requested operation. Surfaced through the HTTP handler as
+// 403 + WWW-Authenticate: insufficient_scope (RFC 6750 §3.1).
+var ErrInsufficientScope = errors.New("integrations: insufficient_scope")
+
+// ErrWebhookNotFound is returned by ListWebhooksForClient /
+// DeleteWebhookForClient when the addressed row does not exist
+// OR exists but is owned by a different OAuth2 client (the
+// distinction is intentionally hidden — RFC 7807 §3.1 / RFC
+// 7235: do not leak existence of resources the caller is not
+// authorised to see).
+var ErrWebhookNotFound = errors.New("integrations: webhook not found")
+
+// SubscribeResult is returned from RegisterWebhookForClient so
+// the caller can distinguish "subscribed to all requested events"
+// from "subscribed to some events; these others were filtered
+// out". The integration is expected to re-prompt the user for
+// consent to add the missing scopes if the denied list is
+// non-empty.
+type SubscribeResult struct {
+	Endpoint *webhooks.Endpoint
+	Secret   string   // plaintext signing secret, returned ONCE on register
+	Denied   []string // event types the calling client was not scoped for
+}
+
+// ServiceConfig wires the integration service. All fields are
+// required EXCEPT LimiterStore (nil disables the per-client
+// dispatch quota — appropriate for tests / single-tenant dev
+// boxes that have no Valkey).
+type ServiceConfig struct {
+	// Pool is the Postgres connection pool. The integrations
+	// service runs custom SQL against `webhook_endpoints` to
+	// scope queries by `oauth_client_id`, which the public
+	// webhooks.Service API does not surface.
+	Pool *pgxpool.Pool
+
+	// Webhooks is the underlying delivery machinery. The
+	// integrations service wraps RegisterWebhook / TestFire and
+	// delegates HMAC signing / worker queueing to it.
+	Webhooks *webhooks.Service
+
+	// OAuth resolves OAuth2 clients (used to look up the
+	// per-client dispatch_quota_per_hour override at fire time).
+	OAuth *oauth.Service
+
+	// LimiterStore is the Valkey-compatible counter store. When
+	// nil, Dispatch never returns ErrClientQuotaExceeded — the
+	// per-client quota is effectively unbounded. The same store
+	// type is shared with internal/middleware/ratelimit so
+	// operators wire one Valkey client for all rate limiters.
+	LimiterStore middleware.RateLimiterStore
+
+	// DefaultClientDispatchPerHour is the default per-client
+	// quota when oauth_clients.dispatch_quota_per_hour is NULL.
+	// Zero defaults to the package constant.
+	DefaultClientDispatchPerHour int
+
+	// Logger is used for transient-error diagnostics and the
+	// fail-open path on rate limiter outage. Defaults to
+	// log.Default().
+	Logger *log.Logger
+
+	// Now overrides time.Now for tests. Defaults to time.Now.
+	Now func() time.Time
+}
+
+// Service is the public API of the integration framework. It
+// composes the underlying webhooks.Service with OAuth2-client
+// scope filtering and rate-limited dispatch.
+type Service struct {
+	cfg ServiceConfig
+}
+
+// NewService constructs an integration framework Service. The
+// returned Service is safe for concurrent use across all
+// methods.
+func NewService(cfg ServiceConfig) (*Service, error) {
+	if cfg.Pool == nil {
+		return nil, errors.New("integrations.NewService: Pool is required")
+	}
+	if cfg.Webhooks == nil {
+		return nil, errors.New("integrations.NewService: Webhooks is required")
+	}
+	if cfg.OAuth == nil {
+		return nil, errors.New("integrations.NewService: OAuth is required")
+	}
+	if cfg.DefaultClientDispatchPerHour <= 0 {
+		cfg.DefaultClientDispatchPerHour = DefaultClientDispatchPerHour
+	}
+	if cfg.Logger == nil {
+		cfg.Logger = log.Default()
+	}
+	if cfg.Now == nil {
+		cfg.Now = time.Now
+	}
+	return &Service{cfg: cfg}, nil
+}
+
+// RegisterWebhookForClient is the subscribe-time entry point.
+// It:
+//
+//  1. Validates the input (non-empty URL, tenant + client IDs).
+//  2. Filters the requested event list through
+//     FilterEventsForClient. If every event was denied, returns
+//     ErrInsufficientScope so the handler can answer 422 with
+//     the denied list (so the integration knows which scope to
+//     ask the user for).
+//  3. Delegates to webhooks.Service.RegisterWebhook to create
+//     the row and mint the plaintext secret.
+//  4. UPDATES the freshly-created row to stamp
+//     `oauth_client_id` so subsequent list/delete/dispatch
+//     queries scope to this client. The update is done with an
+//     INSERT-then-UPDATE pattern (rather than threading a new
+//     parameter through webhooks.Service) so the underlying
+//     package stays unaware of OAuth2 — a deliberate decoupling
+//     choice documented in doc.go.
+//
+// Returns SubscribeResult with the final endpoint, the
+// plaintext secret (only available here once), and the list of
+// denied event types so the caller can surface them.
+func (s *Service) RegisterWebhookForClient(
+	ctx context.Context,
+	tenantID, oauthClientID string,
+	grantedScopes []string,
+	url string,
+	requestedEvents []string,
+	signingVersion string,
+) (*SubscribeResult, error) {
+	if strings.TrimSpace(tenantID) == "" {
+		return nil, errors.New("integrations: tenantID required")
+	}
+	if strings.TrimSpace(oauthClientID) == "" {
+		return nil, errors.New("integrations: oauthClientID required")
+	}
+	if strings.TrimSpace(url) == "" {
+		return nil, errors.New("integrations: url required")
+	}
+
+	allowed, denied := FilterEventsForClient(grantedScopes, requestedEvents)
+	if len(requestedEvents) > 0 && len(allowed) == 0 {
+		// Every requested event was denied — the integration
+		// has no scope to receive any of them. Fail fast
+		// rather than register a webhook that will never fire.
+		return &SubscribeResult{Denied: denied}, ErrInsufficientScope
+	}
+
+	ep, secret, err := s.cfg.Webhooks.RegisterWebhook(ctx, tenantID, url, allowed, signingVersion)
+	if err != nil {
+		return nil, fmt.Errorf("integrations: register webhook: %w", err)
+	}
+
+	// Stamp the oauth_client_id on the freshly-created row.
+	// Done in a separate transaction (rather than inside the
+	// webhooks.Service insert) so the loose coupling holds.
+	// The row is guaranteed to exist at this point — the INSERT
+	// above ran inside its own transaction and committed.
+	err = pgx.BeginFunc(ctx, s.cfg.Pool, func(tx pgx.Tx) error {
+		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
+			return err
+		}
+		cmdTag, err := tx.Exec(ctx, `
+			UPDATE webhook_endpoints
+			SET oauth_client_id = $3::uuid, updated_at = now()
+			WHERE id = $1::uuid AND tenant_id = $2::uuid
+		`, ep.ID, tenantID, oauthClientID)
+		if err != nil {
+			return err
+		}
+		if cmdTag.RowsAffected() == 0 {
+			return fmt.Errorf("integrations: stamp oauth_client_id: 0 rows affected (id=%s tenant=%s)", ep.ID, tenantID)
+		}
+		return nil
+	})
+	if err != nil {
+		// Best-effort rollback: delete the orphan row so the
+		// subsequent retry doesn't see a half-created webhook.
+		// Errors here are logged but don't override the original
+		// failure — the operator's primary signal is the
+		// stamp-failed error.
+		if delErr := s.cfg.Webhooks.DeleteWebhook(ctx, tenantID, ep.ID); delErr != nil {
+			s.cfg.Logger.Printf("integrations: failed to clean up orphan webhook %s after stamp failure: %v", ep.ID, delErr)
+		}
+		return nil, fmt.Errorf("integrations: stamp oauth_client_id: %w", err)
+	}
+
+	return &SubscribeResult{Endpoint: ep, Secret: secret, Denied: denied}, nil
+}
+
+// ListWebhooksForClient returns the webhooks the calling
+// OAuth2 client owns. Cross-client visibility is impossible by
+// construction: the SQL filters on `oauth_client_id`.
+func (s *Service) ListWebhooksForClient(ctx context.Context, tenantID, oauthClientID string) ([]webhooks.Endpoint, error) {
+	if strings.TrimSpace(tenantID) == "" || strings.TrimSpace(oauthClientID) == "" {
+		return nil, errors.New("integrations: tenantID + oauthClientID required")
+	}
+	var out []webhooks.Endpoint
+	err := pgx.BeginFunc(ctx, s.cfg.Pool, func(tx pgx.Tx) error {
+		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
+			return err
+		}
+		rows, err := tx.Query(ctx, `
+			SELECT id::text, tenant_id::text, url, events, active, signing_version, created_at, updated_at
+			FROM webhook_endpoints
+			WHERE tenant_id = $1::uuid AND oauth_client_id = $2::uuid
+			ORDER BY created_at DESC
+		`, tenantID, oauthClientID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var ep webhooks.Endpoint
+			var rawEvents []byte
+			if err := rows.Scan(&ep.ID, &ep.TenantID, &ep.URL, &rawEvents, &ep.Active, &ep.SigningVersion, &ep.CreatedAt, &ep.UpdatedAt); err != nil {
+				return err
+			}
+			_ = json.Unmarshal(rawEvents, &ep.Events)
+			out = append(out, ep)
+		}
+		return rows.Err()
+	})
+	return out, err
+}
+
+// DeleteWebhookForClient removes a webhook the calling OAuth2
+// client owns. Returns ErrWebhookNotFound if the row does not
+// exist OR is owned by a different client — the same error in
+// either case so the response does not leak existence of rows
+// the caller is not authorised to see.
+func (s *Service) DeleteWebhookForClient(ctx context.Context, tenantID, oauthClientID, webhookID string) error {
+	if strings.TrimSpace(tenantID) == "" || strings.TrimSpace(oauthClientID) == "" || strings.TrimSpace(webhookID) == "" {
+		return errors.New("integrations: tenantID + oauthClientID + webhookID required")
+	}
+	return pgx.BeginFunc(ctx, s.cfg.Pool, func(tx pgx.Tx) error {
+		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
+			return err
+		}
+		cmdTag, err := tx.Exec(ctx, `
+			DELETE FROM webhook_endpoints
+			WHERE id = $1::uuid AND tenant_id = $2::uuid AND oauth_client_id = $3::uuid
+		`, webhookID, tenantID, oauthClientID)
+		if err != nil {
+			return err
+		}
+		if cmdTag.RowsAffected() == 0 {
+			return ErrWebhookNotFound
+		}
+		return nil
+	})
+}
+
+// TestFireForClient enqueues a synthetic `webhook.ping`
+// delivery for a webhook the calling OAuth2 client owns. The
+// existence check is layered on top of webhooks.Service.TestFire
+// so we can return ErrWebhookNotFound for cross-client targets.
+func (s *Service) TestFireForClient(ctx context.Context, tenantID, oauthClientID, webhookID string) (int, error) {
+	if strings.TrimSpace(tenantID) == "" || strings.TrimSpace(oauthClientID) == "" || strings.TrimSpace(webhookID) == "" {
+		return 0, errors.New("integrations: tenantID + oauthClientID + webhookID required")
+	}
+	// Verify ownership BEFORE delegating, so the underlying
+	// "endpoint not found" error from webhooks.Service.TestFire
+	// (which doesn't know about OAuth2 clients) does not leak
+	// the existence of an admin-owned endpoint.
+	var exists bool
+	err := pgx.BeginFunc(ctx, s.cfg.Pool, func(tx pgx.Tx) error {
+		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `
+			SELECT EXISTS(SELECT 1 FROM webhook_endpoints
+				WHERE id = $1::uuid AND tenant_id = $2::uuid AND oauth_client_id = $3::uuid)
+		`, webhookID, tenantID, oauthClientID).Scan(&exists)
+	})
+	if err != nil {
+		return 0, err
+	}
+	if !exists {
+		return 0, ErrWebhookNotFound
+	}
+	return s.cfg.Webhooks.TestFire(ctx, tenantID, webhookID)
+}
+
+// DispatchEvent is the integration-framework dispatcher. For a
+// given (tenantID, eventType, payload) it:
+//
+//  1. Enqueues deliveries for legacy / admin-owned webhooks
+//     (oauth_client_id IS NULL) via the existing
+//     webhooks.Service.DeliverEvent fan-out — these are
+//     unaffected by the integration framework.
+//  2. Enumerates integration-owned subscribers (oauth_client_id
+//     IS NOT NULL) and, for each one:
+//     a. Re-checks the client's granted scopes against
+//        EventAllowedForClient (defence-in-depth — see doc.go
+//        Scope enforcement #3).
+//     b. Consults the per-client rate limiter. On overflow,
+//        the delivery is enqueued with `next_retry_at = next
+//        window boundary` so it ships on the next bucket.
+//     c. Otherwise, INSERTs a delivery row immediately.
+//
+// Returns the total number of delivery rows that were enqueued
+// (admin-owned + integration-owned + quota-deferred).
+func (s *Service) DispatchEvent(ctx context.Context, tenantID, eventType string, payload map[string]any) (int, error) {
+	if strings.TrimSpace(tenantID) == "" || strings.TrimSpace(eventType) == "" {
+		return 0, errors.New("integrations: tenantID + eventType required")
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return 0, fmt.Errorf("integrations: marshal payload: %w", err)
+	}
+
+	enqueued := 0
+
+	// Step 1: admin-owned webhook fan-out (legacy path,
+	// unaffected by scope filtering).
+	admin, err := s.dispatchAdminOwned(ctx, tenantID, eventType, body)
+	if err != nil {
+		return enqueued, fmt.Errorf("integrations: admin-owned dispatch: %w", err)
+	}
+	enqueued += admin
+
+	// Step 2: integration-owned subscribers, with per-client
+	// scope and quota enforcement.
+	integ, err := s.dispatchIntegrationOwned(ctx, tenantID, eventType, body)
+	if err != nil {
+		return enqueued, fmt.Errorf("integrations: integration-owned dispatch: %w", err)
+	}
+	enqueued += integ
+
+	return enqueued, nil
+}
+
+// dispatchAdminOwned inserts deliveries for webhook_endpoints
+// rows that have NULL oauth_client_id (legacy / admin-owned).
+// Behaviour matches the pre-Phase-E webhooks.Service.DeliverEvent
+// path; no scope filter, no per-client rate limit.
+func (s *Service) dispatchAdminOwned(ctx context.Context, tenantID, eventType string, body []byte) (int, error) {
+	var enqueued int
+	err := pgx.BeginFunc(ctx, s.cfg.Pool, func(tx pgx.Tx) error {
+		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
+			return err
+		}
+		rows, err := tx.Query(ctx, `
+			SELECT id::text FROM webhook_endpoints
+			WHERE tenant_id = $1::uuid AND active = true
+			  AND oauth_client_id IS NULL
+			  AND (jsonb_array_length(events) = 0 OR events ? $2)
+		`, tenantID, eventType)
+		if err != nil {
+			return err
+		}
+		var ids []string
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return err
+			}
+			ids = append(ids, id)
+		}
+		rows.Close()
+		for _, id := range ids {
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO webhook_deliveries (tenant_id, endpoint_id, event_type, payload)
+				VALUES ($1::uuid, $2::uuid, $3, $4::jsonb)
+			`, tenantID, id, eventType, string(body)); err != nil {
+				return err
+			}
+			enqueued++
+		}
+		return nil
+	})
+	return enqueued, err
+}
+
+// integrationSubscriber bundles the row data we need to apply
+// scope + quota enforcement before INSERTing a delivery.
+type integrationSubscriber struct {
+	EndpointID    string
+	OAuthClientID string
+	QuotaPerHour  *int     // nil means use service default
+	GrantedScopes []string // resolved from oauth_clients table
+}
+
+// dispatchIntegrationOwned enumerates integration-owned
+// subscribers, runs the defence-in-depth scope check and the
+// per-client rate limit, and enqueues a delivery (or a
+// quota-deferred delivery with future next_retry_at) for each.
+func (s *Service) dispatchIntegrationOwned(ctx context.Context, tenantID, eventType string, body []byte) (int, error) {
+	subs, err := s.loadIntegrationSubscribers(ctx, tenantID, eventType)
+	if err != nil {
+		return 0, err
+	}
+	enqueued := 0
+	for _, sub := range subs {
+		if !EventAllowedForClient(sub.GrantedScopes, eventType) {
+			// Subscribed at some past point with broader
+			// scopes; the user has since revoked. Skip
+			// silently — the next OAuth2 token refresh will
+			// reflect the revocation and the integration
+			// can re-prompt.
+			s.cfg.Logger.Printf("integrations: skip delivery for endpoint=%s client=%s event=%s — scope no longer granted",
+				sub.EndpointID, sub.OAuthClientID, eventType)
+			continue
+		}
+
+		quota := s.cfg.DefaultClientDispatchPerHour
+		if sub.QuotaPerHour != nil {
+			quota = *sub.QuotaPerHour
+		}
+		allowed, nextRetryAt := s.checkQuota(ctx, sub.OAuthClientID, quota)
+		if err := s.insertIntegrationDelivery(ctx, tenantID, sub.EndpointID, eventType, body, allowed, nextRetryAt); err != nil {
+			// One subscriber's failure must not block other
+			// subscribers — log and continue.
+			s.cfg.Logger.Printf("integrations: insert delivery failed for endpoint=%s client=%s: %v", sub.EndpointID, sub.OAuthClientID, err)
+			continue
+		}
+		enqueued++
+	}
+	return enqueued, nil
+}
+
+// loadIntegrationSubscribers reads all integration-owned
+// webhook_endpoints rows subscribed to the given event_type for
+// the given tenant, joined to oauth_clients for the per-client
+// quota override and the granted-scopes snapshot.
+//
+// `granted_scopes` is read from the oauth_clients row's
+// allowed_scopes column (set at client creation / consent
+// time). NOTE: this is a deliberate simplification — the strict
+// reading of the OAuth2 spec is that scope enforcement at
+// DISPATCH time should consult the user's current grant set,
+// not the client's allowed-scopes-set; the two diverge if the
+// user re-consented after the client was created and chose to
+// grant fewer scopes than the client requested. The current
+// schema does not have a per-user-grant row, so we use the
+// client's allowed-scopes as a defensive upper bound. The
+// follow-up PR that introduces per-user grants will swap the
+// source here without changing the dispatcher contract.
+func (s *Service) loadIntegrationSubscribers(ctx context.Context, tenantID, eventType string) ([]integrationSubscriber, error) {
+	var subs []integrationSubscriber
+	err := pgx.BeginFunc(ctx, s.cfg.Pool, func(tx pgx.Tx) error {
+		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
+			return err
+		}
+		rows, err := tx.Query(ctx, `
+			SELECT we.id::text, we.oauth_client_id::text,
+			       oc.dispatch_quota_per_hour, oc.allowed_scopes
+			FROM webhook_endpoints we
+			JOIN oauth_clients oc ON oc.id = we.oauth_client_id
+			WHERE we.tenant_id = $1::uuid
+			  AND we.active = true
+			  AND we.oauth_client_id IS NOT NULL
+			  AND (jsonb_array_length(we.events) = 0 OR we.events ? $2)
+		`, tenantID, eventType)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var sub integrationSubscriber
+			var quota *int
+			var rawScopes []byte
+			if err := rows.Scan(&sub.EndpointID, &sub.OAuthClientID, &quota, &rawScopes); err != nil {
+				return err
+			}
+			sub.QuotaPerHour = quota
+			if len(rawScopes) > 0 {
+				if err := json.Unmarshal(rawScopes, &sub.GrantedScopes); err != nil {
+					// Malformed scope JSON in oauth_clients
+					// is treated as "no scopes" (deny by
+					// default) rather than skipped — caller
+					// will hit the scope check and skip.
+					sub.GrantedScopes = nil
+				}
+			}
+			subs = append(subs, sub)
+		}
+		return rows.Err()
+	})
+	return subs, err
+}
+
+// checkQuota consults the rate limiter for the given client.
+// Returns (allowed=true, nextRetryAt=zero) when the bucket has
+// room, (allowed=false, nextRetryAt=window boundary) when it
+// is full, and (allowed=true, nextRetryAt=zero) on a transient
+// limiter error (fail-open — see doc.go).
+func (s *Service) checkQuota(ctx context.Context, clientID string, quotaPerHour int) (bool, time.Time) {
+	if s.cfg.LimiterStore == nil || quotaPerHour <= 0 {
+		return true, time.Time{}
+	}
+	now := s.cfg.Now().UTC()
+	// Hourly buckets keyed on (client_id, bucket-start). At
+	// most one delivery per bucket pays the EXPIRE cost; all
+	// subsequent INCRs share the TTL window.
+	bucket := now.Truncate(time.Hour).Unix()
+	key := fmt.Sprintf("kmail:integ:dispatch:%s:%d", clientID, bucket)
+	ttl := time.Hour + 5*time.Minute // small grace so a late delivery still sees the TTL
+
+	count, err := s.cfg.LimiterStore.IncrWithTTL(ctx, key, ttl)
+	if err != nil {
+		// Fail-open: don't take dispatch offline because the
+		// rate limiter is unhealthy.
+		s.cfg.Logger.Printf("integrations: rate limiter incr %s: %v (fail-open)", key, err)
+		return true, time.Time{}
+	}
+	if count > int64(quotaPerHour) {
+		// Compute the next bucket boundary so the deferred
+		// delivery rides in the fresh quota window.
+		nextBoundary := now.Truncate(time.Hour).Add(time.Hour)
+		return false, nextBoundary
+	}
+	return true, time.Time{}
+}
+
+// insertIntegrationDelivery enqueues either an immediate
+// delivery (allowed=true) or a quota-deferred delivery
+// (allowed=false, next_retry_at=window boundary). At-least-once
+// semantics — the worker will pick up the deferred row when
+// next_retry_at passes.
+func (s *Service) insertIntegrationDelivery(
+	ctx context.Context,
+	tenantID, endpointID, eventType string,
+	body []byte,
+	allowed bool,
+	nextRetryAt time.Time,
+) error {
+	return pgx.BeginFunc(ctx, s.cfg.Pool, func(tx pgx.Tx) error {
+		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
+			return err
+		}
+		if allowed {
+			_, err := tx.Exec(ctx, `
+				INSERT INTO webhook_deliveries (tenant_id, endpoint_id, event_type, payload)
+				VALUES ($1::uuid, $2::uuid, $3, $4::jsonb)
+			`, tenantID, endpointID, eventType, string(body))
+			return err
+		}
+		// Quota-deferred path: explicitly stamp
+		// next_retry_at so the worker holds the row until the
+		// next quota window opens.
+		_, err := tx.Exec(ctx, `
+			INSERT INTO webhook_deliveries (tenant_id, endpoint_id, event_type, payload, next_retry_at)
+			VALUES ($1::uuid, $2::uuid, $3, $4::jsonb, $5)
+		`, tenantID, endpointID, eventType, string(body), nextRetryAt)
+		return err
+	})
+}
