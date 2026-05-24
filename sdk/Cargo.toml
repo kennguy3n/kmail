@@ -25,6 +25,7 @@ members = [
     "kmail-ffi",
     "kmail-napi",
     "kmail-cli",
+    "uniffi-bindgen",
 ]
 
 [workspace.package]
@@ -105,3 +106,28 @@ codegen-units = 1
 # panics-with-symbols.
 opt-level = 1
 debug = 1
+
+# Custom release profile used by the iOS XCFramework build pipeline.
+# Inherits everything from `release` except `strip`, which MUST be
+# `none` for two distinct reasons:
+#
+#   1. `uniffi-bindgen` extracts the binding metadata by reading
+#      `UNIFFI_META_*` symbols out of the host cdylib (via goblin
+#      ELF / Mach-O parsing). With `strip = "symbols"`, those
+#      symbols are gone and `uniffi-bindgen print-repr` returns an
+#      empty interface, producing empty Swift / Kotlin sources.
+#
+#   2. The iOS `aarch64-apple-ios` / `aarch64-apple-ios-sim` /
+#      `x86_64-apple-ios` targets emit *staticlibs* (`.a`) that
+#      Xcode links into the consuming app. A staticlib with its
+#      symbol table stripped is unlinkable — `ld64` cannot resolve
+#      the FFI surface.
+#
+# We don't simply flip the workspace-default `release` profile
+# because the napi-rs Electron cdylib *does* want stripping (the
+# binding ships inside a desktop app bundle and the unstripped
+# size penalty is real). Keeping the profiles separate lets each
+# platform make its own tradeoff explicit.
+[profile.release-with-symbols]
+inherits = "release"
+strip = "none"
