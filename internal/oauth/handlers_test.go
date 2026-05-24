@@ -427,6 +427,170 @@ func TestApprove_ApprovalRedirectsWithCode(t *testing.T) {
 	}
 }
 
+// =================== CSRF (Approve) ===================
+
+func TestApprove_RejectsMissingCSRFCookie(t *testing.T) {
+	svc := newFakeService()
+	svc.clients["client-conf-1"] = makeConfidentialClient()
+	h := newHandlersWithAPI(svc, userResolverOK)
+	form := url.Values{}
+	form.Set("client_id", "client-conf-1")
+	form.Set("redirect_uri", "https://app.example.com/cb")
+	form.Set("decision", "approve")
+	form.Set("csrf_token", "abcd1234")
+	req := httptest.NewRequest(http.MethodPost, "/oauth/authorize/approve",
+		strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	// Deliberately no cookie.
+	rr := httptest.NewRecorder()
+	h.Approve(rr, req)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d (body=%s)", rr.Code, rr.Body.String())
+	}
+	if svc.calls["IssueAuthorizationCode"] != 0 {
+		t.Errorf("CSRF-rejected request must NOT mint a code")
+	}
+}
+
+func TestApprove_RejectsMissingCSRFForm(t *testing.T) {
+	svc := newFakeService()
+	svc.clients["client-conf-1"] = makeConfidentialClient()
+	h := newHandlersWithAPI(svc, userResolverOK)
+	form := url.Values{}
+	form.Set("client_id", "client-conf-1")
+	form.Set("redirect_uri", "https://app.example.com/cb")
+	form.Set("decision", "approve")
+	// Deliberately no csrf_token in form.
+	req := httptest.NewRequest(http.MethodPost, "/oauth/authorize/approve",
+		strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(&http.Cookie{Name: csrfCookieName, Value: "abcd1234"})
+	rr := httptest.NewRecorder()
+	h.Approve(rr, req)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d", rr.Code)
+	}
+}
+
+func TestApprove_RejectsMismatchedCSRF(t *testing.T) {
+	svc := newFakeService()
+	svc.clients["client-conf-1"] = makeConfidentialClient()
+	h := newHandlersWithAPI(svc, userResolverOK)
+	form := url.Values{}
+	form.Set("client_id", "client-conf-1")
+	form.Set("redirect_uri", "https://app.example.com/cb")
+	form.Set("decision", "approve")
+	form.Set("csrf_token", "form-value")
+	req := httptest.NewRequest(http.MethodPost, "/oauth/authorize/approve",
+		strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(&http.Cookie{Name: csrfCookieName, Value: "cookie-value-different"})
+	rr := httptest.NewRecorder()
+	h.Approve(rr, req)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d", rr.Code)
+	}
+}
+
+func TestApprove_ClearsCSRFCookieAfterSuccess(t *testing.T) {
+	svc := newFakeService()
+	svc.clients["client-conf-1"] = makeConfidentialClient()
+	svc.codeToReturn = "ok-code"
+	h := newHandlersWithAPI(svc, userResolverOK)
+	form := url.Values{}
+	form.Set("client_id", "client-conf-1")
+	form.Set("redirect_uri", "https://app.example.com/cb")
+	form.Set("decision", "approve")
+	form.Set("scope", "kmail.read")
+	rr := httptest.NewRecorder()
+	h.Approve(rr, newApproveRequest(form))
+	if rr.Code != http.StatusFound {
+		t.Fatalf("expected 302, got %d (body=%s)", rr.Code, rr.Body.String())
+	}
+	// Expect a Set-Cookie that clears the CSRF cookie (MaxAge<0).
+	found := false
+	for _, sc := range rr.Result().Cookies() {
+		if sc.Name == csrfCookieName && sc.MaxAge < 0 {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected csrf cookie to be cleared after successful Approve")
+	}
+}
+
+func TestAuthorize_PlantsCSRFCookieAndFormField(t *testing.T) {
+	svc := newFakeService()
+	svc.clients["client-conf-1"] = makeConfidentialClient()
+	h := newHandlersWithAPI(svc, userResolverOK)
+	// Use a deterministic nonce so we can assert on it.
+	h.csrfNonce = func() (string, error) { return "fixed-test-nonce", nil }
+
+	q := url.Values{}
+	q.Set("response_type", "code")
+	q.Set("client_id", "client-conf-1")
+	q.Set("redirect_uri", "https://app.example.com/cb")
+	q.Set("scope", "kmail.read")
+	q.Set("state", "s1")
+	req := httptest.NewRequest(http.MethodGet, "/oauth/authorize?"+q.Encode(), nil)
+	rr := httptest.NewRecorder()
+	h.Authorize(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d (body=%s)", rr.Code, rr.Body.String())
+	}
+	// Cookie planted.
+	var cookieVal string
+	for _, sc := range rr.Result().Cookies() {
+		if sc.Name == csrfCookieName {
+			cookieVal = sc.Value
+			if !sc.HttpOnly {
+				t.Errorf("csrf cookie must be HttpOnly")
+			}
+			if sc.SameSite != http.SameSiteStrictMode {
+				t.Errorf("csrf cookie must be SameSite=Strict")
+			}
+		}
+	}
+	if cookieVal != "fixed-test-nonce" {
+		t.Errorf("expected csrf cookie value 'fixed-test-nonce', got %q", cookieVal)
+	}
+	// Hidden form field planted with the SAME value.
+	if !strings.Contains(rr.Body.String(),
+		`<input type="hidden" name="csrf_token" value="fixed-test-nonce">`) {
+		t.Errorf("consent screen missing csrf_token hidden field with expected value")
+	}
+}
+
+// =================== Prefix routing ===================
+
+func TestAuthorize_FormActionRespectsRoutePrefix(t *testing.T) {
+	svc := newFakeService()
+	svc.clients["client-conf-1"] = makeConfidentialClient()
+	h := newHandlersWithAPI(svc, userResolverOK)
+	mux := http.NewServeMux()
+	// Mount under a non-default prefix to verify the consent form
+	// action threads the prefix through.
+	h.RegisterRoutes(mux, "/api/v1/oauth")
+
+	q := url.Values{}
+	q.Set("response_type", "code")
+	q.Set("client_id", "client-conf-1")
+	q.Set("redirect_uri", "https://app.example.com/cb")
+	q.Set("scope", "kmail.read")
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/oauth/authorize?"+q.Encode(), nil)
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d (body=%s)", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(),
+		`<form method="POST" action="/api/v1/oauth/authorize/approve">`) {
+		t.Errorf("form action does not reflect /api/v1/oauth prefix; body=%s", rr.Body.String())
+	}
+}
+
 // =================== Token (POST /oauth/token) ===================
 
 func TestToken_RejectsNonPost(t *testing.T) {
@@ -733,7 +897,12 @@ func TestRegisterRoutes_AllFourEndpointsBound(t *testing.T) {
 		wantStatus   int
 	}{
 		{"GET", "/oauth/authorize", http.StatusBadRequest},
-		{"POST", "/oauth/authorize/approve", http.StatusBadRequest},
+		// 403 (not 400) for the bare /approve probe because the
+		// CSRF double-submit gate fires before form validation —
+		// any POST without a matched cookie+form pair is now
+		// rejected. This is the desired ordering: cheap deny
+		// before any service-layer work.
+		{"POST", "/oauth/authorize/approve", http.StatusForbidden},
 		{"POST", "/oauth/token", http.StatusUnauthorized},
 		{"POST", "/oauth/revoke", http.StatusUnauthorized},
 	}
@@ -752,10 +921,20 @@ func TestRegisterRoutes_AllFourEndpointsBound(t *testing.T) {
 
 // =================== Helpers ===================
 
+// newApproveRequest builds an Approve POST with a matched
+// CSRF cookie + hidden form field so the double-submit check
+// passes. Tests that want to exercise CSRF rejection should
+// construct the request inline instead of using this helper.
 func newApproveRequest(form url.Values) *http.Request {
+	const csrf = "test-csrf-nonce-deadbeef"
+	if form == nil {
+		form = url.Values{}
+	}
+	form.Set("csrf_token", csrf)
 	req := httptest.NewRequest(http.MethodPost, "/oauth/authorize/approve",
 		strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(&http.Cookie{Name: csrfCookieName, Value: csrf})
 	return req
 }
 

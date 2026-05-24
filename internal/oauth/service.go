@@ -115,14 +115,16 @@ func (s *Service) RegisterClient(
 	redirectJSON, _ := json.Marshal(redirectURIs)
 	scopesJSON, _ := json.Marshal(allowedScopes)
 
-	var c Client
+	var (
+		c           Client
+		redirectRaw []byte
+		scopesRaw   []byte
+	)
 	err = pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
 			return err
 		}
 		var (
-			redirectRaw []byte
-			scopesRaw   []byte
 			homepageOpt *string
 			logoOpt     *string
 		)
@@ -153,57 +155,30 @@ func (s *Service) RegisterClient(
 	if err != nil {
 		return nil, "", err
 	}
-	// Decode JSONB columns into the typed struct.
-	_ = json.Unmarshal([]byte(c.HomepageURL), &c.HomepageURL) // no-op for plain string
-	if err := json.Unmarshal([]byte("[]"), &c.RedirectURIs); err == nil {
-		// Re-populate from the actual returned rows; we need a
-		// second SELECT because Scan into a []byte for JSONB
-		// gave us the raw bytes, but the typed Client struct
-		// wants []string. The cleaner path is the GetClient
-		// helper below.
+	// Materialise the JSONB columns into the typed struct from
+	// the RETURNING scan directly. Previously this routine did
+	// a second SELECT (getClientByPK) after the INSERT to work
+	// around the byte-vs-[]string mismatch — wasteful, and the
+	// intermediate `json.Unmarshal([]byte("[]"), ...)` was a no-op
+	// against a literal rather than the scanned bytes.
+	if err := json.Unmarshal(redirectRaw, &c.RedirectURIs); err != nil {
+		return nil, "", fmt.Errorf("oauth: decode redirect_uris from INSERT: %w", err)
 	}
-	full, err := s.getClientByPK(ctx, c.ID)
-	if err != nil {
-		return nil, "", fmt.Errorf("oauth: re-read newly-registered client: %w", err)
+	if err := json.Unmarshal(scopesRaw, &c.AllowedScopes); err != nil {
+		return nil, "", fmt.Errorf("oauth: decode allowed_scopes from INSERT: %w", err)
 	}
-	return full, plaintextSecret, nil
+	return &c, plaintextSecret, nil
 }
 
 // GetClient fetches a client by its client_id (the public
-// identifier). Tenant-scoped read.
+// identifier). Tenant-scoped read. Returns ErrClientNotFound for
+// both unknown and deactivated rows so callers cannot distinguish
+// the two cases (deactivation should look identical to deletion
+// to anyone outside the admin surface).
 func (s *Service) GetClient(ctx context.Context, tenantID, clientID string) (*Client, error) {
 	if tenantID == "" || clientID == "" {
 		return nil, ErrClientNotFound
 	}
-	return s.queryClient(ctx, tenantID, "client_id = $1", clientID)
-}
-
-func (s *Service) getClientByPK(ctx context.Context, id string) (*Client, error) {
-	// Cross-tenant lookup by primary key; used internally after
-	// INSERT to materialise the typed struct without an RLS
-	// round-trip. Caller MUST NOT expose this surface to HTTP.
-	c := &Client{}
-	var redirectRaw, scopesRaw []byte
-	err := s.pool.QueryRow(ctx, `
-		SELECT id::text, tenant_id::text, client_id, client_type, name,
-		       COALESCE(homepage_url, ''), COALESCE(logo_url, ''),
-		       redirect_uris, allowed_scopes, active, created_at, updated_at
-		FROM oauth_clients
-		WHERE id = $1::uuid
-	`, id).Scan(
-		&c.ID, &c.TenantID, &c.ClientID, &c.ClientType, &c.Name,
-		&c.HomepageURL, &c.LogoURL, &redirectRaw, &scopesRaw,
-		&c.Active, &c.CreatedAt, &c.UpdatedAt,
-	)
-	if err != nil {
-		return nil, err
-	}
-	_ = json.Unmarshal(redirectRaw, &c.RedirectURIs)
-	_ = json.Unmarshal(scopesRaw, &c.AllowedScopes)
-	return c, nil
-}
-
-func (s *Service) queryClient(ctx context.Context, tenantID, where string, args ...any) (*Client, error) {
 	c := &Client{}
 	var redirectRaw, scopesRaw []byte
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
@@ -215,8 +190,8 @@ func (s *Service) queryClient(ctx context.Context, tenantID, where string, args 
 			       COALESCE(homepage_url, ''), COALESCE(logo_url, ''),
 			       redirect_uris, allowed_scopes, active, created_at, updated_at
 			FROM oauth_clients
-			WHERE `+where, args...,
-		).Scan(
+			WHERE client_id = $1 AND active = true
+		`, clientID).Scan(
 			&c.ID, &c.TenantID, &c.ClientID, &c.ClientType, &c.Name,
 			&c.HomepageURL, &c.LogoURL, &redirectRaw, &scopesRaw,
 			&c.Active, &c.CreatedAt, &c.UpdatedAt,
@@ -228,8 +203,12 @@ func (s *Service) queryClient(ctx context.Context, tenantID, where string, args 
 		}
 		return nil, err
 	}
-	_ = json.Unmarshal(redirectRaw, &c.RedirectURIs)
-	_ = json.Unmarshal(scopesRaw, &c.AllowedScopes)
+	if err := json.Unmarshal(redirectRaw, &c.RedirectURIs); err != nil {
+		return nil, fmt.Errorf("oauth: decode redirect_uris: %w", err)
+	}
+	if err := json.Unmarshal(scopesRaw, &c.AllowedScopes); err != nil {
+		return nil, fmt.Errorf("oauth: decode allowed_scopes: %w", err)
+	}
 	return c, nil
 }
 
@@ -254,7 +233,7 @@ func (s *Service) LookupClientForExchange(ctx context.Context, clientID string) 
 		       COALESCE(homepage_url, ''), COALESCE(logo_url, ''),
 		       redirect_uris, allowed_scopes, active, created_at, updated_at
 		FROM oauth_clients
-		WHERE client_id = $1
+		WHERE client_id = $1 AND active = true
 	`, clientID).Scan(
 		&c.ID, &c.TenantID, &c.ClientID, &c.ClientType, &c.Name,
 		&c.HomepageURL, &c.LogoURL, &redirectRaw, &scopesRaw,
@@ -266,8 +245,12 @@ func (s *Service) LookupClientForExchange(ctx context.Context, clientID string) 
 		}
 		return nil, err
 	}
-	_ = json.Unmarshal(redirectRaw, &c.RedirectURIs)
-	_ = json.Unmarshal(scopesRaw, &c.AllowedScopes)
+	if err := json.Unmarshal(redirectRaw, &c.RedirectURIs); err != nil {
+		return nil, fmt.Errorf("oauth: decode redirect_uris: %w", err)
+	}
+	if err := json.Unmarshal(scopesRaw, &c.AllowedScopes); err != nil {
+		return nil, fmt.Errorf("oauth: decode allowed_scopes: %w", err)
+	}
 	return c, nil
 }
 
@@ -549,101 +532,143 @@ func (s *Service) RefreshAccessToken(
 	refreshHash := hashToken(plaintextRefreshToken)
 	now := s.now()
 
+	// The entire rotation (claim → validate → mint new pair →
+	// revoke old access tokens) runs inside ONE transaction so a
+	// concurrent caller racing with the same plaintext refresh
+	// token cannot pass the revoked_at check twice. The atomic
+	// `UPDATE ... WHERE revoked_at IS NULL RETURNING` mirrors the
+	// pattern ExchangeAuthorizationCode uses for one-shot
+	// authorization codes (RFC 6749 §4.1.2 / RFC 6819 §5.2.2):
+	// the row's revoked_at flips and the row is returned in a
+	// single statement, so only one concurrent caller wins the
+	// claim. If the tx later fails for any reason (mint error,
+	// access-token revoke error), the rollback unrevokes the
+	// row — at most one in-flight mint can succeed at a time.
 	var (
-		refreshID, refreshUserID string
-		refreshClientID          string
-		refreshTenantID          string
-		scopesRaw                []byte
-		expiresAt                time.Time
-		revokedAt                *time.Time
+		resp        *TokenResponse
+		replayRowID string
 	)
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		if err := middleware.SetTenantGUC(ctx, tx, client.TenantID); err != nil {
 			return err
 		}
-		return tx.QueryRow(ctx, `
-			SELECT id::text, client_id::text, tenant_id::text, user_id::text,
-			       scopes, expires_at, revoked_at
-			FROM oauth_refresh_tokens
-			WHERE token_hash = $1
-		`, refreshHash).Scan(
-			&refreshID, &refreshClientID, &refreshTenantID, &refreshUserID,
-			&scopesRaw, &expiresAt, &revokedAt,
+
+		var (
+			claimedID, claimedUserID, claimedClientID string
+			scopesRaw                                 []byte
+			expiresAt                                 time.Time
 		)
-	})
-	if err != nil {
+		err := tx.QueryRow(ctx, `
+			UPDATE oauth_refresh_tokens
+			   SET revoked_at = $2
+			 WHERE token_hash = $1
+			   AND revoked_at IS NULL
+			RETURNING id::text, client_id::text, user_id::text,
+			          scopes, expires_at
+		`, refreshHash, now).Scan(
+			&claimedID, &claimedClientID, &claimedUserID,
+			&scopesRaw, &expiresAt,
+		)
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, &OAuthError{
+			// Either the token doesn't exist at all, or some
+			// other in-flight call already revoked it (legit
+			// rotation race OR genuine replay of a leaked old
+			// token). A second SELECT in the same tx
+			// distinguishes the two cases. We don't run the
+			// chain revocation here — it has to happen in a
+			// fresh tx because this one is going to roll back
+			// (the atomic UPDATE didn't move anything but we
+			// still want clean tx semantics).
+			var existingID string
+			selErr := tx.QueryRow(ctx, `
+				SELECT id::text FROM oauth_refresh_tokens WHERE token_hash = $1
+			`, refreshHash).Scan(&existingID)
+			if errors.Is(selErr, pgx.ErrNoRows) {
+				return ErrRefreshTokenNotFound
+			}
+			if selErr != nil {
+				return selErr
+			}
+			replayRowID = existingID
+			return ErrRefreshTokenReplay
+		}
+		if err != nil {
+			return err
+		}
+
+		if claimedClientID != client.ID {
+			// Forces tx rollback → claim is undone. Return a
+			// typed OAuthError so the handler maps it to the
+			// right wire envelope.
+			return &OAuthError{
 				Code:        ErrCodeInvalidGrant,
-				Description: "refresh token not found",
+				Description: "refresh token was issued to a different client",
 				HTTPStatus:  400,
 			}
 		}
-		return nil, err
-	}
+		if now.After(expiresAt) {
+			return &OAuthError{
+				Code:        ErrCodeInvalidGrant,
+				Description: "refresh token expired",
+				HTTPStatus:  400,
+			}
+		}
 
-	// Client check: refresh token must belong to the client.
-	if refreshClientID != client.ID {
+		var grantedScopes []string
+		if err := json.Unmarshal(scopesRaw, &grantedScopes); err != nil {
+			return fmt.Errorf("oauth: decode scopes from claimed refresh row: %w", err)
+		}
+
+		// Mint the new pair INSIDE this tx so a partial failure
+		// rolls back both the claim and the new rows — never
+		// leaving orphaned tokens whose plaintext was never
+		// returned to a caller.
+		minted, _, err := s.mintTokensTx(ctx, tx, client, claimedUserID, grantedScopes, claimedID, now)
+		if err != nil {
+			return err
+		}
+
+		// Revoke every access token issued under the claimed
+		// refresh token — those are the ones the caller had
+		// alongside the now-rotated refresh token.
+		if _, err := tx.Exec(ctx, `
+			UPDATE oauth_access_tokens SET revoked_at = $2
+			WHERE refresh_token_id = $1::uuid AND revoked_at IS NULL
+		`, claimedID, now); err != nil {
+			return err
+		}
+
+		resp = minted
+		return nil
+	})
+
+	switch {
+	case errors.Is(err, ErrRefreshTokenNotFound):
 		return nil, &OAuthError{
 			Code:        ErrCodeInvalidGrant,
-			Description: "refresh token was issued to a different client",
+			Description: "refresh token not found",
 			HTTPStatus:  400,
 		}
-	}
-
-	// Replay detection: a revoked refresh token presented here
-	// means a previous /oauth/token call already rotated it. If
-	// the legitimate client had rotated, it would have stored the
-	// new token; presenting the old one means the old one leaked.
-	// Revoke the entire successor chain to invalidate whatever
-	// the attacker has been able to mint.
-	if revokedAt != nil {
-		if err := s.revokeRefreshChain(ctx, client.TenantID, refreshID); err != nil {
-			return nil, fmt.Errorf("oauth: revoke chain on replay: %w", err)
+	case errors.Is(err, ErrRefreshTokenReplay):
+		// The tx rolled back without revoking anything; now
+		// fire the replay-revocation in a fresh tx. The chain
+		// revocation is independent of whether we won the
+		// rotation race, so doing it after rollback is fine
+		// and avoids holding row locks longer than needed.
+		if cerr := s.revokeRefreshChain(ctx, client.TenantID, replayRowID); cerr != nil {
+			return nil, fmt.Errorf("oauth: revoke chain on replay: %w", cerr)
 		}
 		return nil, &OAuthError{
 			Code:        ErrCodeInvalidGrant,
 			Description: "refresh token replay detected — token family revoked",
 			HTTPStatus:  400,
 		}
-	}
-
-	if now.After(expiresAt) {
-		return nil, &OAuthError{
-			Code:        ErrCodeInvalidGrant,
-			Description: "refresh token expired",
-			HTTPStatus:  400,
+	case err != nil:
+		var oerr *OAuthError
+		if errors.As(err, &oerr) {
+			return nil, oerr
 		}
-	}
-
-	var grantedScopes []string
-	_ = json.Unmarshal(scopesRaw, &grantedScopes)
-
-	// Mint new tokens; chain the new refresh row to the old one
-	// so a future replay of the old one can walk the chain.
-	resp, err := s.mintTokens(ctx, client, refreshUserID, grantedScopes, refreshID)
-	if err != nil {
 		return nil, err
-	}
-
-	// Revoke the old refresh token AND all access tokens it issued.
-	err = pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		if err := middleware.SetTenantGUC(ctx, tx, client.TenantID); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(ctx, `
-			UPDATE oauth_refresh_tokens SET revoked_at = $2 WHERE id = $1::uuid AND revoked_at IS NULL
-		`, refreshID, now); err != nil {
-			return err
-		}
-		_, err := tx.Exec(ctx, `
-			UPDATE oauth_access_tokens SET revoked_at = $2
-			WHERE refresh_token_id = $1::uuid AND revoked_at IS NULL
-		`, refreshID, now)
-		return err
-	})
-	if err != nil {
-		return nil, fmt.Errorf("oauth: revoke rotated tokens: %w", err)
 	}
 	return resp, nil
 }
@@ -652,6 +677,10 @@ func (s *Service) RefreshAccessToken(
 // to the given client/user/scopes and persists them. parentID is
 // the previous refresh token's row id (empty string for a brand
 // new chain from /authorize; non-empty for /refresh).
+//
+// Opens its own transaction. Callers that need the mint to share
+// a transaction with an outer atomic claim should call
+// mintTokensTx instead.
 func (s *Service) mintTokens(
 	ctx context.Context,
 	client *Client,
@@ -660,53 +689,79 @@ func (s *Service) mintTokens(
 	parentRefreshID string,
 ) (*TokenResponse, error) {
 	now := s.now()
+	var resp *TokenResponse
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := middleware.SetTenantGUC(ctx, tx, client.TenantID); err != nil {
+			return err
+		}
+		r, _, err := s.mintTokensTx(ctx, tx, client, userID, scopes, parentRefreshID, now)
+		if err != nil {
+			return err
+		}
+		resp = r
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("oauth: persist tokens: %w", err)
+	}
+	return resp, nil
+}
+
+// mintTokensTx is the transaction-bound core of mintTokens. The
+// caller MUST have already opened a transaction AND called
+// middleware.SetTenantGUC on it before invoking this helper. The
+// extra returned string is the new refresh token's row id, useful
+// for callers that want to chain further work (e.g. update related
+// rows in the same transaction).
+func (s *Service) mintTokensTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	client *Client,
+	userID string,
+	scopes []string,
+	parentRefreshID string,
+	now time.Time,
+) (*TokenResponse, string, error) {
 	plaintextAccess, err := generateOpaqueToken(32)
 	if err != nil {
-		return nil, fmt.Errorf("oauth: generate access token: %w", err)
+		return nil, "", fmt.Errorf("oauth: generate access token: %w", err)
 	}
 	plaintextRefresh, err := generateOpaqueToken(32)
 	if err != nil {
-		return nil, fmt.Errorf("oauth: generate refresh token: %w", err)
+		return nil, "", fmt.Errorf("oauth: generate refresh token: %w", err)
 	}
 	accessHash := hashToken(plaintextAccess)
 	refreshHash := hashToken(plaintextRefresh)
 	scopesJSON, _ := json.Marshal(scopes)
 
+	var parentPtr *string
+	if parentRefreshID != "" {
+		parentPtr = &parentRefreshID
+	}
 	var newRefreshID string
-	err = pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		if err := middleware.SetTenantGUC(ctx, tx, client.TenantID); err != nil {
-			return err
-		}
-		var parentPtr *string
-		if parentRefreshID != "" {
-			parentPtr = &parentRefreshID
-		}
-		if err := tx.QueryRow(ctx, `
-			INSERT INTO oauth_refresh_tokens (
-				tenant_id, client_id, user_id, token_hash, scopes, parent_id, expires_at
-			)
-			VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5::jsonb, $6::uuid, $7)
-			RETURNING id::text
-		`,
-			client.TenantID, client.ID, userID, refreshHash, string(scopesJSON),
-			parentPtr, now.Add(s.refreshTokenTTL),
-		).Scan(&newRefreshID); err != nil {
-			return err
-		}
-		_, err := tx.Exec(ctx, `
-			INSERT INTO oauth_access_tokens (
-				tenant_id, client_id, user_id, token_hash, scopes,
-				expires_at, refresh_token_id
-			)
-			VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5::jsonb, $6, $7::uuid)
-		`,
-			client.TenantID, client.ID, userID, accessHash, string(scopesJSON),
-			now.Add(s.accessTokenTTL), newRefreshID,
+	if err := tx.QueryRow(ctx, `
+		INSERT INTO oauth_refresh_tokens (
+			tenant_id, client_id, user_id, token_hash, scopes, parent_id, expires_at
 		)
-		return err
-	})
-	if err != nil {
-		return nil, fmt.Errorf("oauth: persist tokens: %w", err)
+		VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5::jsonb, $6::uuid, $7)
+		RETURNING id::text
+	`,
+		client.TenantID, client.ID, userID, refreshHash, string(scopesJSON),
+		parentPtr, now.Add(s.refreshTokenTTL),
+	).Scan(&newRefreshID); err != nil {
+		return nil, "", err
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO oauth_access_tokens (
+			tenant_id, client_id, user_id, token_hash, scopes,
+			expires_at, refresh_token_id
+		)
+		VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5::jsonb, $6, $7::uuid)
+	`,
+		client.TenantID, client.ID, userID, accessHash, string(scopesJSON),
+		now.Add(s.accessTokenTTL), newRefreshID,
+	); err != nil {
+		return nil, "", err
 	}
 
 	return &TokenResponse{
@@ -715,7 +770,7 @@ func (s *Service) mintTokens(
 		ExpiresIn:    int(s.accessTokenTTL.Seconds()),
 		RefreshToken: plaintextRefresh,
 		Scope:        joinScopes(scopes),
-	}, nil
+	}, newRefreshID, nil
 }
 
 // revokeRefreshChain walks `parent_id` references forward from
@@ -784,12 +839,20 @@ func (s *Service) ValidateAccessToken(ctx context.Context, plaintextToken string
 	// yet. The token_hash is globally unique (UNIQUE constraint
 	// on `oauth_access_tokens.token_hash`) so this is safe. We
 	// then apply the tenant GUC in the downstream handler chain.
+	//
+	// The JOIN also requires the issuing client to still be
+	// `active = true` — otherwise a deactivated app's existing
+	// tokens would keep working until natural expiry, which
+	// defeats the operator action of deactivating it. An
+	// already-issued bearer token presented after deactivation
+	// looks identical to a revoked token from the caller's
+	// perspective.
 	err := s.pool.QueryRow(ctx, `
 		SELECT t.id::text, t.tenant_id::text, t.user_id::text, c.client_id,
 		       t.scopes, t.expires_at, t.revoked_at
 		FROM oauth_access_tokens t
 		JOIN oauth_clients c ON c.id = t.client_id
-		WHERE t.token_hash = $1
+		WHERE t.token_hash = $1 AND c.active = true
 	`, tokenHash).Scan(
 		&tokenID, &tenantID, &userID, &clientID, &scopesRaw, &expiresAt, &revokedAt,
 	)

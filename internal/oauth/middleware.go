@@ -113,9 +113,18 @@ func extractBearerToken(r *http.Request) (string, error) {
 // We use the JSON body as the primary signal for SDKs / curl
 // users; the header is the protocol-mandated form for browser
 // libraries that expect to challenge on 401.
+//
+// Per RFC 7235 §2.1 the auth-param values are quoted-strings:
+// they cannot contain unescaped DQUOTE / backslash / CR / LF.
+// We escape callers' inputs defensively even though all current
+// callers pass hardcoded strings — a future caller threading a
+// user-controlled value into `description` would otherwise be
+// able to inject extra headers (CRLF) or terminate the
+// quoted-string prematurely (DQUOTE).
 func writeWWWAuthenticate(w http.ResponseWriter, errorCode, description string, status int) {
 	w.Header().Set("WWW-Authenticate",
-		`Bearer realm="kmail", error="`+errorCode+`", error_description="`+description+`"`)
+		`Bearer realm="kmail", error="`+quotedStringEscape(errorCode)+
+			`", error_description="`+quotedStringEscape(description)+`"`)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	body := map[string]string{
@@ -123,4 +132,34 @@ func writeWWWAuthenticate(w http.ResponseWriter, errorCode, description string, 
 		"error_description": description,
 	}
 	_ = json.NewEncoder(w).Encode(body)
+}
+
+// quotedStringEscape returns `s` made safe for embedding inside
+// the value of an HTTP `quoted-string` production (RFC 9110 §5.6.4
+// / RFC 7235 §2.1). Backslash and DQUOTE are backslash-escaped;
+// control characters (which are forbidden inside quoted-string
+// values per the ABNF: VCHAR / SP / HTAB / obs-text) are stripped
+// rather than escaped, because no Bearer-error vocabulary needs
+// them and emitting them would risk header-injection in clients
+// that lazily concatenate.
+func quotedStringEscape(s string) string {
+	if s == "" {
+		return ""
+	}
+	out := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == '\\' || c == '"':
+			out = append(out, '\\', c)
+		case c == '\t' || c == ' ':
+			out = append(out, c)
+		case c < 0x20, c == 0x7f:
+			// Drop CR/LF/NUL/etc. silently — they have no
+			// place in a Bearer error envelope.
+		default:
+			out = append(out, c)
+		}
+	}
+	return string(out)
 }

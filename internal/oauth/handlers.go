@@ -2,6 +2,9 @@ package oauth
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"html/template"
@@ -9,6 +12,18 @@ import (
 	"net/url"
 	"strings"
 )
+
+// csrfCookieName is the cookie that carries the consent-screen
+// CSRF token. Path-scoped to the OAuth2 prefix so it is not
+// leaked to unrelated routes; HttpOnly so JavaScript on the
+// embedding page cannot read it; SameSite=Strict so a malicious
+// cross-origin form cannot use a user's session to forge an
+// approval. The double-submit pattern (cookie + hidden form
+// field, compared with constant-time equality) is defense in
+// depth on top of SameSite — a browser that lazily enforces
+// SameSite still cannot satisfy the equality check without
+// reading the cookie.
+const csrfCookieName = "kmail_oauth_csrf"
 
 // serviceAPI is the small slice of *Service that the HTTP layer
 // needs. Defining it on the consumer side (handlers) — as
@@ -56,7 +71,37 @@ type Handlers struct {
 	UserResolver func(r *http.Request) (userID string, tenantID string, ok bool)
 
 	consentTmpl *template.Template
+
+	// routePrefix is the URL prefix the OAuth2 routes are mounted
+	// under (as passed to RegisterRoutes). The consent template
+	// embeds it in the form action so the BFF can mount this set
+	// of routes under any prefix — e.g. `/api/v1/oauth` — without
+	// the approve POST 404'ing because the form was hardcoded to
+	// `/oauth/authorize/approve`. Set in RegisterRoutes; empty if
+	// the handlers were instantiated without going through it
+	// (in which case Authorize falls back to the empty prefix,
+	// i.e. the root, which is the legacy behaviour).
+	routePrefix string
+
+	// secureCookies, when true, marks the CSRF cookie as Secure
+	// (cookie-set on plaintext HTTP will be ignored by RFC 6265).
+	// Tests and local dev get an insecure default; production
+	// callers set this true via SetSecureCookies before wiring
+	// the routes. Falling open to false on test/dev is acceptable
+	// because the CSRF cookie itself contains no session data —
+	// it is just a random nonce.
+	secureCookies bool
+
+	// csrfNonce generates the per-request CSRF nonce. Defaults to
+	// crypto/rand-backed; tests can substitute a deterministic
+	// generator without resorting to runtime monkey-patching.
+	csrfNonce func() (string, error)
 }
+
+// SetSecureCookies marks all cookies set by this handler set
+// (currently just the CSRF cookie) as Secure. Call this in
+// production wiring; leave it off for local plaintext HTTP dev.
+func (h *Handlers) SetSecureCookies(secure bool) { h.secureCookies = secure }
 
 // NewHandlers constructs the HTTP handler set bound to a Service.
 // UserResolver MUST be wired before calling Authorize / Approve —
@@ -75,13 +120,31 @@ func newHandlersWithAPI(svc serviceAPI, userResolver func(r *http.Request) (stri
 		svc:          svc,
 		UserResolver: userResolver,
 		consentTmpl:  template.Must(template.New("consent").Parse(consentHTML)),
+		csrfNonce:    randomCSRFNonce,
 	}
 }
 
-// ServeMux registers all four OAuth2 endpoints under the given
-// prefix (typically "/oauth"). Returns the mux for chaining.
+// randomCSRFNonce returns 32 bytes of crypto/rand entropy as a
+// raw-URL-base64 string (no padding, URL-safe — fits in a cookie
+// value AND a hidden form field without escaping).
+func randomCSRFNonce() (string, error) {
+	var buf [32]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(buf[:]), nil
+}
+
+// RegisterRoutes registers all four OAuth2 endpoints under the
+// given prefix (typically "/oauth"). The prefix is stashed on the
+// handler so the consent template renders the correct form
+// action even when the routes are mounted under a non-default
+// prefix — without this, the approve POST hardcoded to
+// `/oauth/authorize/approve` would 404 when the BFF mounted
+// these routes under e.g. `/api/v1/oauth`.
 func (h *Handlers) RegisterRoutes(mux *http.ServeMux, prefix string) {
 	prefix = strings.TrimRight(prefix, "/")
+	h.routePrefix = prefix
 	mux.HandleFunc(prefix+"/authorize", h.Authorize)
 	mux.HandleFunc(prefix+"/authorize/approve", h.Approve)
 	mux.HandleFunc(prefix+"/token", h.Token)
@@ -176,9 +239,25 @@ func (h *Handlers) Authorize(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Render the consent screen. The Approve form POSTs back to
-	// /oauth/authorize/approve with the same parameters embedded
-	// as hidden fields so we can re-validate them server-side —
-	// never trust the user-agent to round-trip them honestly.
+	// `<prefix>/authorize/approve` with the same parameters
+	// embedded as hidden fields so we can re-validate them
+	// server-side — never trust the user-agent to round-trip them
+	// honestly. We also mint a CSRF nonce, plant it both in a
+	// cookie AND in a hidden form field, and check equality on
+	// the POST handler (double-submit cookie pattern).
+	csrf, err := h.csrfNonce()
+	if err != nil {
+		http.Error(w, "csrf generation failed", http.StatusInternalServerError)
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     csrfCookieName,
+		Value:    csrf,
+		Path:     h.csrfCookiePath(),
+		HttpOnly: true,
+		Secure:   h.secureCookies,
+		SameSite: http.SameSiteStrictMode,
+	})
 	tplData := consentTemplateData{
 		ClientName:          client.Name,
 		ClientHomepage:      client.HomepageURL,
@@ -189,11 +268,25 @@ func (h *Handlers) Authorize(w http.ResponseWriter, r *http.Request) {
 		State:               req.State,
 		CodeChallenge:       req.CodeChallenge,
 		CodeChallengeMethod: req.CodeChallengeMethod,
+		ApproveURL:          h.routePrefix + "/authorize/approve",
+		CSRFToken:           csrf,
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := h.consentTmpl.Execute(w, tplData); err != nil {
 		http.Error(w, "consent screen render failed", http.StatusInternalServerError)
 	}
+}
+
+// csrfCookiePath returns the cookie Path. Scope-limit to the
+// OAuth2 prefix so the cookie isn't sent on every request to the
+// BFF; fall back to "/" when no prefix was set (e.g. test
+// harnesses that constructed Handlers directly via NewHandlers
+// without going through RegisterRoutes).
+func (h *Handlers) csrfCookiePath() string {
+	if h.routePrefix == "" {
+		return "/"
+	}
+	return h.routePrefix
 }
 
 // =================== Approve (user clicked Approve) ===================
@@ -222,6 +315,32 @@ func (h *Handlers) Approve(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "authentication required", http.StatusUnauthorized)
 		return
 	}
+
+	// CSRF verification BEFORE any state-changing work. The
+	// cookie was set by Authorize when it rendered the consent
+	// screen; the form field is the same value, planted by the
+	// browser when the user submitted Approve. Both must match
+	// (constant-time compare) AND both must be non-empty — an
+	// empty cookie + empty form would otherwise trivially match.
+	cookie, err := r.Cookie(csrfCookieName)
+	formCSRF := r.Form.Get("csrf_token")
+	if err != nil || cookie.Value == "" || formCSRF == "" ||
+		subtle.ConstantTimeCompare([]byte(cookie.Value), []byte(formCSRF)) != 1 {
+		http.Error(w, "csrf token mismatch", http.StatusForbidden)
+		return
+	}
+	// Invalidate the cookie on the response so it can't be
+	// replayed against a second Approve. Set MaxAge < 0 per RFC
+	// 6265 §4.1.2.2 to instruct the browser to delete it.
+	http.SetCookie(w, &http.Cookie{
+		Name:     csrfCookieName,
+		Value:    "",
+		Path:     h.csrfCookiePath(),
+		HttpOnly: true,
+		Secure:   h.secureCookies,
+		SameSite: http.SameSiteStrictMode,
+		MaxAge:   -1,
+	})
 
 	clientID := r.Form.Get("client_id")
 	redirectURI := r.Form.Get("redirect_uri")
@@ -520,6 +639,14 @@ type consentTemplateData struct {
 	State               string
 	CodeChallenge       string
 	CodeChallengeMethod string
+	// ApproveURL is the URL the consent form POSTs to. Threaded
+	// from Handlers.routePrefix so the form action is correct
+	// regardless of where the BFF mounts these routes.
+	ApproveURL string
+	// CSRFToken is the per-request CSRF nonce. Same value is
+	// also set in the kmail_oauth_csrf cookie; Approve compares
+	// the two with constant-time equality.
+	CSRFToken string
 }
 
 // consentHTML is intentionally minimal — the KChat shell injects
@@ -558,13 +685,14 @@ const consentHTML = `<!DOCTYPE html>
       {{ end }}
     </ul>
   </div>
-  <form method="POST" action="/oauth/authorize/approve">
+  <form method="POST" action="{{ .ApproveURL }}">
     <input type="hidden" name="client_id" value="{{ .ClientID }}">
     <input type="hidden" name="redirect_uri" value="{{ .RedirectURI }}">
     <input type="hidden" name="scope" value="{{ range $i, $s := .RequestedScopes }}{{ if $i }} {{ end }}{{ $s }}{{ end }}">
     <input type="hidden" name="state" value="{{ .State }}">
     <input type="hidden" name="code_challenge" value="{{ .CodeChallenge }}">
     <input type="hidden" name="code_challenge_method" value="{{ .CodeChallengeMethod }}">
+    <input type="hidden" name="csrf_token" value="{{ .CSRFToken }}">
     <div class="actions">
       <button type="submit" name="decision" value="approve" class="primary">Allow</button>
       <button type="submit" name="decision" value="deny">Cancel</button>
