@@ -11,13 +11,19 @@ package jmap
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -40,14 +46,25 @@ type ShardResolver interface {
 
 // ProxyConfig wires the JMAP reverse proxy. `StalwartURL` is the
 // internal Stalwart JMAP endpoint (e.g., `http://stalwart:8080` in
-// the local compose stack). `Pool` is used to resolve the acting
-// user's Stalwart account ID per
+// the local compose stack, `https://kmail-stalwart-0.kmail-stalwart.svc:8443`
+// in production where mTLS is mandatory). `Pool` is used to
+// resolve the acting user's Stalwart account ID per
 // `docs/JMAP-CONTRACT.md` §3.3. `Logger` is optional; if nil, a
 // logger writing to the default output is used.
 type ProxyConfig struct {
 	StalwartURL string
 	Pool        *pgxpool.Pool
 	Logger      *log.Logger
+
+	// TLS, when non-nil, configures the BFF→Stalwart transport for
+	// mutual TLS authentication. In production the BFF presents a
+	// per-pod client certificate issued by cert-manager so
+	// Stalwart can authenticate the caller cryptographically
+	// rather than relying on a trusted-network posture
+	// (`docs/ARCHITECTURE.md` §7). When nil, the transport falls
+	// back to whatever scheme `StalwartURL` declares — plain HTTP
+	// in compose dev, HTTPS without a client cert in staging.
+	TLS *ClientTLSConfig
 
 	// AccountCacheTTL controls how long the `(tenant_id, kchat_user_id)
 	// → stalwart_account_id` cache entries live. Defaults to 5
@@ -102,16 +119,539 @@ type ProxyConfig struct {
 	PreDeliverHook func(ctx context.Context, body []byte) error
 }
 
+// ClientTLSConfig configures the BFF→Stalwart mTLS transport.
+//
+// The expected layout in production is that cert-manager issues a
+// short-lived (24h) leaf certificate for each BFF pod from an
+// internal Issuer/ClusterIssuer, mounted via a Kubernetes Secret
+// onto `/etc/kmail/tls`. The Stalwart server is configured to
+// trust the same root and demand a client certificate (TLS
+// `verify_client = required`).
+//
+// `CAFile` is the PEM bundle that pins which CAs Stalwart's
+// server certificate must chain to. `ServerName` is the SNI /
+// `tls.Config.ServerName` value. Leaving it empty lets Go's
+// transport derive SNI per-connection from each upstream URL —
+// the correct default for shard failover, where the secondary's
+// certificate may not carry the primary's hostname. Set it
+// explicitly only when the upstream URL host does not match the
+// SAN on Stalwart's server cert (e.g. when going through a
+// pod-local sidecar). `MinVersion` raises the floor; the
+// transport never speaks below TLS 1.2 even when this is zero.
+type ClientTLSConfig struct {
+	CertFile   string
+	KeyFile    string
+	CAFile     string
+	ServerName string
+	MinVersion uint16
+}
+
+// validate returns an error when the config is unusable. Empty
+// configs are caught here so callers don't have to repeat the
+// guard.
+func (c *ClientTLSConfig) validate() error {
+	if c == nil {
+		return errors.New("jmap.ClientTLSConfig: nil receiver")
+	}
+	if strings.TrimSpace(c.CertFile) == "" {
+		return errors.New("jmap.ClientTLSConfig: CertFile is required")
+	}
+	if strings.TrimSpace(c.KeyFile) == "" {
+		return errors.New("jmap.ClientTLSConfig: KeyFile is required")
+	}
+	return nil
+}
+
+// clientTLSBuild bundles a base *tls.Config with the trust-root
+// loader and pinned ServerName so the transport can mint a fresh
+// per-connection config from the dial target. The per-connection
+// path exists specifically to keep hostname verification correct
+// when the upstream URL is an IP literal — Go's TLS stack strips
+// SNI for IP literals per RFC 6066, so `state.ServerName` in a
+// shared VerifyConnection callback would be empty and `DNSName: ""`
+// in `x509.VerifyOptions` would silently skip the hostname check
+// entirely. The mitigation: build VerifyConnection per dial, with
+// the dial host (which may be an IP literal) closed over so it
+// becomes the `DNSName` passed to `x509.Certificate.Verify` — Go's
+// verifier then enforces the cert's `IPAddresses` SAN list against
+// that value instead of falling through to chain-only verification.
+type clientTLSBuild struct {
+	base           *tls.Config
+	caLoader       *caPoolLoader
+	pinnedSrvName  string
+	customVerifier bool // true when CAFile was set; otherwise the stdlib verifier is fine
+}
+
+// build assembles the *tls.Config that the BFF transport presents
+// to Stalwart. The initial keypair and CA bundle loads run at
+// startup so a misconfigured deployment fails fast on boot;
+// subsequent rotations are picked up on the next handshake via
+// the `GetClientCertificate` and `VerifyConnection` callbacks
+// (see keypairLoader / caPoolLoader). This means cert-manager
+// rotation — of either the BFF leaf certificate OR the trust
+// root — continues to work even in clusters where the Reloader
+// controller is not installed.
+func (c *ClientTLSConfig) build(logger *log.Logger) (*clientTLSBuild, error) {
+	if err := c.validate(); err != nil {
+		return nil, err
+	}
+	kpLoader := &keypairLoader{
+		certFile: c.CertFile,
+		keyFile:  c.KeyFile,
+		logger:   logger,
+	}
+	// Validate the on-disk keypair once at startup so we surface
+	// `bad cert / bad key` to the operator before serving traffic
+	// rather than at the first handshake.
+	if _, err := kpLoader.load(); err != nil {
+		return nil, fmt.Errorf("jmap.ClientTLSConfig: load keypair: %w", err)
+	}
+	min := c.MinVersion
+	if min == 0 {
+		min = tls.VersionTLS12
+	}
+	b := &clientTLSBuild{
+		base: &tls.Config{
+			GetClientCertificate: kpLoader.get,
+			MinVersion:           min,
+			ServerName:           c.ServerName,
+		},
+		pinnedSrvName: c.ServerName,
+	}
+	if strings.TrimSpace(c.CAFile) != "" {
+		b.caLoader = &caPoolLoader{
+			caFile: c.CAFile,
+			logger: logger,
+		}
+		// Validate the trust root at startup for the same fail-fast
+		// reason as the keypair. The pool is cached and re-loaded on
+		// the next handshake whenever the file's mtime changes.
+		if _, err := b.caLoader.load(); err != nil {
+			return nil, fmt.Errorf("jmap.ClientTLSConfig: load CA bundle: %w", err)
+		}
+		b.customVerifier = true
+	}
+	return b, nil
+}
+
+// perConnConfig clones the base config and stamps in the dial host
+// so VerifyConnection has correct DNSName / IPAddresses verification
+// even when SNI is suppressed (IP-literal URLs). The returned config
+// is safe for `tls.Client` — every connection gets its own clone.
+//
+// `dialHost` is the host portion of the dial address (no port). It
+// may be a hostname, an IPv4 / IPv6 literal, or — in the unusual
+// case of a malformed dial — empty. An empty `dialHost` combined
+// with an empty `pinnedSrvName` is the failure case that motivated
+// this refactor: previously it slipped through as chain-only
+// verification; now it produces a hard handshake error.
+func (b *clientTLSBuild) perConnConfig(dialHost string) *tls.Config {
+	cfg := b.base.Clone()
+	// Prefer the operator's explicit ServerName pin if one is set
+	// — this is the documented escape hatch when the upstream URL
+	// host doesn't match the SAN on Stalwart's server cert (e.g.
+	// going through a pod-local sidecar). Otherwise, fall back to
+	// the dial host. Setting `ServerName` here drives BOTH Go's
+	// per-connection SNI emission and `state.ServerName` in the
+	// VerifyConnection callback below.
+	if cfg.ServerName == "" {
+		cfg.ServerName = dialHost
+	}
+	if !b.customVerifier {
+		return cfg
+	}
+	// `InsecureSkipVerify=true` *combined with* `VerifyConnection`
+	// is the documented Go stdlib pattern for swapping in a custom
+	// verifier — it disables the built-in cert chain check so we
+	// can do it ourselves against a freshly-loaded pool. The logic
+	// below is otherwise identical to the default behavior: it
+	// pins the chain to our CA roots AND enforces the dial host
+	// matches a SAN (DNS name OR IPAddresses entry, depending on
+	// whether dialHost parses as an IP literal).
+	cfg.InsecureSkipVerify = true
+	pinned := b.pinnedSrvName
+	loader := b.caLoader
+	cfg.VerifyConnection = func(state tls.ConnectionState) error {
+		if len(state.PeerCertificates) == 0 {
+			return errors.New("jmap.ClientTLSConfig: peer presented no certificate")
+		}
+		pool, err := loader.load()
+		if err != nil {
+			return fmt.Errorf("jmap.ClientTLSConfig: load CA bundle: %w", err)
+		}
+		// Resolve the name that must appear in the SAN list, in
+		// priority order:
+		//
+		//   1. The operator's explicit `ServerName` pin (overrides
+		//      everything; intentional for sidecar / proxy cases).
+		//   2. `state.ServerName` — populated by Go when SNI was
+		//      sent (the common hostname case).
+		//   3. The dial host — used when SNI was suppressed because
+		//      the URL host is an IP literal (RFC 6066). Go's x509
+		//      verifier treats `DNSName` that parses as an IP as a
+		//      check against the cert's `IPAddresses` SAN, so this
+		//      is the correct value to pass even though the field
+		//      is named `DNSName`.
+		verifyName := pinned
+		if verifyName == "" {
+			verifyName = state.ServerName
+		}
+		if verifyName == "" {
+			verifyName = dialHost
+		}
+		if verifyName == "" {
+			// Should be impossible — the transport's DialTLSContext
+			// always passes a non-empty host. Treat as a hard error
+			// rather than silently falling through to chain-only
+			// verification, which would let a server impersonating
+			// any other Stalwart on the same root authenticate.
+			return errors.New("jmap.ClientTLSConfig: no name available for hostname verification (empty SNI and empty dial host); refusing chain-only verification")
+		}
+		opts := x509.VerifyOptions{
+			Roots:         pool,
+			Intermediates: x509.NewCertPool(),
+			DNSName:       verifyName,
+		}
+		for _, ic := range state.PeerCertificates[1:] {
+			opts.Intermediates.AddCert(ic)
+		}
+		if _, err := state.PeerCertificates[0].Verify(opts); err != nil {
+			return fmt.Errorf("jmap.ClientTLSConfig: verify peer: %w", err)
+		}
+		return nil
+	}
+	return cfg
+}
+
+// keypairLoader is the `GetClientCertificate` provider used by
+// the mTLS transport. It caches the most-recently-loaded keypair
+// and re-reads the underlying files whenever either file's mtime
+// changes, so cert-manager rotations land on the next handshake.
+//
+// The cache is keyed on a tuple of (cert mtime, key mtime). A
+// shared RWMutex protects the cache; the common path (no
+// rotation) takes the read lock and returns immediately.
+type keypairLoader struct {
+	certFile string
+	keyFile  string
+	logger   *log.Logger
+	// now is the wall-clock source used by the expiry check.
+	// Defaults to time.Now; tests inject a fixed clock to make
+	// the WARN threshold deterministic.
+	now func() time.Time
+
+	mu        sync.RWMutex
+	cert      *tls.Certificate
+	certMTime time.Time
+	keyMTime  time.Time
+	// lastExpiryWarn dedup's the WARN log so a single near-
+	// expiry cert doesn't spam the log on every reload check.
+	// The map key is the leaf NotAfter so a rotated cert with
+	// a new horizon emits a fresh WARN if it also lands inside
+	// the threshold.
+	lastExpiryWarn time.Time
+}
+
+// certExpiryWarnThreshold is the maximum remaining lifetime
+// below which the keypair loader logs a WARN on every reload
+// (deduplicated per leaf NotAfter). The default Helm chart
+// configures cert-manager for 24h certs with 8h renewal, so any
+// remaining lifetime < 24h means either renewal is broken or
+// the Reloader controller never restarted the pod — both are
+// production-affecting conditions an operator needs to see in
+// the BFF logs.
+const certExpiryWarnThreshold = 24 * time.Hour
+
+// get satisfies tls.Config.GetClientCertificate.
+func (l *keypairLoader) get(_ *tls.CertificateRequestInfo) (*tls.Certificate, error) {
+	return l.load()
+}
+
+// load returns the cached *tls.Certificate, reloading from disk
+// if either underlying file has been replaced since the last read.
+func (l *keypairLoader) load() (*tls.Certificate, error) {
+	certInfo, err := os.Stat(l.certFile)
+	if err != nil {
+		return nil, fmt.Errorf("jmap.keypairLoader: stat cert %q: %w", l.certFile, err)
+	}
+	keyInfo, err := os.Stat(l.keyFile)
+	if err != nil {
+		return nil, fmt.Errorf("jmap.keypairLoader: stat key %q: %w", l.keyFile, err)
+	}
+
+	l.mu.RLock()
+	if l.cert != nil && certInfo.ModTime().Equal(l.certMTime) && keyInfo.ModTime().Equal(l.keyMTime) {
+		cert := l.cert
+		l.mu.RUnlock()
+		return cert, nil
+	}
+	l.mu.RUnlock()
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	// Double-check under the write lock — another goroutine may
+	// have reloaded while we were upgrading.
+	if l.cert != nil && certInfo.ModTime().Equal(l.certMTime) && keyInfo.ModTime().Equal(l.keyMTime) {
+		return l.cert, nil
+	}
+
+	loaded, err := tls.LoadX509KeyPair(l.certFile, l.keyFile)
+	if err != nil {
+		return nil, fmt.Errorf("jmap.keypairLoader: reload keypair: %w", err)
+	}
+	prev := l.cert
+	l.cert = &loaded
+	l.certMTime = certInfo.ModTime()
+	l.keyMTime = keyInfo.ModTime()
+	if l.logger != nil {
+		leafNotAfter := "unknown"
+		leafSubject := "unknown"
+		var leaf *x509.Certificate
+		if len(loaded.Certificate) > 0 {
+			if parsed, perr := x509.ParseCertificate(loaded.Certificate[0]); perr == nil {
+				leaf = parsed
+				leafNotAfter = parsed.NotAfter.UTC().Format(time.RFC3339)
+				leafSubject = parsed.Subject.CommonName
+				if leafSubject == "" && len(parsed.DNSNames) > 0 {
+					leafSubject = parsed.DNSNames[0]
+				}
+			}
+		}
+		if prev == nil {
+			l.logger.Printf("jmap proxy: loaded client TLS keypair subject=%q notAfter=%s", leafSubject, leafNotAfter)
+		} else {
+			l.logger.Printf("jmap proxy: rotated client TLS keypair subject=%q notAfter=%s", leafSubject, leafNotAfter)
+		}
+		if leaf != nil {
+			l.maybeWarnNearExpiryLocked(leaf, leafSubject)
+		}
+	}
+	return l.cert, nil
+}
+
+// maybeWarnNearExpiryLocked emits a WARN when the loaded leaf is
+// within `certExpiryWarnThreshold` of expiry — or already past
+// it. The caller MUST hold l.mu in write mode. The WARN is
+// dedup'd per (leaf NotAfter) so a near-expiry cert that gets
+// re-checked on every handshake doesn't spam the log; an
+// operational rotation that lands a fresh cert resets the
+// dedup key naturally.
+func (l *keypairLoader) maybeWarnNearExpiryLocked(leaf *x509.Certificate, subject string) {
+	now := l.clockLocked()
+	remaining := leaf.NotAfter.Sub(now)
+	if remaining > certExpiryWarnThreshold {
+		return
+	}
+	if l.lastExpiryWarn.Equal(leaf.NotAfter) {
+		return
+	}
+	l.lastExpiryWarn = leaf.NotAfter
+	switch {
+	case remaining <= 0:
+		l.logger.Printf(
+			"WARN: jmap proxy: client TLS keypair subject=%q is EXPIRED (notAfter=%s, expired %s ago); "+
+				"cert-manager renewal may be broken or Reloader did not restart the pod.",
+			subject, leaf.NotAfter.UTC().Format(time.RFC3339), -remaining.Round(time.Second),
+		)
+	default:
+		l.logger.Printf(
+			"WARN: jmap proxy: client TLS keypair subject=%q expires in %s (notAfter=%s); "+
+				"verify cert-manager renewal is healthy and Reloader is installed so the BFF picks up the rotation.",
+			subject, remaining.Round(time.Second), leaf.NotAfter.UTC().Format(time.RFC3339),
+		)
+	}
+}
+
+// clockLocked returns the keypair loader's wall-clock instant.
+// Pulled into a helper so tests can inject a deterministic clock
+// via the `now` field.
+func (l *keypairLoader) clockLocked() time.Time {
+	if l.now != nil {
+		return l.now()
+	}
+	return time.Now()
+}
+
+// caPoolLoader is the dynamic trust-root provider used by the
+// mTLS transport. It mirrors keypairLoader for the CA bundle:
+// each handshake stats the file, returns the cached pool when
+// unchanged, and re-parses the on-disk PEM whenever mtime moves
+// forward. CA rotations are far rarer than leaf rotations (the
+// internal PKI root typically lasts years) but the same
+// "rotation works without Reloader" guarantee applies — when
+// cert-manager updates the CA bundle in the mounted Secret we
+// pick it up on the next request.
+type caPoolLoader struct {
+	caFile string
+	logger *log.Logger
+
+	mu     sync.RWMutex
+	pool   *x509.CertPool
+	mtime  time.Time
+	digest string
+}
+
+// load returns the cached *x509.CertPool, re-parsing the PEM
+// bundle from disk whenever the underlying file has been
+// replaced since the last successful load.
+func (l *caPoolLoader) load() (*x509.CertPool, error) {
+	info, err := os.Stat(l.caFile)
+	if err != nil {
+		return nil, fmt.Errorf("jmap.caPoolLoader: stat CA %q: %w", l.caFile, err)
+	}
+
+	l.mu.RLock()
+	if l.pool != nil && info.ModTime().Equal(l.mtime) {
+		pool := l.pool
+		l.mu.RUnlock()
+		return pool, nil
+	}
+	l.mu.RUnlock()
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	// Double-check under the write lock.
+	if l.pool != nil && info.ModTime().Equal(l.mtime) {
+		return l.pool, nil
+	}
+
+	pem, err := os.ReadFile(l.caFile)
+	if err != nil {
+		return nil, fmt.Errorf("jmap.caPoolLoader: read CA %q: %w", l.caFile, err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pem) {
+		return nil, fmt.Errorf("jmap.caPoolLoader: CA bundle %q contained no usable certs", l.caFile)
+	}
+	// SHA-256 digest of the PEM bytes lets us suppress log spam
+	// when the file mtime changes but the contents are byte-
+	// identical (e.g. a noop reconciliation in cert-manager).
+	sum := sha256.Sum256(pem)
+	digest := hex.EncodeToString(sum[:])
+	prev := l.pool
+	l.pool = pool
+	l.mtime = info.ModTime()
+	prevDigest := l.digest
+	l.digest = digest
+	if l.logger != nil && digest != prevDigest {
+		if prev == nil {
+			l.logger.Printf("jmap proxy: loaded CA bundle sha256=%s", digest)
+		} else {
+			l.logger.Printf("jmap proxy: rotated CA bundle sha256=%s (was %s)", digest, prevDigest)
+		}
+	}
+	return l.pool, nil
+}
+
+// isBareSvcHostname reports whether `host` is a Kubernetes
+// in-cluster DNS short form ending in `.svc` but not the FQDN
+// `.svc.cluster.local`. Cert-manager's Certificate resource
+// generates SANs for the FQDN form only (see
+// `templates/stalwart-mtls.yaml`), so any `.svc`-only hostname
+// will fail TLS hostname verification. The Helm chart's default
+// `KMAIL_STALWART_URL` and operator overrides both go through
+// this check.
+func isBareSvcHostname(host string) bool {
+	if !strings.HasSuffix(host, ".svc") {
+		return false
+	}
+	// Already-FQDN forms (`.svc.cluster.local`, `.svc.example.com`)
+	// are excluded because they DO match the cert SAN list.
+	return !strings.Contains(host, ".svc.")
+}
+
+// newClientTLSTransport returns an *http.Transport configured for
+// mTLS to Stalwart. The dialer and timeout values match the
+// stdlib defaults (`http.DefaultTransport`) so retry / dial
+// behaviour is unchanged when the only addition is a client cert.
+//
+// The transport installs a `DialTLSContext` wrapper rather than
+// relying on `TLSClientConfig` + Go's auto-promotion, because the
+// auto-promoted config does not give us the dial host before the
+// handshake. We need it to keep hostname verification correct for
+// IP-literal upstream URLs — see clientTLSBuild.perConnConfig for
+// the full rationale. The wrapper:
+//
+//  1. Dials TCP exactly like the stdlib default.
+//  2. Splits the dial address into host:port and uses the host
+//     (an FQDN, an IPv4 literal, or `[IPv6]`-stripped) to build a
+//     per-connection *tls.Config.
+//  3. Performs the TLS handshake explicitly with HandshakeContext
+//     so cancellation propagates and the handshake-deadline
+//     observance matches `TLSHandshakeTimeout`.
+func newClientTLSTransport(b *clientTLSBuild) *http.Transport {
+	dialer := &net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+	tr := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           dialer.DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   10,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		// Pointer-equal `b.base` is INTENTIONAL and load-bearing
+		// for HTTP/2 negotiation; do not "decouple" the transport's
+		// TLSClientConfig from the per-connection clone source.
+		//
+		// When `ForceAttemptHTTP2` is true, the net/http package's
+		// `http2configureTransports` registration mutates
+		// `TLSClientConfig.NextProtos` to prepend `"h2"` so ALPN
+		// announces HTTP/2 on the wire. Because `perConnConfig`
+		// clones `b.base` (which IS this same pointer) at dial
+		// time, every per-connection *tls.Config inherits the
+		// HTTP/2-aware NextProtos and the handshake negotiates
+		// HTTP/2 cleanly. A future refactor that points
+		// `TLSClientConfig` at a *different* *tls.Config than
+		// `perConnConfig` clones from would silently downgrade
+		// every BFF→Stalwart request to HTTP/1.1.
+		//
+		// The actual handshake runs in DialTLSContext below; this
+		// field is kept populated so the transport's HTTP/2 setup
+		// path has a config to mutate and ALPN works as expected.
+		TLSClientConfig: b.base,
+	}
+	tr.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host, _, err := net.SplitHostPort(addr)
+		if err != nil {
+			// Fall back to the raw addr; if it's malformed the
+			// dial below will surface a clearer error.
+			host = addr
+		}
+		raw, err := dialer.DialContext(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		perConn := b.perConnConfig(host)
+		// Match the transport's TLSHandshakeTimeout so an
+		// unresponsive server fails the dial promptly rather than
+		// hanging the whole HTTP request.
+		hsCtx, cancel := context.WithTimeout(ctx, tr.TLSHandshakeTimeout)
+		defer cancel()
+		tlsConn := tls.Client(raw, perConn)
+		if err := tlsConn.HandshakeContext(hsCtx); err != nil {
+			_ = raw.Close()
+			return nil, err
+		}
+		return tlsConn, nil
+	}
+	return tr
+}
+
 // Proxy forwards authenticated JMAP requests from the React client
 // to Stalwart, injecting the acting user's Stalwart account ID
 // (resolved and cached from Postgres) into the `X-KMail-Stalwart-Account-Id`
 // header for the downstream.
 //
-// In Phase 1 the proxy does not mint the Stalwart-trusted internal
-// OIDC token documented in `docs/JMAP-CONTRACT.md` §3.2 — that
-// signing-key dance lands in Phase 2. The header-based account
-// identification is a deliberate placeholder that the upstream
-// Stalwart config pairs with a trusted-network rule in local dev.
+// Production hardening: the BFF presents a mutual-TLS client
+// certificate to Stalwart (see `ClientTLSConfig` and the
+// cert-manager Certificate resource in the Helm chart). Stalwart
+// is configured to require a client cert (`verify_client = required`)
+// and pins the BFF's issuing CA. This replaces the trusted-network
+// posture used in early Phase 4 development.
 //
 // Phase 4 adds shard-aware routing: when `cfg.Shards` is wired, the
 // proxy resolves each tenant's primary Stalwart URL on every
@@ -197,10 +737,50 @@ func NewProxy(cfg ProxyConfig) (*Proxy, error) {
 		stripPR: "/jmap",
 		breaker: breaker,
 	}
+	base := http.DefaultTransport
+	if cfg.TLS != nil {
+		tlsCfg, err := cfg.TLS.build(logger)
+		if err != nil {
+			return nil, fmt.Errorf("jmap.NewProxy: build TLS client config: %w", err)
+		}
+		// ServerName intentionally left empty when the operator did
+		// not pin it: Go's transport derives SNI per-connection from
+		// each upstream URL, which is the correct behaviour for shard
+		// failover where the secondary's certificate may not carry
+		// the primary's hostname.
+		//
+		// If both Shards AND a pinned ServerName are wired, the SNI
+		// is frozen to that single name on every retry, which means
+		// every shard's server certificate MUST also carry that
+		// name as a SAN or the failover handshake will fail with
+		// `certificate is valid for X, not Y`. Loudly warn the
+		// operator at startup so they either widen the SAN list on
+		// every shard's server cert or remove the pin from
+		// `mtls.serverName` in the Helm values.
+		if cfg.Shards != nil && strings.TrimSpace(cfg.TLS.ServerName) != "" {
+			logger.Printf("jmap proxy: WARNING shard failover is wired but a pinned TLS ServerName=%q is set; every shard's server certificate MUST list %q as a SAN or failover handshakes will fail. Leave mtls.serverName empty to let the transport derive SNI per-connection from each shard URL.", cfg.TLS.ServerName, cfg.TLS.ServerName)
+		}
+		// Defensive warning: mTLS is wired but the configured
+		// StalwartURL is plain HTTP or uses the bare `.svc` short
+		// hostname (which is NOT in the SAN list cert-manager
+		// generates in `stalwart-mtls.yaml` — those SANs are the
+		// FQDN `.svc.cluster.local` form). Either case will lead
+		// to a TLS handshake failure on the first request; flagging
+		// at startup lets the operator catch the mismatch before
+		// traffic starts flowing instead of after.
+		if target.Scheme != "https" {
+			logger.Printf("jmap proxy: WARNING mTLS is configured (KMAIL_STALWART_TLS_CERT set) but StalwartURL scheme is %q \u2014 mutual-TLS only fires on https URLs. Set KMAIL_STALWART_URL to an https://...:8443 endpoint or disable mTLS to silence this warning.", target.Scheme)
+		} else if isBareSvcHostname(target.Hostname()) {
+			logger.Printf("jmap proxy: WARNING mTLS is enabled but StalwartURL hostname %q uses the bare `.svc` short form, which is NOT in the SAN list of the server certificate (the Helm chart generates `.svc.cluster.local` SANs). Switch KMAIL_STALWART_URL to the `.svc.cluster.local` FQDN form or override mtls.serverName to match.", target.Hostname())
+		}
+		base = newClientTLSTransport(tlsCfg)
+	} else if target.Scheme == "https" {
+		logger.Printf("jmap proxy: WARNING StalwartURL=%s is HTTPS but no client TLS configured \u2014 falling back to default transport (no mutual auth)", cfg.StalwartURL)
+	}
 	p.rp = &httputil.ReverseProxy{
 		Rewrite:      p.rewrite,
 		ErrorHandler: p.errorHandler,
-		Transport:    &shardFailoverTransport{proxy: p, base: http.DefaultTransport},
+		Transport:    &shardFailoverTransport{proxy: p, base: base},
 	}
 	return p, nil
 }
@@ -523,8 +1103,16 @@ func (p *Proxy) rewrite(r *httputil.ProxyRequest) {
 	if accountID != "" {
 		r.Out.Header.Set("X-KMail-Stalwart-Account-Id", accountID)
 	}
-	// Stalwart's JMAP is authoritative for its own auth; the BFF's
-	// Phase 1 posture is trusted-network only (see package doc).
+	// The BFF authenticates itself to Stalwart via the mutual-TLS
+	// client certificate presented by the transport (see
+	// `ClientTLSConfig`). Stalwart pins the issuing CA and refuses
+	// any connection that does not chain to it, so the
+	// X-KMail-* identity headers are only honoured for callers
+	// the transport already vouched for cryptographically. The
+	// inbound `Authorization` header (the user's OIDC bearer) is
+	// stripped because Stalwart neither needs it nor trusts it —
+	// the BFF is the authentication boundary, the mTLS handshake
+	// is the BFF→Stalwart trust boundary.
 	r.Out.Header.Del("Authorization")
 }
 

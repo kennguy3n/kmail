@@ -1,12 +1,14 @@
 package middleware
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/base64"
 	"encoding/json"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -69,7 +71,7 @@ func issueToken(t *testing.T, priv *rsa.PrivateKey, kid string, claims jwt.MapCl
 // ------------------------------------------------------------------
 
 func TestAuthenticate_DevBypass(t *testing.T) {
-	o := MustNewOIDC(OIDCConfig{DevBypassToken: "dev-secret"})
+	o := MustNewOIDC(OIDCConfig{DevBypassToken: "dev-secret", Env: EnvDevelopment})
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.Header.Set("Authorization", "Bearer dev-secret")
 	req.Header.Set("X-KMail-Dev-Tenant-Id", "t1")
@@ -85,7 +87,7 @@ func TestAuthenticate_DevBypass(t *testing.T) {
 }
 
 func TestAuthenticate_MissingAuthorization(t *testing.T) {
-	o := MustNewOIDC(OIDCConfig{DevBypassToken: "dev-secret"})
+	o := MustNewOIDC(OIDCConfig{DevBypassToken: "dev-secret", Env: EnvDevelopment})
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	if _, err := o.authenticate(req); err == nil {
 		t.Fatal("expected error for missing Authorization header")
@@ -283,7 +285,7 @@ func TestJWKSFetcher_CachesAcrossCalls(t *testing.T) {
 // ------------------------------------------------------------------
 
 func TestWrap_Passes401OnError(t *testing.T) {
-	o := MustNewOIDC(OIDCConfig{DevBypassToken: "dev-secret"})
+	o := MustNewOIDC(OIDCConfig{DevBypassToken: "dev-secret", Env: EnvDevelopment})
 	handler := o.Wrap(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -296,7 +298,7 @@ func TestWrap_Passes401OnError(t *testing.T) {
 }
 
 func TestWrap_PropagatesContext(t *testing.T) {
-	o := MustNewOIDC(OIDCConfig{DevBypassToken: "dev-secret"})
+	o := MustNewOIDC(OIDCConfig{DevBypassToken: "dev-secret", Env: EnvDevelopment})
 	var gotTenant string
 	handler := o.Wrap(http.HandlerFunc(func(_ http.ResponseWriter, req *http.Request) {
 		gotTenant = TenantIDFrom(req.Context())
@@ -326,10 +328,173 @@ func TestAudienceContains(t *testing.T) {
 }
 
 func TestNewOIDC_ReturnsError_WhenDiscoveryURLEmpty(t *testing.T) {
-	// Happy path: empty issuer → no JWKS → OK.
-	if _, err := NewOIDC(OIDCConfig{}); err != nil {
-		t.Fatalf("expected no error on empty config, got %v", err)
+	// Happy path: empty issuer in development → no JWKS → OK.
+	if _, err := NewOIDC(OIDCConfig{Env: EnvDevelopment}); err != nil {
+		t.Fatalf("expected no error on empty dev config, got %v", err)
 	}
+}
+
+// ------------------------------------------------------------------
+// Production-guard tests: dev-only auth paths must be unreachable
+// when KMAIL_ENV != "development".
+// ------------------------------------------------------------------
+
+func TestNewOIDC_RefusesMissingJWKSInProduction(t *testing.T) {
+	_, err := NewOIDC(OIDCConfig{Env: "production"})
+	if err == nil {
+		t.Fatal("expected NewOIDC to refuse a JWKS-less production config")
+	}
+	if !strings.Contains(err.Error(), "JWKS") {
+		t.Errorf("expected JWKS error, got %v", err)
+	}
+	// Pin both env var names in the error so an operator landing
+	// here from a Helm-deployed cluster (KMAIL_-prefixed form) AND
+	// an operator landing here from a docker-compose / shell
+	// invocation (bare form) both find the right knob in the
+	// message. `getenvKMail` in internal/config/config.go resolves
+	// both forms, so the error message MUST advertise both.
+	for _, want := range []string{
+		"KMAIL_KCHAT_OIDC_ISSUER",
+		"KCHAT_OIDC_ISSUER",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("expected error to advertise %q, got %v", want, err)
+		}
+	}
+}
+
+func TestNewOIDC_RefusesEmptyEnvForJWKSlessConfig(t *testing.T) {
+	// Empty env defaults to non-dev: must fail closed, not silently
+	// downgrade to the unverified-JWT fallback.
+	if _, err := NewOIDC(OIDCConfig{}); err == nil {
+		t.Fatal("expected NewOIDC to refuse empty Env with no JWKS")
+	}
+}
+
+// TestAuthenticate_NoJWKSInProductionAdvertisesBothEnvVarForms exercises
+// the runtime error path: a deployment that managed to construct an
+// OIDC instance with no JWKS (e.g. by mutating the config after
+// NewOIDC) must still surface BOTH env var names when authenticate
+// reaches the "no JWKS issuer configured" branch. Otherwise an
+// operator who hits this in a live cluster grep's the wrong name.
+func TestAuthenticate_NoJWKSInProductionAdvertisesBothEnvVarForms(t *testing.T) {
+	o := &OIDC{cfg: OIDCConfig{Env: EnvProduction}}
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Bearer some-token-that-is-not-the-dev-bypass")
+	_, err := o.authenticate(req)
+	if err == nil {
+		t.Fatal("expected authenticate to fail with no JWKS configured")
+	}
+	for _, want := range []string{
+		"KMAIL_KCHAT_OIDC_ISSUER",
+		"KCHAT_OIDC_ISSUER",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("expected runtime auth error to advertise %q, got %v", want, err)
+		}
+	}
+}
+
+func TestNewOIDC_RefusesDevBypassInProduction(t *testing.T) {
+	priv, _ := rsa.GenerateKey(rand.Reader, 2048)
+	issuer, stop := newTestJWKSServer(t, priv, "test-kid")
+	defer stop()
+	_, err := NewOIDC(OIDCConfig{
+		Issuer:         issuer,
+		Env:            "production",
+		DevBypassToken: "should-not-be-set",
+	})
+	if err == nil {
+		t.Fatal("expected NewOIDC to refuse DevBypassToken outside development")
+	}
+	if !strings.Contains(err.Error(), "DEV_BYPASS_TOKEN") {
+		t.Errorf("expected DEV_BYPASS_TOKEN error, got %v", err)
+	}
+}
+
+func TestAuthenticate_DevBypassRejectedOutsideDev(t *testing.T) {
+	// Build an OIDC middleware that has both a JWKS issuer (so
+	// NewOIDC accepts the config) AND a dev-bypass token. The
+	// authenticate() implementation must still refuse the bypass
+	// token because Env != development. This is the defence in
+	// depth for the case where a deployment somehow ends up with
+	// both fields set despite the constructor guard (e.g. a
+	// future caller that bypasses NewOIDC).
+	priv, _ := rsa.GenerateKey(rand.Reader, 2048)
+	issuer, stop := newTestJWKSServer(t, priv, "test-kid")
+	defer stop()
+
+	o := &OIDC{cfg: OIDCConfig{
+		Issuer:         issuer,
+		Env:            "production",
+		DevBypassToken: "dev-secret",
+	}}
+	if mw, err := NewOIDC(OIDCConfig{Issuer: issuer, Env: "production"}); err == nil {
+		// Borrow the auto-built JWKS fetcher so verifyAndExtract
+		// has a valid key source — we only want to assert that the
+		// dev-bypass path is rejected, not exercise the JWT
+		// verifier itself.
+		o.cfg.JWKS = mw.cfg.JWKS
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Bearer dev-secret")
+	if _, err := o.authenticate(req); err == nil {
+		t.Fatal("expected dev-bypass rejection outside development")
+	}
+}
+
+func TestAuthenticate_UnverifiedFallbackRejectedOutsideDev(t *testing.T) {
+	// Direct construction of an OIDC whose Env is non-dev and
+	// whose JWKS is nil — the request-time path must refuse
+	// before ever falling back to decodeJWTClaims. NewOIDC would
+	// normally refuse this config, so we instantiate &OIDC{}
+	// directly to exercise authenticate() in isolation.
+	o := &OIDC{cfg: OIDCConfig{Env: "production"}}
+	tok := makeUnverifiedJWT(t, map[string]any{
+		"tenant_id":     "t1",
+		"kchat_user_id": "u1",
+	})
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	if _, err := o.authenticate(req); err == nil {
+		t.Fatal("expected unverified-JWT fallback rejection outside development")
+	}
+}
+
+func TestAuthenticate_UnverifiedFallbackAllowedInDev(t *testing.T) {
+	// In development, the no-JWKS fallback still works so
+	// contributors can hand-roll a JWT against a stack with no
+	// real issuer.
+	o := &OIDC{cfg: OIDCConfig{Env: EnvDevelopment}}
+	tok := makeUnverifiedJWT(t, map[string]any{
+		"tenant_id":     "t1",
+		"kchat_user_id": "u1",
+	})
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	claims, err := o.authenticate(req)
+	if err != nil {
+		t.Fatalf("authenticate: %v", err)
+	}
+	if claims.TenantID != "t1" || claims.KChatUserID != "u1" {
+		t.Errorf("unexpected claims: %+v", claims)
+	}
+}
+
+// makeUnverifiedJWT builds a compact JWT with a junk signature so
+// decodeJWTClaims succeeds in the dev fallback. The header is the
+// canonical `{"alg":"none","typ":"JWT"}` so test consumers don't
+// need to provide signing material.
+func makeUnverifiedJWT(t *testing.T, claims map[string]any) string {
+	t.Helper()
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
+	body, err := json.Marshal(claims)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	payload := base64.RawURLEncoding.EncodeToString(body)
+	return header + "." + payload + ".sig"
 }
 
 // Internal sanity check on decodeJWTClaims — the no-JWKS fallback
@@ -340,5 +505,84 @@ func TestDecodeJWTClaims_Malformed(t *testing.T) {
 	}
 	if _, err := decodeJWTClaims(strings.Repeat("a", 10)); err == nil {
 		t.Error("expected not-a-jwt error")
+	}
+}
+
+// TestNewOIDC_WarnsOnUnknownEnv exercises the operator-typo
+// guard: a KMAIL_ENV value that isn't one of the recognised
+// strings silently falls through to production-grade behaviour,
+// so NewOIDC must log a warning that names the unknown value.
+func TestNewOIDC_WarnsOnUnknownEnv(t *testing.T) {
+	priv, _ := rsa.GenerateKey(rand.Reader, 2048)
+	issuer, stop := newTestJWKSServer(t, priv, "test-kid")
+	defer stop()
+
+	var buf bytes.Buffer
+	_, err := NewOIDC(OIDCConfig{
+		Issuer: issuer,
+		Env:    "develpment", // typo
+		Logger: log.New(&buf, "", 0),
+	})
+	if err != nil {
+		t.Fatalf("NewOIDC: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, `KMAIL_ENV="develpment"`) {
+		t.Errorf("expected warning naming the unknown env, got: %q", out)
+	}
+	if !strings.Contains(out, "treating as production") {
+		t.Errorf("expected warning to explain fail-safe behaviour, got: %q", out)
+	}
+}
+
+// TestNewOIDC_DoesNotWarnOnKnownEnv pins the silent path: each
+// of the recognised KMAIL_ENV values must NOT emit the
+// unknown-env warning.
+func TestNewOIDC_DoesNotWarnOnKnownEnv(t *testing.T) {
+	priv, _ := rsa.GenerateKey(rand.Reader, 2048)
+	issuer, stop := newTestJWKSServer(t, priv, "test-kid")
+	defer stop()
+	// "dev", "prod", "stg" are explicitly recognised aliases —
+	// the docker-compose convention (`KMAIL_ENV: dev`) must not
+	// silently trigger the unknown-env warning.
+	for _, env := range []string{"", "development", "DEVELOPMENT", "  staging  ", "production", "dev", "DEV", "prod", "stg"} {
+		t.Run(env, func(t *testing.T) {
+			var buf bytes.Buffer
+			_, err := NewOIDC(OIDCConfig{
+				Issuer: issuer,
+				Env:    env,
+				Logger: log.New(&buf, "", 0),
+			})
+			if err != nil {
+				t.Fatalf("NewOIDC: %v", err)
+			}
+			if strings.Contains(buf.String(), "is not one of") {
+				t.Errorf("unexpected unknown-env warning for Env=%q: %s", env, buf.String())
+			}
+		})
+	}
+}
+
+// TestNewOIDC_DevAliasUnlocksDevBypass pins the docker-compose
+// developer-experience case: `KMAIL_ENV=dev` (the alias) must
+// be treated identically to `KMAIL_ENV=development`, including
+// allowing `DevBypassToken` to be wired without rejecting at
+// construction time.
+func TestNewOIDC_DevAliasUnlocksDevBypass(t *testing.T) {
+	for _, env := range []string{"dev", "DEV", "  dev  ", "development"} {
+		t.Run(env, func(t *testing.T) {
+			var buf bytes.Buffer
+			o, err := NewOIDC(OIDCConfig{
+				Env:            env,
+				DevBypassToken: "let-me-in",
+				Logger:         log.New(&buf, "", 0),
+			})
+			if err != nil {
+				t.Fatalf("NewOIDC(Env=%q): unexpected error: %v", env, err)
+			}
+			if !o.cfg.isDevEnv() {
+				t.Fatalf("isDevEnv()=false for Env=%q, want true", env)
+			}
+		})
 	}
 }

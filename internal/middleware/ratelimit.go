@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"github.com/kennguy3n/kmail/internal/valkeyurl"
 )
 
 // RateLimiterConfig wires the Valkey-backed sliding-window rate
@@ -300,9 +302,11 @@ type RedisStore struct {
 
 // NewRedisStore is a convenience constructor that dials Valkey at
 // `url` and returns a RedisStore wrapping the client. Callers that
-// already own a *redis.Client should use NewRedisStoreFromClient.
+// already own a *redis.Client should use `NewRedisStoreFromClient`
+// directly. URL form (`redis://` / `rediss://`) and bare `host:port`
+// are both accepted via `valkeyurl.Parse`.
 func NewRedisStore(url string) (*RedisStore, error) {
-	opts, err := parseValkeyURL(url)
+	opts, err := valkeyurl.Parse(url)
 	if err != nil {
 		return nil, err
 	}
@@ -330,18 +334,6 @@ func (s *RedisStore) ensureScript() {
 	})
 }
 
-func parseValkeyURL(url string) (*redis.Options, error) {
-	if url == "" {
-		return nil, errors.New("valkey url is empty")
-	}
-	// Accept both full-DSN (redis://host:port) and bare host:port
-	// for convenience — the compose stack exposes the latter.
-	if len(url) > 8 && url[:8] == "redis://" || len(url) > 9 && url[:9] == "rediss://" {
-		return redis.ParseURL(url)
-	}
-	return &redis.Options{Addr: url}, nil
-}
-
 // Allow runs the combined tenant+user sliding-window Lua script
 // against Valkey. The ZSET member inserted on admission is
 // `<now-ms>:<8-byte-hex>` so two requests landing in the same
@@ -349,6 +341,12 @@ func parseValkeyURL(url string) (*redis.Options, error) {
 // what dedupes, not the score). Returns `(tenantOK, userOK, err)`
 // per the RateLimiterStore contract: each flag reports whether
 // that scope's CHECK passed, not the post-rollback ZSET state.
+//
+// URL parsing for the underlying *redis.Client lives in the
+// shared `internal/valkeyurl` package (Phase A) so the rate
+// limiter, the shared circuit breaker, and the misc valkey
+// consumers all accept the same `redis://` / `rediss://` /
+// bare `host:port` forms with a single regression suite.
 func (s *RedisStore) Allow(
 	ctx context.Context,
 	tenantKey, userKey string,

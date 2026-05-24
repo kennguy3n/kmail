@@ -10,6 +10,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -34,8 +35,16 @@ type Config struct {
 
 	// StalwartURL is the internal Stalwart JMAP endpoint the BFF
 	// proxies to. In compose this is `http://stalwart:8080`; in
-	// production it is an internal service URL behind the mesh.
+	// production it is an internal HTTPS service URL the BFF
+	// reaches over mutual TLS (see `StalwartMTLS`).
 	StalwartURL string
+
+	// StalwartMTLS holds the mTLS client material the BFF
+	// presents to Stalwart. In production cert-manager mounts a
+	// per-pod keypair under `/etc/kmail/tls`. Empty values
+	// disable client-cert auth — only acceptable in local
+	// compose dev where the upstream listens on plain HTTP.
+	StalwartMTLS StalwartMTLSConfig
 
 	// ValkeyURL is the Redis-compatible Valkey connection string
 	// used for session caches, rate-limit buckets, and the
@@ -59,8 +68,18 @@ type Config struct {
 	// DevBypassToken is a static bearer token that the auth
 	// middleware accepts when running in dev mode. Never set this in
 	// production; the value is a convenience for local development
-	// only. Empty disables the bypass.
+	// only. Empty disables the bypass. The middleware refuses to
+	// boot if this is non-empty while `Env != "development"`.
 	DevBypassToken string
+
+	// Env names the deployment posture: "development", "staging",
+	// "production", etc. The string is opaque to most of the BFF,
+	// but the OIDC middleware uses it to gate developer-only auth
+	// shortcuts — the dev-bypass token and the unverified-JWT
+	// fallback are only honoured when `Env == "development"`.
+	// Empty defaults to "production" so a misconfigured deployment
+	// fails closed instead of silently exposing dev paths.
+	Env string
 
 	// RateLimit controls the Valkey-backed rate limiter mounted in
 	// front of the JMAP proxy and tenant handlers (per
@@ -249,6 +268,90 @@ type RateLimitConfig struct {
 	Window time.Duration
 }
 
+// StalwartMTLSConfig wires the BFF→Stalwart mutual-TLS handshake.
+//
+// Production deployments are expected to set every field via
+// cert-manager (see `deploy/helm/kmail/templates/stalwart-client-cert.yaml`).
+// The defaults are all empty so a misconfigured environment fails
+// closed: the proxy logs a warning when StalwartURL is HTTPS but
+// no client certificate is configured. Setting only some of the
+// fields is rejected by `internal/jmap.ClientTLSConfig.validate`.
+type StalwartMTLSConfig struct {
+	// CertFile is the path to the PEM-encoded client certificate.
+	CertFile string
+	// KeyFile is the path to the matching PEM-encoded private key.
+	KeyFile string
+	// CAFile, when non-empty, is the PEM bundle pinning which CAs
+	// Stalwart's server certificate must chain to. Empty uses
+	// the host's default trust store.
+	CAFile string
+	// ServerName overrides the SNI / certificate-name field on
+	// the TLS handshake. Empty falls back to the host portion of
+	// StalwartURL.
+	ServerName string
+}
+
+// Enabled reports whether the proxy should construct a TLS
+// transport. Both CertFile and KeyFile must be set; the proxy
+// itself catches partial configuration with a clearer error.
+func (c StalwartMTLSConfig) Enabled() bool {
+	return strings.TrimSpace(c.CertFile) != "" && strings.TrimSpace(c.KeyFile) != ""
+}
+
+// Validate inspects the four mTLS knobs and returns a descriptive
+// error when the combination is internally inconsistent (e.g. one
+// of CertFile/KeyFile set without the other, or CAFile/ServerName
+// set without a usable keypair). Returns nil for the two
+// legitimate states:
+//
+//   - all four empty: mTLS fully disabled. The proxy talks plain
+//     HTTP (or hits the StalwartURL HTTPS-without-cert warning).
+//   - CertFile + KeyFile both set: mTLS enabled. CAFile and
+//     ServerName remain optional refinements.
+//
+// Callers (main.go) surface the error as a startup WARN rather
+// than fatal — a misconfigured local dev environment shouldn't
+// refuse to boot, but the operator MUST see the message so they
+// can fix it before the silent fall-through to plain HTTP. The
+// proxy's `ClientTLSConfig.validate` returns a hard error on the
+// same condition, but that path is only reached when `Enabled()`
+// is true, so partial-config (where one of cert/key is empty)
+// otherwise slips through silently.
+func (c StalwartMTLSConfig) Validate() error {
+	cert := strings.TrimSpace(c.CertFile) != ""
+	key := strings.TrimSpace(c.KeyFile) != ""
+	ca := strings.TrimSpace(c.CAFile) != ""
+	sn := strings.TrimSpace(c.ServerName) != ""
+	switch {
+	case !cert && !key && !ca && !sn:
+		return nil
+	case cert && key:
+		return nil
+	case cert && !key:
+		return errors.New("config.StalwartMTLS: KMAIL_STALWART_TLS_CERT is set but KMAIL_STALWART_TLS_KEY is empty; mTLS will be silently disabled")
+	case !cert && key:
+		return errors.New("config.StalwartMTLS: KMAIL_STALWART_TLS_KEY is set but KMAIL_STALWART_TLS_CERT is empty; mTLS will be silently disabled")
+	case (ca || sn) && !cert && !key:
+		// CAFile or ServerName without a client keypair is a
+		// half-configured deployment that produces no TLS
+		// handshake at all — almost certainly an operator
+		// typo (forgot the cert/key vars).
+		return errors.New("config.StalwartMTLS: KMAIL_STALWART_TLS_CA or KMAIL_STALWART_TLS_SERVER_NAME is set without KMAIL_STALWART_TLS_CERT and KMAIL_STALWART_TLS_KEY; mTLS will be silently disabled")
+	default:
+		// unreachable: the switch above is exhaustive over
+		// {cert,key} × {true,false} with the (ca||sn) carve-out for
+		// the cert==false && key==false branch. Every input
+		// combination is covered by one of the explicit cases;
+		// this default exists only to keep `go vet` happy with the
+		// implicit-return path. If a future change adds a new
+		// boolean dimension (e.g. a fifth `mTLSEnabled` toggle),
+		// this default WILL start matching real inputs — at which
+		// point it should grow a real diagnostic, not silently
+		// pass.
+		return nil
+	}
+}
+
 // DNSConfig wires the DNS Onboarding Service. The defaults target
 // KMail's dev infrastructure (`kmail.local`) so `go run
 // ./cmd/kmail-api` and `go run ./cmd/kmail-dns` work out of the
@@ -311,21 +414,33 @@ func Load() (*Config, error) {
 			ReadHeaderTimeout: getenvDuration("KMAIL_API_READ_HEADER_TIMEOUT", 10*time.Second),
 			ShutdownTimeout:   getenvDuration("KMAIL_API_SHUTDOWN_TIMEOUT", 30*time.Second),
 		},
+		// Every KMail-owned env var is read with the `KMAIL_` prefix
+		// first (the convention enforced by the Helm chart's ConfigMap
+		// and Secret), falling back to the bare name so docker-compose
+		// and existing shell scripts keep working without churn. The
+		// Helm-only override at deployment-api.yaml depends on the
+		// KMail-prefixed lookup landing here.
 		DatabaseURL: getenvKMail("DATABASE_URL", "postgresql://kmail:kmail@localhost:5432/kmail?sslmode=disable"),
 		// Stalwart's container port 8080 is published to host 18080
 		// in `docker-compose.yml` precisely so a host-run BFF
 		// (`go run ./cmd/kmail-api`) can reach it without colliding
 		// with the BFF's own :8080 listener. Inside compose, override
-		// this with `STALWART_URL=http://stalwart:8080`. Routed through
-		// `getenvKMail` so the Helm chart's `KMAIL_STALWART_URL`
-		// override (set by the mTLS template) actually reaches the
-		// binary — without the prefix lookup the chart would silently
-		// fall back to plain HTTP.
-		StalwartURL:       getenvKMail("STALWART_URL", "http://localhost:18080"),
+		// this with `STALWART_URL=http://stalwart:8080`; in Kubernetes
+		// the Helm chart sets `KMAIL_STALWART_URL` (which wins over
+		// `STALWART_URL` per getenvKMail's lookup order) and is what
+		// switches the proxy from HTTP to HTTPS-with-mTLS.
+		StalwartURL: getenvKMail("STALWART_URL", "http://localhost:18080"),
+		StalwartMTLS: StalwartMTLSConfig{
+			CertFile:   getenv("KMAIL_STALWART_TLS_CERT", ""),
+			KeyFile:    getenv("KMAIL_STALWART_TLS_KEY", ""),
+			CAFile:     getenv("KMAIL_STALWART_TLS_CA", ""),
+			ServerName: getenv("KMAIL_STALWART_TLS_SERVER_NAME", ""),
+		},
 		ValkeyURL:         getenvKMail("VALKEY_URL", "valkey:6379"),
 		KChatOIDCIssuer:   getenvKMail("KCHAT_OIDC_ISSUER", ""),
 		KChatOIDCAudience: getenvKMail("KCHAT_OIDC_AUDIENCE", ""),
 		DevBypassToken:    getenv("KMAIL_DEV_BYPASS_TOKEN", ""),
+		Env:               getenv("KMAIL_ENV", "production"),
 		RateLimit: RateLimitConfig{
 			Enabled:   GetenvBool("KMAIL_RATELIMIT_ENABLED", false),
 			TenantRPM: GetenvInt("KMAIL_RATELIMIT_TENANT_RPM", 1000),
@@ -337,7 +452,8 @@ func Load() (*Config, error) {
 			// publishes zk-fabric on host `:9080` (S3) and `:9081`
 			// (console) to avoid collision with the BFF on :8080.
 			// Inside compose, override with
-			// `ZK_FABRIC_S3_URL=http://zk-fabric:8080`.
+			// `ZK_FABRIC_S3_URL=http://zk-fabric:8080`; the Helm chart
+			// uses the `KMAIL_`-prefixed forms via getenvKMail.
 			S3URL:      getenvKMail("ZK_FABRIC_S3_URL", "http://localhost:9080"),
 			ConsoleURL: getenvKMail("ZK_FABRIC_CONSOLE_URL", "http://localhost:9081"),
 			AccessKey:  getenvKMail("ZK_FABRIC_ACCESS_KEY", "kmail-access-key"),
@@ -413,9 +529,11 @@ func getenv(key, fallback string) string {
 // the Helm template at `deploy/helm/kmail/templates/
 // deployment-api.yaml` (which sets KMAIL_-prefixed names) actually
 // take effect — without this layer the binary would read the bare
-// name, miss the override, and silently fall back to its dev
-// default (e.g. `valkey:6379` for VALKEY_URL, making the shared
-// circuit breaker silently operate on the wrong host).
+// name, miss the override, and silently talk plain HTTP to
+// Stalwart (when the mTLS override is dropped) or talk to the
+// dev-default `valkey:6379` instead of the chart-supplied host
+// (when the VALKEY_URL override is dropped — silently routing the
+// shared circuit breaker at the wrong target).
 func getenvKMail(key, fallback string) string {
 	if v, ok := os.LookupEnv("KMAIL_" + key); ok && v != "" {
 		return v

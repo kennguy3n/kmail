@@ -116,12 +116,19 @@ var providers = map[HSMProviderType]HSMKeyProvider{
 	HSMPKCS11: PKCS11Provider{},
 }
 
+// ErrEnvelopeNotConfigured signals that a write touched the HSM
+// credentials store without a configured kmail-secrets envelope.
+// The service refuses to fall back to plaintext storage: an
+// operator must wire `KMAIL_SECRETS_KEY` and rebuild the service
+// with `NewCMKServiceWithEnvelope` (or `SetEnvelope`).
+var ErrEnvelopeNotConfigured = errors.New("cmk: kmail-secrets envelope not configured (set KMAIL_SECRETS_KEY)")
+
 // RegisterHSMKey validates the connection params, enforces
 // privacy-plan gating (same as PEM CMK), and persists a row in
-// `cmk_hsm_configs`. The credentials buffer is stored as-is; in
-// production the kmail-secrets envelope wraps it before insert
-// — that wiring lands when the real KMIP / PKCS#11 client is
-// integrated.
+// `cmk_hsm_configs` with the credentials AES-256-GCM wrapped by
+// the kmail-secrets envelope (`internal/cmk/envelope.go`). The
+// service refuses to insert plaintext: if no envelope is wired
+// the write returns ErrEnvelopeNotConfigured.
 func (s *CMKService) RegisterHSMKey(ctx context.Context, tenantID, plan string, reg HSMRegistration) (*HSMConfig, error) {
 	if strings.TrimSpace(tenantID) == "" {
 		return nil, errors.New("cmk: tenantID required")
@@ -131,6 +138,12 @@ func (s *CMKService) RegisterHSMKey(ctx context.Context, tenantID, plan string, 
 	}
 	if s.pool == nil {
 		return nil, errors.New("cmk: pool not configured")
+	}
+	// Snapshot the envelope once so a concurrent SetEnvelope
+	// cannot interleave the nil-check and the Wrap call below.
+	envelope := s.getEnvelope()
+	if envelope == nil {
+		return nil, ErrEnvelopeNotConfigured
 	}
 	provider, ok := providers[reg.Provider]
 	if !ok {
@@ -144,8 +157,12 @@ func (s *CMKService) RegisterHSMKey(ctx context.Context, tenantID, plan string, 
 	if err := provider.Validate(ctx, cfg, reg.Credentials); err != nil {
 		return nil, err
 	}
+	wrapped, err := envelope.Wrap([]byte(reg.Credentials))
+	if err != nil {
+		return nil, fmt.Errorf("cmk: wrap HSM credentials: %w", err)
+	}
 	var out HSMConfig
-	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+	err = pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
 			return err
 		}
@@ -155,7 +172,7 @@ func (s *CMKService) RegisterHSMKey(ctx context.Context, tenantID, plan string, 
 			VALUES ($1::uuid, $2, $3, $4, $5, 'pending')
 			RETURNING id::text, tenant_id::text, provider_type, endpoint, slot_id,
 			          status, last_test_at, last_test_error, created_at, updated_at
-		`, tenantID, string(reg.Provider), reg.Endpoint, reg.SlotID, []byte(reg.Credentials)).Scan(
+		`, tenantID, string(reg.Provider), reg.Endpoint, reg.SlotID, wrapped).Scan(
 			&out.ID, &out.TenantID, &out.Provider, &out.Endpoint, &out.SlotID,
 			&out.Status, &out.LastTestAt, &out.LastTestError, &out.CreatedAt, &out.UpdatedAt,
 		)
@@ -212,6 +229,16 @@ func (s *CMKService) EncryptDEK(ctx context.Context, tenantID, configID, keyLabe
 	if err != nil {
 		return nil, nil, err
 	}
+	// Best-effort PIN scrubbing. Go's GC may have already copied
+	// the underlying bytes elsewhere by the time the wire call
+	// returns (and the `string(creds)` conversion on the KMIP path
+	// produces an unreachable heap copy that cannot be zeroed at
+	// all), so this is a defense-in-depth measure rather than a
+	// hard guarantee. It still narrows the in-process exposure
+	// window from "until next GC + N other allocations" down to
+	// "until function return". See pkcs11Encrypt doc for the full
+	// lifetime-contract rationale.
+	defer clear(creds)
 	switch cfg.Provider {
 	case HSMKMIP:
 		client := NewKMIPClient(strings.TrimPrefix(strings.TrimPrefix(cfg.Endpoint, "kmips://"), "kmip://"), nil)
@@ -219,7 +246,10 @@ func (s *CMKService) EncryptDEK(ctx context.Context, tenantID, configID, keyLabe
 		client.Password = string(creds)
 		ciphertext, iv, err = client.Encrypt(keyLabel, plaintext)
 	case HSMPKCS11:
-		ciphertext, iv, err = pkcs11Encrypt(ctx, *cfg, keyLabel, plaintext)
+		// `creds` carries the unwrapped PKCS#11 PIN — the cgo
+		// build needs it for `C_Login`. The no-cgo shim ignores
+		// the slice and returns errPKCS11NotBuilt.
+		ciphertext, iv, err = pkcs11Encrypt(ctx, *cfg, creds, keyLabel, plaintext)
 	default:
 		return nil, nil, fmt.Errorf("cmk: unsupported provider_type %q", cfg.Provider)
 	}
@@ -239,6 +269,8 @@ func (s *CMKService) DecryptDEK(ctx context.Context, tenantID, configID, keyLabe
 	if err != nil {
 		return nil, err
 	}
+	// See EncryptDEK for the lifetime rationale.
+	defer clear(creds)
 	var out []byte
 	switch cfg.Provider {
 	case HSMKMIP:
@@ -246,7 +278,7 @@ func (s *CMKService) DecryptDEK(ctx context.Context, tenantID, configID, keyLabe
 		client.Password = string(creds)
 		out, err = client.Decrypt(keyLabel, ciphertext, iv)
 	case HSMPKCS11:
-		out, err = pkcs11Decrypt(ctx, *cfg, keyLabel, ciphertext, iv)
+		out, err = pkcs11Decrypt(ctx, *cfg, creds, keyLabel, ciphertext, iv)
 	default:
 		return nil, fmt.Errorf("cmk: unsupported provider_type %q", cfg.Provider)
 	}
@@ -258,7 +290,11 @@ func (s *CMKService) DecryptDEK(ctx context.Context, tenantID, configID, keyLabe
 }
 
 // loadHSMConfig pulls the row + decrypted credentials for use by
-// EncryptDEK / DecryptDEK.
+// EncryptDEK / DecryptDEK. The stored bytes are unwrapped through
+// the kmail-secrets envelope; legacy plaintext rows (written
+// before the envelope landed) are returned verbatim so the
+// migration story is "new writes go through Wrap, reads accept
+// either".
 func (s *CMKService) loadHSMConfig(ctx context.Context, tenantID, configID string) (*HSMConfig, []byte, error) {
 	if s.pool == nil {
 		return nil, nil, errors.New("cmk: pool not configured")
@@ -284,7 +320,83 @@ func (s *CMKService) loadHSMConfig(ctx context.Context, tenantID, configID strin
 	if err != nil {
 		return nil, nil, err
 	}
-	return &cfg, creds, nil
+	envelope := s.getEnvelope()
+	plain, wasEncrypted, err := s.unwrapHSMCredentialsWith(envelope, creds)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !wasEncrypted && envelope != nil && len(creds) > 0 {
+		s.warnLegacyPlaintextHSM(tenantID, configID)
+	}
+	return &cfg, plain, nil
+}
+
+// unwrapHSMCredentials decrypts the stored credential blob with
+// the configured envelope and returns the plaintext bytes plus a
+// flag indicating whether the blob was AEAD-protected. The
+// envelope's magic-prefix check distinguishes three states:
+//
+//   - Blob carries the magic prefix AND auth succeeds →
+//     plaintext, wasEncrypted=true.
+//   - Blob carries the magic prefix AND auth fails →
+//     ErrEnvelopeCorrupted bubbles up. This is the case the bot
+//     called out: a master-key rotation leaves the previous
+//     epoch's rows un-decryptable, and surfacing this as an error
+//     prevents the worse failure of silently returning ciphertext
+//     as if it were a legacy plaintext credential.
+//   - Blob has NO magic prefix → legacy plaintext written before
+//     the envelope landed; returned as-is with wasEncrypted=false
+//     so warnLegacyPlaintextHSM can log a one-time migration
+//     signal at the call site.
+//
+// When no envelope is configured the blob is returned as-is for
+// read compatibility, but writes still require the envelope — see
+// RegisterHSMKey.
+func (s *CMKService) unwrapHSMCredentials(blob []byte) ([]byte, bool, error) {
+	return s.unwrapHSMCredentialsWith(s.getEnvelope(), blob)
+}
+
+// unwrapHSMCredentialsWith is the same as unwrapHSMCredentials
+// but takes a pre-snapshotted envelope so a caller that has
+// already pulled the envelope at function entry doesn't acquire
+// the read lock a second time and can be sure the same envelope
+// instance is used for both the nil-check at the call site and
+// the Unwrap call here.
+func (s *CMKService) unwrapHSMCredentialsWith(envelope SecretsEnvelope, blob []byte) ([]byte, bool, error) {
+	if envelope == nil {
+		return blob, false, nil
+	}
+	plain, wasEncrypted, err := envelope.Unwrap(blob)
+	if err != nil {
+		return nil, false, fmt.Errorf("cmk: unwrap HSM credentials: %w", err)
+	}
+	return plain, wasEncrypted, nil
+}
+
+// warnLegacyPlaintextHSM logs a single warning the first time we
+// observe a legacy-plaintext credential blob for a given
+// (tenant, config) pair. Operators are expected to re-register
+// affected HSM configs through the API so the next write goes
+// through the envelope.
+func (s *CMKService) warnLegacyPlaintextHSM(tenantID, configID string) {
+	key := tenantID + "/" + configID
+	if _, loaded := s.legacyPlaintextSeen.LoadOrStore(key, struct{}{}); loaded {
+		return
+	}
+	// Snapshot the logger pointer once under the read lock so a
+	// concurrent SetLogger swap cannot race the field read under
+	// Go's memory model (-race would otherwise flag this).
+	// getLogger also covers the zero-value-fixture case where
+	// `s.logger` is nil.
+	logger := s.getLogger()
+	if logger != nil {
+		logger.Printf(
+			"cmk: legacy-plaintext HSM credentials detected tenant=%s config=%s — "+
+				"re-register this HSM config through the API to wrap with the envelope; "+
+				"this warning will only fire once per (tenant, config) per process",
+			tenantID, configID,
+		)
+	}
 }
 
 // markHSMUsed bumps `last_used_at` to now() (Phase 8 column).
@@ -306,7 +418,9 @@ func (s *CMKService) markHSMUsed(ctx context.Context, tenantID, configID string)
 
 // TestHSMConnection re-runs the provider's Validate against a
 // stored row and updates `status`, `last_test_at`,
-// `last_test_error` accordingly.
+// `last_test_error` accordingly. The persisted credential blob is
+// unwrapped through the kmail-secrets envelope before it is fed
+// to the provider.
 func (s *CMKService) TestHSMConnection(ctx context.Context, tenantID, configID string) (*HSMConfig, error) {
 	if s.pool == nil {
 		return nil, errors.New("cmk: pool not configured")
@@ -335,7 +449,15 @@ func (s *CMKService) TestHSMConnection(ctx context.Context, tenantID, configID s
 		if !ok {
 			return fmt.Errorf("cmk: unsupported provider_type %q", out.Provider)
 		}
-		validateErr := provider.Validate(ctx, out, string(creds))
+		envelope := s.getEnvelope()
+		plain, wasEncrypted, err := s.unwrapHSMCredentialsWith(envelope, creds)
+		if err != nil {
+			return err
+		}
+		if !wasEncrypted && envelope != nil && len(creds) > 0 {
+			s.warnLegacyPlaintextHSM(tenantID, configID)
+		}
+		validateErr := provider.Validate(ctx, out, string(plain))
 		newStatus := "active"
 		errMsg := ""
 		if validateErr != nil {
