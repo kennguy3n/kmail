@@ -78,6 +78,19 @@ jobs:
     # Run on PRs and pushes to main. Skip on forks because Stalwart
     # needs ~3GB RAM and a forked PR runner often OOMs before the
     # health check passes; the maintainer fork covers this surface.
+    #
+    # BRANCH-PROTECTION NOTE: an entirely-skipped job reports neither
+    # success nor failure to GitHub's status API — it is simply
+    # absent. If a future branch protection rule is added that
+    # REQUIRES the `Integration` status check, this absence will
+    # block fork PRs permanently. The right fix at that point is
+    # NOT to add a no-op fallback job (that defeats the protection),
+    # but to either (a) waive the check for fork-origin PRs via
+    # ruleset bypass, or (b) run the integration job on a beefier
+    # self-hosted runner that can absorb the Stalwart memory cost.
+    # Until branch protection is enabled, the silent skip is the
+    # right behaviour because a fork-PR OOM would surface as an
+    # ambiguous health-check failure that's hard to attribute.
     if: github.event.pull_request.head.repo.full_name == github.repository || github.event_name == 'push'
     timeout-minutes: 25
     env:
