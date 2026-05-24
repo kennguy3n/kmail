@@ -3,25 +3,26 @@ name: CI
 on:
   push:
     branches: [main]
-  # Don't fire any job on PRs that only touch documentation /
-  # screenshots / non-code text. These changes can't break the
-  # binary, the web bundle, or the integration stack, so burning
-  # ~30 minutes of runner time on every README typo is pure waste.
-  # The list below mirrors what Renovate / dependabot treat as
-  # doc-only; if you add a new top-level docs directory, append it
-  # here. Code-adjacent docs (e.g. inline godoc) ride along with
-  # their `.go` file and DO trigger the relevant job via the
-  # paths-filter `changes` job below.
+  # NOTE: we intentionally do NOT use `paths-ignore` here.
+  #
+  # `paths-ignore` causes the workflow to never fire at all for
+  # matching PRs, which means no status check is ever reported.
+  # If branch protection requires `CI Status` (the aggregate
+  # job at the bottom of this file — and it should), a doc-only
+  # PR would be blocked indefinitely with a missing required
+  # check. See https://docs.github.com/actions/managing-workflow-runs/skipping-workflow-runs
+  # and the discussion in https://github.com/orgs/community/discussions/13690.
+  #
+  # Instead, the workflow always fires, the cheap `changes` job
+  # below runs (one checkout + paths-filter, ~10s), and the
+  # subsystem jobs skip via their own `if:` clauses when no
+  # relevant files were touched. The aggregate `CI Status` job
+  # then reports success because every underlying job was either
+  # successful or *legitimately* skipped per the matrix below.
+  # Net cost on a doc-only PR: ~15s of runner time vs. ~30min
+  # for the full sweep — acceptable for keeping branch
+  # protection trivially compatible.
   pull_request:
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - 'AGENTS.md'
-      - 'CHANGELOG.md'
-      - 'LICENSE'
-      - '.github/CODEOWNERS'
-      - '.github/ISSUE_TEMPLATE/**'
-      - '.github/PULL_REQUEST_TEMPLATE.md'
 
 jobs:
   # `changes` classifies the PR diff into subsystem-scoped buckets
@@ -35,12 +36,15 @@ jobs:
   #     therefore skips the Go job legitimately, but a PR that
   #     touches `Makefile` or `migrations/**` re-fires it because
   #     either could change build / test behaviour.
-  #  2. On `push` events to main, ALL outputs are 'true' regardless
-  #     of the actual diff — the post-merge run is the canonical
-  #     full-fan-out check, and we never want a main-branch commit
-  #     to skip a job just because the diff happened to be doc-
-  #     adjacent. The downstream jobs' `if:` clauses encode this
-  #     via `github.event_name == 'push'`.
+  #  2. On `push` events to main, the downstream jobs unconditionally
+  #     fire regardless of the filter outputs. dorny/paths-filter
+  #     still performs its normal path matching against the push
+  #     diff (it does NOT auto-set outputs to 'true' on push), but
+  #     each downstream job's `if:` clause carries an explicit
+  #     `github.event_name == 'push'` OR branch that bypasses the
+  #     filter result. The post-merge run is the canonical full-
+  #     fan-out check; we never want a main-branch commit to skip
+  #     a job just because the diff happened to be doc-adjacent.
   #  3. The CI Status aggregate (`ci-status` job at the bottom)
   #     ACCEPTS `result == 'skipped'` for go/web/integration when
   #     the corresponding filter output is 'false'. Branch
@@ -236,11 +240,11 @@ jobs:
     if: |
       (github.event.pull_request.head.repo.full_name == github.repository ||
        github.event_name == 'push') &&
-      (needs.changes.outputs.integration == 'true' ||
+      (github.event_name == 'push' ||
+       needs.changes.outputs.integration == 'true' ||
        needs.changes.outputs.helm == 'true' ||
        needs.changes.outputs.ci_workflows == 'true' ||
-       contains(github.event.pull_request.labels.*.name, 'ci:full') ||
-       github.event_name == 'push')
+       contains(github.event.pull_request.labels.*.name, 'ci:full'))
     timeout-minutes: 25
     env:
       KMAIL_API_URL: http://localhost:8088
@@ -470,6 +474,7 @@ jobs:
       - name: Verify dependent job results
         run: |
           set -euo pipefail
+          changes_result='${{ needs.changes.result }}'
           go_result='${{ needs.go.result }}'
           web_result='${{ needs.web.result }}'
           integration_result='${{ needs.integration.result }}'
@@ -480,7 +485,22 @@ jobs:
           ci_workflows_changed='${{ needs.changes.outputs.ci_workflows }}'
           event='${{ github.event_name }}'
           ci_full_label='${{ contains(github.event.pull_request.labels.*.name, 'ci:full') }}'
-          echo "event=${event} go=${go_result}/${go_changed} web=${web_result}/${web_changed} integration=${integration_result}/${integration_changed} helm=${helm_changed} ci_workflows=${ci_workflows_changed} ci_full_label=${ci_full_label}"
+          echo "event=${event} changes=${changes_result} go=${go_result}/${go_changed} web=${web_result}/${web_changed} integration=${integration_result}/${integration_changed} helm=${helm_changed} ci_workflows=${ci_workflows_changed} ci_full_label=${ci_full_label}"
+
+          # If the changes-detection job itself didn't succeed,
+          # every downstream job was skipped AND the filter
+          # outputs are empty strings. In that state none of the
+          # checks below can distinguish 'nothing changed' from
+          # 'detection broke' — the empty strings satisfy every
+          # `!= 'true'` guard and a legitimate-skip verdict gets
+          # silently returned for jobs that never even had a
+          # chance to fire. Fail closed: if classification
+          # itself broke, `ci-status` must fail.
+          if [[ "${changes_result}" != "success" ]]; then
+            echo "::error::changes-detection job did not succeed (result=${changes_result}); cannot trust filter outputs — failing CI Status closed"
+            exit 1
+          fi
+
           fail=0
 
           # `go` and `web` may legitimately skip when the path
