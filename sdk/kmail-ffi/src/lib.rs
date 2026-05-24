@@ -19,7 +19,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use kmail_core::{ClientConfig, EmailAddress, EmailDraft, EmailSummary, KMailClient, Mailbox};
+use kmail_core::{
+    AeadEnvelope, ClientConfig, ConfidentialEnvelope, EmailAddress, EmailDraft, EmailSummary,
+    KMailClient, KeyMaterial, Mailbox, MlsKeyProvider,
+};
 
 uniffi::setup_scaffolding!();
 
@@ -186,6 +189,183 @@ pub struct FfiSyncSummary {
     pub pending_actions_applied: u64,
     pub pending_actions_failed: u64,
     pub pending_actions_deferred: u64,
+}
+
+/// AEAD envelope at the FFI boundary.
+///
+/// Mirrors [`kmail_core::AeadEnvelope`] but with a `Vec<u8>` nonce
+/// instead of the `[u8; 12]` fixed-array field — UniFFI dictionaries
+/// can't express fixed-size byte arrays directly, and Swift /
+/// Kotlin both render `[UInt8]` / `ByteArray` for `bytes` regardless
+/// of length. The conversion functions below enforce the
+/// `NONCE_LEN == 12` invariant at the FFI boundary, surfacing a
+/// short / oversized nonce as `KMailError::InvalidArgument` rather
+/// than a downstream AES-GCM length error.
+#[derive(uniffi::Record)]
+pub struct FfiAeadEnvelope {
+    pub nonce: Vec<u8>,
+    pub ciphertext: Vec<u8>,
+    pub aad: Vec<u8>,
+}
+
+impl From<AeadEnvelope> for FfiAeadEnvelope {
+    fn from(env: AeadEnvelope) -> Self {
+        Self {
+            nonce: env.nonce.to_vec(),
+            ciphertext: env.ciphertext,
+            aad: env.aad,
+        }
+    }
+}
+
+impl TryFrom<FfiAeadEnvelope> for AeadEnvelope {
+    type Error = KMailError;
+    fn try_from(env: FfiAeadEnvelope) -> Result<Self, Self::Error> {
+        if env.nonce.len() != kmail_core::crypto::NONCE_LEN {
+            return Err(KMailError::InvalidArgument {
+                message: format!(
+                    "AEAD nonce must be {} bytes, got {}",
+                    kmail_core::crypto::NONCE_LEN,
+                    env.nonce.len()
+                ),
+            });
+        }
+        let mut nonce = [0u8; kmail_core::crypto::NONCE_LEN];
+        nonce.copy_from_slice(&env.nonce);
+        Ok(AeadEnvelope {
+            nonce,
+            ciphertext: env.ciphertext,
+            aad: env.aad,
+        })
+    }
+}
+
+/// Confidential Send envelope at the FFI boundary.
+///
+/// Mirrors [`kmail_core::ConfidentialEnvelope`] with the same
+/// fixed-array → `Vec<u8>` translation as [`FfiAeadEnvelope`].
+#[derive(uniffi::Record)]
+pub struct FfiConfidentialEnvelope {
+    pub kek_salt: Vec<u8>,
+    pub wrapped_dek: FfiAeadEnvelope,
+    pub payload: FfiAeadEnvelope,
+}
+
+impl From<ConfidentialEnvelope> for FfiConfidentialEnvelope {
+    fn from(env: ConfidentialEnvelope) -> Self {
+        Self {
+            kek_salt: env.kek_salt.to_vec(),
+            wrapped_dek: env.wrapped_dek.into(),
+            payload: env.payload.into(),
+        }
+    }
+}
+
+impl TryFrom<FfiConfidentialEnvelope> for ConfidentialEnvelope {
+    type Error = KMailError;
+    fn try_from(env: FfiConfidentialEnvelope) -> Result<Self, Self::Error> {
+        if env.kek_salt.len() != kmail_core::crypto::KEK_SALT_LEN {
+            return Err(KMailError::InvalidArgument {
+                message: format!(
+                    "Confidential KEK salt must be {} bytes, got {}",
+                    kmail_core::crypto::KEK_SALT_LEN,
+                    env.kek_salt.len()
+                ),
+            });
+        }
+        let mut kek_salt = [0u8; kmail_core::crypto::KEK_SALT_LEN];
+        kek_salt.copy_from_slice(&env.kek_salt);
+        Ok(ConfidentialEnvelope {
+            kek_salt,
+            wrapped_dek: env.wrapped_dek.try_into()?,
+            payload: env.payload.try_into()?,
+        })
+    }
+}
+
+// ---------------------------------------------------------------
+// MLS provider callback trait
+// ---------------------------------------------------------------
+//
+// Swift / Kotlin implementors back this trait with calls into the
+// KChat MLS SDK on each platform. The Rust side wraps the foreign
+// trait object in [`ForeignMlsKeyProvider`] which adapts it to the
+// SDK-internal `MlsKeyProvider` interface. The adapter exists
+// because UniFFI's foreign-trait machinery cannot return the
+// SDK-private `KeyMaterial` type directly (it owns the
+// zeroize-on-drop semantics that we do NOT want to leak across
+// the FFI boundary — the foreign caller MUST return raw bytes
+// and trust the SDK to wrap them).
+
+/// Foreign-implementable trait. The platform shell provides this
+/// (in Swift / Kotlin) and hands it to the SDK via
+/// [`KMailClientHandle::set_mls_provider`].
+///
+/// Contract — same as the Rust-side
+/// [`kmail_core::MlsKeyProvider`]:
+///   - Return exactly 32 bytes from each method.
+///   - Determinism across the lifetime of one MLS epoch.
+///   - Distinct secrets per distinct `recipient_user_id` /
+///     `folder_id` (uniqueness is a contract obligation; the
+///     trait can't enforce it).
+#[uniffi::export(with_foreign)]
+pub trait FfiMlsKeyProvider: Send + Sync {
+    fn confidential_send_leaf_secret(
+        &self,
+        recipient_user_id: String,
+    ) -> Result<Vec<u8>, KMailError>;
+    fn vault_folder_master_secret(&self, folder_id: String) -> Result<Vec<u8>, KMailError>;
+}
+
+/// Adapter from the foreign-implemented [`FfiMlsKeyProvider`] to
+/// the Rust-side [`MlsKeyProvider`].
+///
+/// The adapter validates the foreign side's contract (32-byte
+/// return) and converts the raw `Vec<u8>` into the
+/// zeroize-on-drop [`KeyMaterial`] wrapper before handing it back
+/// to the SDK. If the foreign side returns a wrong-length buffer,
+/// we surface that as `Error::KeyStore` rather than letting it
+/// propagate into the crypto layer as a confusing "invalid key
+/// length" error.
+struct ForeignMlsKeyProvider {
+    foreign: Arc<dyn FfiMlsKeyProvider>,
+}
+
+impl MlsKeyProvider for ForeignMlsKeyProvider {
+    fn confidential_send_leaf_secret(
+        &self,
+        recipient_user_id: &str,
+    ) -> kmail_core::Result<KeyMaterial> {
+        let bytes = self
+            .foreign
+            .confidential_send_leaf_secret(recipient_user_id.to_string())
+            .map_err(|e| {
+                kmail_core::Error::KeyStore(format!("foreign MlsKeyProvider returned error: {e}"))
+            })?;
+        if bytes.len() != 32 {
+            return Err(kmail_core::Error::KeyStore(format!(
+                "foreign MlsKeyProvider returned {}-byte Confidential Send secret, expected 32",
+                bytes.len()
+            )));
+        }
+        Ok(KeyMaterial::new(bytes))
+    }
+
+    fn vault_folder_master_secret(&self, folder_id: &str) -> kmail_core::Result<KeyMaterial> {
+        let bytes = self
+            .foreign
+            .vault_folder_master_secret(folder_id.to_string())
+            .map_err(|e| {
+                kmail_core::Error::KeyStore(format!("foreign MlsKeyProvider returned error: {e}"))
+            })?;
+        if bytes.len() != 32 {
+            return Err(kmail_core::Error::KeyStore(format!(
+                "foreign MlsKeyProvider returned {}-byte Vault secret, expected 32",
+                bytes.len()
+            )));
+        }
+        Ok(KeyMaterial::new(bytes))
+    }
 }
 
 // ---------------------------------------------------------------
@@ -398,6 +578,184 @@ impl KMailClientHandle {
             })
             .await??;
         Ok(())
+    }
+
+    // ---------------------------------------------------------
+    // Crypto surface (Confidential Send + Zero-Access Vault)
+    // ---------------------------------------------------------
+
+    /// Seal `plaintext` into a Zero-Access Vault envelope under a
+    /// caller-supplied 32-byte per-folder master key.
+    ///
+    /// Synchronous because the underlying crypto is pure CPU
+    /// work; bouncing through the runtime would just add
+    /// scheduling latency without parallelism.
+    pub fn seal_vault_envelope(
+        &self,
+        folder_master_key: Vec<u8>,
+        plaintext: Vec<u8>,
+        aad: Vec<u8>,
+    ) -> Result<FfiAeadEnvelope, KMailError> {
+        let env = self
+            .inner
+            .seal_vault_envelope(&folder_master_key, &plaintext, &aad)?;
+        Ok(env.into())
+    }
+
+    /// Decrypt a Zero-Access Vault envelope. Symmetric inverse
+    /// of [`KMailClientHandle::seal_vault_envelope`].
+    pub fn decrypt_vault_envelope(
+        &self,
+        folder_master_key: Vec<u8>,
+        envelope: FfiAeadEnvelope,
+    ) -> Result<Vec<u8>, KMailError> {
+        let env: AeadEnvelope = envelope.try_into()?;
+        Ok(self
+            .inner
+            .decrypt_vault_envelope(&folder_master_key, &env)?)
+    }
+
+    /// Seal `plaintext` into a Confidential Send envelope under
+    /// a caller-supplied 32-byte MLS leaf secret.
+    pub fn seal_confidential_envelope(
+        &self,
+        mls_leaf_secret: Vec<u8>,
+        plaintext: Vec<u8>,
+        payload_aad: Vec<u8>,
+        wrap_aad: Vec<u8>,
+    ) -> Result<FfiConfidentialEnvelope, KMailError> {
+        let env = self.inner.seal_confidential_envelope(
+            &mls_leaf_secret,
+            &plaintext,
+            &payload_aad,
+            &wrap_aad,
+        )?;
+        Ok(env.into())
+    }
+
+    /// Open a Confidential Send envelope. Symmetric inverse of
+    /// [`KMailClientHandle::seal_confidential_envelope`].
+    pub fn open_confidential_envelope(
+        &self,
+        mls_leaf_secret: Vec<u8>,
+        envelope: FfiConfidentialEnvelope,
+    ) -> Result<Vec<u8>, KMailError> {
+        let env: ConfidentialEnvelope = envelope.try_into()?;
+        Ok(self
+            .inner
+            .open_confidential_envelope(&mls_leaf_secret, &env)?)
+    }
+
+    // ---------------------------------------------------------
+    // MlsKeyProvider plumbing
+    // ---------------------------------------------------------
+
+    /// Plug a foreign-implemented [`FfiMlsKeyProvider`] into the
+    /// client. After this call, the `*_message` convenience
+    /// methods below can derive keys via the provider without
+    /// the caller threading raw key bytes through every call.
+    pub async fn set_mls_provider(
+        &self,
+        provider: Arc<dyn FfiMlsKeyProvider>,
+    ) -> Result<(), KMailError> {
+        let inner = self.inner.clone();
+        let adapter: Arc<dyn MlsKeyProvider> =
+            Arc::new(ForeignMlsKeyProvider { foreign: provider });
+        runtime()
+            .spawn(async move { inner.set_mls_provider(adapter).await })
+            .await?;
+        Ok(())
+    }
+
+    /// Drop the currently-plugged [`FfiMlsKeyProvider`]. Subsequent
+    /// `*_message` convenience calls will return
+    /// `KMailError::KeyStore`.
+    pub async fn clear_mls_provider(&self) -> Result<(), KMailError> {
+        let inner = self.inner.clone();
+        runtime()
+            .spawn(async move { inner.clear_mls_provider().await })
+            .await?;
+        Ok(())
+    }
+
+    /// Convenience: seal a Vault message by asking the plugged
+    /// [`FfiMlsKeyProvider`] for the per-folder master key.
+    pub async fn write_vault_message(
+        &self,
+        folder_id: String,
+        plaintext: Vec<u8>,
+        aad: Vec<u8>,
+    ) -> Result<FfiAeadEnvelope, KMailError> {
+        let inner = self.inner.clone();
+        let env = runtime()
+            .spawn(async move {
+                inner
+                    .write_vault_message(&folder_id, &plaintext, &aad)
+                    .await
+            })
+            .await??;
+        Ok(env.into())
+    }
+
+    /// Convenience: open a Vault message by asking the plugged
+    /// [`FfiMlsKeyProvider`] for the per-folder master key.
+    pub async fn open_vault_message(
+        &self,
+        folder_id: String,
+        envelope: FfiAeadEnvelope,
+    ) -> Result<Vec<u8>, KMailError> {
+        let env: AeadEnvelope = envelope.try_into()?;
+        let inner = self.inner.clone();
+        let pt = runtime()
+            .spawn(async move { inner.open_vault_message(&folder_id, &env).await })
+            .await??;
+        Ok(pt)
+    }
+
+    /// Convenience: seal a Confidential Send message by asking
+    /// the plugged [`FfiMlsKeyProvider`] for the per-recipient
+    /// leaf secret.
+    pub async fn encrypt_confidential_message(
+        &self,
+        recipient_user_id: String,
+        plaintext: Vec<u8>,
+        payload_aad: Vec<u8>,
+        wrap_aad: Vec<u8>,
+    ) -> Result<FfiConfidentialEnvelope, KMailError> {
+        let inner = self.inner.clone();
+        let env = runtime()
+            .spawn(async move {
+                inner
+                    .encrypt_confidential_message(
+                        &recipient_user_id,
+                        &plaintext,
+                        &payload_aad,
+                        &wrap_aad,
+                    )
+                    .await
+            })
+            .await??;
+        Ok(env.into())
+    }
+
+    /// Convenience: open a Confidential Send message by asking
+    /// the plugged [`FfiMlsKeyProvider`] for the per-recipient
+    /// leaf secret.
+    pub async fn decrypt_confidential_message(
+        &self,
+        recipient_user_id: String,
+        envelope: FfiConfidentialEnvelope,
+    ) -> Result<Vec<u8>, KMailError> {
+        let env: ConfidentialEnvelope = envelope.try_into()?;
+        let inner = self.inner.clone();
+        let pt = runtime()
+            .spawn(async move {
+                inner
+                    .decrypt_confidential_message(&recipient_user_id, &env)
+                    .await
+            })
+            .await??;
+        Ok(pt)
     }
 }
 
