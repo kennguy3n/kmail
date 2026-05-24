@@ -1,0 +1,163 @@
+name: SDK iOS
+
+# Build + test the iOS XCFramework on every PR that touches the
+# Rust SDK or the Swift package. macOS runners cost ~10x ubuntu
+# runners; we path-filter aggressively so unrelated PRs don't pay
+# the price.
+#
+# This workflow is intentionally a separate file from `ci.yml`
+# (the Go / Web / Rust-on-Ubuntu workflow). Two reasons:
+#
+#   1. macOS runners are a different SKU; mixing them with the
+#      ubuntu jobs in `ci.yml` forces every step in `ci.yml`
+#      onto macOS if `runs-on: macos-14` is set at the workflow
+#      level, and forces every step here onto ubuntu if the
+#      other way round. Keeping the workflows separate lets each
+#      pick the right runner family.
+#   2. Branch protection in `ci.yml`'s `ci-status` aggregate is
+#      already complex; adding macOS into that mix would force
+#      ALL the legitimate-skip logic to also work across runner
+#      families. By keeping iOS as its own `SDK iOS` check, the
+#      protection rule can be configured "required on iOS-
+#      affecting PRs only" via the GitHub UI's path-rule support.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      # Trigger when the Rust SDK changes — the iOS staticlib is
+      # built from this source.
+      - 'sdk/**'
+      # The Swift package itself.
+      - 'apps/ios/**'
+      # The build script that produces the XCFramework. The
+      # path is technically a subset of `sdk/**` above, but we
+      # list it explicitly as a tripwire: if someone later
+      # narrows the `sdk/**` glob (e.g. to exclude `sdk/target/`
+      # or `sdk/scripts/`), this entry keeps the iOS pipeline
+      # triggering on script edits.
+      - 'sdk/scripts/build-ios-xcframework.sh'
+      # The workflow file itself (defence-in-depth so a CI edit
+      # always re-runs the build it gates).
+      - '.github/workflows/sdk-build-ios.yml'
+
+# Cancel an in-flight run when a new commit lands on the same PR.
+# macOS minutes are expensive — there's no value in finishing
+# the build of a stale commit.
+concurrency:
+  group: sdk-ios-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Build XCFramework + Swift Tests
+    # macos-14 = arm64 host (M1+). The host arch matters because
+    # `cargo build --target aarch64-apple-darwin` on an x86_64
+    # runner has to bootstrap a fresh stage-1 toolchain (slow);
+    # on arm64 the host triple matches the iOS sim triple and
+    # cargo reuses the cached toolchain.
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pin to the same toolchain the workspace was developed
+      # against. `dtolnay/rust-toolchain` installs rustup, the
+      # requested toolchain, and the named components atomically.
+      # The Rust iOS targets are added by the build script itself
+      # via `rustup target add` — we don't list them in `targets:`
+      # here because the script is the canonical place to manage
+      # the iOS target list.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # Cache the cargo registry + target dir keyed on
+      # `sdk/Cargo.lock`. The iOS cross-compile produces a target
+      # tree per architecture (~600 MiB total) so caching this
+      # cuts a cold build from ~12 min to ~2 min. The cache key
+      # includes the workspace `Cargo.lock` hash so a dependency
+      # bump invalidates the cache (otherwise we'd risk linking
+      # against a stale archive).
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sdk -> target
+          # Per-architecture cache keys. The default cache key
+          # only varies by Cargo.lock; iOS adds three more
+          # architectures to the target dir, each ~150 MiB,
+          # which would otherwise blow past the 10 GB per-repo
+          # cache cap.
+          shared-key: ios-staticlibs
+
+      # Print the Xcode version for log triage. macos-14 ships
+      # with Xcode 15.4 at the time of writing; we don't pin a
+      # specific version because uniffi-bindgen + the Swift
+      # facade work on any Xcode 15+, but if the runner image
+      # ships a regression we want to see it in the log without
+      # digging into runner-image release notes.
+      - name: Report tooling versions
+        run: |
+          xcodebuild -version
+          swift --version
+          rustc --version
+          cargo --version
+
+      - name: Build XCFramework
+        run: ./sdk/scripts/build-ios-xcframework.sh
+
+      # Sanity-check the assembled XCFramework structure. The
+      # script already produces a loud failure if Info.plist is
+      # missing, but a regression in xcodebuild's slice naming
+      # would still produce a valid Info.plist with the wrong
+      # contents. Verify the two LibraryIdentifier entries by name:
+      # one device slice (`ios-arm64`) and one combined simulator
+      # slice (`ios-arm64_x86_64-simulator`) — the two simulator
+      # architectures are lipo'd into a single fat staticlib before
+      # `xcodebuild -create-xcframework` so the assembled
+      # XCFramework declares only one simulator variant.
+      - name: Validate XCFramework slices
+        run: |
+          set -euo pipefail
+          FW="apps/ios/Frameworks/KMailFFI.xcframework"
+          test -f "$FW/Info.plist"
+          # Convert the binary plist to JSON and parse with
+          # python -c in a single line (multi-line python inside
+          # a YAML run block requires careful column-0
+          # indentation that github actions can mishandle).
+          # Failing here means the XCFramework was assembled with
+          # unexpected slice identifiers — the Swift Package
+          # would still build but the iOS device build would
+          # fail at link time with a "missing slice" error.
+          # Catching it here surfaces the cause directly.
+          JSON=$(plutil -convert json -o - "$FW/Info.plist")
+          echo "Info.plist JSON: $JSON"
+          python3 -c "import json,sys; info=json.loads(sys.argv[1]); ids=sorted([l['LibraryIdentifier'] for l in info['AvailableLibraries']]); expected=sorted(['ios-arm64','ios-arm64_x86_64-simulator']); assert ids == expected, f'expected {expected}, got {ids}'; print('XCFramework slices OK:', ids)" "$JSON"
+
+      - name: Verify generated Swift bindings exist
+        run: |
+          set -euo pipefail
+          test -f apps/ios/Sources/KMail/Generated/KMailFFI.swift
+          # The generated file should contain the public API
+          # surface — at least the KMailError enum and the
+          # KMailClientHandle class. If uniffi-bindgen regressed
+          # and emitted an empty file (e.g. host cdylib stripped
+          # of symbols), this catches it before swift build
+          # produces a confusing missing-symbol error.
+          grep -q 'public enum KMailError' apps/ios/Sources/KMail/Generated/KMailFFI.swift
+          grep -q 'class KMailClientHandle' apps/ios/Sources/KMail/Generated/KMailFFI.swift
+
+      - name: Swift build
+        working-directory: apps/ios
+        run: swift build -c release
+
+      - name: Swift test
+        working-directory: apps/ios
+        # `swift test` runs against the host (macOS arm64) using
+        # the simulator slice of the XCFramework — that's the
+        # standard SPM testing flow. It exercises the same FFI
+        # code path that the iOS device build will hit, just
+        # against a different staticlib slice.
+        run: swift test

@@ -137,6 +137,55 @@ impl ClientConfig {
             bootstrap_mailbox_role: Some("inbox".into()),
         }
     }
+
+    /// Apply per-field optional overrides from a foreign-binding
+    /// caller in-place. This is the canonical lowering ladder shared
+    /// by the UniFFI (`kmail-ffi`) and napi (`kmail-napi`) bindings;
+    /// both call this with the values their record type carries, so
+    /// the two FFI surfaces cannot drift in their default-handling
+    /// semantics. Add a new optional field here and update both
+    /// `client_open` (UniFFI) and `KMailClientJs::open` (napi) to
+    /// thread it through — the compiler will catch any forgotten
+    /// call site because the parameter list grows.
+    ///
+    /// The two tiers of optionality are baked in:
+    ///
+    /// * **Tier 1 — numeric fields.** `None` means "inherit the
+    ///   `ClientConfig::new` default", because the core type stores
+    ///   the value as a non-optional primitive. The override only
+    ///   fires on `Some(value)`. Used for `attachment_cache_bytes`,
+    ///   `request_timeout_secs`, `retry_budget_secs`, and
+    ///   `initial_sync_email_window`.
+    /// * **Tier 2 — string fields.** `None` is a legitimate "no
+    ///   value" because the core type already stores
+    ///   `Option<String>`. Verbatim assignment — passing `None`
+    ///   genuinely clears the field. Used for `account_id` and
+    ///   `bootstrap_mailbox_role`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_optional_overrides(
+        &mut self,
+        attachment_cache_bytes: Option<u64>,
+        request_timeout_secs: Option<u32>,
+        retry_budget_secs: Option<u32>,
+        initial_sync_email_window: Option<u32>,
+        account_id: Option<String>,
+        bootstrap_mailbox_role: Option<String>,
+    ) {
+        if let Some(b) = attachment_cache_bytes {
+            self.attachment_cache_bytes = b;
+        }
+        if let Some(t) = request_timeout_secs {
+            self.request_timeout = Duration::from_secs(u64::from(t));
+        }
+        if let Some(t) = retry_budget_secs {
+            self.retry_budget = Duration::from_secs(u64::from(t));
+        }
+        if let Some(w) = initial_sync_email_window {
+            self.initial_sync_email_window = w;
+        }
+        self.account_id = account_id;
+        self.bootstrap_mailbox_role = bootstrap_mailbox_role;
+    }
 }
 
 impl std::fmt::Debug for ClientConfig {

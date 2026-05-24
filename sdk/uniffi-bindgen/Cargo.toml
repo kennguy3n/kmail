@@ -1,0 +1,27 @@
+[package]
+name = "uniffi-bindgen"
+description = "Project-local UniFFI bindgen runner. Drives the same uniffi-bindgen CLI logic shipped by the `uniffi` crate (the `cli` feature), but lives in our workspace so CI can run `cargo run -p uniffi-bindgen -- generate ...` against the metadata embedded in `kmail-ffi`'s compiled cdylib without having to install a separately-versioned binary."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Pinning this to a `[[bin]]` rather than the default `[lib] +
+# src/main.rs` setup is the canonical UniFFI 0.28 pattern. The
+# `uniffi` crate gates its bindgen entry-point behind the `cli`
+# feature; we re-export it here so the binary name matches what
+# the `build-ios-xcframework.sh` and `sdk-build-ios.yml` workflows
+# invoke (`cargo run -p uniffi-bindgen --bin uniffi-bindgen --`).
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/main.rs"
+
+[dependencies]
+# `cli` brings in `uniffi_bindgen_main` and the binding generators
+# for Swift, Kotlin, Python, and Ruby. We only consume Swift and
+# Kotlin in this repo, but the feature is monolithic — there's no
+# meaningful binary-size penalty because this crate ships only in
+# the dev / CI image, never in the cdylib that the platform shells
+# embed.
+uniffi = { workspace = true, features = ["cli"] }

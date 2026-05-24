@@ -40,8 +40,28 @@ sdk/
 │   ├── build.rs
 │   ├── package.json
 │   └── src/lib.rs
-└── kmail-cli/                  # internal debug CLI
-    └── src/main.rs
+├── kmail-cli/                  # internal debug CLI
+│   └── src/main.rs
+├── uniffi-bindgen/             # project-local UniFFI bindgen runner
+│   ├── Cargo.toml
+│   └── src/main.rs             # forwards to uniffi::uniffi_bindgen_main
+└── scripts/
+    └── build-ios-xcframework.sh  # macOS-only XCFramework build pipeline
+```
+
+The iOS Swift Package lives in a sibling tree:
+
+```
+apps/
+└── ios/                        # Swift Package Manager package
+    ├── Package.swift           # KMail library + KMailFFI binary target
+    ├── Sources/KMail/
+    │   ├── KMail.swift         # Public Swift facade + Codable EmailDraft
+    │   ├── MlsKeyProvider.swift # ClosureMlsKeyProvider helper
+    │   └── Generated/          # (gitignored) uniffi-bindgen output
+    ├── Tests/KMailTests/       # XCTest integration tests
+    ├── Frameworks/             # (gitignored) KMailFFI.xcframework
+    └── README.md               # iOS consumer docs
 ```
 
 ## Dependencies
@@ -66,17 +86,17 @@ shares the same versions:
 | Target               | Command                                                                                                  |
 | -------------------- | -------------------------------------------------------------------------------------------------------- |
 | Host (dev / CI)      | `cargo build --workspace --all-targets`                                                                  |
-| iOS device           | `cargo build -p kmail-ffi --target aarch64-apple-ios --release` *(follow-up PR)*                         |
-| iOS simulator (arm)  | `cargo build -p kmail-ffi --target aarch64-apple-ios-sim --release` *(follow-up PR)*                     |
-| iOS simulator (x64)  | `cargo build -p kmail-ffi --target x86_64-apple-ios --release` *(follow-up PR)*                          |
+| iOS XCFramework      | `./sdk/scripts/build-ios-xcframework.sh` (macOS-only; full XCFramework + Swift bindings)                 |
+| iOS device only      | `cargo build -p kmail-ffi --target aarch64-apple-ios --profile release-with-symbols`                     |
+| iOS sim (Apple Si)   | `cargo build -p kmail-ffi --target aarch64-apple-ios-sim --profile release-with-symbols`                 |
+| iOS sim (Intel Mac)  | `cargo build -p kmail-ffi --target x86_64-apple-ios --profile release-with-symbols`                      |
 | Android arm64        | `cargo build -p kmail-ffi --target aarch64-linux-android --release` *(follow-up PR)*                     |
 | Android armv7        | `cargo build -p kmail-ffi --target armv7-linux-androideabi --release` *(follow-up PR)*                   |
 | Android x86_64       | `cargo build -p kmail-ffi --target x86_64-linux-android --release` *(follow-up PR)*                      |
 | Desktop (napi-rs)    | `cd sdk/kmail-napi && npx @napi-rs/cli build --release` *(follow-up PR for multi-target sweep)*          |
 
-Cross-compile sweeps for iOS, Android, and napi targets land in
-follow-up PRs that wire the XCFramework, AAR, and `.node` bundling
-into CI.
+Cross-compile sweeps for Android and napi targets land in
+follow-up PRs that wire the AAR and `.node` bundling into CI.
 
 ## UniFFI binding generation
 
@@ -84,16 +104,67 @@ into CI.
 surface is small enough that proc-macros are simpler and let the
 compiler check binding shape against the implementation.
 
-To regenerate the Swift / Kotlin packages:
+Binding extraction goes through a project-local runner crate at
+`sdk/uniffi-bindgen/`, which forwards `argv` to
+`uniffi::uniffi_bindgen_main()`. Using a workspace-local runner
+(rather than `cargo install uniffi-bindgen-cli`) pins the bindgen
+version to whatever the workspace pins `uniffi` to, so the
+generator and the runtime scaffolding cannot drift apart.
+
+The binding extraction reads `UNIFFI_META_*` symbols out of a
+compiled cdylib using `goblin`. The workspace-default
+`[profile.release]` has `strip = "symbols"`, which removes those
+symbols. For binding extraction (and for iOS staticlibs, which
+need symbols for Xcode linking) use the
+`[profile.release-with-symbols]` custom profile:
 
 ```bash
-cd sdk/kmail-ffi
-cargo run --bin uniffi-bindgen -- generate --library target/debug/libkmail_ffi.{so,dylib} --language swift --out-dir bindings/swift
-cargo run --bin uniffi-bindgen -- generate --library target/debug/libkmail_ffi.{so,dylib} --language kotlin --out-dir bindings/kotlin
+cd sdk
+cargo build -p kmail-ffi --profile release-with-symbols
+cargo run -p uniffi-bindgen -- generate --library target/release-with-symbols/libkmail_ffi.{so,dylib} --language swift --out-dir /tmp/bindings/swift
+cargo run -p uniffi-bindgen -- generate --library target/release-with-symbols/libkmail_ffi.{so,dylib} --language kotlin --out-dir /tmp/bindings/kotlin
 ```
 
-The platform shell repos consume these bindings as a Swift package
-and a Gradle module respectively.
+The iOS Swift Package consumes the Swift bindings via
+`sdk/scripts/build-ios-xcframework.sh`, which runs the above
+generation plus assembles a `KMailFFI.xcframework` (see the iOS
+shell section below).
+
+## iOS shell
+
+The iOS Swift Package at `apps/ios/` wraps the SDK as a Swift
+Package Manager package consumable by iOS / iPadOS / Mac
+Catalyst apps.
+
+Three pieces have to line up:
+
+1. **XCFramework** — a multi-slice binary container holding the
+   `kmail-ffi` Rust staticlib for three iOS triples (device
+   arm64, simulator arm64, simulator x86_64). The simulator
+   slices are lipo'd into one fat staticlib so Xcode only sees
+   one simulator variant.
+2. **Generated Swift bindings** — `uniffi-bindgen` emits a
+   single `.swift` file plus a C header + modulemap. The Swift
+   binding goes into `Sources/KMail/Generated/`; the C header
+   and modulemap go into each XCFramework slice.
+3. **Hand-written Swift facade** — `apps/ios/Sources/KMail/`
+   re-exports the uniffi-generated types with Swift-idiomatic
+   names (`Mailbox` instead of `FfiMailbox`), adds
+   `LocalizedError` conformance to `KMailError`, and provides
+   a high-level `KMailClient` wrapper that accepts `URL` /
+   `Codable EmailDraft` instead of strings + JSON.
+
+The full build runs in one command on a macOS host:
+
+```bash
+./sdk/scripts/build-ios-xcframework.sh
+cd apps/ios && swift test
+```
+
+The script is macOS-only — it depends on `lipo` and
+`xcodebuild -create-xcframework`. CI runs it on `macos-14`
+(arm64) via `.github/workflows/sdk-build-ios.yml`. See
+`apps/ios/README.md` for the downstream consumer docs.
 
 ## napi-rs build
 
