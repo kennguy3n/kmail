@@ -1,0 +1,574 @@
+package oauth
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"html/template"
+	"net/http"
+	"net/url"
+	"strings"
+)
+
+// serviceAPI is the small slice of *Service that the HTTP layer
+// needs. Defining it on the consumer side (handlers) — as
+// idiomatic Go — gives two benefits: tests can drive the handlers
+// with an in-memory fake (no Postgres pool required), and the
+// interface boundary documents exactly which service methods are
+// part of the wire-protocol contract vs. internal helpers. The
+// real *Service satisfies serviceAPI by virtue of its method set.
+type serviceAPI interface {
+	GetClient(ctx context.Context, tenantID, clientID string) (*Client, error)
+	IssueAuthorizationCode(ctx context.Context, client *Client, userID, redirectURI string, scopes []string, codeChallenge, codeChallengeMethod string) (string, error)
+	LookupClientForExchange(ctx context.Context, clientID string) (*Client, error)
+	VerifyClientSecret(ctx context.Context, client *Client, secret string) error
+	ExchangeAuthorizationCode(ctx context.Context, client *Client, code, redirectURI, codeVerifier string) (*TokenResponse, error)
+	RefreshAccessToken(ctx context.Context, client *Client, refreshToken string) (*TokenResponse, error)
+	RevokeToken(ctx context.Context, client *Client, token string) error
+}
+
+// Handlers wires the OAuth2 endpoints to a Service. The handlers
+// are deliberately thin — protocol details (state validation,
+// PKCE verification, code consumption atomicity) live in the
+// service layer so they're unit-testable without spinning up an
+// HTTP server.
+//
+// The four endpoints are:
+//
+//	GET  /oauth/authorize          — consent screen, browser-facing
+//	POST /oauth/authorize/approve  — user clicks "Approve", browser-facing
+//	POST /oauth/token              — code or refresh-token exchange, machine-facing
+//	POST /oauth/revoke             — RFC 7009 revocation, machine-facing
+//
+// The consent screen is rendered with html/template; the machine
+// endpoints emit JSON envelopes per RFC 6749 §5.
+type Handlers struct {
+	svc serviceAPI
+
+	// UserResolver returns the authenticated KChat user ID for an
+	// incoming request. It bridges the existing KChat OIDC
+	// middleware to the OAuth2 flow without coupling the two:
+	// /oauth/authorize is reached by a logged-in human in the
+	// KChat web UI, and the user-JWT claim is what tells us whose
+	// consent is being recorded. Implementations typically pull
+	// the user ID out of the request context populated by
+	// internal/middleware's OIDC verifier.
+	UserResolver func(r *http.Request) (userID string, tenantID string, ok bool)
+
+	consentTmpl *template.Template
+}
+
+// NewHandlers constructs the HTTP handler set bound to a Service.
+// UserResolver MUST be wired before calling Authorize / Approve —
+// the consent flow is meaningless without an authenticated user.
+func NewHandlers(svc *Service, userResolver func(r *http.Request) (string, string, bool)) *Handlers {
+	return newHandlersWithAPI(svc, userResolver)
+}
+
+// newHandlersWithAPI is the test seam: it accepts any serviceAPI
+// implementation so handler tests can supply an in-memory fake.
+// External callers must use NewHandlers with the concrete
+// *Service so production code paths can't silently bypass the
+// real persistence layer.
+func newHandlersWithAPI(svc serviceAPI, userResolver func(r *http.Request) (string, string, bool)) *Handlers {
+	return &Handlers{
+		svc:          svc,
+		UserResolver: userResolver,
+		consentTmpl:  template.Must(template.New("consent").Parse(consentHTML)),
+	}
+}
+
+// ServeMux registers all four OAuth2 endpoints under the given
+// prefix (typically "/oauth"). Returns the mux for chaining.
+func (h *Handlers) RegisterRoutes(mux *http.ServeMux, prefix string) {
+	prefix = strings.TrimRight(prefix, "/")
+	mux.HandleFunc(prefix+"/authorize", h.Authorize)
+	mux.HandleFunc(prefix+"/authorize/approve", h.Approve)
+	mux.HandleFunc(prefix+"/token", h.Token)
+	mux.HandleFunc(prefix+"/revoke", h.Revoke)
+}
+
+// =================== Authorize (consent screen) ===================
+
+// authorizeRequest is the parsed shape of the inbound
+// /oauth/authorize?... query. It exists so the handler can reject
+// malformed requests with structured errors before rendering the
+// consent screen (we don't want the user to click Approve only to
+// hit a 400 from the token endpoint later).
+type authorizeRequest struct {
+	ResponseType        string
+	ClientID            string
+	RedirectURI         string
+	Scope               []string
+	State               string
+	CodeChallenge       string
+	CodeChallengeMethod string
+}
+
+// Authorize renders the consent screen for a logged-in user.
+//
+// Per RFC 6749 §4.1.1, /oauth/authorize MUST accept response_type,
+// client_id, redirect_uri, scope, state, and (for PKCE) the
+// code_challenge / code_challenge_method pair. We validate:
+//   - response_type == "code" (we only support the authorization
+//     code grant; the implicit grant is deprecated)
+//   - client_id resolves to an active oauth_clients row
+//   - redirect_uri exactly matches one of the client's allow-list
+//     entries
+//   - every requested scope is in client.AllowedScopes
+//   - for public clients, code_challenge is present
+//
+// Validation errors that the client app caused (unknown client,
+// mismatched redirect_uri) are returned as HTTP 400 to the
+// browser — we MUST NOT redirect to the supplied redirect_uri in
+// those cases, because the URL is itself untrusted. Validation
+// errors that the *user-agent* caused after a valid request are
+// delivered via the redirect URL per the spec.
+func (h *Handlers) Authorize(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	req := parseAuthorizeRequest(r)
+
+	if req.ResponseType != "code" {
+		http.Error(w, "response_type must be 'code'", http.StatusBadRequest)
+		return
+	}
+	if req.ClientID == "" {
+		http.Error(w, "client_id required", http.StatusBadRequest)
+		return
+	}
+
+	userID, tenantID, ok := h.UserResolver(r)
+	if !ok || userID == "" || tenantID == "" {
+		// Spec requires sending the user to login first. The BFF
+		// is expected to wrap this handler with the OIDC user-JWT
+		// middleware that handles the redirect; receiving an
+		// unauthenticated request here means that wrapping is
+		// missing, which is a configuration bug.
+		http.Error(w, "authentication required", http.StatusUnauthorized)
+		return
+	}
+
+	client, err := h.svc.GetClient(r.Context(), tenantID, req.ClientID)
+	if err != nil {
+		http.Error(w, "unknown or inactive client", http.StatusBadRequest)
+		return
+	}
+	if !redirectURIInAllowList(client.RedirectURIs, req.RedirectURI) {
+		// Per RFC 6749 §3.1.2.4 we MUST NOT redirect to a
+		// mismatched URI — the user agent should see the error.
+		http.Error(w, "redirect_uri does not match client allow-list", http.StatusBadRequest)
+		return
+	}
+	for _, sc := range req.Scope {
+		if !containsString(client.AllowedScopes, sc) {
+			h.redirectWithError(w, r, req.RedirectURI, req.State,
+				ErrCodeInvalidScope, "scope "+sc+" not allowed for this client")
+			return
+		}
+	}
+	if client.ClientType == ClientTypePublic && req.CodeChallenge == "" {
+		h.redirectWithError(w, r, req.RedirectURI, req.State,
+			ErrCodeInvalidRequest, "public clients must use PKCE")
+		return
+	}
+
+	// Render the consent screen. The Approve form POSTs back to
+	// /oauth/authorize/approve with the same parameters embedded
+	// as hidden fields so we can re-validate them server-side —
+	// never trust the user-agent to round-trip them honestly.
+	tplData := consentTemplateData{
+		ClientName:          client.Name,
+		ClientHomepage:      client.HomepageURL,
+		ClientLogo:          client.LogoURL,
+		RequestedScopes:     req.Scope,
+		RedirectURI:         req.RedirectURI,
+		ClientID:            req.ClientID,
+		State:               req.State,
+		CodeChallenge:       req.CodeChallenge,
+		CodeChallengeMethod: req.CodeChallengeMethod,
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := h.consentTmpl.Execute(w, tplData); err != nil {
+		http.Error(w, "consent screen render failed", http.StatusInternalServerError)
+	}
+}
+
+// =================== Approve (user clicked Approve) ===================
+
+// Approve handles the POST from the consent screen. The form
+// carries the same parameters as the original /oauth/authorize
+// request (as hidden fields). We re-validate them server-side
+// because the user-agent could have tampered with them.
+//
+// On success we mint a one-time code, persist it, and redirect to
+// the client's redirect_uri with ?code=...&state=.... If the user
+// instead clicked Deny, the form would submit `decision=deny` and
+// we redirect with the access_denied error.
+func (h *Handlers) Approve(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "malformed form", http.StatusBadRequest)
+		return
+	}
+
+	userID, tenantID, ok := h.UserResolver(r)
+	if !ok {
+		http.Error(w, "authentication required", http.StatusUnauthorized)
+		return
+	}
+
+	clientID := r.Form.Get("client_id")
+	redirectURI := r.Form.Get("redirect_uri")
+	state := r.Form.Get("state")
+	codeChallenge := r.Form.Get("code_challenge")
+	codeChallengeMethod := r.Form.Get("code_challenge_method")
+	scopes := splitScopes(r.Form.Get("scope"))
+	decision := r.Form.Get("decision")
+
+	client, err := h.svc.GetClient(r.Context(), tenantID, clientID)
+	if err != nil {
+		http.Error(w, "unknown or inactive client", http.StatusBadRequest)
+		return
+	}
+	if !redirectURIInAllowList(client.RedirectURIs, redirectURI) {
+		http.Error(w, "redirect_uri does not match client allow-list", http.StatusBadRequest)
+		return
+	}
+
+	if decision != "approve" {
+		h.redirectWithError(w, r, redirectURI, state,
+			ErrCodeAccessDenied, "user denied consent")
+		return
+	}
+
+	code, err := h.svc.IssueAuthorizationCode(
+		r.Context(), client, userID, redirectURI, scopes,
+		codeChallenge, codeChallengeMethod,
+	)
+	if err != nil {
+		h.redirectWithOAuthError(w, r, redirectURI, state, err)
+		return
+	}
+
+	u, _ := url.Parse(redirectURI)
+	q := u.Query()
+	q.Set("code", code)
+	if state != "" {
+		q.Set("state", state)
+	}
+	u.RawQuery = q.Encode()
+	http.Redirect(w, r, u.String(), http.StatusFound)
+}
+
+// =================== Token endpoint ===================
+
+// Token implements /oauth/token, which routes by grant_type to
+// either ExchangeAuthorizationCode or RefreshAccessToken.
+//
+// Confidential clients authenticate via HTTP Basic (preferred per
+// RFC 6749 §2.3.1) OR via form parameters client_id +
+// client_secret (the §2.3.1 alternative). Public clients
+// authenticate by sending only client_id; they MUST present a
+// code_verifier matching the original code_challenge.
+//
+// Per spec, this endpoint MUST emit JSON, set Cache-Control:
+// no-store, and use grant-type-specific error codes.
+func (h *Handlers) Token(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeOAuthError(w, &OAuthError{Code: ErrCodeInvalidRequest, Description: "POST required", HTTPStatus: http.StatusMethodNotAllowed})
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
+
+	if err := r.ParseForm(); err != nil {
+		writeOAuthError(w, &OAuthError{Code: ErrCodeInvalidRequest, Description: "malformed form body", HTTPStatus: http.StatusBadRequest})
+		return
+	}
+
+	grantType := r.Form.Get("grant_type")
+	clientID, clientSecret, isBasic := r.BasicAuth()
+	if !isBasic {
+		clientID = r.Form.Get("client_id")
+		clientSecret = r.Form.Get("client_secret")
+	}
+	if clientID == "" {
+		writeOAuthError(w, &OAuthError{Code: ErrCodeInvalidClient, Description: "client_id required", HTTPStatus: http.StatusUnauthorized})
+		return
+	}
+
+	client, err := h.svc.LookupClientForExchange(r.Context(), clientID)
+	if err != nil {
+		writeOAuthError(w, &OAuthError{Code: ErrCodeInvalidClient, Description: "unknown client", HTTPStatus: http.StatusUnauthorized})
+		return
+	}
+	if client.ClientType == ClientTypeConfidential {
+		if err := h.svc.VerifyClientSecret(r.Context(), client, clientSecret); err != nil {
+			writeOAuthError(w, &OAuthError{Code: ErrCodeInvalidClient, Description: "client authentication failed", HTTPStatus: http.StatusUnauthorized})
+			return
+		}
+	}
+
+	switch grantType {
+	case GrantTypeAuthorizationCode:
+		h.handleAuthCodeGrant(w, r, client)
+	case GrantTypeRefreshToken:
+		h.handleRefreshGrant(w, r, client)
+	default:
+		writeOAuthError(w, &OAuthError{Code: ErrCodeUnsupportedGrantType, Description: "grant_type must be authorization_code or refresh_token", HTTPStatus: http.StatusBadRequest})
+	}
+}
+
+func (h *Handlers) handleAuthCodeGrant(w http.ResponseWriter, r *http.Request, client *Client) {
+	code := r.Form.Get("code")
+	redirectURI := r.Form.Get("redirect_uri")
+	codeVerifier := r.Form.Get("code_verifier")
+	if code == "" {
+		writeOAuthError(w, &OAuthError{Code: ErrCodeInvalidRequest, Description: "code required", HTTPStatus: http.StatusBadRequest})
+		return
+	}
+	resp, err := h.svc.ExchangeAuthorizationCode(r.Context(), client, code, redirectURI, codeVerifier)
+	if err != nil {
+		writeOAuthError(w, mapTokenError(err))
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (h *Handlers) handleRefreshGrant(w http.ResponseWriter, r *http.Request, client *Client) {
+	refreshToken := r.Form.Get("refresh_token")
+	if refreshToken == "" {
+		writeOAuthError(w, &OAuthError{Code: ErrCodeInvalidRequest, Description: "refresh_token required", HTTPStatus: http.StatusBadRequest})
+		return
+	}
+	resp, err := h.svc.RefreshAccessToken(r.Context(), client, refreshToken)
+	if err != nil {
+		writeOAuthError(w, mapTokenError(err))
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// =================== Revoke (RFC 7009) ===================
+
+// Revoke implements RFC 7009. Spec is permissive: revoking an
+// unknown or already-revoked token returns 200 OK. The only error
+// shape allowed is unsupported_token_type, which we never emit
+// (we accept both access and refresh tokens transparently).
+func (h *Handlers) Revoke(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeOAuthError(w, &OAuthError{Code: ErrCodeInvalidRequest, Description: "POST required", HTTPStatus: http.StatusMethodNotAllowed})
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		writeOAuthError(w, &OAuthError{Code: ErrCodeInvalidRequest, Description: "malformed form body", HTTPStatus: http.StatusBadRequest})
+		return
+	}
+
+	clientID, clientSecret, isBasic := r.BasicAuth()
+	if !isBasic {
+		clientID = r.Form.Get("client_id")
+		clientSecret = r.Form.Get("client_secret")
+	}
+	if clientID == "" {
+		writeOAuthError(w, &OAuthError{Code: ErrCodeInvalidClient, Description: "client_id required", HTTPStatus: http.StatusUnauthorized})
+		return
+	}
+	client, err := h.svc.LookupClientForExchange(r.Context(), clientID)
+	if err != nil {
+		writeOAuthError(w, &OAuthError{Code: ErrCodeInvalidClient, Description: "unknown client", HTTPStatus: http.StatusUnauthorized})
+		return
+	}
+	if client.ClientType == ClientTypeConfidential {
+		if err := h.svc.VerifyClientSecret(r.Context(), client, clientSecret); err != nil {
+			writeOAuthError(w, &OAuthError{Code: ErrCodeInvalidClient, Description: "client authentication failed", HTTPStatus: http.StatusUnauthorized})
+			return
+		}
+	}
+
+	token := r.Form.Get("token")
+	if token == "" {
+		// RFC 7009 §2.1: empty token is treated as an unknown
+		// token, which the spec mandates a 200 OK response for.
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	// Service swallows ErrAccessTokenNotFound / ErrRefreshTokenNotFound.
+	if err := h.svc.RevokeToken(r.Context(), client, token); err != nil {
+		// Only true server errors land here.
+		writeOAuthError(w, &OAuthError{Code: ErrCodeServerError, Description: "revocation failed", HTTPStatus: http.StatusInternalServerError})
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+// =================== Helpers ===================
+
+func parseAuthorizeRequest(r *http.Request) authorizeRequest {
+	q := r.URL.Query()
+	return authorizeRequest{
+		ResponseType:        q.Get("response_type"),
+		ClientID:            q.Get("client_id"),
+		RedirectURI:         q.Get("redirect_uri"),
+		Scope:               splitScopes(q.Get("scope")),
+		State:               q.Get("state"),
+		CodeChallenge:       q.Get("code_challenge"),
+		CodeChallengeMethod: q.Get("code_challenge_method"),
+	}
+}
+
+func splitScopes(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	out := strings.Fields(raw)
+	return out
+}
+
+// redirectWithError sends the user-agent back to the client's
+// redirect_uri with ?error=...&state=..., per RFC 6749 §4.1.2.1.
+func (h *Handlers) redirectWithError(w http.ResponseWriter, r *http.Request, redirectURI, state, code, description string) {
+	u, err := url.Parse(redirectURI)
+	if err != nil || u.Scheme == "" {
+		http.Error(w, description, http.StatusBadRequest)
+		return
+	}
+	q := u.Query()
+	q.Set("error", code)
+	q.Set("error_description", description)
+	if state != "" {
+		q.Set("state", state)
+	}
+	u.RawQuery = q.Encode()
+	http.Redirect(w, r, u.String(), http.StatusFound)
+}
+
+// redirectWithOAuthError unwraps an OAuthError (if present) and
+// dispatches to redirectWithError with the right code.
+func (h *Handlers) redirectWithOAuthError(w http.ResponseWriter, r *http.Request, redirectURI, state string, err error) {
+	var oerr *OAuthError
+	if errors.As(err, &oerr) {
+		h.redirectWithError(w, r, redirectURI, state, oerr.Code, oerr.Description)
+		return
+	}
+	h.redirectWithError(w, r, redirectURI, state, ErrCodeServerError, "internal error issuing authorization code")
+}
+
+// mapTokenError converts service-layer sentinel errors into the
+// OAuth2-spec error envelope. Unknown errors collapse to
+// invalid_grant (the safest fallback for /oauth/token) so we
+// don't leak internal error text to third-party clients.
+func mapTokenError(err error) *OAuthError {
+	var oerr *OAuthError
+	if errors.As(err, &oerr) {
+		return oerr
+	}
+	switch {
+	case errors.Is(err, ErrCodeNotFound),
+		errors.Is(err, ErrCodeAlreadyConsumed),
+		errors.Is(err, ErrInvalidRedirectURI),
+		errors.Is(err, ErrInvalidCodeVerifier),
+		errors.Is(err, ErrRefreshTokenNotFound),
+		errors.Is(err, ErrRefreshTokenReplay),
+		errors.Is(err, ErrPKCERequiredButMissing):
+		return &OAuthError{Code: ErrCodeInvalidGrant, Description: "authorization grant invalid", HTTPStatus: http.StatusBadRequest}
+	case errors.Is(err, ErrScopeNotAllowed):
+		return &OAuthError{Code: ErrCodeInvalidScope, Description: "scope not allowed", HTTPStatus: http.StatusBadRequest}
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+		return &OAuthError{Code: ErrCodeServerError, Description: "request cancelled", HTTPStatus: http.StatusServiceUnavailable}
+	default:
+		return &OAuthError{Code: ErrCodeInvalidGrant, Description: "authorization grant invalid", HTTPStatus: http.StatusBadRequest}
+	}
+}
+
+func writeOAuthError(w http.ResponseWriter, oerr *OAuthError) {
+	w.Header().Set("Content-Type", "application/json")
+	status := oerr.HTTPStatus
+	if status == 0 {
+		status = http.StatusBadRequest
+	}
+	w.WriteHeader(status)
+	body := map[string]string{"error": oerr.Code}
+	if oerr.Description != "" {
+		body["error_description"] = oerr.Description
+	}
+	_ = json.NewEncoder(w).Encode(body)
+}
+
+func writeJSON(w http.ResponseWriter, status int, body any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(body)
+}
+
+// =================== Consent screen template ===================
+
+type consentTemplateData struct {
+	ClientName          string
+	ClientHomepage      string
+	ClientLogo          string
+	RequestedScopes     []string
+	RedirectURI         string
+	ClientID            string
+	State               string
+	CodeChallenge       string
+	CodeChallengeMethod string
+}
+
+// consentHTML is intentionally minimal — the KChat shell injects
+// branding around it. We render scope strings verbatim because
+// they're constrained to a known set in types.go (KnownScopes);
+// any client-controlled value (ClientName, ClientHomepage,
+// ClientLogo) is auto-escaped by html/template.
+const consentHTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Authorize {{ .ClientName }}</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body { font-family: -apple-system, system-ui, sans-serif; max-width: 480px; margin: 4rem auto; padding: 0 1rem; }
+    h1 { font-size: 1.25rem; }
+    .scopes { background: #f6f8fa; padding: 1rem; border-radius: 6px; }
+    .scopes li { margin: 0.3rem 0; }
+    .actions { margin-top: 1.5rem; display: flex; gap: 0.75rem; }
+    button { padding: 0.5rem 1rem; border-radius: 6px; border: 1px solid #d0d7de; cursor: pointer; }
+    button.primary { background: #0969da; color: white; border-color: #0969da; }
+    img.logo { width: 48px; height: 48px; border-radius: 8px; vertical-align: middle; margin-right: 0.5rem; }
+  </style>
+</head>
+<body>
+  <h1>
+    {{ if .ClientLogo }}<img class="logo" src="{{ .ClientLogo }}" alt="">{{ end }}
+    {{ .ClientName }} wants to access your KMail
+  </h1>
+  {{ if .ClientHomepage }}<p><a href="{{ .ClientHomepage }}" target="_blank" rel="noopener noreferrer">Learn more about this app</a></p>{{ end }}
+  <div class="scopes">
+    <strong>It will be able to:</strong>
+    <ul>
+      {{ range .RequestedScopes }}
+      <li><code>{{ . }}</code></li>
+      {{ end }}
+    </ul>
+  </div>
+  <form method="POST" action="/oauth/authorize/approve">
+    <input type="hidden" name="client_id" value="{{ .ClientID }}">
+    <input type="hidden" name="redirect_uri" value="{{ .RedirectURI }}">
+    <input type="hidden" name="scope" value="{{ range $i, $s := .RequestedScopes }}{{ if $i }} {{ end }}{{ $s }}{{ end }}">
+    <input type="hidden" name="state" value="{{ .State }}">
+    <input type="hidden" name="code_challenge" value="{{ .CodeChallenge }}">
+    <input type="hidden" name="code_challenge_method" value="{{ .CodeChallengeMethod }}">
+    <div class="actions">
+      <button type="submit" name="decision" value="approve" class="primary">Allow</button>
+      <button type="submit" name="decision" value="deny">Cancel</button>
+    </div>
+  </form>
+</body>
+</html>`
