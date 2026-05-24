@@ -204,7 +204,19 @@ jobs:
           # renamed the field back to `message`, the resulting
           # generated code would not compile under Kotlin 1.9+ —
           # fail loudly here instead.
-          grep -q '`description`: kotlin.String' "$KT" \
+          #
+          # `description` is NOT a Kotlin reserved word so uniffi
+          # 0.28's Kotlin codegen renders the field unescaped:
+          #     description: kotlin.String
+          # Older uniffi versions (and a hypothetical future one
+          # that re-introduces blanket backtick-escaping) emit:
+          #     `description`: kotlin.String
+          # Accept both via a single `grep -E` with optional
+          # backticks. Anchoring on `: kotlin.String` keeps the
+          # match scoped to a type-annotated field declaration so
+          # a stray reference to the word `description` in a doc
+          # comment can't accidentally satisfy the check.
+          grep -Eq '`?description`?: kotlin\.String' "$KT" \
             || (echo "generated Kotlin missing description field on error variants" && exit 1)
 
       # The Gradle build does THREE things in one invocation:
