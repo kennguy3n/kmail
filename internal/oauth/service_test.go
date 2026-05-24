@@ -131,6 +131,76 @@ func TestVerifyPKCE_UnknownMethod(t *testing.T) {
 	}
 }
 
+// =================== URL validators ===================
+
+// TestValidateRedirectURI pins the RFC 6749 §3.1.2 + RFC 8252 §7.1
+// requirements that this package enforces at client-registration
+// time. The validator is defence-in-depth for the consent screen's
+// auto-escaping URL filter and the /authorize redirect-target
+// guard: catching a bad scheme at registration means we never
+// serve a "broken link to #ZgotmplZ" page later.
+func TestValidateRedirectURI(t *testing.T) {
+	cases := []struct {
+		name    string
+		raw     string
+		wantErr bool
+	}{
+		{"https accepted", "https://example.com/cb", false},
+		{"http accepted (localhost dev per RFC 8252 §8.3)", "http://localhost:8080/cb", false},
+		{"reverse-dns native scheme accepted", "com.example.app://callback", false},
+		{"empty string rejected", "", true},
+		{"no scheme rejected", "example.com/cb", true},
+		{"javascript scheme rejected", "javascript:alert(1)", true},
+		{"data URI rejected", "data:text/html,<script>alert(1)</script>", true},
+		{"vbscript scheme rejected", "vbscript:msgbox(1)", true},
+		{"file scheme rejected", "file:///etc/passwd", true},
+		{"single-token custom scheme rejected (not reverse-DNS)", "mycustom://cb", true},
+		{"JAVASCRIPT (case-insensitive) rejected", "JAVASCRIPT:alert(1)", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateRedirectURI(tc.raw)
+			if tc.wantErr && err == nil {
+				t.Errorf("expected error for %q, got nil", tc.raw)
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("expected no error for %q, got %v", tc.raw, err)
+			}
+		})
+	}
+}
+
+// TestValidateExternalDisplayURL pins the homepage_url / logo_url
+// rules: http or https only, host required. Defence-in-depth atop
+// html/template's URL filter for href/src contexts.
+func TestValidateExternalDisplayURL(t *testing.T) {
+	cases := []struct {
+		name    string
+		field   string
+		raw     string
+		wantErr bool
+	}{
+		{"https homepage accepted", "homepage_url", "https://example.com/", false},
+		{"http homepage accepted (intranet)", "homepage_url", "http://intranet.local/", false},
+		{"https logo accepted", "logo_url", "https://cdn.example.com/logo.png", false},
+		{"javascript: rejected", "homepage_url", "javascript:alert(1)", true},
+		{"data: rejected", "logo_url", "data:image/png;base64,iVBORw0KGgo=", true},
+		{"missing host rejected", "homepage_url", "https:///nohost", true},
+		{"unparseable rejected", "logo_url", "://not-a-url", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateExternalDisplayURL(tc.field, tc.raw)
+			if tc.wantErr && err == nil {
+				t.Errorf("expected error for field=%s raw=%q, got nil", tc.field, tc.raw)
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("expected no error for field=%s raw=%q, got %v", tc.field, tc.raw, err)
+			}
+		})
+	}
+}
+
 // =================== generateOpaqueToken / hashToken ===================
 
 func TestGenerateOpaqueToken_Length(t *testing.T) {

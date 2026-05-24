@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -876,6 +877,61 @@ func TestRevoke_ServerErrorMapsTo500(t *testing.T) {
 		t.Fatalf("expected 500 on db error, got %d", rr.Code)
 	}
 	assertOAuthErrorJSON(t, rr.Body.Bytes(), ErrCodeServerError)
+}
+
+// TestRevoke_UnwrapsOAuthError pins the RFC 7009 §2.2 contract:
+// when the service rejects a revocation because the token was
+// issued to a DIFFERENT client (or any other client error), the
+// handler MUST surface the underlying *OAuthError wire envelope
+// (e.g. unauthorized_client/400), not collapse to server_error/500.
+// The earlier shape mapped any non-nil err to 500 which masked the
+// cross-client signal a well-behaved confidential client needs in
+// order to distinguish "token doesn't exist" (silent 200) from
+// "token isn't yours" (400 unauthorized_client).
+func TestRevoke_UnwrapsOAuthError(t *testing.T) {
+	svc := newFakeService()
+	svc.clients["client-conf-1"] = makeConfidentialClient()
+	svc.errRevoke = &OAuthError{
+		Code:        ErrCodeUnauthorizedClient,
+		Description: "token was issued to a different client",
+		HTTPStatus:  http.StatusBadRequest,
+	}
+	h := newHandlersWithAPI(svc, userResolverOK)
+	rr := httptest.NewRecorder()
+	form := url.Values{}
+	form.Set("client_id", "client-conf-1")
+	form.Set("client_secret", "any")
+	form.Set("token", "some-token")
+	h.Revoke(rr, newRevokeRequest(form))
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 (unauthorized_client) unwrapped from *OAuthError, got %d", rr.Code)
+	}
+	assertOAuthErrorJSON(t, rr.Body.Bytes(), ErrCodeUnauthorizedClient)
+}
+
+// TestRevoke_UnwrapsWrappedOAuthError pins the wrapping path
+// (errors.As, not errors.Is) so a service-level wrapped error
+// like `fmt.Errorf("revoke: %w", &OAuthError{...})` still surfaces
+// the inner envelope.
+func TestRevoke_UnwrapsWrappedOAuthError(t *testing.T) {
+	svc := newFakeService()
+	svc.clients["client-conf-1"] = makeConfidentialClient()
+	svc.errRevoke = fmt.Errorf("revoke failed: %w", &OAuthError{
+		Code:        ErrCodeUnauthorizedClient,
+		Description: "token was issued to a different client",
+		HTTPStatus:  http.StatusBadRequest,
+	})
+	h := newHandlersWithAPI(svc, userResolverOK)
+	rr := httptest.NewRecorder()
+	form := url.Values{}
+	form.Set("client_id", "client-conf-1")
+	form.Set("client_secret", "any")
+	form.Set("token", "some-token")
+	h.Revoke(rr, newRevokeRequest(form))
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 unwrapped via errors.As, got %d", rr.Code)
+	}
+	assertOAuthErrorJSON(t, rr.Body.Bytes(), ErrCodeUnauthorizedClient)
 }
 
 // =================== RegisterRoutes ===================

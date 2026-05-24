@@ -518,10 +518,38 @@ func (h *Handlers) Revoke(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
-	// Service swallows ErrAccessTokenNotFound / ErrRefreshTokenNotFound.
+	// Service swallows ErrAccessTokenNotFound / ErrRefreshTokenNotFound
+	// (the RFC 7009 silent-success contract). What can still come
+	// back is:
+	//   * an *OAuthError, e.g. unauthorized_client/400 when a
+	//     client presents a token issued to a DIFFERENT client —
+	//     this MUST be surfaced as its own RFC 6749 §5.2 wire
+	//     envelope, NOT collapsed to server_error/500. RFC 7009
+	//     §2.2 explicitly says: "If the server is unable to
+	//     locate the token using the given hint, it MUST extend
+	//     its search across all of its supported token types. An
+	//     authorization server MAY ignore this parameter,
+	//     particularly if it is able to detect the token type
+	//     automatically. This specification defines two such
+	//     values [...]. The authorization server first validates
+	//     the client credentials [...] and then verifies whether
+	//     the token was issued to the client making the
+	//     revocation request." — the cross-client case is a
+	//     client error, not a server error.
+	//   * a plain error (DB / tx / context cancel), which IS a
+	//     server error and collapses to the original 500 envelope.
+	// errors.As unwraps both *OAuthError and any nested wrapping.
 	if err := h.svc.RevokeToken(r.Context(), client, token); err != nil {
-		// Only true server errors land here.
-		writeOAuthError(w, &OAuthError{Code: ErrCodeServerError, Description: "revocation failed", HTTPStatus: http.StatusInternalServerError})
+		var oerr *OAuthError
+		if errors.As(err, &oerr) {
+			writeOAuthError(w, oerr)
+			return
+		}
+		writeOAuthError(w, &OAuthError{
+			Code:        ErrCodeServerError,
+			Description: "revocation failed",
+			HTTPStatus:  http.StatusInternalServerError,
+		})
 		return
 	}
 	w.WriteHeader(http.StatusOK)
@@ -580,23 +608,40 @@ func (h *Handlers) redirectWithOAuthError(w http.ResponseWriter, r *http.Request
 	h.redirectWithError(w, r, redirectURI, state, ErrCodeServerError, "internal error issuing authorization code")
 }
 
-// mapTokenError converts service-layer sentinel errors into the
-// OAuth2-spec error envelope. Unknown errors collapse to
-// invalid_grant (the safest fallback for /oauth/token) so we
-// don't leak internal error text to third-party clients.
+// mapTokenError converts service-layer errors into the OAuth2-spec
+// wire envelope. The /oauth/token handler is the only caller.
+//
+// The primary error mechanism in this package is *OAuthError —
+// every code path in service.go that wants to return a
+// spec-compliant client-error reply returns one directly with the
+// right Code + HTTPStatus already populated, and `errors.As`
+// unwraps that here. The sentinel checks below are the secondary
+// path: a handful of service functions (specifically
+// RefreshAccessToken) return plain `errors.New(...)` sentinels
+// instead of *OAuthError so the inner Postgres transaction can
+// roll back via a typed return and the outer caller still gets a
+// stable wire shape.
+//
+// Only the sentinels actually returned to mapTokenError are kept
+// in the switch. The others (ErrCodeNotFound, ErrCodeAlreadyConsumed,
+// ErrInvalidRedirectURI, ErrInvalidCodeVerifier, ErrPKCERequiredButMissing)
+// would also map to invalid_grant if they ever appeared, but no
+// /oauth/token code path returns them today — they're either
+// returned via *OAuthError (and unwrapped above) or returned from
+// IssueAuthorizationCode (which is called from /oauth/authorize,
+// not /oauth/token). Adding them defensively was masking a real
+// gap in test coverage; remove them so any future regression that
+// routes one through here is caught by the default branch's
+// "authorization grant invalid" reply (which is the right
+// fallback for /oauth/token anyway per RFC 6749 §5.2).
 func mapTokenError(err error) *OAuthError {
 	var oerr *OAuthError
 	if errors.As(err, &oerr) {
 		return oerr
 	}
 	switch {
-	case errors.Is(err, ErrCodeNotFound),
-		errors.Is(err, ErrCodeAlreadyConsumed),
-		errors.Is(err, ErrInvalidRedirectURI),
-		errors.Is(err, ErrInvalidCodeVerifier),
-		errors.Is(err, ErrRefreshTokenNotFound),
-		errors.Is(err, ErrRefreshTokenReplay),
-		errors.Is(err, ErrPKCERequiredButMissing):
+	case errors.Is(err, ErrRefreshTokenNotFound),
+		errors.Is(err, ErrRefreshTokenReplay):
 		return &OAuthError{Code: ErrCodeInvalidGrant, Description: "authorization grant invalid", HTTPStatus: http.StatusBadRequest}
 	case errors.Is(err, ErrScopeNotAllowed):
 		return &OAuthError{Code: ErrCodeInvalidScope, Description: "scope not allowed", HTTPStatus: http.StatusBadRequest}

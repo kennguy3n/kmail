@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -81,8 +82,18 @@ func (s *Service) RegisterClient(
 		return nil, "", errors.New("oauth: at least one redirect_uri required")
 	}
 	for _, ru := range redirectURIs {
-		if _, err := url.Parse(ru); err != nil {
-			return nil, "", fmt.Errorf("oauth: invalid redirect_uri %q: %w", ru, err)
+		if err := validateRedirectURI(ru); err != nil {
+			return nil, "", err
+		}
+	}
+	if homepageURL != "" {
+		if err := validateExternalDisplayURL("homepage_url", homepageURL); err != nil {
+			return nil, "", err
+		}
+	}
+	if logoURL != "" {
+		if err := validateExternalDisplayURL("logo_url", logoURL); err != nil {
+			return nil, "", err
 		}
 	}
 	for _, sc := range allowedScopes {
@@ -334,7 +345,17 @@ func (s *Service) IssueAuthorizationCode(
 		challengePtr = &codeChallenge
 		method := codeChallengeMethod
 		if method == "" {
-			method = CodeChallengeMethodS256
+			// RFC 7636 §4.3: "If the client does not send the
+			// `code_challenge_method` parameter, the server MUST
+			// use 'plain'." Persisting 'S256' here would silently
+			// break interop with any spec-conformant client that
+			// computed challenge == verifier and omitted the
+			// method param — their PKCE exchange would fail every
+			// time because we'd hash their verifier and compare
+			// against their plaintext challenge. The verification
+			// path in ExchangeAuthorizationCode mirrors this
+			// default for the same reason.
+			method = CodeChallengeMethodPlain
 		}
 		methodPtr = &method
 	}
@@ -395,7 +416,6 @@ func (s *Service) ExchangeAuthorizationCode(
 		codeChallenge                    *string
 		codeChallengeMethod              *string
 		scopesRaw                        []byte
-		consumedAt                       *time.Time
 		expiresAt                        time.Time
 		codeClientID, codeTenantID       string
 	)
@@ -405,6 +425,17 @@ func (s *Service) ExchangeAuthorizationCode(
 	// consumed AND returns its fields, so a concurrent
 	// /oauth/token exchange with the same code can only succeed
 	// once.
+	//
+	// The WHERE clause filters BOTH `consumed_at IS NULL` AND
+	// `expires_at > $2` so an expired code is never "consumed"
+	// in the first place. If we only filtered on consumed_at and
+	// checked expiry post-consumption (the prior shape), an
+	// expired-but-fresh code would still get its consumed_at
+	// stamp — harmless functionally (it can't be reused
+	// anyway), but it muddies forensic audits and means a
+	// retried exchange returns "already consumed" instead of
+	// the more accurate "expired". Filtering in the WHERE
+	// clause also keeps the index probe single-pass.
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		if err := middleware.SetTenantGUC(ctx, tx, client.TenantID); err != nil {
 			return err
@@ -412,7 +443,9 @@ func (s *Service) ExchangeAuthorizationCode(
 		err := tx.QueryRow(ctx, `
 			UPDATE oauth_authorization_codes
 			SET consumed_at = $2
-			WHERE code_hash = $1 AND consumed_at IS NULL
+			WHERE code_hash = $1
+			  AND consumed_at IS NULL
+			  AND expires_at > $2
 			RETURNING id::text, client_id::text, tenant_id::text, user_id::text,
 			          redirect_uri, granted_scopes, code_challenge,
 			          code_challenge_method, expires_at
@@ -432,7 +465,6 @@ func (s *Service) ExchangeAuthorizationCode(
 		}
 		return nil, err
 	}
-	_ = consumedAt // referenced for tx; suppress unused warnings on the named return
 
 	// Step 2: validate the code matches THIS client (a code
 	// issued for client A cannot be exchanged by client B).
@@ -462,16 +494,15 @@ func (s *Service) ExchangeAuthorizationCode(
 		}
 	}
 
-	// Step 4: expiry check.
-	if now.After(expiresAt) {
-		return nil, &OAuthError{
-			Code:        ErrCodeInvalidGrant,
-			Description: "authorization code expired",
-			HTTPStatus:  400,
-		}
-	}
-
-	// Step 5: PKCE verification.
+	// Step 4: PKCE verification.
+	//
+	// Expiry is no longer checked here because Step 1's WHERE
+	// clause already filtered expired codes — reaching this
+	// point implies `expires_at > now()` at the moment of
+	// consumption. expiresAt is kept on the return path so a
+	// caller-side guard (e.g. a future audit hook) can still
+	// reason about lifetime if needed.
+	_ = expiresAt
 	if codeChallenge != nil && *codeChallenge != "" {
 		if codeVerifier == "" {
 			return nil, &OAuthError{
@@ -480,7 +511,16 @@ func (s *Service) ExchangeAuthorizationCode(
 				HTTPStatus:  400,
 			}
 		}
-		method := CodeChallengeMethodS256
+		// RFC 7636 §4.3: default method is 'plain' when omitted.
+		// This mirrors the IssueAuthorizationCode default — if a
+		// pre-RFC-7636-compliance code was persisted before this
+		// fix, the stored methodPtr will be 'S256' (the old
+		// default) and that wire value will still win below; the
+		// default only applies to legacy stored rows where the
+		// method column is NULL (those don't exist after the
+		// IssueAuthorizationCode change, but we keep the
+		// defensive default for grandfather safety).
+		method := CodeChallengeMethodPlain
 		if codeChallengeMethod != nil {
 			method = *codeChallengeMethod
 		}
@@ -950,6 +990,77 @@ func (s *Service) RevokeToken(ctx context.Context, client *Client, plaintextToke
 }
 
 // =================== Helpers ===================
+
+// validateRedirectURI mirrors what RFC 6749 §3.1.2 requires of a
+// redirect_uri: an absolute URI, non-empty, with a scheme. The
+// scheme MUST be one of http/https for browser-facing flows; we
+// also permit a native app's custom scheme (e.g. com.example.app://
+// per RFC 8252 §7.1) so installed apps can complete the
+// authorization_code grant.
+//
+// Disallowing javascript:, data:, file:, and similar "active" URI
+// schemes here is defence-in-depth: html/template's URL filter at
+// render time already blocks javascript: in href/src contexts, but
+// catching it at registration means a confused-deputy attack on the
+// consent screen (admin pastes a malicious URL, html/template
+// silently filters it to "#ZgotmplZ", consent screen has a broken
+// link) never reaches the rendering layer in the first place.
+func validateRedirectURI(raw string) error {
+	if raw == "" {
+		return errors.New("oauth: redirect_uri must not be empty")
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("oauth: invalid redirect_uri %q: %w", raw, err)
+	}
+	if u.Scheme == "" {
+		return fmt.Errorf("oauth: redirect_uri %q must include a scheme", raw)
+	}
+	scheme := strings.ToLower(u.Scheme)
+	switch scheme {
+	case "https", "http":
+		// http is permitted to support localhost development per
+		// RFC 8252 §8.3; production deployments should restrict
+		// via the chart's allowed_scopes / network policy. The
+		// scheme by itself is not where we enforce TLS.
+		return nil
+	case "javascript", "data", "vbscript", "file":
+		return fmt.Errorf("oauth: redirect_uri %q uses a dangerous scheme", raw)
+	default:
+		// RFC 8252 §7.1 custom URI scheme for native apps
+		// (e.g. com.example.app://callback). Permit but require
+		// a reverse-DNS-style scheme so adversaries can't
+		// register "*://anything" wildcards.
+		if !strings.Contains(scheme, ".") {
+			return fmt.Errorf("oauth: redirect_uri %q uses a non-reverse-DNS custom scheme", raw)
+		}
+		return nil
+	}
+}
+
+// validateExternalDisplayURL checks a URL that will be rendered
+// (NOT redirected to) on the consent screen — homepage_url and
+// logo_url. These appear inside <a href=...> and <img src=...>
+// contexts. html/template's auto-escaping URL filter would
+// neutralise a javascript: URL at render time, but we still want
+// to refuse it at registration so the consent screen never has a
+// "broken link to #ZgotmplZ" UX. https-only here because we don't
+// want a mixed-content warning on the consent screen, and a
+// homepage_url ought to be securable.
+func validateExternalDisplayURL(field, raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("oauth: invalid %s %q: %w", field, raw, err)
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "https" && scheme != "http" {
+		return fmt.Errorf("oauth: %s %q must use http or https (got %q)", field, raw, u.Scheme)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("oauth: %s %q must include a host", field, raw)
+	}
+	return nil
+}
 
 // generateOpaqueToken returns a URL-safe base64-encoded random
 // token of `byteLen` bytes of entropy. 32 bytes ≈ 43 base64 chars
