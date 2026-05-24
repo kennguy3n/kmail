@@ -338,6 +338,16 @@ func (c StalwartMTLSConfig) Validate() error {
 		// typo (forgot the cert/key vars).
 		return errors.New("config.StalwartMTLS: KMAIL_STALWART_TLS_CA or KMAIL_STALWART_TLS_SERVER_NAME is set without KMAIL_STALWART_TLS_CERT and KMAIL_STALWART_TLS_KEY; mTLS will be silently disabled")
 	default:
+		// unreachable: the switch above is exhaustive over
+		// {cert,key} × {true,false} with the (ca||sn) carve-out for
+		// the cert==false && key==false branch. Every input
+		// combination is covered by one of the explicit cases;
+		// this default exists only to keep `go vet` happy with the
+		// implicit-return path. If a future change adds a new
+		// boolean dimension (e.g. a fifth `mTLSEnabled` toggle),
+		// this default WILL start matching real inputs — at which
+		// point it should grow a real diagnostic, not silently
+		// pass.
 		return nil
 	}
 }

@@ -1,0 +1,116 @@
+==============================================================================
+KMail Helm chart release: {{ .Release.Name }} (namespace {{ .Release.Namespace }})
+Chart version: {{ .Chart.Version }} | App version: {{ .Chart.AppVersion }}
+==============================================================================
+
+POST-INSTALL CHECKLIST
+----------------------
+
+1. Verify the BFF reached steady state:
+
+     kubectl -n {{ .Release.Namespace }} rollout status deployment/{{ include "kmail.fullname" . }}-api --timeout=180s
+
+   Then probe /healthz on each replica:
+
+     kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/name={{ include "kmail.name" . }},app.kubernetes.io/component=api -o name | \
+       xargs -I{} kubectl -n {{ .Release.Namespace }} exec {} -- wget -qO- http://localhost:{{ .Values.kmailApi.service.targetPort }}/healthz
+
+2. Verify Stalwart is reachable via the StatefulSet:
+
+     kubectl -n {{ .Release.Namespace }} rollout status statefulset/{{ include "kmail.fullname" . }}-stalwart --timeout=300s
+
+
+==============================================================================
+MIGRATION NOTES (upgrading from < Phase A)
+==============================================================================
+
+Phase A landed two behavior changes that affect existing staging /
+production deployments. Confirm both before flipping live traffic.
+
+(1) OIDC FAIL-CLOSED (auth.go NewOIDC guard)
+--------------------------------------------
+
+In Phase A, the BFF now REFUSES TO BOOT in any non-development
+environment when KMAIL_KCHAT_OIDC_ISSUER (or bare KCHAT_OIDC_ISSUER)
+is empty. Previously, an empty issuer silently degraded the auth
+middleware to the unverified-JWT fallback path — a security
+regression. The new guard at internal/middleware/auth.go:NewOIDC
+makes the failure mode explicit.
+
+If your existing staging install relied on the silent fallback,
+this release WILL fail to start with:
+
+    fatal: KCHAT_OIDC_ISSUER (or KMAIL_KCHAT_OIDC_ISSUER) is required
+    in non-development environments; got empty value
+
+To migrate:
+
+  a) Set the issuer in your values.yaml override:
+
+       kmailApi:
+         config:
+           KMAIL_KCHAT_OIDC_ISSUER: "https://kchat.example.com"
+           KMAIL_KCHAT_OIDC_AUDIENCE: "kmail-prod"
+
+  b) OR, if you are still doing local development, set
+     KMAIL_ENV=development to keep the unverified-JWT fallback
+     enabled for the duration of dev work. The fallback IS NOT
+     available in any other KMAIL_ENV value.
+
+The chart's default `KMAIL_KCHAT_OIDC_ISSUER: ""` is INTENTIONAL —
+it forces a deliberate operator decision instead of pointing at a
+phantom URL. See values.yaml lines 125-137.
+
+(2) KMAIL_ENV NOT IN HELM CONFIGMAP (relies on Go default)
+-----------------------------------------------------------
+
+KMAIL_ENV is deliberately NOT set in the ConfigMap. The Go binary's
+default for KMAIL_ENV is `""` (empty), which the auth middleware
+maps to "production" semantics — the fail-closed default. If you
+ever want this chart to run in development mode (NOT recommended
+for any reachable-from-public-internet install), explicitly set:
+
+    kmailApi:
+      config:
+        KMAIL_ENV: "development"
+
+Note that `KMAIL_ENV: "dev"` is also recognized as a synonym
+(matching the docker-compose convention at docker-compose.yml).
+Anything else (including the empty string) selects fail-closed
+production semantics.
+
+(3) STALWART URL FOR mTLS
+-------------------------
+
+When `stalwart.mtls.enabled=true`, the deployment template injects
+a KMAIL_STALWART_URL override that points at the HTTPS listener
+(port 8443) with the configured serverName. This OVERRIDES the
+plain-HTTP URL in the ConfigMap — operators do NOT need to manually
+edit the ConfigMap URL when flipping mTLS on. See
+deployment-api.yaml:44-60 for the conditional injection.
+
+
+==============================================================================
+USEFUL DIAGNOSTICS
+==============================================================================
+
+* View the in-use config (with secrets redacted):
+
+    kubectl -n {{ .Release.Namespace }} exec deployment/{{ include "kmail.fullname" . }}-api -- \
+      wget -qO- http://localhost:{{ .Values.kmailApi.service.targetPort }}/debug/config
+
+* Stream BFF logs:
+
+    kubectl -n {{ .Release.Namespace }} logs -l app.kubernetes.io/component=api -f --tail=200
+
+* Inspect Stalwart admin UI (port-forward — admin auth required):
+
+    kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "kmail.fullname" . }}-stalwart 8080:8080
+
+* Force a Reloader-style rolling restart (if a referenced Secret /
+  ConfigMap rotated and Reloader is not installed):
+
+    kubectl -n {{ .Release.Namespace }} rollout restart deployment/{{ include "kmail.fullname" . }}-api
+
+For the full operational playbook see docs/DEVELOPMENT.md and
+docs/JMAP-CONTRACT.md in the kmail repo.
