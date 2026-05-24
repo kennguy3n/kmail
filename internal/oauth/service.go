@@ -557,7 +557,18 @@ func (s *Service) ExchangeAuthorizationCode(
 	}
 
 	var grantedScopes []string
-	_ = json.Unmarshal(scopesRaw, &grantedScopes)
+	// JSONB columns enforce well-formed JSON at the storage layer,
+	// so this scopesRaw is structurally guaranteed to decode. We
+	// still check the error to match the explicit-check pattern
+	// used in RefreshAccessToken (`service.go:709`) — a silent
+	// fallthrough to an empty slice would mint a zero-scope
+	// access token, which is the worst possible failure mode
+	// (call succeeds, caller has no scopes, every downstream
+	// resource access returns 403). Better to fail closed and
+	// surface the surprise.
+	if err := json.Unmarshal(scopesRaw, &grantedScopes); err != nil {
+		return nil, fmt.Errorf("oauth: decode granted_scopes from authorization_code: %w", err)
+	}
 
 	// Step 6: mint access + refresh tokens.
 	return s.mintTokens(ctx, client, codeUserID, grantedScopes, "" /* no parent refresh */)
@@ -981,7 +992,17 @@ func (s *Service) ValidateAccessToken(ctx context.Context, plaintextToken string
 		return nil, err
 	}
 	var scopes []string
-	_ = json.Unmarshal(scopesRaw, &scopes)
+	// Match the explicit-check pattern in RefreshAccessToken /
+	// ExchangeAuthorizationCode rather than silently swallowing
+	// a decode error. A token row whose `scopes` JSONB is
+	// somehow malformed (impossible given column-level JSONB
+	// validation, but defensive against e.g. a manual SQL edit
+	// in an incident shell) MUST fail closed so the caller gets
+	// 401 / ErrAccessTokenNotFound rather than a zero-scope
+	// access pass.
+	if err := json.Unmarshal(scopesRaw, &scopes); err != nil {
+		return nil, fmt.Errorf("oauth: decode access_token scopes: %w", err)
+	}
 	return &AccessTokenContext{
 		TokenID:   tokenID,
 		TenantID:  tenantID,

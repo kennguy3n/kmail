@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"html/template"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -96,12 +97,63 @@ type Handlers struct {
 	// crypto/rand-backed; tests can substitute a deterministic
 	// generator without resorting to runtime monkey-patching.
 	csrfNonce func() (string, error)
+
+	// logger records server-side errors that the RFC 6749 wire
+	// envelope intentionally hides from the client (database
+	// failures, unexpected service-layer errors mapped to
+	// `server_error/500` by `mapTokenError`). Without this hook
+	// the only observability for those failures would be the
+	// HTTP access log, which doesn't surface the underlying
+	// pgx / network / template error string. Defaults to
+	// `log.Default()` when nil so callers that forget to wire
+	// it still get errors on stderr. Settable via SetLogger.
+	logger *log.Logger
 }
 
 // SetSecureCookies marks all cookies set by this handler set
 // (currently just the CSRF cookie) as Secure. Call this in
 // production wiring; leave it off for local plaintext HTTP dev.
 func (h *Handlers) SetSecureCookies(secure bool) { h.secureCookies = secure }
+
+// SetLogger overrides the default `log.Default()` server-side
+// error sink. Production callers should wire this so the OAuth2
+// failures land in the same prefixed logger the rest of the BFF
+// uses; tests can leave it default or substitute a buffer-backed
+// logger to assert error-path observability.
+func (h *Handlers) SetLogger(logger *log.Logger) {
+	if logger == nil {
+		logger = log.Default()
+	}
+	h.logger = logger
+}
+
+// writeTokenError logs the underlying service-layer error
+// server-side (so a database / pgx / network failure is visible
+// in operator logs even though the wire envelope intentionally
+// hides it from the caller) and then writes the RFC 6749 wire
+// envelope through writeOAuthError. The endpoint hint is the
+// path being handled — useful for grep-narrowing logs to the
+// /oauth/token vs /oauth/revoke surface. Only 5xx envelopes log;
+// 4xx envelopes are client mistakes (wrong secret, expired
+// code, replay) that are signal in the access log, not the
+// error log.
+func (h *Handlers) writeTokenError(w http.ResponseWriter, endpoint string, err error) {
+	wireErr := mapTokenError(err)
+	if wireErr.HTTPStatus >= 500 {
+		h.serverLogger().Printf("oauth: %s server-side failure: %v", endpoint, err)
+	}
+	writeOAuthError(w, wireErr)
+}
+
+// serverLogger returns the configured logger, falling back to
+// the package-default if SetLogger was never called. Keeps the
+// nil check in one place rather than at every callsite.
+func (h *Handlers) serverLogger() *log.Logger {
+	if h.logger != nil {
+		return h.logger
+	}
+	return log.Default()
+}
 
 // NewHandlers constructs the HTTP handler set bound to a Service.
 // UserResolver MUST be wired before calling Authorize / Approve —
@@ -465,7 +517,7 @@ func (h *Handlers) handleAuthCodeGrant(w http.ResponseWriter, r *http.Request, c
 	}
 	resp, err := h.svc.ExchangeAuthorizationCode(r.Context(), client, code, redirectURI, codeVerifier)
 	if err != nil {
-		writeOAuthError(w, mapTokenError(err))
+		h.writeTokenError(w, "/oauth/token authorization_code", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, resp)
@@ -479,7 +531,7 @@ func (h *Handlers) handleRefreshGrant(w http.ResponseWriter, r *http.Request, cl
 	}
 	resp, err := h.svc.RefreshAccessToken(r.Context(), client, refreshToken)
 	if err != nil {
-		writeOAuthError(w, mapTokenError(err))
+		h.writeTokenError(w, "/oauth/token refresh_token", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, resp)
@@ -556,6 +608,12 @@ func (h *Handlers) Revoke(w http.ResponseWriter, r *http.Request) {
 			writeOAuthError(w, oerr)
 			return
 		}
+		// Server-side failure (DB / tx / context cancel). Log
+		// the underlying error before collapsing it to the
+		// generic 500 envelope so operators can grep the
+		// stderr stream to root-cause without exposing the
+		// detail to the caller.
+		h.serverLogger().Printf("oauth: /oauth/revoke server-side failure: %v", err)
 		writeOAuthError(w, &OAuthError{
 			Code:        ErrCodeServerError,
 			Description: "revocation failed",
