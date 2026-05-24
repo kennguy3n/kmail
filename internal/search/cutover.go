@@ -132,7 +132,11 @@ type CutoverStore interface {
 	// the bookkeeping eventually skews the cutover dashboard.
 	// Idempotent: rows already in another state are left alone.
 	// Returns the count of rows promoted so the worker can log it.
-	ReconcileCompleted(ctx context.Context, targetBackend string, before time.Time) (int64, error)
+	// `now` is the timestamp written to `completed_at` / `updated_at`
+	// — the worker passes `cfg.Now()` so the same injectable clock
+	// used by Claim/MarkCompleted/MarkFailed governs this path too,
+	// keeping integration tests deterministic.
+	ReconcileCompleted(ctx context.Context, targetBackend string, before, now time.Time) (int64, error)
 }
 
 // CutoverConfig parameterises the auto-cutover worker.
@@ -283,7 +287,7 @@ func (w *CutoverWorker) Tick(ctx context.Context) {
 	// promoted to `completed` before we scan for new candidates.
 	// Reconciliation failure is logged and ignored — the main
 	// cutover loop is independent of it.
-	if n, err := w.cfg.Store.ReconcileCompleted(ctx, BackendOpenSearch, now.Add(-w.cfg.ReconcileAfter)); err != nil {
+	if n, err := w.cfg.Store.ReconcileCompleted(ctx, BackendOpenSearch, now.Add(-w.cfg.ReconcileAfter), now); err != nil {
 		w.cfg.Logger.Printf("search.cutover: reconcile: %v", err)
 	} else if n > 0 {
 		w.cfg.Logger.Printf("search.cutover: reconcile: promoted %d stale in_progress rows to completed", n)
@@ -504,9 +508,11 @@ func (s *PostgresCutoverStore) MarkFailed(ctx context.Context, tenantID, reason 
 // ReconcileCompleted implements CutoverStore. The UPDATE joins
 // against `tenants.search_backend` so the promotion is gated on
 // the actual production state: only rows whose tenant is ALREADY
-// on `targetBackend` get promoted. `updated_at` is bumped to the
-// reconcile timestamp so the dashboard reflects the recovery.
-func (s *PostgresCutoverStore) ReconcileCompleted(ctx context.Context, targetBackend string, before time.Time) (int64, error) {
+// on `targetBackend` get promoted. `updated_at` is bumped to
+// `now` (caller-provided via `cfg.Now()`) so the dashboard
+// reflects the recovery and integration tests can drive a
+// deterministic clock.
+func (s *PostgresCutoverStore) ReconcileCompleted(ctx context.Context, targetBackend string, before, now time.Time) (int64, error) {
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE search_cutover_jobs j
 		   SET cutover_state = 'completed',
@@ -519,7 +525,7 @@ func (s *PostgresCutoverStore) ReconcileCompleted(ctx context.Context, targetBac
 		   AND j.cutover_state  = 'in_progress'
 		   AND j.updated_at     < $2
 		   AND t.search_backend = $1
-	`, targetBackend, before, time.Now().UTC())
+	`, targetBackend, before, now.UTC())
 	if err != nil {
 		return 0, err
 	}

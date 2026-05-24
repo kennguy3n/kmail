@@ -136,14 +136,13 @@ func (s *inMemoryCutoverStore) MarkFailed(_ context.Context, tenantID, reason st
 // ReconcileCompleted mirrors the production Postgres impl: walk
 // the rows, promote any `in_progress` row whose tenant is already
 // on `targetBackend` AND whose updated_at predates `before`. The
-// completion timestamp uses time.Now() to match the production
-// query (which uses NOW() so the dashboard reflects when the
-// reconciliation actually fired, not when the migration started).
-func (s *inMemoryCutoverStore) ReconcileCompleted(_ context.Context, targetBackend string, before time.Time) (int64, error) {
+// completion timestamp is the caller-supplied `now` so the test's
+// injected clock (CutoverConfig.Now) drives both the SQL path and
+// the in-memory test double identically.
+func (s *inMemoryCutoverStore) ReconcileCompleted(_ context.Context, targetBackend string, before, now time.Time) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var n int64
-	now := time.Now()
 	for tenantID, r := range s.rows {
 		if r.state != CutoverInProgress {
 			continue

@@ -363,9 +363,9 @@ func Load() (*Config, error) {
 			CoreSeatCents:       GetenvInt("KMAIL_BILLING_CORE_CENTS", 300),
 			ProSeatCents:        GetenvInt("KMAIL_BILLING_PRO_CENTS", 600),
 			PrivacySeatCents:    GetenvInt("KMAIL_BILLING_PRIVACY_CENTS", 900),
-			CorePerSeatBytes:    getenvInt64("KMAIL_BILLING_CORE_PERSEAT_BYTES", 5*1024*1024*1024),
-			ProPerSeatBytes:     getenvInt64("KMAIL_BILLING_PRO_PERSEAT_BYTES", 15*1024*1024*1024),
-			PrivacyPerSeatBytes: getenvInt64("KMAIL_BILLING_PRIVACY_PERSEAT_BYTES", 50*1024*1024*1024),
+			CorePerSeatBytes:    GetenvInt64("KMAIL_BILLING_CORE_PERSEAT_BYTES", 5*1024*1024*1024),
+			ProPerSeatBytes:     GetenvInt64("KMAIL_BILLING_PRO_PERSEAT_BYTES", 15*1024*1024*1024),
+			PrivacyPerSeatBytes: GetenvInt64("KMAIL_BILLING_PRIVACY_PERSEAT_BYTES", 50*1024*1024*1024),
 			QuotaWorkerInterval: getenvDuration("KMAIL_QUOTA_WORKER_INTERVAL", 5*time.Minute),
 			QuotaWorkerEnabled:  getenvBool("KMAIL_QUOTA_WORKER_ENABLED", false),
 		},
@@ -384,24 +384,11 @@ func Load() (*Config, error) {
 			LogFormat:      getenv("KMAIL_LOG_FORMAT", "text"),
 		},
 		Attachments: AttachmentsConfig{
-			ThresholdBytes: getenvInt64("KMAIL_ATTACHMENT_THRESHOLD_BYTES", 10*1024*1024),
+			ThresholdBytes: GetenvInt64("KMAIL_ATTACHMENT_THRESHOLD_BYTES", 10*1024*1024),
 			DefaultExpiry:  getenvDuration("KMAIL_ATTACHMENT_EXPIRY", 7*24*time.Hour),
 			BucketName:     getenv("KMAIL_ATTACHMENT_BUCKET", "kmail-attachments"),
 		},
 	}, nil
-}
-
-// getenvInt64 parses the named environment variable as an int64.
-func getenvInt64(key string, fallback int64) int64 {
-	v, ok := os.LookupEnv(key)
-	if !ok || v == "" {
-		return fallback
-	}
-	n, err := strconv.ParseInt(v, 10, 64)
-	if err != nil {
-		return fallback
-	}
-	return n
 }
 
 // getenv returns the value of the named environment variable or the

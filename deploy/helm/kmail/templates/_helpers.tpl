@@ -71,7 +71,18 @@ weighted/failover groupings stay stable across helm upgrades.
 {{- define "kmail.multiregionIngressAnnotations" -}}
 {{- $mr := .Values.multiregion -}}
 {{- if and $mr.enabled $mr.externalDNSProvider $mr.region $mr.domain $mr.globalHost -}}
-{{- $weight := default 100 $mr.dnsWeight -}}
+{{/*
+  dnsWeight handling: Go templates' `default` returns the fallback
+  for ANY zero value, including the integer 0. That collides with
+  `dnsWeight: 0` (the documented region-drain knob — see
+  `values.yaml`), so we resolve the value with an explicit
+  nil-check that preserves an explicit zero. The chart's default
+  weight (100) is applied only when dnsWeight is genuinely unset.
+*/}}
+{{- $weight := 100 -}}
+{{- if hasKey $mr "dnsWeight" -}}
+{{- $weight = $mr.dnsWeight -}}
+{{- end -}}
 external-dns.alpha.kubernetes.io/hostname: {{ printf "mail-%s.%s,%s" $mr.region $mr.domain $mr.globalHost | quote }}
 external-dns.alpha.kubernetes.io/set-identifier: {{ $mr.region | quote }}
 {{- if eq $mr.externalDNSProvider "aws" }}

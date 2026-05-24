@@ -439,8 +439,11 @@ func (b *RedisCircuitBreaker) keys(host string) (string, string) {
 // Open reports whether the breaker for `host` is currently tripped.
 // Fail-open semantics: if the Valkey call errors, we LOG and return
 // false so we don't take down the proxy when the breaker store is
-// unavailable. The local in-process breaker is still attached to the
-// proxy as a belt-and-braces guard when this mode is selected.
+// unavailable. There is no local in-process layer underneath this —
+// `Proxy.breaker` holds exactly one implementation at a time. The
+// fail-open return is the entire fallback story; if you need a
+// second guard, wrap this in a composite CircuitBreaker at wire-up
+// time in cmd/kmail-api/main.go (not done by default).
 func (b *RedisCircuitBreaker) Open(ctx context.Context, host string) bool {
 	b.ensureAllowScript()
 	failKey, openKey := b.keys(host)
