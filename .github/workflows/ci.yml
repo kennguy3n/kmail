@@ -81,16 +81,15 @@ jobs:
     #
     # BRANCH-PROTECTION NOTE: an entirely-skipped job reports neither
     # success nor failure to GitHub's status API — it is simply
-    # absent. If a future branch protection rule is added that
-    # REQUIRES the `Integration` status check, this absence will
-    # block fork PRs permanently. The right fix at that point is
-    # NOT to add a no-op fallback job (that defeats the protection),
-    # but to either (a) waive the check for fork-origin PRs via
-    # ruleset bypass, or (b) run the integration job on a beefier
-    # self-hosted runner that can absorb the Stalwart memory cost.
-    # Until branch protection is enabled, the silent skip is the
-    # right behaviour because a fork-PR OOM would surface as an
-    # ambiguous health-check failure that's hard to attribute.
+    # absent. To keep this skip safe for any future branch
+    # protection rule, the aggregate `ci-status` job at the bottom
+    # of this file is the canonical required check. It runs
+    # `if: always()`, depends on go/web/integration, and treats
+    # `integration.result == 'skipped'` as a pass (legitimate when
+    # the fork-skip condition fires). Branch protection rules
+    # should require `CI Status`, NOT the underlying `Integration`
+    # name. See the comment block above `ci-status` for the full
+    # rationale and the result matrix per PR origin.
     if: github.event.pull_request.head.repo.full_name == github.repository || github.event_name == 'push'
     timeout-minutes: 25
     env:
@@ -277,3 +276,75 @@ jobs:
       - name: docker compose down
         if: always()
         run: docker compose down -v --remove-orphans
+
+  # Aggregate guard job for branch protection. The `integration`
+  # job is intentionally skipped on fork-origin PRs (see the
+  # comment block above its `if:` — Stalwart's ~3GB memory
+  # envelope OOMs forked runners). A bare `Integration` required
+  # status check would therefore block every fork PR
+  # indefinitely, because GitHub treats a skipped job as
+  # *neither* pass nor fail — it is simply absent from the
+  # status API, and a required check that never reports cannot
+  # be marked green.
+  #
+  # The canonical fix is a single aggregate job (this one) that:
+  #   1. Depends on go / web / integration.
+  #   2. Runs `if: always()` so it executes even when integration
+  #      is skipped on forks (otherwise IT would inherit the
+  #      skip and the problem cascades upward).
+  #   3. Treats `integration.result == 'skipped'` as a pass —
+  #      legitimate when the fork-skip condition fired — but
+  #      `success` is the only acceptable result for go / web,
+  #      because nothing skips those.
+  #   4. Reports its own pass/fail to the status API.
+  #
+  # Branch protection then requires THIS job (`CI Status`), not
+  # the three underlying ones. Fork PRs report:
+  #   go: success, web: success, integration: skipped, ci-status: success
+  # main-repo PRs report:
+  #   go: success, web: success, integration: success, ci-status: success
+  # A real failure of any job correctly fails ci-status because
+  # the conditional below requires `!= 'failure'` AND
+  # `!= 'cancelled'` for every dependency.
+  #
+  # The bash arithmetic deliberately fails closed: any result
+  # the conditional doesn't recognise (a new GitHub result
+  # string) will be caught by the else-branch and reported as
+  # failure rather than silently passing.
+  ci-status:
+    name: CI Status
+    if: always()
+    needs: [go, web, integration]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify dependent job results
+        run: |
+          set -euo pipefail
+          go_result='${{ needs.go.result }}'
+          web_result='${{ needs.web.result }}'
+          integration_result='${{ needs.integration.result }}'
+          echo "go=${go_result} web=${web_result} integration=${integration_result}"
+          fail=0
+          # go and web have no skip path — anything other than
+          # 'success' must fail the aggregate.
+          if [[ "${go_result}" != "success" ]]; then
+            echo "::error::go job did not succeed (result=${go_result})"
+            fail=1
+          fi
+          if [[ "${web_result}" != "success" ]]; then
+            echo "::error::web job did not succeed (result=${web_result})"
+            fail=1
+          fi
+          # integration is legitimately skipped on fork-origin
+          # PRs by design. Treat 'success' OR 'skipped' as
+          # acceptable; anything else (failure, cancelled,
+          # unknown) fails the aggregate.
+          case "${integration_result}" in
+            success|skipped)
+              ;;
+            *)
+              echo "::error::integration job did not succeed or skip cleanly (result=${integration_result})"
+              fail=1
+              ;;
+          esac
+          exit ${fail}
