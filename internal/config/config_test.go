@@ -218,6 +218,38 @@ func TestConfigString_RedactsPassword(t *testing.T) {
 	}
 }
 
+// TestConfigString_RedactsValkeyDSNPassword pins the Phase D round-10
+// fix: now that ValkeyURL defaults to a full DSN format
+// (`redis://localhost:6379`) instead of a bare `host:port`, a
+// production override like `redis://user:s3cret@valkey:6379` would
+// leak credentials in the startup log unless `String()` routes
+// ValkeyURL through `redactDSN`. Symmetric coverage with the
+// DatabaseURL case above.
+func TestConfigString_RedactsValkeyDSNPassword(t *testing.T) {
+	cfg := &Config{
+		HTTP:        HTTPConfig{Addr: ":8088"},
+		DatabaseURL: "postgresql://kmail:dbpass@localhost:5432/kmail",
+		StalwartURL: "http://stalwart:8080",
+		ValkeyURL:   "redis://default:s3cret@valkey.svc:6379/0",
+	}
+	s := cfg.String()
+	if containsSubstring(s, "s3cret") {
+		t.Errorf("Config.String leaked Valkey password: %q", s)
+	}
+	// The host part of the DSN must still appear so operators can
+	// confirm the right endpoint was loaded.
+	if !containsSubstring(s, "valkey.svc:6379") {
+		t.Errorf("Config.String dropped Valkey host: %q", s)
+	}
+	// redactDSN is a no-op on a bare host:port — verify regression
+	// coverage so the rate-limiter Lua callers that hand-craft a
+	// `host:port` continue to see their value verbatim.
+	cfg.ValkeyURL = "valkey:6379"
+	if !containsSubstring(cfg.String(), "ValkeyURL=valkey:6379") {
+		t.Errorf("Config.String mangled bare host:port: %q", cfg.String())
+	}
+}
+
 func containsSubstring(s, sub string) bool {
 	if sub == "" {
 		return true

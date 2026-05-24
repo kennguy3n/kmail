@@ -499,7 +499,15 @@ func (c *Config) String() string {
 		c.HTTP.Addr,
 		redactDSN(c.DatabaseURL),
 		c.StalwartURL,
-		c.ValkeyURL,
+		// ValkeyURL is routed through redactDSN because the default
+		// format is now a full DSN (`redis://localhost:6379`), so a
+		// production override like `redis://user:pass@valkey:6379`
+		// would otherwise leak credentials into the startup log line.
+		// redactDSN is a no-op on bare `host:port` strings — it
+		// returns the original input when no `scheme://` prefix is
+		// present — so the rate-limiter Lua callers that still hand
+		// us a bare `host:port` see no change in logged output.
+		redactDSN(c.ValkeyURL),
 		c.KChatOIDCIssuer,
 		c.DevBypassToken != "",
 		c.ZKFabric.S3URL,
