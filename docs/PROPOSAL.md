@@ -287,7 +287,7 @@ ingestion) dominate.
 ```mermaid
 flowchart TD
     WebClient["React Web Client"]
-    MobileClient["React Native / Mobile Client"]
+    NativeClient["Rust SDK clients<br/>(iOS / Android / Desktop)"]
     ThirdParty["Thunderbird / Apple Mail / CalDAV clients"]
     ExternalMTA["External MTAs (Gmail, M365, etc.)"]
 
@@ -304,7 +304,7 @@ flowchart TD
     Valkey["Valkey / Redis<br/>(sessions, rate limits, short state)"]
 
     WebClient --> BFF
-    MobileClient --> BFF
+    NativeClient --> BFF
     ThirdParty --> Stalwart
     ExternalMTA --> Stalwart
 
@@ -324,8 +324,17 @@ flowchart TD
 
 ### 4.2 Component ownership
 
-- **React Web / Mobile Clients** — native KChat Mail and Calendar
-  UI. No separate "mail app"; mail lives as a pane inside KChat.
+- **React Web Client** — native KChat Mail and Calendar UI. No
+  separate "mail app"; mail lives as a pane inside KChat.
+- **Rust SDK clients (iOS / Android / Desktop)** — thin native
+  shells (Swift UI, Jetpack Compose, Electron + React) backed by
+  the shared `kmail-sdk` Rust workspace. The SDK owns JMAP
+  transport, offline SQLite cache + delta-pull sync, MLS-derived
+  Zero-Access Vault decryption, push token registration, and the
+  attachment blob cache. UniFFI generates the Swift / Kotlin
+  bindings; napi-rs generates the desktop Node-API addon. See
+  `docs/SDK.md` for the build pipeline and `ARCHITECTURE.md` §10
+  for the layered architecture.
 - **Go API Gateway / BFF** — the only client-facing HTTP surface for
   KChat clients. Speaks KChat auth, talks JMAP to Stalwart on behalf
   of the UI, enforces tenant policy, handles session and rate limit
@@ -402,12 +411,22 @@ operations, and the zk-object-fabric S3 API for blob-level concerns.
 
 ## 6. Rust Components
 
-- **Stalwart** — the only Rust component in Phase 1. Handles:
+- **Stalwart** — the server-side Rust core. Handles:
   - MIME parsing.
   - SMTP, IMAP, JMAP, CalDAV, CardDAV, WebDAV protocol handling.
   - Storage integration (PostgreSQL, zk-object-fabric S3, search,
     Valkey).
   - Sieve filtering, spam/phishing scoring.
+- **kmail-sdk** — the client-side Rust core, a Cargo workspace
+  under `sdk/` that compiles to:
+  - iOS static library + Swift package (UniFFI).
+  - Android shared library + Kotlin bindings (UniFFI).
+  - Node-API addon (`@kmail/sdk-native`) for the Electron desktop
+    client (napi-rs).
+  Owns the JMAP client protocol, offline SQLite cache with
+  delta-pull sync, MLS key derivation, AES-256-GCM Zero-Access
+  Vault decryption, push token registration, and attachment LRU
+  cache. Native shells are thin presentation layers.
 - **Future Rust, only after profiling** (tracked for Phase 3+):
   - MIME preprocessor for heavy inbound tenants.
   - Encryption / dedupe proxy in front of zk-object-fabric (if the
@@ -415,7 +434,6 @@ operations, and the zk-object-fabric S3 API for blob-level concerns.
   - Search ingestion pipeline (if Meilisearch ingest becomes the
     bottleneck).
   - Malware scanning adapter.
-  - Local sync agent for offline desktop clients.
 
 Go is the default server-side language. Rust is used where it
 materially moves the needle, not by default.

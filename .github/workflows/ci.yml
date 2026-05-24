@@ -64,6 +64,7 @@ jobs:
       web: ${{ steps.filter.outputs.web }}
       integration: ${{ steps.filter.outputs.integration }}
       helm: ${{ steps.filter.outputs.helm }}
+      sdk: ${{ steps.filter.outputs.sdk }}
       ci_workflows: ${{ steps.filter.outputs.ci_workflows }}
     steps:
       - uses: actions/checkout@v4
@@ -128,6 +129,17 @@ jobs:
             # and the template wouldn't get re-rendered.
             helm:
               - 'deploy/helm/**'
+            # The kmail-sdk Cargo workspace lives under `sdk/`. The
+            # job that runs `cargo test`/`clippy`/`fmt --check`
+            # depends on every Rust source file plus the workspace
+            # `Cargo.toml`/`Cargo.lock` and any napi / UniFFI
+            # build scaffolding under those crate roots. We
+            # deliberately do NOT include `apps/**` here because
+            # the platform shells live behind their own per-shell
+            # CI sweep (added in a follow-up workstream).
+            sdk:
+              - 'sdk/**'
+              - '.github/workflows/ci.yml'
             # When the workflow itself changes we re-run
             # everything so we can validate the new YAML
             # actually does what it claims. This is the
@@ -168,6 +180,66 @@ jobs:
 
       - name: make test
         run: make test
+
+  sdk:
+    name: SDK
+    needs: changes
+    # Same gating shape as the Go / Web jobs above:
+    #   1) the sdk path-filter said files changed,
+    #   2) the workflow itself changed (defence-in-depth so a CI
+    #      edit always re-runs everything that depends on it),
+    #   3) the run is a `push` to main (canonical full fan-out).
+    if: |
+      needs.changes.outputs.sdk == 'true' ||
+      needs.changes.outputs.ci_workflows == 'true' ||
+      github.event_name == 'push'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pin to the version the workspace was developed against.
+      # `dtolnay/rust-toolchain` is the canonical action — it
+      # installs rustup, the requested toolchain, and the named
+      # components atomically. `rustfmt` and `clippy` are mandatory
+      # for the lint steps below.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # `Swatinem/rust-cache` caches the registry + target dir
+      # keyed on the workspace `Cargo.lock`, which cuts a cold
+      # build (~3 min) down to ~30 seconds on subsequent runs.
+      # Scoped to the `sdk/` workspace so it doesn't collide
+      # with any future Rust workspaces elsewhere in the repo.
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sdk -> target
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        # `-D warnings` promotes every clippy warning to an error.
+        # The crates explicitly opt into `clippy::all` only (NOT
+        # `clippy::pedantic`) — see kmail-core/src/lib.rs for the
+        # rationale. Pedantic lints flip on stylistic rewrites
+        # that fight idiomatic Rust; we want correctness checks,
+        # not the linter dictating phrasing.
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace --all-targets
+
+      - name: cargo build (release sanity)
+        # A release build catches optimiser-only issues (overflow
+        # checks differ, dead-code elision differs, etc.). Cheap
+        # in CI thanks to the cargo cache above.
+        run: cargo build --workspace --release
 
   web:
     name: Web
@@ -483,7 +555,7 @@ jobs:
   ci-status:
     name: CI Status
     if: always()
-    needs: [changes, go, web, integration]
+    needs: [changes, go, web, sdk, integration]
     runs-on: ubuntu-latest
     steps:
       - name: Verify dependent job results
@@ -492,15 +564,17 @@ jobs:
           changes_result='${{ needs.changes.result }}'
           go_result='${{ needs.go.result }}'
           web_result='${{ needs.web.result }}'
+          sdk_result='${{ needs.sdk.result }}'
           integration_result='${{ needs.integration.result }}'
           go_changed='${{ needs.changes.outputs.go }}'
           web_changed='${{ needs.changes.outputs.web }}'
+          sdk_changed='${{ needs.changes.outputs.sdk }}'
           integration_changed='${{ needs.changes.outputs.integration }}'
           helm_changed='${{ needs.changes.outputs.helm }}'
           ci_workflows_changed='${{ needs.changes.outputs.ci_workflows }}'
           event='${{ github.event_name }}'
           ci_full_label='${{ contains(github.event.pull_request.labels.*.name, 'ci:full') }}'
-          echo "event=${event} changes=${changes_result} go=${go_result}/${go_changed} web=${web_result}/${web_changed} integration=${integration_result}/${integration_changed} helm=${helm_changed} ci_workflows=${ci_workflows_changed} ci_full_label=${ci_full_label}"
+          echo "event=${event} changes=${changes_result} go=${go_result}/${go_changed} web=${web_result}/${web_changed} sdk=${sdk_result}/${sdk_changed} integration=${integration_result}/${integration_changed} helm=${helm_changed} ci_workflows=${ci_workflows_changed} ci_full_label=${ci_full_label}"
 
           # If the changes-detection job itself didn't succeed,
           # every downstream job was skipped AND the filter
@@ -564,6 +638,7 @@ jobs:
 
           check_subsystem go "${go_result}" "${go_changed}" || fail=1
           check_subsystem web "${web_result}" "${web_changed}" || fail=1
+          check_subsystem sdk "${sdk_result}" "${sdk_changed}" || fail=1
 
           # Integration has an additional legitimate skip path:
           # fork-origin PRs. We can't tell at this layer whether

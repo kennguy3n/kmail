@@ -1,0 +1,27 @@
+[package]
+name = "kmail-cli"
+description = "Debug CLI for the KMail SDK. Drives KMailClient directly against a BFF for integration testing without bringing up an iOS / Android / Electron shell."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "kmail"
+path = "src/main.rs"
+
+[dependencies]
+kmail-core = { path = "../kmail-core" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "env-filter"] }
+clap = { version = "4.5", default-features = false, features = ["derive", "std", "color", "help", "usage", "error-context", "suggestions", "env"] }
+chrono = { workspace = true }
+tempfile = { workspace = true }
+
+[dev-dependencies]
+# unit tests reuse tempfile from the runtime dep above.
