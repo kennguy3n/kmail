@@ -80,7 +80,20 @@ spec:
     {{- $svc := .Values.stalwart.service.headlessName }}
     {{- $ns := .Release.Namespace }}
     {{- range $i, $_ := until (int .Values.stalwart.replicaCount) }}
+    {{/*
+      Emit ALL THREE per-pod DNS forms so an operator override
+      to KMAIL_STALWART_URL works regardless of which suffix
+      depth they happen to use:
+        - bare short name (cluster-internal, no namespace)
+        - intermediate `.svc` form (the Kubernetes-stable short
+          form most callers reach for first)
+        - full `.svc.cluster.local` FQDN (chart-generated default)
+      Omitting the middle form caused TLS handshake failures
+      with a non-obvious "x509: certificate is valid for ...
+      not ..." error.
+    */}}
     - {{ printf "%s-stalwart-%d.%s" $name $i $svc | quote }}
+    - {{ printf "%s-stalwart-%d.%s.%s.svc" $name $i $svc $ns | quote }}
     - {{ printf "%s-stalwart-%d.%s.%s.svc.cluster.local" $name $i $svc $ns | quote }}
     {{- end }}
   issuerRef:
