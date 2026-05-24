@@ -16,6 +16,16 @@ spec:
       labels:
         {{- include "kmail.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: api
+      {{- if .Values.mtls.enabled }}
+      annotations:
+        # When cert-manager rotates the underlying Secret the pod
+        # is restarted so the new keypair gets picked up. The
+        # Reloader controller (https://github.com/stakater/Reloader)
+        # is the recommended way to surface this; the annotation
+        # is a no-op if Reloader is not installed.
+        reloader.stakater.com/auto: "true"
+        secret.reloader.stakater.com/reload: "{{ include "kmail.fullname" . }}-stalwart-client-tls"
+      {{- end }}
     spec:
       serviceAccountName: {{ include "kmail.serviceAccountName" . }}
       {{- with .Values.kmailApi.topologySpreadConstraints }}
@@ -41,38 +51,64 @@ spec:
             - secretRef:
                 name: {{ include "kmail.secretName" . }}
           {{- /*
-            Two surfaces want to inject env vars into the kmail-api
-            container: the unconditional KMAIL_API_ADDR (so the
-            container's listen address is driven by the same value
-            as `containerPort` above and the Service `targetPort`),
-            and the conditional multi-region block (per-pod replica
-            routing). YAML forbids duplicate mapping keys, and Go's
-            parser (used by Helm AND by the kube-apiserver during
-            admission) silently drops all but the LAST `env:` it
-            sees, so the two blocks MUST live under a single `env:`
-            mapping. Putting them in two separate `env:` keys would
-            silently drop KMAIL_API_ADDR whenever multiregion is
-            enabled, leaving the binary on its in-source default
-            (`:8088`) while the Service targets the value of
-            `kmailApi.service.targetPort` — readiness probes would
-            then never succeed.
+            Three surfaces want to inject env vars into the kmail-api
+            container:
+              (1) the unconditional `KMAIL_API_ADDR` so the binary's
+                  listen address is templated from the same
+                  `kmailApi.service.targetPort` value that drives
+                  `containerPort` above and the Service `targetPort`
+                  — the three MUST agree or readiness probes fail
+                  silently;
+              (2) Phase A's mTLS block (BFF→Stalwart HTTPS over the
+                  cert-manager-issued client keypair); and
+              (3) Phase C's multi-region block (per-pod replica
+                  routing).
+            YAML forbids duplicate mapping keys, and Go's parser
+            (used by Helm AND by the kube-apiserver during admission)
+            silently drops all but the LAST `env:` it sees, so all
+            three blocks MUST live under a single `env:` mapping.
+            Because `KMAIL_API_ADDR` is unconditional, the `env:`
+            key itself is always emitted — Gatekeeper / Kyverno
+            policies that reject `env: null` are unaffected since
+            the key always has at least one child entry.
           */ -}}
           {{- $mr := .Values.multiregion }}
           {{- $needMR := and $mr.enabled (or $mr.region $mr.peerRegions $mr.valkeyReplicaURLs) }}
           env:
             # `KMAIL_API_ADDR` is NOT placed in the ConfigMap
-            # (`values.yaml: kmailApi.config`) because it must
-            # be derived from the same value the deployment uses
-            # for `containerPort` above. A static ConfigMap entry
-            # would let the two drift; this per-pod env keeps
-            # them in lock-step. The binary's in-source default
-            # is `:8088` (see `internal/config/config.go`) so a
-            # host-run BFF avoids the docker-compose 8080 host
-            # publish; in Kubernetes Stalwart is its own pod, so
-            # the BFF binds whatever this value says (`:8080` by
-            # default).
+            # (`values.yaml: kmailApi.config`) because it must be
+            # derived from the same value the deployment uses for
+            # `containerPort` above. A static ConfigMap entry would
+            # let the two drift; this per-pod env keeps them in
+            # lock-step. The binary's in-source default is `:8088`
+            # (see `internal/config/config.go`) so a host-run BFF
+            # avoids the docker-compose 8080 host publish; in
+            # Kubernetes Stalwart is its own pod, so the BFF binds
+            # whatever this value says (`:8080` by default).
             - name: KMAIL_API_ADDR
               value: ":{{ .Values.kmailApi.service.targetPort }}"
+            {{- if .Values.mtls.enabled }}
+            # When mTLS is enabled the BFF MUST speak HTTPS on
+            # Stalwart's `jmap-tls` listener (port 8443), and the
+            # hostname MUST be one of the SANs cert-manager baked
+            # into the server certificate (see stalwart-mtls.yaml).
+            # The .svc-only short form is NOT in the SAN list, so
+            # we override KMAIL_STALWART_URL here with the FQDN
+            # form. `env:` takes precedence over the ConfigMap
+            # value carried in envFrom.
+            - name: KMAIL_STALWART_URL
+              value: {{ printf "https://%s-stalwart-0.%s.%s.svc.cluster.local:8443" (include "kmail.fullname" .) .Values.stalwart.service.headlessName .Release.Namespace | quote }}
+            - name: KMAIL_STALWART_TLS_CERT
+              value: /etc/kmail/tls/stalwart-client/tls.crt
+            - name: KMAIL_STALWART_TLS_KEY
+              value: /etc/kmail/tls/stalwart-client/tls.key
+            - name: KMAIL_STALWART_TLS_CA
+              value: /etc/kmail/tls/stalwart-client/ca.crt
+            {{- with .Values.mtls.serverName }}
+            - name: KMAIL_STALWART_TLS_SERVER_NAME
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
             {{- if $needMR }}
             {{- with $mr.region }}
             - name: KMAIL_REGION
@@ -87,6 +123,12 @@ spec:
               value: {{ . | quote }}
             {{- end }}
             {{- end }}
+          {{- if .Values.mtls.enabled }}
+          volumeMounts:
+            - name: stalwart-client-tls
+              mountPath: /etc/kmail/tls/stalwart-client
+              readOnly: true
+          {{- end }}
           readinessProbe:
             httpGet:
               path: /readyz
@@ -101,3 +143,10 @@ spec:
             periodSeconds: 20
           resources:
             {{- toYaml .Values.kmailApi.resources | nindent 12 }}
+      {{- if .Values.mtls.enabled }}
+      volumes:
+        - name: stalwart-client-tls
+          secret:
+            secretName: {{ include "kmail.fullname" . }}-stalwart-client-tls
+            defaultMode: 0400
+      {{- end }}

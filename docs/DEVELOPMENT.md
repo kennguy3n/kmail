@@ -90,6 +90,128 @@ kmail-stalwart     Up (healthy)
 There is no setup wizard to walk through — `stalwart-init` runs
 the configuration for you. See §4 for what it does under the hood.
 
+Once the compose stack is up, start the Go BFF and the Vite dev
+server on your host. The BFF refuses to boot in production-shaped
+configurations (no JWKS issuer, or a dev bypass token wired in)
+unless `KMAIL_ENV=development` is exported, so the local shell
+needs the flag:
+
+```bash
+# In one shell — the Go BFF.
+export KMAIL_ENV=development                # unlocks unverified-JWT fallback + dev bypass
+export KMAIL_DEV_BYPASS_TOKEN=dev-token      # optional; only honoured when KMAIL_ENV=development
+go run ./cmd/kmail-api
+
+# In another shell — the React frontend.
+cd web && npm install && npm run dev
+```
+
+`KMAIL_ENV` defaults to `production` (see `internal/config/config.go`)
+so that a misconfigured deployment fails closed. Recognised values
+are `development`, `staging`, and `production`; the shorthand
+aliases `dev`, `stg`, and `prod` (matching the `docker-compose.yml`
+sidecar convention) are accepted and resolve to the canonical
+forms before any guard is evaluated. Anything else is treated as
+`production` and `NewOIDC` emits an operator-facing warning at
+startup.
+
+#### Migration note: OIDC fail-closed (production / staging)
+
+As of the Phase A hardening, `NewOIDC` refuses to construct when
+`KCHAT_OIDC_ISSUER` is empty *and* `KMAIL_ENV` is anything other
+than `development` / `dev`. Existing deployments that relied on
+the unverified-JWT fallback to boot will now fail with a startup
+error like:
+
+```
+NewOIDC: KCHAT_OIDC_ISSUER is required when KMAIL_ENV=%q
+```
+
+To migrate:
+
+1. Point `KCHAT_OIDC_ISSUER` (and `KMAIL_KCHAT_OIDC_ISSUER` in
+   the Helm ConfigMap) at the KChat OIDC issuer URL — the same
+   URL the KChat Authelia / Keycloak install advertises in its
+   `/.well-known/openid-configuration` document.
+2. Verify the JWKS endpoint is reachable from the BFF pods (the
+   chart's egress NetworkPolicy already allows DNS + the issuer
+   host).
+3. Re-roll the kmail-api deployment.
+
+There is no way to opt out of this check in staging or
+production — the dev bypass and unverified fallback are
+hard-locked behind `KMAIL_ENV=development`. This is intentional:
+both paths were authentication-bypass vectors before the Phase A
+fix. See `docs/JMAP-CONTRACT.md` "OIDC fail-closed" for the
+on-the-wire details.
+
+### Scaling Stalwart with mTLS enabled
+
+When `mtls.enabled=true` in the Helm values, the server
+certificate SANs are generated at template-render time from
+`stalwart.replicaCount` (see
+`deploy/helm/kmail/templates/stalwart-mtls.yaml`). Scaling the
+StatefulSet *without* a corresponding `helm upgrade` will leave
+the new replicas (e.g. `stalwart-2`, `stalwart-3`) presenting a
+certificate whose SAN list excludes their pod DNS names, and
+BFF→Stalwart handshakes to those pods will fail with `x509:
+certificate is valid for X, not Y`.
+
+The correct procedure is therefore:
+
+```bash
+# WRONG — leaves SAN list stale, new pods fail TLS handshake.
+kubectl scale statefulset/kmail-stalwart --replicas=4
+
+# RIGHT — re-renders Certificate resource, cert-manager reissues
+# with all four pod DNS names in the SAN list, Reloader restarts
+# the existing pods to pick up the new cert.
+helm upgrade kmail ./deploy/helm/kmail \
+  --reuse-values \
+  --set stalwart.replicaCount=4
+```
+
+The BFF logs a startup WARNING if it detects an mTLS + bare
+`.svc` hostname mismatch (see `internal/jmap/proxy.go`
+`NewProxy`), so a misconfigured override of `KMAIL_STALWART_URL`
+also surfaces immediately rather than after the first request.
+
+In production the BFF presents a client certificate to Stalwart
+(mTLS) instead of relying on a trusted-network header. The Helm
+chart wires this up via cert-manager; local dev keeps using
+plain HTTP against `http://localhost:8080`.
+
+### cert-manager Issuer must emit `ca.crt`
+
+The BFF reads its trust anchor from `/etc/kmail/tls/stalwart-client/ca.crt`
+(via `KMAIL_STALWART_TLS_CA`, set by
+`deploy/helm/kmail/templates/deployment-api.yaml`). The file is
+populated by cert-manager into the client-cert Secret — but only
+when the configured `Issuer` (or `ClusterIssuer`) actually
+provides the CA. Most in-cluster Issuers (`ca`, `vault`, `step-ca`,
+`selfsigned` with `isCA: true`) do; some external ACME Issuers do
+*not* attach a `ca.crt` key to the issued Secret.
+
+If the chosen Issuer does not emit `ca.crt`, the BFF will fail at
+startup with `cmk/jmap: open /etc/kmail/tls/stalwart-client/ca.crt:
+no such file or directory` from `caPoolLoader.load()` in
+`internal/jmap/proxy.go`. This is the intended fail-fast — there
+is no safe default for a trust anchor.
+
+Resolutions, in order of preference:
+
+1. **Switch to an Issuer that bundles the CA**, since trust-anchor
+   management belongs with cert-manager. Most production setups
+   use the in-cluster `ca` Issuer chained to a long-lived root.
+2. **Mount the CA bundle separately**: create a `ConfigMap`
+   holding the internal-PKI root, add it via Helm `extraVolumes` /
+   `extraVolumeMounts` at the same `/etc/kmail/tls/stalwart-client`
+   path. This is the operator-managed escape hatch when the
+   Issuer is fixed by external constraints (compliance, audit).
+
+Either approach yields the same on-disk contract; the BFF does
+not care how the file arrived.
+
 
 ## 4. Automated first-boot configuration
 

@@ -85,13 +85,30 @@ services:
       - valkey_data:/data
 
   # zk-object-fabric is the S3-compatible multi-tenant storage
-  # gateway KMail ships with in production. The `context` path
-  # points at a sibling checkout of kennguy3n/zk-object-fabric; the
-  # demo Dockerfile there builds a minimal gateway running the
-  # `local_fs_dev` provider and a pre-loaded `kmail-dev` tenant.
-  # Override with `image: ghcr.io/kennguy3n/zk-object-fabric:dev`
-  # once the registry publishes a pinned tag.
+  # gateway KMail ships with in production. Two surfaces consume
+  # this service:
+  #
+  #   1. Local dev (`make dev`): a sibling checkout of
+  #      kennguy3n/zk-object-fabric is built via `build.context`.
+  #      The demo Dockerfile there produces a minimal gateway
+  #      running the `local_fs_dev` provider with a pre-loaded
+  #      `kmail-dev` tenant.
+  #   2. CI (`.github/workflows/ci.yml` integration job, plus the
+  #      nightly `chaos.yml`): the runner only checks out the
+  #      kmail repo, so the sibling path doesn't exist. The
+  #      `image:` fallback below resolves the published GHCR tag
+  #      so `docker compose up` succeeds without the sibling
+  #      checkout. Compose prefers `image:` over `build:` when
+  #      the image already exists locally, and `docker compose
+  #      pull` (which both workflows run before `up`) populates
+  #      the local cache from GHCR.
+  #
+  # Pinned to `:dev` rather than a digest because the sibling
+  # repo is iterated in lockstep with kmail during the Phase E
+  # OAuth2 integration work — pin to a digest once the gateway
+  # surface is frozen for v1.
   zk-fabric:
+    image: ghcr.io/kennguy3n/zk-object-fabric:dev
     build:
       context: ../zk-object-fabric
     container_name: kmail-zk-fabric

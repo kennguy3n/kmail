@@ -13,6 +13,10 @@ spec:
   ports:
     - name: jmap
       port: 8080
+    {{- if .Values.mtls.enabled }}
+    - name: jmap-tls
+      port: 8443
+    {{- end }}
     - name: smtp
       port: 25
     - name: imap
@@ -37,6 +41,14 @@ spec:
       labels:
         {{- include "kmail.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: stalwart
+      {{- if .Values.mtls.enabled }}
+      # cert-manager rotates the underlying Secret in place. Pods
+      # are rotated by the Reloader controller so they pick up
+      # the new server keypair without manual intervention.
+      annotations:
+        reloader.stakater.com/auto: "true"
+        secret.reloader.stakater.com/reload: "{{ include "kmail.fullname" . }}-stalwart-server-tls"
+      {{- end }}
     spec:
       # `subdomain` pairs with the headless service name above so
       # each pod gets a stable DNS entry of the form
@@ -49,6 +61,10 @@ spec:
           ports:
             - name: jmap
               containerPort: 8080
+            {{- if .Values.mtls.enabled }}
+            - name: jmap-tls
+              containerPort: 8443
+            {{- end }}
             - name: smtp
               containerPort: 25
             - name: imap
@@ -56,8 +72,20 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
+            {{- if .Values.mtls.enabled }}
+            - name: server-tls
+              mountPath: /etc/stalwart/tls
+              readOnly: true
+            {{- end }}
           resources:
             {{- toYaml .Values.stalwart.resources | nindent 12 }}
+      {{- if .Values.mtls.enabled }}
+      volumes:
+        - name: server-tls
+          secret:
+            secretName: {{ include "kmail.fullname" . }}-stalwart-server-tls
+            defaultMode: 0400
+      {{- end }}
   volumeClaimTemplates:
     - metadata:
         name: data

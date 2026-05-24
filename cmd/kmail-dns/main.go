@@ -59,6 +59,7 @@ func main() {
 		Issuer:         cfg.KChatOIDCIssuer,
 		Audience:       cfg.KChatOIDCAudience,
 		DevBypassToken: cfg.DevBypassToken,
+		Env:            cfg.Env,
 		Pool:           pool,
 		Logger:         logger,
 	})

@@ -126,25 +126,54 @@ Zero-Access Vault folders. The BFF enforces:
   application-level JMAP `urn:ietf:params:jmap:error:unauthorized`
   error in the response body for in-session discovery.
 
+#### OIDC fail-closed (Phase A hardening)
+
+`NewOIDC` REQUIRES `KCHAT_OIDC_ISSUER` to be set when
+`KMAIL_ENV` is anything other than `development` (or its `dev`
+alias). Specifically:
+
+- `KMAIL_ENV` empty / `production` / `staging`: missing or empty
+  `KCHAT_OIDC_ISSUER` is fatal at startup. The unverified-JWT
+  fallback is disabled in this mode — every request MUST present
+  a token whose signature verifies against the JWKS.
+- `KMAIL_ENV=development` (or `dev`): the BFF tolerates a missing
+  issuer and falls back to decoding the bearer token without
+  signature verification, ONLY to make local development against
+  the docker-compose stack possible.
+
+Migration: an existing staging deployment that omitted the
+issuer must add it before upgrading. There is no toggle to
+opt out — both the unverified fallback and the
+`KMAIL_DEV_BYPASS_TOKEN` shortcut are authentication-bypass
+vectors and are locked behind the development gate by design.
+
 ### 3.2 BFF → Stalwart authentication
 
-- Stalwart is configured with OIDC as an authentication source and
-  accepts bearer tokens issued by the BFF's internal OIDC issuer,
-  not the client-facing KChat issuer.
-- Per request, the BFF mints a short-lived (60 s) internal service
-  token that carries:
-  - `sub`: the Stalwart account identifier for the authenticated
-    user (resolved from the tenant service — see §3.3).
-  - `tid`: the tenant identifier.
-  - `scope`: a pinned scope string that restricts the token to JMAP
-    data-plane operations (no admin operations).
-  - `act`: the acting KChat user ID (for audit correlation).
-- The token is signed by a BFF-owned key that Stalwart trusts via
-  JWKS discovery on the BFF's internal service endpoint.
-- **No password or long-lived credential is ever forwarded to
-  Stalwart.** This is what lets us rotate the BFF's signing key
-  without user-visible re-auth and keeps client-side credentials
-  out of Stalwart's log surface.
+- The BFF authenticates itself to Stalwart with a **mutual-TLS
+  client certificate** issued by the internal KMail PKI. Stalwart
+  is configured with `verify_client = required` and pins the
+  issuing CA, so any connection from a caller that cannot present
+  a valid client cert is dropped at the TLS handshake before any
+  HTTP layer runs.
+- The client certificate is provisioned by cert-manager on every
+  kmail-api pod (see `deploy/helm/kmail/templates/stalwart-mtls.yaml`).
+  Certificates have a 24-hour lifetime and are renewed automatically
+  8 hours before expiry; the Reloader controller restarts the pod
+  so it picks up the new keypair without manual intervention.
+- The acting tenant and user identity travel as headers
+  (`X-KMail-Tenant-Id`, `X-KMail-Kchat-User-Id`,
+  `X-KMail-Stalwart-Account-Id`) that Stalwart trusts **only**
+  because the TLS layer has already authenticated the caller as
+  the BFF. Stalwart applies no header trust to non-mTLS callers.
+- Per-user OIDC bearer tokens issued by KChat are stripped at the
+  proxy (`Authorization` header is deleted). The BFF is the
+  authentication boundary for end users; the mTLS handshake is
+  the BFF→Stalwart trust boundary. No password or long-lived
+  credential is ever forwarded to Stalwart.
+- The legacy trusted-network posture (Stalwart accepting the
+  identity headers from any source on the cluster network) is
+  removed for production; it is only acceptable in local compose
+  development where the upstream listens on plain HTTP.
 
 ### 3.3 KChat identity → Stalwart account resolution
 

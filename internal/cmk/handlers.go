@@ -68,14 +68,31 @@ func (h *Handlers) registerHSM(w http.ResponseWriter, r *http.Request) {
 	}
 	out, err := h.svc.RegisterHSMKey(r.Context(), tenantID, plan, in)
 	if err != nil {
-		status := http.StatusBadRequest
-		if errors.Is(err, ErrPlanNotEligible) {
-			status = http.StatusForbidden
-		}
-		writeError(w, status, err)
+		writeError(w, statusForHSMRegisterErr(err), err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, out)
+}
+
+// statusForHSMRegisterErr maps RegisterHSMKey errors to HTTP status
+// codes. Pulled out of the handler so the mapping is unit-testable
+// without standing up a Postgres pool. Distinguishes three classes:
+//
+//   - ErrPlanNotEligible: client-resolvable (upgrade plan)        -> 403
+//   - ErrEnvelopeNotConfigured: server config issue
+//     (KMAIL_SECRETS_KEY unset). A 400 would mislead the client
+//     into hunting for a payload bug; 503 signals "feature
+//     unavailable, retry after operator action."                  -> 503
+//   - everything else: payload / validation problem.              -> 400
+func statusForHSMRegisterErr(err error) int {
+	switch {
+	case errors.Is(err, ErrPlanNotEligible):
+		return http.StatusForbidden
+	case errors.Is(err, ErrEnvelopeNotConfigured):
+		return http.StatusServiceUnavailable
+	default:
+		return http.StatusBadRequest
+	}
 }
 
 func (h *Handlers) testHSM(w http.ResponseWriter, r *http.Request) {

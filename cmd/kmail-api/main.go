@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -46,6 +47,7 @@ import (
 	"github.com/kennguy3n/kmail/internal/sieve"
 	"github.com/kennguy3n/kmail/internal/sharedinbox"
 	"github.com/kennguy3n/kmail/internal/tenant"
+	"github.com/kennguy3n/kmail/internal/valkeyurl"
 	"github.com/kennguy3n/kmail/internal/vault"
 	"github.com/kennguy3n/kmail/internal/webhooks"
 )
@@ -77,6 +79,7 @@ func main() {
 		Issuer:         cfg.KChatOIDCIssuer,
 		Audience:       cfg.KChatOIDCAudience,
 		DevBypassToken: cfg.DevBypassToken,
+		Env:            cfg.Env,
 		Pool:           pool,
 		Logger:         logger,
 	})
@@ -103,13 +106,16 @@ func main() {
 		})
 	}
 	wrapAuthRL := func(h http.Handler) http.Handler {
-		wrapped := authMW.Wrap(h)
+		// Auth always sits at the outermost layer so 401s short
+		// out before the rate limiter ever consults Valkey. The
+		// rate limiter, when enabled, is inserted BETWEEN auth
+		// and the handler so the limiter can read tenant/user IDs
+		// from the context that auth populates.
+		inner := h
 		if rateLimiter != nil {
-			// Rate limit AFTER auth so tenant / user IDs are in
-			// context when the limiter consults Valkey.
-			wrapped = authMW.Wrap(rateLimiter.Wrap(h))
+			inner = rateLimiter.Wrap(h)
 		}
-		return wrapped
+		return authMW.Wrap(inner)
 	}
 
 	// Multi-tenant Stalwart shard routing — constructed early so
@@ -141,6 +147,43 @@ func main() {
 		malware.NewHandlers(malware.NewNoopScanner(), logger).Register(mux, authMW.Wrap)
 	}
 
+	// Surface partial mTLS configuration loudly. `Enabled()` only
+	// returns true when BOTH cert+key are set, so an operator that
+	// sets only one (or only CAFile / ServerName) would otherwise
+	// see the proxy silently fall through to plain HTTP with no
+	// hint at boot. `Validate()` reports the specific mismatch.
+	//
+	// In dev we log a warning so a developer mid-mTLS-setup
+	// doesn't get blocked from booting the BFF. In any non-dev
+	// environment (staging, production, or anything the auth
+	// middleware would treat as production by default) this is
+	// fatal — the alternative is a deployment that says it's
+	// running with mTLS in its config but actually talks plain
+	// HTTP to Stalwart, which is the misconfiguration the
+	// production-fail-closed rule exists to catch.
+	if err := cfg.StalwartMTLS.Validate(); err != nil {
+		if middleware.IsDevEnv(cfg.Env) {
+			logger.Printf("jmap proxy: WARNING partial mTLS config (dev): %v", err)
+		} else {
+			logger.Fatalf("jmap proxy: partial mTLS config in env=%q (fail-closed): %v", cfg.Env, err)
+		}
+	}
+	var stalwartTLS *jmap.ClientTLSConfig
+	if cfg.StalwartMTLS.Enabled() {
+		stalwartTLS = &jmap.ClientTLSConfig{
+			CertFile:   cfg.StalwartMTLS.CertFile,
+			KeyFile:    cfg.StalwartMTLS.KeyFile,
+			CAFile:     cfg.StalwartMTLS.CAFile,
+			ServerName: cfg.StalwartMTLS.ServerName,
+		}
+		logger.Printf("jmap proxy: mTLS to Stalwart enabled (cert=%s ca=%s server=%s)",
+			cfg.StalwartMTLS.CertFile, cfg.StalwartMTLS.CAFile, cfg.StalwartMTLS.ServerName)
+	} else if strings.HasPrefix(cfg.StalwartURL, "https://") {
+		// HTTPS without a client cert is a production-config bug.
+		// The proxy itself also logs a warning, but surfacing it
+		// here makes the misconfiguration obvious at boot.
+		logger.Printf("jmap proxy: WARNING StalwartURL is HTTPS but KMAIL_STALWART_TLS_CERT/KEY are unset \u2014 BFF will not authenticate to Stalwart")
+	}
 	// Valkey is consumed by deliverability, push, calendar reminders,
 	// the SLO tracker, AND the shared JMAP circuit breaker (Phase 5).
 	// Stand it up early so the breaker can share trip state across
@@ -155,18 +198,23 @@ func main() {
 	breakerCooldown := getenvDuration("KMAIL_BREAKER_COOLDOWN", 30*time.Second)
 	breakerWindow := getenvDuration("KMAIL_BREAKER_WINDOW", 60*time.Second)
 
-	// Route through `middleware.ParseValkeyURL` so both bare
-	// `host:port` (the legacy in-source default) AND a full DSN
-	// (`redis://valkey:6379` — the compose / Helm override format)
-	// are accepted. Without this,
-	// `redis.NewClient(&redis.Options{Addr: "redis://valkey:6379"})`
-	// stores the literal URL as the dial target and fails at first
-	// use, since `redis.Options.Addr` requires a bare `host:port`.
+	// `cfg.ValkeyURL` arrives in one of two wire forms the codebase
+	// accepts — a `redis://` / `rediss://` DSN (the Helm Secret
+	// default, also the only form that lets an operator point at
+	// managed Valkey/Redis with TLS) or a bare `host:port`
+	// (the docker-compose default and the in-tree dev convention).
+	// `redis.NewClient` only understands the bare form on
+	// `Options.Addr`, so route through `valkeyurl.Parse` to
+	// normalise both. Without this normalisation a Helm deployment
+	// shipping the chart's `redis://valkey:6379` Secret would try
+	// to resolve the literal string `redis://valkey` as a DNS name
+	// and fail at boot — the exact failure mode Phase A's PR #31
+	// was opened to close.
 	var valkeyClient *redis.Client
 	if cfg.ValkeyURL != "" {
-		opts, err := middleware.ParseValkeyURL(cfg.ValkeyURL)
+		opts, err := valkeyurl.Parse(cfg.ValkeyURL)
 		if err != nil {
-			logger.Fatalf("middleware.ParseValkeyURL: %v", err)
+			logger.Fatalf("valkey url %q: %v", cfg.ValkeyURL, err)
 		}
 		valkeyClient = redis.NewClient(opts)
 		// Release the connection pool on shutdown so the
@@ -184,8 +232,8 @@ func main() {
 	// reachable. cfg.ValkeyURL has a non-empty default
 	// ("redis://localhost:6379" since the Phase D port-layout flip;
 	// previously "valkey:6379" — both forms still parse via
-	// `middleware.ParseValkeyURL` for backward compatibility with
-	// any external caller that still hand-crafts the bare form)
+	// `valkeyurl.Parse` for backward compatibility with any
+	// external caller that still hand-crafts the bare form)
 	// so `valkeyClient != nil` is always true in practice — that's
 	// fine because the rest of the program's Valkey consumers
 	// (deliverability, push, calendar reminder, SLO tracker, ...)
@@ -243,14 +291,14 @@ func main() {
 	} else {
 		logger.Printf("jmap: shared circuit breaker disabled (KMAIL_VALKEY_URL unset); falling back to per-pod breaker")
 	}
-
 	proxy, err := jmap.NewProxy(jmap.ProxyConfig{
-		StalwartURL:          cfg.StalwartURL,
-		Pool:                 pool,
-		Logger:               logger,
-		Shards:               shardSvc,
-		PreDeliverHook:       malwareHook,
-		Breaker:              jmapBreaker,
+		StalwartURL:           cfg.StalwartURL,
+		Pool:                  pool,
+		Logger:                logger,
+		Shards:                shardSvc,
+		PreDeliverHook:        malwareHook,
+		TLS:                   stalwartTLS,
+		Breaker:               jmapBreaker,
 		CircuitBreakThreshold: breakerThreshold,
 		CircuitBreakCooldown:  breakerCooldown,
 		CircuitBreakWindow:    breakerWindow,
@@ -432,18 +480,36 @@ func main() {
 	})
 	push.NewHandlers(pushSvc, logger).Register(mux, authMW)
 
+	// kmail-secrets envelope. KMAIL_SECRETS_KEY is the single
+	// master key from which every BFF-side at-rest encryption key
+	// derives — DKIM private keys, TOTP shared secrets, recovery
+	// codes, HSM credentials. We load it exactly once, here, so
+	// the operational signal ("is the envelope wired up?") is
+	// logged once instead of three times, and so every consumer
+	// shares the same `*cmk.AESGCMEnvelope` value (cheaper, and
+	// makes future KMS-backed rotations a single swap).
+	secretsEnvelope, secretsEnvelopeErr := cmk.LoadEnvelope()
+	if secretsEnvelopeErr != nil {
+		// DKIM and TOTP fall back to plaintext-on-disk when the
+		// envelope is unset (the legacy behaviour, kept for dev).
+		// HSM credential registration is *refused* in this state by
+		// the `ErrEnvelopeNotConfigured` guard in cmk/hsm.go — the
+		// API will return 503 for HSM registration. Keep the log
+		// message honest about that asymmetry so an operator who
+		// reads only this line doesn't believe HSM credentials are
+		// silently stored plaintext.
+		logger.Printf("secrets: KMAIL_SECRETS_KEY unset (%v) — DKIM/TOTP secrets will be stored unwrapped, HSM registration will be refused (DEV ONLY)", secretsEnvelopeErr)
+		secretsEnvelope = nil
+	}
+
 	// DKIM rotation surface (Phase 7). Lives next to the DNS
 	// wizard so the wizard UI can show "rotation pending" rows
 	// when an admin has rolled a new selector but DNS hasn't
 	// caught up yet. The kmail-secrets envelope wraps freshly
-	// generated private keys before they hit dkim_keys; in dev
-	// (no KMAIL_SECRETS_KEY) the service logs a loud warning and
-	// stores plaintext PEM.
+	// generated private keys before they hit dkim_keys.
 	dkimSvc := dns.NewDKIMRotationService(pool, logger)
-	if env, err := cmk.LoadEnvelope(); err == nil {
-		dkimSvc = dkimSvc.WithEnvelope(env)
-	} else {
-		logger.Printf("dkim: KMAIL_SECRETS_KEY unset (%v) — DKIM private keys will be stored as plaintext PEM", err)
+	if secretsEnvelope != nil {
+		dkimSvc = dkimSvc.WithEnvelope(secretsEnvelope)
 	}
 	dns.NewDKIMHandlers(dkimSvc, logger).Register(mux, authMW)
 
@@ -542,16 +608,11 @@ func main() {
 	// usable from any authenticator app. The shared secret is
 	// wrapped by the kmail-secrets envelope; recovery codes are
 	// SHA-256 hashed.
-	envelope, err := cmk.LoadEnvelope()
-	if err != nil {
-		logger.Printf("totp: KMAIL_SECRETS_KEY not set — TOTP secrets stored unwrapped (DEV ONLY): %v", err)
-		envelope = nil
-	}
 	middleware.NewTOTPHandlers(middleware.TOTPConfig{
 		Pool:     pool,
 		Logger:   logger,
 		Issuer:   "KMail",
-		Envelope: envelope,
+		Envelope: secretsEnvelope,
 	}).Register(mux, authMW)
 
 	// Shared-inbox workflow state machine. The service was built
@@ -675,7 +736,14 @@ func main() {
 
 	// Phase 5 — Customer-managed keys (privacy plan only; the
 	// handler enforces the plan gate via a per-request lookup).
-	cmkSvc := cmk.NewCMKService(pool)
+	// The kmail-secrets envelope wraps HSM connection credentials
+	// (KMIP password, PKCS#11 PIN) at rest. We reuse the shared
+	// `secretsEnvelope` loaded above so KMAIL_SECRETS_KEY is the
+	// single master key for every BFF-side at-rest secret.
+	cmkSvc := cmk.NewCMKServiceWithEnvelope(pool, secretsEnvelope)
+	if secretsEnvelope == nil {
+		logger.Printf("cmk: KMAIL_SECRETS_KEY not set — HSM credential registration will be refused (set the env var to enable BYOC HSM)")
+	}
 	cmk.NewHandlers(cmkSvc, pool, logger).Register(mux, authMW)
 
 	// Phase 5 — Confidential Send portal. The public portal route

@@ -87,6 +87,7 @@ func runServe(ctx context.Context, logger *log.Logger, cfg *config.Config, pool 
 		Issuer:         cfg.KChatOIDCIssuer,
 		Audience:       cfg.KChatOIDCAudience,
 		DevBypassToken: cfg.DevBypassToken,
+		Env:            cfg.Env,
 		Pool:           pool,
 		Logger:         logger,
 	})
