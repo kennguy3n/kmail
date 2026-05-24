@@ -26,26 +26,28 @@ import (
 	"github.com/kennguy3n/kmail/internal/audit"
 	"github.com/kennguy3n/kmail/internal/billing"
 	"github.com/kennguy3n/kmail/internal/calendarbridge"
-	"github.com/kennguy3n/kmail/internal/contactbridge"
 	"github.com/kennguy3n/kmail/internal/chatbridge"
 	"github.com/kennguy3n/kmail/internal/cmk"
-	"github.com/kennguy3n/kmail/internal/config"
 	"github.com/kennguy3n/kmail/internal/confidentialsend"
+	"github.com/kennguy3n/kmail/internal/config"
+	"github.com/kennguy3n/kmail/internal/contactbridge"
 	"github.com/kennguy3n/kmail/internal/deliverability"
 	"github.com/kennguy3n/kmail/internal/dns"
 	"github.com/kennguy3n/kmail/internal/export"
+	"github.com/kennguy3n/kmail/internal/integrations"
 	"github.com/kennguy3n/kmail/internal/jmap"
 	"github.com/kennguy3n/kmail/internal/malware"
 	"github.com/kennguy3n/kmail/internal/middleware"
 	"github.com/kennguy3n/kmail/internal/migration"
 	"github.com/kennguy3n/kmail/internal/monitoring"
+	"github.com/kennguy3n/kmail/internal/oauth"
 	"github.com/kennguy3n/kmail/internal/onboarding"
 	"github.com/kennguy3n/kmail/internal/push"
 	"github.com/kennguy3n/kmail/internal/retention"
 	"github.com/kennguy3n/kmail/internal/scim"
 	"github.com/kennguy3n/kmail/internal/search"
-	"github.com/kennguy3n/kmail/internal/sieve"
 	"github.com/kennguy3n/kmail/internal/sharedinbox"
+	"github.com/kennguy3n/kmail/internal/sieve"
 	"github.com/kennguy3n/kmail/internal/tenant"
 	"github.com/kennguy3n/kmail/internal/valkeyurl"
 	"github.com/kennguy3n/kmail/internal/vault"
@@ -798,6 +800,56 @@ func main() {
 	webhookSvc := webhooks.NewService(pool)
 	webhooks.NewHandlers(webhookSvc, logger).Register(mux, authMW)
 	go webhooks.NewWorker(webhookSvc, logger).Run(ctx)
+
+	// Phase E #14 — OAuth2 authorization server for third-party
+	// integrations. Mounted at /api/v1/oauth/* (so all four
+	// endpoints: authorize / authorize/approve / token / revoke
+	// share a stable prefix). The user-JWT-aware resolver
+	// extracts the consenting user from the OIDC token attached
+	// by the BFF's existing auth chain; without it the consent
+	// screen has nothing to bind the access token to.
+	oauthSvc := oauth.NewService(pool)
+	oauthHandlers := oauth.NewHandlers(oauthSvc, func(r *http.Request) (userID, tenantID string, ok bool) {
+		// The consenting user is the kchat user authenticated by
+		// the BFF's OIDC chain (middleware.OIDC). That chain
+		// stashes (tenant_id, kchat_user_id) in the request
+		// context; both must be present — an OAuth2 consent
+		// without an authenticated user is meaningless.
+		uid := middleware.KChatUserIDFrom(r.Context())
+		tid := middleware.TenantIDFrom(r.Context())
+		if uid == "" || tid == "" {
+			return "", "", false
+		}
+		return uid, tid, true
+	})
+	// In production the consent CSRF cookie MUST be Secure;
+	// the local-dev path (KMAIL_ENV=development) serves plain
+	// HTTP so the Secure flag would suppress the cookie on the
+	// redirect.
+	oauthHandlers.SetSecureCookies(strings.ToLower(strings.TrimSpace(os.Getenv("KMAIL_ENV"))) != "development")
+	oauthHandlers.RegisterRoutes(mux, "/api/v1/oauth")
+
+	// Phase E #15-17 — Integration framework. Wraps webhookSvc
+	// with OAuth2-client scope filtering and per-client rate-
+	// limited dispatch. The boundary AuthMiddleware lives in
+	// the oauth package (verifies Bearer token against
+	// oauth_access_tokens, attaches AccessTokenContext).
+	oauthAuthMW := oauth.NewAuthMiddleware(oauthSvc)
+	integLimiterStore, err := middleware.NewRedisStore(cfg.ValkeyURL)
+	if err != nil {
+		log.Fatalf("integrations: build rate limiter store from KMAIL_VALKEY_URL: %v", err)
+	}
+	integSvc, err := integrations.NewService(integrations.ServiceConfig{
+		Pool:         pool,
+		Webhooks:     webhookSvc,
+		OAuth:        oauthSvc,
+		LimiterStore: integLimiterStore,
+		Logger:       logger,
+	})
+	if err != nil {
+		log.Fatalf("integrations: %v", err)
+	}
+	integrations.NewHandlers(integSvc, logger).Register(mux, oauthAuthMW)
 
 	// Phase 5 closeout — Onboarding checklist.
 	onboardingSvc := onboarding.NewService(pool)
