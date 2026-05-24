@@ -93,6 +93,28 @@ jobs:
           go-version: "1.25.x"
           cache: true
 
+      # The zk-fabric service in `docker-compose.yml` builds from
+      # a sibling-repo `build: context: ../zk-object-fabric` path
+      # (the canonical local-dev layout per docs/DEVELOPMENT.md).
+      # The CI runner only checks out the kmail repo, so the
+      # sibling path doesn't exist by default and `docker compose
+      # up` would fail with a `path not found` error. Clone the
+      # sibling at the path the compose file expects before any
+      # compose command runs. `actions/checkout` only writes into
+      # $GITHUB_WORKSPACE, so a direct `git clone` is the simplest
+      # way to land the repo at `../zk-object-fabric` (which
+      # resolves to $GITHUB_WORKSPACE/.. — outside the workspace
+      # but on the same runner volume). Pin to `main` for
+      # reproducibility without locking integration tests to a
+      # stale tag — a zk-object-fabric main breakage surfaces here
+      # as an integration failure, which is the correct signal.
+      - name: Clone zk-object-fabric sibling for compose build context
+        run: |
+          git clone --depth 1 --branch main \
+            https://github.com/kennguy3n/zk-object-fabric.git \
+            ../zk-object-fabric
+          ls -la ../zk-object-fabric | head -10
+
       # The compose stack runs Stalwart + Postgres + Valkey +
       # zk-fabric + Meilisearch + ClamAV in parallel; pulling them
       # up-front saves ~90s on the critical path versus letting
@@ -115,6 +137,7 @@ jobs:
         run: |
           set -e
           for c in kmail-zk-fabric-init kmail-stalwart-init; do
+            completed=0
             for i in $(seq 1 60); do
               status="$(docker inspect -f '{{.State.Status}}' "$c" 2>/dev/null || echo missing)"
               code="$(docker inspect -f '{{.State.ExitCode}}' "$c" 2>/dev/null || echo 0)"
@@ -122,6 +145,7 @@ jobs:
                 exited)
                   if [ "$code" = "0" ]; then
                     echo "$c completed cleanly"
+                    completed=1
                     break
                   fi
                   echo "$c exited with code $code" >&2
@@ -137,6 +161,19 @@ jobs:
                   ;;
               esac
             done
+            # If the inner loop ran out of iterations without
+            # observing an `exited` status, the init container
+            # never finished. Falling through silently here would
+            # let the rest of the workflow (migrations + e2e) run
+            # against an improperly-initialized stack, which is
+            # exactly the kind of failure mode that's hard to
+            # debug from a green CI run. Fail loud instead.
+            if [ "$completed" != "1" ]; then
+              final_status="$(docker inspect -f '{{.State.Status}}' "$c" 2>/dev/null || echo missing)"
+              echo "$c did not finish within 120s (final status=$final_status)" >&2
+              docker logs "$c" >&2 || true
+              exit 1
+            fi
           done
 
       - name: Apply migrations

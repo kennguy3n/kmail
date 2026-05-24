@@ -46,12 +46,17 @@
       "schedule": ["before 6am on monday"]
     },
     {
-      "description": "Stalwart is pinned per docs/STALWART_UPGRADE.md and must NEVER be auto-bumped. Upgrades require the blue/green soak procedure documented in that runbook.",
+      "description": "Stalwart is pinned per docs/STALWART_UPGRADE.md and must NEVER be auto-bumped. Upgrades require the blue/green soak procedure (scripts/test-stalwart-upgrade.sh + IP-reputation validation) documented in that runbook. Notifications stay enabled so security/CVE updates still surface, but PR creation requires explicit dependency-dashboard approval, automerge is off, and the resulting PRs are labelled so reviewers know they bypass the normal auto-merge flow.",
       "matchPackageNames": [
         "stalwartlabs/stalwart",
         "stalwartlabs/mail-server"
       ],
-      "enabled": false
+      "enabled": true,
+      "dependencyDashboardApproval": true,
+      "schedule": ["at any time"],
+      "automerge": false,
+      "prCreation": "approval",
+      "labels": ["dependencies", "stalwart", "manual-review-required"]
     },
     {
       "description": "Postgres and Valkey are state-bearing and must be vetted by hand. Disable major updates; allow minor/patch on a slow cadence.",
@@ -60,7 +65,7 @@
       "enabled": false
     },
     {
-      "description": "Pin Go module replacements that are runtime-critical to the BFF; do not bump them without a full integration sweep.",
+      "description": "Pin Go module replacements that are runtime-critical to the BFF; do not bump them without a full integration sweep. These three power the rate limiter (round-3), the sharded Postgres pool, and the LRU caches respectively. A major bump on any of them must go through manual review.",
       "matchManagers": ["gomod"],
       "matchPackageNames": [
         "github.com/redis/go-redis/v9",
@@ -68,8 +73,7 @@
         "github.com/hashicorp/golang-lru/v2"
       ],
       "matchUpdateTypes": ["major"],
-      "enabled": false,
-      "description2": "These three power the rate limiter (round-3), the sharded Postgres pool, and the LRU caches respectively. A major bump on any of them must go through manual review."
+      "enabled": false
     },
     {
       "description": "Group Go security patches and apply them immediately.",
