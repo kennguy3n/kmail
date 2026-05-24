@@ -52,36 +52,50 @@ fn runtime() -> &'static tokio::runtime::Runtime {
 // Error mapping
 // ---------------------------------------------------------------
 
+// NOTE on field naming: every variant uses `description` rather
+// than `message`. The natural-feeling `message` is a footgun in
+// the Kotlin binding — UniFFI 0.28's Kotlin code generator emits
+// each variant as a subclass of `kotlin.Exception` (which itself
+// inherits `Throwable.message: String?`) and a constructor field
+// named `message: String` shadows that supertype property,
+// producing duplicate-declaration compile errors. Using
+// `description` sidesteps the collision and reads naturally on
+// both bindings: `error.description` on Swift / Kotlin and the
+// usual `Throwable.message` virtual getter (formatted via the
+// `#[error("...")]` Display impl) is still available for log
+// messages. The napi binding constructs error strings from
+// `kmail_core::Error` directly (`sdk/kmail-napi/src/lib.rs::napi_err`)
+// and is unaffected by this field renaming.
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum KMailError {
-    #[error("local store error: {message}")]
-    Store { message: String },
-    #[error("transport error: {message}")]
-    Transport { message: String },
-    #[error("authentication failed: {message}")]
-    Auth { message: String },
-    #[error("forbidden: {message}")]
-    Forbidden { message: String },
-    #[error("not found: {message}")]
-    NotFound { message: String },
+    #[error("local store error: {description}")]
+    Store { description: String },
+    #[error("transport error: {description}")]
+    Transport { description: String },
+    #[error("authentication failed: {description}")]
+    Auth { description: String },
+    #[error("forbidden: {description}")]
+    Forbidden { description: String },
+    #[error("not found: {description}")]
+    NotFound { description: String },
     #[error("rate limited: retry after {retry_after_seconds}s")]
     RateLimit { retry_after_seconds: u64 },
     #[error("jmap method error [{code}]: {description}")]
     JmapMethod { code: String, description: String },
-    #[error("protocol error: {message}")]
-    Protocol { message: String },
+    #[error("protocol error: {description}")]
+    Protocol { description: String },
     #[error("http client error [{status}]: {body}")]
     HttpClient { status: u16, body: String },
     #[error("sync state diverged")]
     SyncStateDiverged,
-    #[error("decryption: {message}")]
-    Decryption { message: String },
-    #[error("key derivation: {message}")]
-    KeyDerivation { message: String },
-    #[error("keystore: {message}")]
-    KeyStore { message: String },
-    #[error("invalid argument: {message}")]
-    InvalidArgument { message: String },
+    #[error("decryption: {description}")]
+    Decryption { description: String },
+    #[error("key derivation: {description}")]
+    KeyDerivation { description: String },
+    #[error("keystore: {description}")]
+    KeyStore { description: String },
+    #[error("invalid argument: {description}")]
+    InvalidArgument { description: String },
     #[error("operation cancelled")]
     Cancelled,
 }
@@ -90,24 +104,24 @@ impl From<kmail_core::Error> for KMailError {
     fn from(value: kmail_core::Error) -> Self {
         use kmail_core::Error as E;
         match value {
-            E::Store(message) => KMailError::Store { message },
-            E::Transport(message) => KMailError::Transport { message },
-            E::Auth(message) => KMailError::Auth { message },
-            E::Forbidden(message) => KMailError::Forbidden { message },
-            E::NotFound(message) => KMailError::NotFound { message },
+            E::Store(description) => KMailError::Store { description },
+            E::Transport(description) => KMailError::Transport { description },
+            E::Auth(description) => KMailError::Auth { description },
+            E::Forbidden(description) => KMailError::Forbidden { description },
+            E::NotFound(description) => KMailError::NotFound { description },
             E::RateLimit {
                 retry_after_seconds,
             } => KMailError::RateLimit {
                 retry_after_seconds,
             },
             E::JmapMethod { code, description } => KMailError::JmapMethod { code, description },
-            E::Protocol(message) => KMailError::Protocol { message },
+            E::Protocol(description) => KMailError::Protocol { description },
             E::HttpClient { status, body } => KMailError::HttpClient { status, body },
             E::SyncStateDiverged => KMailError::SyncStateDiverged,
-            E::Decryption(message) => KMailError::Decryption { message },
-            E::KeyDerivation(message) => KMailError::KeyDerivation { message },
-            E::KeyStore(message) => KMailError::KeyStore { message },
-            E::InvalidArgument(message) => KMailError::InvalidArgument { message },
+            E::Decryption(description) => KMailError::Decryption { description },
+            E::KeyDerivation(description) => KMailError::KeyDerivation { description },
+            E::KeyStore(description) => KMailError::KeyStore { description },
+            E::InvalidArgument(description) => KMailError::InvalidArgument { description },
             E::Cancelled => KMailError::Cancelled,
         }
     }
@@ -119,7 +133,7 @@ impl From<tokio::task::JoinError> for KMailError {
             KMailError::Cancelled
         } else {
             KMailError::Transport {
-                message: format!("background task panicked: {value}"),
+                description: format!("background task panicked: {value}"),
             }
         }
     }
@@ -272,7 +286,7 @@ impl TryFrom<FfiAeadEnvelope> for AeadEnvelope {
     fn try_from(env: FfiAeadEnvelope) -> Result<Self, Self::Error> {
         if env.nonce.len() != kmail_core::crypto::NONCE_LEN {
             return Err(KMailError::InvalidArgument {
-                message: format!(
+                description: format!(
                     "AEAD nonce must be {} bytes, got {}",
                     kmail_core::crypto::NONCE_LEN,
                     env.nonce.len()
@@ -315,7 +329,7 @@ impl TryFrom<FfiConfidentialEnvelope> for ConfidentialEnvelope {
     fn try_from(env: FfiConfidentialEnvelope) -> Result<Self, Self::Error> {
         if env.kek_salt.len() != kmail_core::crypto::KEK_SALT_LEN {
             return Err(KMailError::InvalidArgument {
-                message: format!(
+                description: format!(
                     "Confidential KEK salt must be {} bytes, got {}",
                     kmail_core::crypto::KEK_SALT_LEN,
                     env.kek_salt.len()
@@ -665,7 +679,7 @@ impl KMailClientHandle {
     ) -> Result<(), KMailError> {
         let keywords: serde_json::Value =
             serde_json::from_str(&keywords_json).map_err(|e| KMailError::InvalidArgument {
-                message: format!("invalid keywords json: {e}"),
+                description: format!("invalid keywords json: {e}"),
             })?;
         self.inner.enqueue_set_keywords(&email_id, &keywords)?;
         Ok(())
@@ -674,7 +688,7 @@ impl KMailClientHandle {
     pub async fn send_email(&self, draft_json: String) -> Result<String, KMailError> {
         let draft: EmailDraft =
             serde_json::from_str(&draft_json).map_err(|e| KMailError::InvalidArgument {
-                message: format!("invalid draft json: {e}"),
+                description: format!("invalid draft json: {e}"),
             })?;
         let inner = self.inner.clone();
         let id = runtime()
@@ -1144,6 +1158,20 @@ mod tests {
     /// both `account_id` and `bootstrap_mailbox_role`; this test
     /// re-implements that ladder inline and asserts equivalence on
     /// every field for both the all-None and the all-Some inputs.
+    ///
+    /// **This test also covers the Kotlin/Android binding parity by
+    /// extension**: the Kotlin foreign code generated by UniFFI calls
+    /// the exact same `client_open` entry-point as the Swift code, so
+    /// the lowering ladder this test exercises is the ONE ladder
+    /// shared by every UniFFI consumer. A separate
+    /// `client_open_matches_kotlin_lowering_for_string_tier` would
+    /// just rename this test; the load-bearing Kotlin-specific
+    /// drift-prevention test lives on the Kotlin side at
+    /// `apps/android/kmail-sdk/src/test/.../KMailIntegrationTests.kt`
+    /// (`kotlinDefaultsMatchRustDefaults`), which checks that the
+    /// Kotlin `ClientConfiguration` data class sources its defaults
+    /// from `defaultClientConfig(...)` rather than hardcoded Kotlin
+    /// literals.
     #[test]
     fn client_open_matches_napi_lowering_for_string_tier() {
         // Re-implement the napi `client_open` lowering ladder (minus

@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Android manifest for the kmail-sdk library.
+
+    A library AAR's manifest is merged into the consuming app's
+    manifest at build time. We intentionally declare NOTHING here:
+
+    - No `<application>` tag (it would override the consumer's).
+    - No permissions (the SDK does network + filesystem I/O via
+      Rust; the consumer is responsible for declaring INTERNET,
+      WRITE_EXTERNAL_STORAGE etc. according to their target SDK).
+    - No `<uses-feature>` declarations.
+
+    Consumers SHOULD declare in their own manifest:
+
+        <uses-permission android:name="android.permission.INTERNET" />
+        <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    See `apps/android/README.md` for the full integration guide.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+</manifest>

@@ -421,7 +421,7 @@ public final class KMailClient {
     public func enqueueSetKeywords(emailID: String, keywords: [String: Bool]) throws {
         let json = try JSONEncoder().encode(keywords)
         guard let str = String(data: json, encoding: .utf8) else {
-            throw KMailError.InvalidArgument(message: "keywords dictionary did not encode to UTF-8")
+            throw KMailError.InvalidArgument(description: "keywords dictionary did not encode to UTF-8")
         }
         try handle.enqueueSetKeywords(emailId: emailID, keywordsJson: str)
     }
@@ -433,7 +433,7 @@ public final class KMailClient {
         let encoder = JSONEncoder()
         let data = try encoder.encode(draft)
         guard let json = String(data: data, encoding: .utf8) else {
-            throw KMailError.InvalidArgument(message: "EmailDraft did not encode to UTF-8")
+            throw KMailError.InvalidArgument(description: "EmailDraft did not encode to UTF-8")
         }
         return try await handle.sendEmail(draftJson: json)
     }

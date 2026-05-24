@@ -135,11 +135,13 @@ jobs:
             # `Cargo.toml`/`Cargo.lock` and any napi / UniFFI
             # build scaffolding under those crate roots. We
             # deliberately do NOT include `apps/**` here because
-            # each platform shell has its own per-shell CI workflow
-            # (e.g. `.github/workflows/sdk-build-ios.yml` for iOS,
-            # which builds the XCFramework on a macOS runner). The
-            # sdk job stays ubuntu-only so a pure apps/ios PR
-            # doesn't pay the macOS-runner cost twice.
+            # each platform shell has its own per-shell CI workflow:
+            # `.github/workflows/sdk-build-ios.yml` builds the
+            # XCFramework on a macOS runner, and
+            # `.github/workflows/sdk-build-android.yml` builds the
+            # AAR + jniLibs on a Linux runner with the Android NDK.
+            # The sdk job stays ubuntu-only so a pure apps/ios or
+            # apps/android PR doesn't pay the per-shell cost twice.
             sdk:
               - 'sdk/**'
               - '.github/workflows/ci.yml'

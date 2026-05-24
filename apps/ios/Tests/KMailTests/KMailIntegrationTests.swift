@@ -433,10 +433,10 @@ final class KMailIntegrationTests: XCTestCase {
     /// Sanity-check `KMailError.localizedDescription` for the
     /// common cases. Without `LocalizedError` conformance, Swift
     /// would render the error as something like
-    /// "kmail_ffi.KMailError.Store(message: …)" which is not
+    /// "kmail_ffi.KMailError.Store(description: …)" which is not
     /// user-presentable.
     func testKMailErrorLocalizedDescription() {
-        let store = KMailError.Store(message: "schema migration failed")
+        let store = KMailError.Store(description: "schema migration failed")
         XCTAssertEqual(
             store.localizedDescription, "KMail local store error: schema migration failed"
         )

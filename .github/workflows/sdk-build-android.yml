@@ -1,0 +1,252 @@
+name: SDK Android
+
+# Build + test the Android AAR on every PR that touches the
+# Rust SDK or the Gradle module. Linux runners are cheap; we
+# path-filter modestly so unrelated PRs (e.g. pure Go BFF
+# changes) don't pay the NDK install cost.
+#
+# This workflow is a separate file from `sdk-build-ios.yml`
+# (macOS runner) and `ci.yml` (the Go / Web / Rust-on-Ubuntu
+# workflow). Three reasons:
+#
+#   1. The Android NDK install step is large (~1 GB) and slow
+#      enough that it should NOT run on every PR — the
+#      path-filter avoids that on unrelated PRs.
+#   2. Branch protection in `ci.yml`'s `ci-status` aggregate is
+#      already complex; adding the Android job into that mix
+#      would force `ci.yml` to also know about the NDK install.
+#      By keeping Android as its own `SDK Android` check, the
+#      protection rule can be configured "required on Android-
+#      affecting PRs only" via the GitHub UI's path-rule support.
+#   3. Linux + macOS runners are different SKUs. Keeping the
+#      workflows separate lets each pick the right runner family.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      # Trigger when the Rust SDK changes — the per-ABI .so
+      # files are built from this source.
+      - 'sdk/**'
+      # The Gradle module itself.
+      - 'apps/android/**'
+      # The build script that produces the AAR. The path is
+      # technically a subset of `sdk/**` above, but we list it
+      # explicitly as a tripwire: if someone later narrows the
+      # `sdk/**` glob (e.g. to exclude `sdk/target/` or
+      # `sdk/scripts/`), this entry keeps the Android pipeline
+      # triggering on script edits.
+      - 'sdk/scripts/build-android-aar.sh'
+      # The workflow file itself (defence-in-depth so a CI edit
+      # always re-runs the build it gates).
+      - '.github/workflows/sdk-build-android.yml'
+
+# Cancel an in-flight run when a new commit lands on the same PR.
+# NDK installs are expensive — there's no value in finishing the
+# build of a stale commit.
+concurrency:
+  group: sdk-android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Build AAR + Host JVM Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    # Pin a single NDK version. r25c is the LTS that all four
+    # Android targets (aarch64, armv7, x86_64, i686) build
+    # against cleanly at the time of writing. Newer NDKs may
+    # break the bionic libc symbol table the Rust staticlibs
+    # link against on minSdk 26.
+    env:
+      NDK_VERSION: r25c
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # JDK 17 — required by AGP 8.x. Temurin is the same
+      # distribution used by the Android team's own CI templates.
+      - name: Install JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # Pin to the same toolchain the workspace was developed
+      # against. The Rust Android targets are added by the build
+      # script itself via `rustup target add` — we don't list
+      # them in `targets:` here because the script is the
+      # canonical place to manage the Android target list.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # Cache the cargo registry + target dir keyed on
+      # `sdk/Cargo.lock`. The Android cross-compile produces a
+      # target tree per architecture (~600 MiB total) so caching
+      # this cuts a cold build from ~10 min to ~2 min.
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sdk -> target
+          shared-key: android-staticlibs
+
+      # Install the Android NDK. `nttld/setup-ndk@v1` downloads
+      # the NDK from Google's CDN and exports ANDROID_NDK_HOME
+      # so the build script picks it up automatically. We pin
+      # the version env var above so a newer NDK release can't
+      # silently break the build.
+      - name: Install Android NDK ${{ env.NDK_VERSION }}
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          # Don't add the NDK to PATH — cargo-ndk reads it from
+          # the env var. Adding it to PATH would shadow the host
+          # toolchain in some downstream Gradle steps.
+          add-to-path: false
+
+      # Export the env vars the build script expects. The
+      # NDK setup action sets `ndk-path` in its `outputs`;
+      # mirror it to ANDROID_NDK_HOME so the script's auto-detect
+      # branch is not exercised (CI should always take the
+      # explicit path).
+      - name: Export ANDROID_NDK_HOME
+        run: |
+          echo "ANDROID_NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
+
+      # Install cargo-ndk. The action's binary install is the
+      # fastest path — `cargo install` would build from source
+      # and take ~3 min. The `taiki-e/install-action` mirror
+      # caches the prebuilt binary.
+      - name: Install cargo-ndk
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
+
+      # Print tooling versions for log triage. macos vs linux
+      # tooling drift is one of the most common CI failure
+      # causes; logs let us see the exact version at the time
+      # of the failure.
+      - name: Report tooling versions
+        run: |
+          rustc --version
+          cargo --version
+          cargo-ndk --version
+          java -version
+          gradle --version || true
+          ls -la "$ANDROID_NDK_HOME" | head -5
+
+      - name: Build AAR (cross-compile + Kotlin bindings + jniLibs)
+        run: ./sdk/scripts/build-android-aar.sh
+
+      # Sanity-check the assembled jniLibs layout. The script
+      # already produces a loud failure if a .so is missing, but
+      # a regression in cargo-ndk's output paths would still
+      # produce a structurally valid script that emits an empty
+      # jniLibs dir. Verify each ABI's .so is non-empty.
+      - name: Validate jniLibs layout
+        run: |
+          set -euo pipefail
+          MOD="apps/android/kmail-sdk/src/main/jniLibs"
+          for abi in arm64-v8a armeabi-v7a x86_64 x86; do
+            test -f "$MOD/$abi/libkmail_ffi.so" \
+              || (echo "missing $abi/libkmail_ffi.so" && exit 1)
+            size=$(stat -c '%s' "$MOD/$abi/libkmail_ffi.so")
+            # A stripped staticlib for kmail-ffi is ~3-6 MiB
+            # depending on the target. Anything under 100 KiB
+            # almost certainly means cargo-ndk produced an empty
+            # archive — fail loudly here rather than at AAR pack.
+            if [[ "$size" -lt 102400 ]]; then
+              echo "error: $abi/libkmail_ffi.so is only $size bytes (expected > 100KiB)"
+              exit 1
+            fi
+            echo "OK $abi: $size bytes"
+          done
+
+      # Sanity-check the uniffi-generated Kotlin source. If the
+      # symbols got stripped from the host cdylib, uniffi-bindgen
+      # would silently emit a file with no public API — catch
+      # that here before gradle build hits an empty source.
+      #
+      # uniffi-bindgen emits its output under
+      # `<srcRoot>/uniffi/<crate>/` (package `uniffi.kmail_ffi`).
+      # That path is set by uniffi-bindgen itself (not us); see
+      # the comment in `sdk/scripts/build-android-aar.sh` for
+      # the full reasoning.
+      - name: Verify generated Kotlin bindings exist
+        run: |
+          set -euo pipefail
+          GEN="apps/android/kmail-sdk/src/main/kotlin/uniffi/kmail_ffi"
+          test -d "$GEN" || (echo "missing $GEN" && exit 1)
+          # uniffi-bindgen 0.28 emits one .kt file per UDL crate.
+          # We assert at least one non-empty .kt file is present
+          # and that the file mentions our public API surface
+          # (KMailClientHandle is the central handle type the
+          # Kotlin facade wraps).
+          KT=$(find "$GEN" -name '*.kt' -type f | head -1)
+          test -n "$KT" || (echo "no .kt files generated under $GEN" && exit 1)
+          grep -q 'KMailClientHandle' "$KT" \
+            || (echo "generated Kotlin missing KMailClientHandle" && exit 1)
+          grep -q 'sealed class KMailException' "$KT" \
+            || grep -q 'class KMailException' "$KT" \
+            || (echo "generated Kotlin missing KMailException" && exit 1)
+          # Sanity-check the error-field rename (see the
+          # `NOTE on field naming` block in `sdk/kmail-ffi/src/lib.rs`)
+          # is reflected in the generated code. If a future change
+          # renamed the field back to `message`, the resulting
+          # generated code would not compile under Kotlin 1.9+ —
+          # fail loudly here instead.
+          grep -q '`description`: kotlin.String' "$KT" \
+            || (echo "generated Kotlin missing description field on error variants" && exit 1)
+
+      # The Gradle build does THREE things in one invocation:
+      #   1. Compile the Kotlin facade + uniffi-generated source.
+      #   2. Assemble the release AAR (packaging the jniLibs).
+      #   3. Run the host-JVM unit tests against the linux-x86_64
+      #      libkmail_ffi.so staged in build/host-jna/.
+      #
+      # `--no-daemon` is critical for CI: the Gradle daemon
+      # keeps a long-lived JVM alive that breaks the runner's
+      # post-step cleanup. `--warning-mode=summary` keeps the
+      # log readable.
+      - name: Gradle assemble + test
+        working-directory: apps/android
+        run: |
+          gradle :kmail-sdk:assembleRelease :kmail-sdk:test \
+            --no-daemon \
+            --warning-mode=summary
+
+      # Sanity-check the assembled AAR. The Gradle task already
+      # fails on packaging errors, but a future plugin regression
+      # could produce a structurally valid AAR with the wrong
+      # contents. Verify the AAR exists and that it bundles
+      # each of the four ABI .so files.
+      - name: Validate AAR contents
+        run: |
+          set -euo pipefail
+          AAR=$(find apps/android/kmail-sdk/build/outputs/aar -name 'kmail-sdk-release.aar')
+          test -n "$AAR" || (echo "no release AAR produced" && exit 1)
+          echo "Inspecting $AAR"
+          unzip -l "$AAR"
+          for abi in arm64-v8a armeabi-v7a x86_64 x86; do
+            if ! unzip -l "$AAR" | grep -q "jni/$abi/libkmail_ffi.so"; then
+              echo "error: AAR is missing jni/$abi/libkmail_ffi.so"
+              exit 1
+            fi
+            echo "OK AAR contains jni/$abi/libkmail_ffi.so"
+          done
+
+      - name: Upload AAR artifact
+        # On the main branch only, upload the AAR as a workflow
+        # artifact for downstream Maven publishing. PR builds
+        # skip this step to keep artifact storage usage bounded.
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: kmail-sdk-release-aar
+          path: apps/android/kmail-sdk/build/outputs/aar/kmail-sdk-release.aar
+          retention-days: 30
