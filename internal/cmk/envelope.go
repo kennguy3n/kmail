@@ -19,20 +19,40 @@
 //
 // Backwards-compatible read:
 //
-//	The magic prefix lets Unwrap distinguish three states cleanly:
+//	Unwrap is a four-state state machine. The magic prefix
+//	disambiguates the two unambiguous cases; AEAD auth on the
+//	old layout disambiguates the remaining two:
 //
 //	• Magic present + GCM auth OK   → plaintext, wasEncrypted=true.
 //	• Magic present + GCM auth fails → ERROR (corruption / wrong
 //	  key / tampered row). Callers must NOT silently fall through
 //	  to plaintext, which would surface raw ciphertext as if it
 //	  were a legacy plaintext credential.
-//	• Magic absent                  → legacy plaintext written
-//	  before the envelope landed; return as-is with
-//	  wasEncrypted=false. Callers WARN once per (tenant, config)
-//	  via warnLegacyPlaintextHSM so the migration is visible.
+//	• Magic absent  + old-format GCM auth OK → plaintext,
+//	  wasEncrypted=true. The blob was written by an EARLIER
+//	  revision of this envelope (no magic, layout = nonce||ct).
+//	  This preserves data continuity for any deployment that
+//	  encrypted DKIM keys or TOTP secrets before the magic
+//	  prefix was introduced.
+//	• Magic absent  + old-format GCM auth fails → legacy
+//	  plaintext written before the envelope landed; return as-is
+//	  with wasEncrypted=false. Callers WARN once per (tenant,
+//	  config) via warnLegacyPlaintextHSM so the migration is
+//	  visible.
+//
+// Note: the "magic-absent + auth-fails" case loses the
+// key-rotation safety guarantee that the magic prefix provides
+// for new-format blobs (because we cannot distinguish "wrong key
+// on old-format ciphertext" from "genuine legacy plaintext").
+// The window during which this matters is bounded: it ends as
+// soon as every old-format row has been read once and re-written
+// by Wrap, which produces a new-format blob. For deployments
+// that have NEVER written old-format ciphertext (i.e. they never
+// ran a pre-magic-prefix revision of this code), every read is
+// a new-format read and the key-rotation guarantee is exact.
 //
 // New writes always go through Wrap, so over time the database
-// settles into all-ciphertext.
+// settles into all-ciphertext with magic prefix.
 package cmk
 
 import (
@@ -125,33 +145,60 @@ func (e *AESGCMEnvelope) Wrap(plaintext []byte) ([]byte, error) {
 	return out, nil
 }
 
-// Unwrap reverses Wrap. The magic prefix lets us distinguish three
-// states cleanly (see package doc):
+// Unwrap reverses Wrap. It is a four-state state machine (see
+// package doc); the magic prefix disambiguates the two
+// unambiguous cases, and AEAD auth on the old layout
+// disambiguates the remaining two:
 //
-//   - Magic present + GCM auth OK   → returns plaintext, true, nil.
-//   - Magic present + GCM auth fails → returns nil, false,
+//   - Magic present + GCM auth OK     → returns plaintext, true, nil.
+//   - Magic present + GCM auth fails  → returns nil, false,
 //     ErrEnvelopeCorrupted. The likely cause is key rotation
 //     pointed at the previous epoch's rows; callers MUST surface
 //     this rather than silently returning ciphertext-as-plaintext.
-//   - Magic absent                  → legacy plaintext (written
-//     before the envelope landed); returns blob, false, nil so
-//     migration callers can warn once and continue.
+//   - Magic absent  + old-format auth OK → returns plaintext,
+//     true, nil. This is the data-continuity path for blobs
+//     written by an earlier revision of this envelope (no magic,
+//     layout = nonce||ct).
+//   - Magic absent  + old-format auth fails → returns blob, false,
+//     nil. Treated as legacy plaintext (written before the
+//     envelope landed) so migration callers can warn once and
+//     continue.
 func (e *AESGCMEnvelope) Unwrap(blob []byte) ([]byte, bool, error) {
-	if len(blob) < len(envelopeMagic) || !bytes.Equal(blob[:len(envelopeMagic)], envelopeMagic[:]) {
-		return blob, false, nil
-	}
-	body := blob[len(envelopeMagic):]
 	ns := e.aead.NonceSize()
-	if len(body) < ns+e.aead.Overhead() {
-		return nil, false, ErrEnvelopeCorrupted
+	ovh := e.aead.Overhead()
+
+	if len(blob) >= len(envelopeMagic) && bytes.Equal(blob[:len(envelopeMagic)], envelopeMagic[:]) {
+		// New format: magic || nonce || ciphertext.
+		body := blob[len(envelopeMagic):]
+		if len(body) < ns+ovh {
+			return nil, false, ErrEnvelopeCorrupted
+		}
+		nonce := body[:ns]
+		ct := body[ns:]
+		pt, err := e.aead.Open(nil, nonce, ct, nil)
+		if err != nil {
+			return nil, false, fmt.Errorf("%w: %v", ErrEnvelopeCorrupted, err)
+		}
+		return pt, true, nil
 	}
-	nonce := body[:ns]
-	ct := body[ns:]
-	pt, err := e.aead.Open(nil, nonce, ct, nil)
-	if err != nil {
-		return nil, false, fmt.Errorf("%w: %v", ErrEnvelopeCorrupted, err)
+
+	// Magic absent. Could be (a) pre-magic-prefix ciphertext
+	// written by an earlier revision of this envelope, or (b)
+	// genuine legacy plaintext that pre-dates the envelope.
+	// Attempt AEAD decrypt with the old layout (nonce at offset
+	// 0): on success it is (a) and we return the plaintext with
+	// wasEncrypted=true; on failure it is (b) and we return the
+	// blob as-is. The probability that random plaintext bytes
+	// pass GCM authentication is 2^-128, so the disambiguation
+	// is reliable.
+	if len(blob) >= ns+ovh {
+		nonce := blob[:ns]
+		ct := blob[ns:]
+		if pt, err := e.aead.Open(nil, nonce, ct, nil); err == nil {
+			return pt, true, nil
+		}
 	}
-	return pt, true, nil
+	return blob, false, nil
 }
 
 // NoopEnvelope is the dev fallback: wraps and unwraps as identity

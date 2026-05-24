@@ -209,6 +209,83 @@ func TestUnwrapHSMCredentials_LegacyMagicAbsentReturnsPassthrough(t *testing.T) 
 	}
 }
 
+// TestUnwrapHSMCredentials_OldFormatBlobReadable pins the round-8
+// data-continuity fix: blobs encrypted by an EARLIER revision of
+// this envelope used the old wire format (no magic prefix, just
+// nonce(12) || ciphertext_with_tag). The new Unwrap must continue
+// to decrypt those blobs so deployments that wrote encrypted DKIM
+// keys or TOTP secrets before the magic prefix was introduced
+// don't lose access to that data after upgrading.
+//
+// The test bypasses Wrap and constructs an old-format blob by
+// driving the underlying AEAD directly, then asserts that Unwrap
+// returns the original plaintext with wasEncrypted=true. Without
+// the data-continuity path in Unwrap, the magic-absent guard
+// would short-circuit and return the raw ciphertext bytes as
+// "legacy plaintext" — which is exactly the silent corruption the
+// round-8 review caught.
+func TestUnwrapHSMCredentials_OldFormatBlobReadable(t *testing.T) {
+	env := newTestEnvelope(t).(*AESGCMEnvelope)
+	s := &CMKService{envelope: env}
+
+	plaintext := []byte("kmip-user:pre-magic-secret")
+
+	// Build an old-format blob: nonce(12) || ciphertext_with_tag,
+	// no magic prefix. This is byte-for-byte what the pre-round-7
+	// Wrap implementation produced.
+	nonce := make([]byte, env.aead.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		t.Fatalf("read nonce: %v", err)
+	}
+	oldBlob := env.aead.Seal(nonce, nonce, plaintext, nil)
+
+	got, wasEnc, err := s.unwrapHSMCredentials(oldBlob)
+	if err != nil {
+		t.Fatalf("unwrapHSMCredentials on old-format blob: %v", err)
+	}
+	if !bytes.Equal(got, plaintext) {
+		t.Errorf("old-format plaintext mismatch: %q != %q", got, plaintext)
+	}
+	if !wasEnc {
+		t.Error("expected wasEncrypted=true for old-format ciphertext")
+	}
+}
+
+// TestUnwrapHSMCredentials_OldFormatWithWrongKeyTreatedAsPlaintext
+// documents the bounded loss of key-rotation safety on the
+// old-format path: when a magic-absent blob fails AEAD auth, we
+// cannot distinguish "wrong key on old-format ciphertext" from
+// "genuine legacy plaintext" — both look like a decrypt failure.
+// The defensible choice is to treat the blob as legacy plaintext
+// (return verbatim with wasEncrypted=false) so deployments that
+// never wrote old-format ciphertext continue to migrate cleanly.
+// Once every old-format row has been re-wrapped via Wrap, every
+// read goes through the magic-prefix path and the key-rotation
+// guarantee becomes exact again.
+func TestUnwrapHSMCredentials_OldFormatWithWrongKeyTreatedAsPlaintext(t *testing.T) {
+	envA := newTestEnvelope(t).(*AESGCMEnvelope)
+	envB := newTestEnvelope(t).(*AESGCMEnvelope) // different key
+
+	plaintext := []byte("kmip-user:pre-magic-secret")
+	nonce := make([]byte, envA.aead.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		t.Fatalf("read nonce: %v", err)
+	}
+	oldBlobUnderA := envA.aead.Seal(nonce, nonce, plaintext, nil)
+
+	s := &CMKService{envelope: envB}
+	got, wasEnc, err := s.unwrapHSMCredentials(oldBlobUnderA)
+	if err != nil {
+		t.Fatalf("unwrap with wrong key: %v", err)
+	}
+	if wasEnc {
+		t.Error("expected wasEncrypted=false for old-format blob under wrong key")
+	}
+	if !bytes.Equal(got, oldBlobUnderA) {
+		t.Error("expected verbatim passthrough for indistinguishable plaintext/ciphertext")
+	}
+}
+
 func TestWarnLegacyPlaintextHSM_DeduplicatesPerConfig(t *testing.T) {
 	var buf bytes.Buffer
 	s := &CMKService{envelope: newTestEnvelope(t)}
