@@ -53,7 +53,10 @@ npm run lint    # lint with eslint (config TBD)
 ## Dev server
 
 The Vite config proxies `/jmap` and `/.well-known/jmap` to
-`http://localhost:8080` (the local `kmail-api`). Adjust
+`http://localhost:8088` (the local `kmail-api`). Port `:8088` —
+not `:8080` — because Stalwart occupies host `:8080` in the
+docker-compose stack; see `internal/config/config.go`
+`HTTPConfig.Addr` for the full rationale. Adjust
 `vite.config.ts` if your BFF runs elsewhere.
 
 ## Phase 1 status

@@ -38,8 +38,11 @@
 # the init script writes over the admin API.
 #
 # zk-fabric is published on host ports 9080 (S3 API) and 9081
-# (console API) to avoid collision with the Go BFF (`kmail-api`) on
-# host 8080.
+# (console API) to avoid collision with Stalwart on host 8080. The
+# host-side Go BFF (`kmail-api`) binds `:8088` by default (see
+# `internal/config/config.go` `KMAIL_API_ADDR`) precisely so it can
+# run concurrently with Stalwart on `:8080`; vite proxies `/jmap`
+# to `http://localhost:8088`.
 
 services:
   postgres:
@@ -82,13 +85,30 @@ services:
       - valkey_data:/data
 
   # zk-object-fabric is the S3-compatible multi-tenant storage
-  # gateway KMail ships with in production. The `context` path
-  # points at a sibling checkout of kennguy3n/zk-object-fabric; the
-  # demo Dockerfile there builds a minimal gateway running the
-  # `local_fs_dev` provider and a pre-loaded `kmail-dev` tenant.
-  # Override with `image: ghcr.io/kennguy3n/zk-object-fabric:dev`
-  # once the registry publishes a pinned tag.
+  # gateway KMail ships with in production. Two surfaces consume
+  # this service:
+  #
+  #   1. Local dev (`make dev`): a sibling checkout of
+  #      kennguy3n/zk-object-fabric is built via `build.context`.
+  #      The demo Dockerfile there produces a minimal gateway
+  #      running the `local_fs_dev` provider with a pre-loaded
+  #      `kmail-dev` tenant.
+  #   2. CI (`.github/workflows/ci.yml` integration job, plus the
+  #      nightly `chaos.yml`): the runner only checks out the
+  #      kmail repo, so the sibling path doesn't exist. The
+  #      `image:` fallback below resolves the published GHCR tag
+  #      so `docker compose up` succeeds without the sibling
+  #      checkout. Compose prefers `image:` over `build:` when
+  #      the image already exists locally, and `docker compose
+  #      pull` (which both workflows run before `up`) populates
+  #      the local cache from GHCR.
+  #
+  # Pinned to `:dev` rather than a digest because the sibling
+  # repo is iterated in lockstep with kmail during the Phase E
+  # OAuth2 integration work — pin to a digest once the gateway
+  # surface is frozen for v1.
   zk-fabric:
+    image: ghcr.io/kennguy3n/zk-object-fabric:dev
     build:
       context: ../zk-object-fabric
     container_name: kmail-zk-fabric
@@ -142,7 +162,8 @@ services:
     #      domains, DKIM keys, …) lives inside the data store and
     #      is written by Stalwart's first-boot setup wizard, served
     #      from the `http-recovery` listener on container port 8080
-    #      (host port 18080).
+    #      (also published to host port 8080 — see the `ports:`
+    #      block below for the rationale on the matched mapping).
     #
     # `STALWART_RECOVERY_ADMIN` pins the bootstrap administrator to
     # a deterministic value so the setup wizard is reproducible
@@ -182,10 +203,10 @@ services:
       # built from the `hostname: localhost` + container-side
       # listener port by `HttpContext::resolve_response_url` in
       # v0.16.0) is directly reachable from a host browser. The Go
-      # BFF (`kmail-api`) historically binds host 8080 during local
-      # development — when running both concurrently, start the BFF
-      # with `--addr=127.0.0.1:8088` and update `web/vite.config.ts`
-      # to proxy `/jmap` there instead.
+      # BFF (`kmail-api`) now binds `:8088` by default (Phase D port
+      # migration in PR #34) so it runs concurrently with Stalwart
+      # without collision — no `--addr` override needed. `web/
+      # vite.config.ts` already proxies `/jmap` to `:8088`.
       - "8080:8080"
     environment:
       # Deterministic recovery admin — lets you log into the setup

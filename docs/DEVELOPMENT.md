@@ -408,12 +408,34 @@ browser is already on.
 
 ### Port 8080 conflict with the Go BFF
 
-The BFF historically binds host `:8080` during local development. For
-running both concurrently, start the BFF with
-`--addr=127.0.0.1:8088` and update `web/vite.config.ts`'s `/jmap`
-proxy target to `http://localhost:8088`. The BFF's internal Stalwart
-target stays `http://stalwart:8080` over the compose network —
-that's unaffected.
+The BFF defaults to `KMAIL_API_ADDR=:8088` (set in
+`internal/config/config.go`) so a host-run `go run ./cmd/kmail-api`
+does NOT collide with Stalwart, which `docker-compose.yml` publishes
+on host port 8080. The Vite dev server's `/jmap` proxy in
+`web/vite.config.ts` is already pointed at `http://localhost:8088`
+to match. If you override `KMAIL_API_ADDR` to bind a different port
+in your shell, update the Vite proxy target to match. The BFF's
+internal Stalwart target stays `http://stalwart:8080` over the
+compose network — that's unaffected.
+
+### Running the BFF on the host
+
+Because host port 8080 is taken by Stalwart in compose, the BFF
+binds `:8088` by default when run on the host. To start it
+alongside a running `docker compose up`:
+
+```
+go run ./cmd/kmail-api
+# listens on http://localhost:8088, proxies JMAP to
+# http://localhost:8080 (the compose-published Stalwart port).
+```
+
+If you want the BFF to listen on a different port set
+`KMAIL_API_ADDR=:9090` (or whatever) in your shell. The internal
+proxy target (`STALWART_URL`) defaults to `http://localhost:8080`
+which is the docker-compose host publish; inside compose,
+override it to `http://stalwart:8080` (the service name on the
+internal network).
 
 ### Setup wizard lost; want to reset the stack
 

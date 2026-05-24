@@ -37,8 +37,12 @@ func TestLoadReturnsDefaults(t *testing.T) {
 		t.Fatalf("Load: %v", err)
 	}
 
-	if cfg.HTTP.Addr != ":8080" {
-		t.Errorf("HTTP.Addr = %q, want :8080", cfg.HTTP.Addr)
+	// Default is :8088 (not :8080) so a host-run BFF doesn't
+	// collide with Stalwart, which docker-compose publishes on
+	// host port 8080. See config.go HTTPConfig.Addr comment for
+	// the full rationale.
+	if cfg.HTTP.Addr != ":8088" {
+		t.Errorf("HTTP.Addr = %q, want :8088", cfg.HTTP.Addr)
 	}
 	if cfg.HTTP.ReadHeaderTimeout != 10*time.Second {
 		t.Errorf("HTTP.ReadHeaderTimeout = %v, want 10s", cfg.HTTP.ReadHeaderTimeout)
@@ -250,7 +254,9 @@ func TestRedactDSN(t *testing.T) {
 
 func TestConfigString_RedactsPassword(t *testing.T) {
 	cfg := &Config{
-		HTTP:           HTTPConfig{Addr: ":8080"},
+		// Mirror the production default (`:8088`) so this test
+		// doesn't accidentally encode an obsolete port layout.
+		HTTP:           HTTPConfig{Addr: ":8088"},
 		DatabaseURL:    "postgresql://kmail:hunter2@localhost:5432/kmail",
 		StalwartURL:    "http://stalwart:8080",
 		ValkeyURL:      "valkey:6379",
@@ -268,6 +274,37 @@ func TestConfigString_RedactsPassword(t *testing.T) {
 	}
 }
 
+// TestConfigString_RedactsValkeyDSNPassword pins the Phase D round-10
+// fix: now that ValkeyURL defaults to a full DSN format
+// (`redis://localhost:6379`) instead of a bare `host:port`, a
+// production override like `redis://user:s3cret@valkey:6379` would
+// leak credentials in the startup log unless `String()` routes
+// ValkeyURL through `redactDSN`. Symmetric coverage with the
+// DatabaseURL case above.
+func TestConfigString_RedactsValkeyDSNPassword(t *testing.T) {
+	cfg := &Config{
+		HTTP:        HTTPConfig{Addr: ":8088"},
+		DatabaseURL: "postgresql://kmail:dbpass@localhost:5432/kmail",
+		StalwartURL: "http://stalwart:8080",
+		ValkeyURL:   "redis://default:s3cret@valkey.svc:6379/0",
+	}
+	s := cfg.String()
+	if containsSubstring(s, "s3cret") {
+		t.Errorf("Config.String leaked Valkey password: %q", s)
+	}
+	// The host part of the DSN must still appear so operators can
+	// confirm the right endpoint was loaded.
+	if !containsSubstring(s, "valkey.svc:6379") {
+		t.Errorf("Config.String dropped Valkey host: %q", s)
+	}
+	// redactDSN is a no-op on a bare host:port — verify regression
+	// coverage so the rate-limiter Lua callers that hand-craft a
+	// `host:port` continue to see their value verbatim.
+	cfg.ValkeyURL = "valkey:6379"
+	if !containsSubstring(cfg.String(), "ValkeyURL=valkey:6379") {
+		t.Errorf("Config.String mangled bare host:port: %q", cfg.String())
+	}
+}
 // TestStalwartMTLSConfig_Validate pins the partial-config detector
 // added so the proxy doesn't silently fall through to plain HTTP
 // when an operator sets KMAIL_STALWART_TLS_CERT without KEY (or

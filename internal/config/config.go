@@ -23,7 +23,12 @@ import (
 // All fields are populated from environment variables; defaults are
 // picked to match the local `docker-compose.yml` stack so `go run
 // ./cmd/kmail-api` against a bare `docker compose up` works without
-// additional configuration.
+// additional configuration. In particular `KMAIL_API_ADDR` defaults
+// to `:8088` (NOT `:8080`) because Stalwart's container port 8080 is
+// published to host port 8080 via the matched `8080:8080` mapping;
+// a host-run BFF therefore has to bind a different port to avoid a
+// `bind: address already in use` collision. The StalwartURL default
+// further down keeps the two halves consistent.
 type Config struct {
 	// HTTP controls the BFF HTTP listener.
 	HTTP HTTPConfig
@@ -231,7 +236,9 @@ type AuditConfig struct {
 // ZKFabricConfig is the connection surface for the zk-object-fabric
 // S3 gateway. In local compose the gateway is reachable at the
 // `zk-fabric` service name; host ports `9080` (S3) and `9081`
-// (console) avoid colliding with the BFF on `:8080`.
+// (console) avoid colliding with Stalwart on host `:8080` and with
+// the BFF on host `:8088` (see HTTPConfig.Addr for the rationale on
+// the BFF's :8088 default).
 type ZKFabricConfig struct {
 	// S3URL is the zk-object-fabric S3 endpoint for direct blob
 	// operations (presigned URLs, attachment links).
@@ -410,7 +417,13 @@ type HTTPConfig struct {
 func Load() (*Config, error) {
 	return &Config{
 		HTTP: HTTPConfig{
-			Addr:              getenv("KMAIL_API_ADDR", ":8080"),
+			// `:8088` (not `:8080`) so a host-run BFF doesn't collide
+			// with Stalwart, which `docker-compose.yml` publishes on
+			// host port 8080 (matched mapping; see the StalwartURL
+			// default below for the rationale). Override with
+			// `KMAIL_API_ADDR=:80` (etc.) in production where the BFF
+			// is the only process on the host.
+			Addr:              getenv("KMAIL_API_ADDR", ":8088"),
 			ReadHeaderTimeout: getenvDuration("KMAIL_API_READ_HEADER_TIMEOUT", 10*time.Second),
 			ShutdownTimeout:   getenvDuration("KMAIL_API_SHUTDOWN_TIMEOUT", 30*time.Second),
 		},
@@ -421,22 +434,49 @@ func Load() (*Config, error) {
 		// Helm-only override at deployment-api.yaml depends on the
 		// KMail-prefixed lookup landing here.
 		DatabaseURL: getenvKMail("DATABASE_URL", "postgresql://kmail:kmail@localhost:5432/kmail?sslmode=disable"),
-		// Stalwart's container port 8080 is published to host 18080
-		// in `docker-compose.yml` precisely so a host-run BFF
-		// (`go run ./cmd/kmail-api`) can reach it without colliding
-		// with the BFF's own :8080 listener. Inside compose, override
-		// this with `STALWART_URL=http://stalwart:8080`; in Kubernetes
-		// the Helm chart sets `KMAIL_STALWART_URL` (which wins over
-		// `STALWART_URL` per getenvKMail's lookup order) and is what
-		// switches the proxy from HTTP to HTTPS-with-mTLS.
-		StalwartURL: getenvKMail("STALWART_URL", "http://localhost:18080"),
+		// Stalwart's container port 8080 is published to host port
+		// 8080 in `docker-compose.yml` (the host port matches the
+		// container port so Stalwart's self-advertised OIDC issuer
+		// URL `http://localhost:8080` is browser-reachable). A
+		// host-run BFF (`go run ./cmd/kmail-api`) must therefore
+		// bind to a non-8080 port — by convention `:8088`; see
+		// `docs/DEVELOPMENT.md` "Running the BFF on the host".
+		// Inside compose, override this default with
+		// `STALWART_URL=http://stalwart:8080` (the service name,
+		// not the published host port).
+		//
+		// Routed through `getenvKMail` (introduced by Phase A) so
+		// the Helm chart's `KMAIL_STALWART_URL` override — set by
+		// the mTLS template — actually reaches the binary. Without
+		// the two-step `KMAIL_<KEY>` → `<KEY>` lookup, the chart
+		// would silently fall back to plain HTTP.
+		StalwartURL: getenvKMail("STALWART_URL", "http://localhost:8080"),
+		// mTLS toggle for the BFF→Stalwart transport. All four
+		// fields are intentionally read with plain `getenv` (not
+		// `getenvKMail`) because they are brand-new variables
+		// introduced by Phase A: there is no legacy bare-name form
+		// to migrate from, so the two-step lookup would only add
+		// noise. The Helm chart sets the `KMAIL_`-prefixed form
+		// directly; docker-compose / local dev keep mTLS disabled
+		// by leaving these unset.
 		StalwartMTLS: StalwartMTLSConfig{
 			CertFile:   getenv("KMAIL_STALWART_TLS_CERT", ""),
 			KeyFile:    getenv("KMAIL_STALWART_TLS_KEY", ""),
 			CAFile:     getenv("KMAIL_STALWART_TLS_CA", ""),
 			ServerName: getenv("KMAIL_STALWART_TLS_SERVER_NAME", ""),
 		},
-		ValkeyURL:         getenvKMail("VALKEY_URL", "valkey:6379"),
+		// `redis://localhost:6379` (full DSN with scheme) so a
+		// host-run BFF reaches the compose-published valkey on
+		// `6379:6379`. Inside compose, override with
+		// `VALKEY_URL=redis://valkey:6379` (the service name) —
+		// which docker-compose.yml already does. Both forms route
+		// through `valkeyurl.Parse` so a bare `host:port` continues
+		// to work for callers that still hand-craft one.
+		//
+		// Routed through `getenvKMail` for the same Helm-prefix
+		// reason as `StalwartURL` above — the chart's Secret uses
+		// `KMAIL_VALKEY_URL`.
+		ValkeyURL:         getenvKMail("VALKEY_URL", "redis://localhost:6379"),
 		KChatOIDCIssuer:   getenvKMail("KCHAT_OIDC_ISSUER", ""),
 		KChatOIDCAudience: getenvKMail("KCHAT_OIDC_AUDIENCE", ""),
 		DevBypassToken:    getenv("KMAIL_DEV_BYPASS_TOKEN", ""),
@@ -450,7 +490,10 @@ func Load() (*Config, error) {
 		ZKFabric: ZKFabricConfig{
 			// Host-mapped defaults match docker-compose.yml, which
 			// publishes zk-fabric on host `:9080` (S3) and `:9081`
-			// (console) to avoid collision with the BFF on :8080.
+			// (console). These are chosen to avoid collision with
+			// Stalwart on host `:8080` (matched 8080:8080 publish)
+			// AND with the BFF on host `:8088` (see HTTPConfig.Addr
+			// for the rationale on the BFF's :8088 default).
 			// Inside compose, override with
 			// `ZK_FABRIC_S3_URL=http://zk-fabric:8080`; the Helm chart
 			// uses the `KMAIL_`-prefixed forms via getenvKMail.
@@ -616,7 +659,15 @@ func (c *Config) String() string {
 		c.HTTP.Addr,
 		redactDSN(c.DatabaseURL),
 		c.StalwartURL,
-		c.ValkeyURL,
+		// ValkeyURL is routed through redactDSN because the default
+		// format is now a full DSN (`redis://localhost:6379`), so a
+		// production override like `redis://user:pass@valkey:6379`
+		// would otherwise leak credentials into the startup log line.
+		// redactDSN is a no-op on bare `host:port` strings — it
+		// returns the original input when no `scheme://` prefix is
+		// present — so the rate-limiter Lua callers that still hand
+		// us a bare `host:port` see no change in logged output.
+		redactDSN(c.ValkeyURL),
 		c.KChatOIDCIssuer,
 		c.DevBypassToken != "",
 		c.ZKFabric.S3URL,

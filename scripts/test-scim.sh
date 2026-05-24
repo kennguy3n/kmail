@@ -12,7 +12,7 @@
 # Usage:
 #   scripts/test-scim.sh [BASE_URL]
 #
-#   BASE_URL defaults to http://localhost:8080 (matches the local
+#   BASE_URL defaults to http://localhost:8088 (matches the local
 #   compose stack BFF). Override via `KMAIL_API_URL` env or first
 #   positional arg.
 #
@@ -20,7 +20,7 @@
 
 set -euo pipefail
 
-BASE_URL="${1:-${KMAIL_API_URL:-http://localhost:8080}}"
+BASE_URL="${1:-${KMAIL_API_URL:-http://localhost:8088}}"
 ADMIN_BEARER="${KMAIL_DEV_BYPASS_TOKEN:-kmail-dev}"
 TENANT_NAME="${SCIM_TEST_TENANT_NAME:-scim-test-$(date +%s)}"
 

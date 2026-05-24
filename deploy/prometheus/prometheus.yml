@@ -15,8 +15,11 @@ scrape_configs:
     metrics_path: /metrics
     # The BFF runs on the host during `make dev`; from inside the
     # compose network Prometheus reaches it via the Docker host
-    # gateway. In production the static_config becomes a proper
-    # service-discovery entry.
+    # gateway. The port matches the BFF's default `KMAIL_API_ADDR`
+    # (`:8088`) — host port 8080 is taken by Stalwart in compose,
+    # so the BFF binds elsewhere on the host (see
+    # internal/config/config.go HTTPConfig.Addr). In production
+    # the static_config becomes a proper service-discovery entry.
     static_configs:
       - targets:
-          - "host.docker.internal:8080"
+          - "host.docker.internal:8088"

@@ -229,7 +229,11 @@ func main() {
 	}
 
 	// Choose the breaker impl based on whether Valkey is actually
-	// reachable. cfg.ValkeyURL has a non-empty default ("valkey:6379")
+	// reachable. cfg.ValkeyURL has a non-empty default
+	// ("redis://localhost:6379" since the Phase D port-layout flip;
+	// previously "valkey:6379" — both forms still parse via
+	// `valkeyurl.Parse` for backward compatibility with any
+	// external caller that still hand-crafts the bare form)
 	// so `valkeyClient != nil` is always true in practice — that's
 	// fine because the rest of the program's Valkey consumers
 	// (deliverability, push, calendar reminder, SLO tracker, ...)

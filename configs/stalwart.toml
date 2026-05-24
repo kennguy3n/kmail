@@ -108,8 +108,11 @@ enable = false
 # Protocol listeners
 # ---------------------------------------------------------------
 # Container-internal ports. The compose file publishes 25/465/587
-# (SMTP), 143/993 (IMAP) to the host and maps Stalwart's internal
-# JMAP 8080 to host 18080 to avoid colliding with the Go BFF.
+# (SMTP), 143/993 (IMAP) to the host and Stalwart's internal JMAP
+# 8080 to host port 8080 (matched mapping so Stalwart's self-
+# advertised OIDC issuer URL is browser-reachable). A host-run
+# Go BFF must therefore bind a non-8080 port — `:8088` by
+# convention; see `docs/DEVELOPMENT.md`.
 
 [server.listener."smtp"]
 protocol = "smtp"

@@ -67,8 +67,12 @@ bench:
 	./scripts/bench/bench-caldav.sh $(BENCH_CALDAV_N)
 
 # e2e runs scripts/test-e2e.sh against the running compose stack.
-# Override KMAIL_API_URL to point at a remote BFF.
-KMAIL_API_URL ?= http://localhost:8080
+# Override KMAIL_API_URL to point at a remote BFF. The default is
+# `:8088` because Stalwart occupies host `:8080` (matched
+# 8080:8080 publish in docker-compose.yml); see
+# internal/config/config.go HTTPConfig.Addr for the full
+# rationale.
+KMAIL_API_URL ?= http://localhost:8088
 e2e:
 	KMAIL_API_URL=$(KMAIL_API_URL) ./scripts/test-e2e.sh
 

@@ -67,3 +67,284 @@ jobs:
         if: steps.check.outputs.present == 'true'
         working-directory: web
         run: npm run test:run
+
+  integration:
+    name: Integration
+    # Don't gate on Go/Web here — Phase D #11 calls the integration
+    # job out as a parallel CI surface, not a gate. The job
+    # exercises the docker compose stack end-to-end and runs the
+    # scripts/test-e2e.sh smoke harness against a host-side BFF.
+    runs-on: ubuntu-latest
+    # Run on PRs and pushes to main. Skip on forks because Stalwart
+    # needs ~3GB RAM and a forked PR runner often OOMs before the
+    # health check passes; the maintainer fork covers this surface.
+    #
+    # BRANCH-PROTECTION NOTE: an entirely-skipped job reports neither
+    # success nor failure to GitHub's status API — it is simply
+    # absent. To keep this skip safe for any future branch
+    # protection rule, the aggregate `ci-status` job at the bottom
+    # of this file is the canonical required check. It runs
+    # `if: always()`, depends on go/web/integration, and treats
+    # `integration.result == 'skipped'` as a pass (legitimate when
+    # the fork-skip condition fires). Branch protection rules
+    # should require `CI Status`, NOT the underlying `Integration`
+    # name. See the comment block above `ci-status` for the full
+    # rationale and the result matrix per PR origin.
+    if: github.event.pull_request.head.repo.full_name == github.repository || github.event_name == 'push'
+    timeout-minutes: 25
+    env:
+      KMAIL_API_URL: http://localhost:8088
+      KMAIL_DEV_BEARER: kmail-dev
+      KMAIL_COMPOSE_PROJECT: kmail
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+          cache: true
+
+      # The zk-fabric service in `docker-compose.yml` builds from
+      # a sibling-repo `build: context: ../zk-object-fabric` path
+      # (the canonical local-dev layout per docs/DEVELOPMENT.md).
+      # The CI runner only checks out the kmail repo, so the
+      # sibling path doesn't exist by default and `docker compose
+      # up` would fail with a `path not found` error. Clone the
+      # sibling at the path the compose file expects before any
+      # compose command runs. `actions/checkout` only writes into
+      # $GITHUB_WORKSPACE, so a direct `git clone` is the simplest
+      # way to land the repo at `../zk-object-fabric` (which
+      # resolves to $GITHUB_WORKSPACE/.. — outside the workspace
+      # but on the same runner volume). Pin to `main` for
+      # reproducibility without locking integration tests to a
+      # stale tag — a zk-object-fabric main breakage surfaces here
+      # as an integration failure, which is the correct signal.
+      - name: Clone zk-object-fabric sibling for compose build context
+        run: |
+          git clone --depth 1 --branch main \
+            https://github.com/kennguy3n/zk-object-fabric.git \
+            ../zk-object-fabric
+          ls -la ../zk-object-fabric | head -10
+
+      # The compose stack runs Stalwart + Postgres + Valkey +
+      # zk-fabric + Meilisearch + ClamAV in parallel; pulling them
+      # up-front saves ~90s on the critical path versus letting
+      # `docker compose up` lazy-pull during startup.
+      - name: docker compose pull
+        run: docker compose pull --quiet
+
+      - name: docker compose up -d
+        run: |
+          docker compose up -d --wait --wait-timeout 300
+          docker compose ps
+
+      # Wait for the one-shot init containers (zk-fabric-init,
+      # stalwart-init) to complete with exit code 0. `--wait`
+      # above already blocks on healthy services, but one-shots
+      # are reported as `exited (0)` which `--wait` treats as
+      # done; this loop is belt-and-braces in case the compose
+      # version on the runner predates the `--wait-timeout` flag.
+      - name: Wait for init containers
+        run: |
+          set -e
+          for c in kmail-zk-fabric-init kmail-stalwart-init; do
+            completed=0
+            for i in $(seq 1 60); do
+              status="$(docker inspect -f '{{.State.Status}}' "$c" 2>/dev/null || echo missing)"
+              code="$(docker inspect -f '{{.State.ExitCode}}' "$c" 2>/dev/null || echo 0)"
+              case "$status" in
+                exited)
+                  if [ "$code" = "0" ]; then
+                    echo "$c completed cleanly"
+                    completed=1
+                    break
+                  fi
+                  echo "$c exited with code $code" >&2
+                  docker logs "$c" >&2 || true
+                  exit 1
+                  ;;
+                running|created|restarting)
+                  sleep 2
+                  ;;
+                *)
+                  echo "$c status=$status; retrying ($i/60)"
+                  sleep 2
+                  ;;
+              esac
+            done
+            # If the inner loop ran out of iterations without
+            # observing an `exited` status, the init container
+            # never finished. Falling through silently here would
+            # let the rest of the workflow (migrations + e2e) run
+            # against an improperly-initialized stack, which is
+            # exactly the kind of failure mode that's hard to
+            # debug from a green CI run. Fail loud instead.
+            if [ "$completed" != "1" ]; then
+              final_status="$(docker inspect -f '{{.State.Status}}' "$c" 2>/dev/null || echo missing)"
+              echo "$c did not finish within 120s (final status=$final_status)" >&2
+              docker logs "$c" >&2 || true
+              exit 1
+            fi
+          done
+
+      - name: Apply migrations
+        run: ./scripts/migrate.sh
+        env:
+          DATABASE_URL: postgresql://kmail:kmail@localhost:5432/kmail
+
+      - name: Build kmail-api
+        run: make build
+
+      - name: Start kmail-api (background, port 8088)
+        # Env vars split by which code path reads them:
+        #
+        # * Vars handled by `internal/config/config.go`'s `getenv`
+        #   helper today read the BARE name (no `KMAIL_` prefix).
+        #   PR #31 introduces a `getenvKMail` two-form lookup that
+        #   accepts both prefixed and bare, but until #31 reaches
+        #   `main` the workflow must use the bare name.
+        # * Vars handled directly via `os.Getenv("KMAIL_...")` in
+        #   `cmd/kmail-api/main.go` (e.g. KMAIL_MEILISEARCH_URL
+        #   at main.go:356) have only one accepted spelling: the
+        #   `KMAIL_`-prefixed form. Strip the prefix and the
+        #   search backend silently disappears at startup.
+        # * KMAIL_API_ADDR / KMAIL_DEV_BYPASS_TOKEN are read via
+        #   `getenv("KMAIL_...")` in config.go's network/auth
+        #   sections (the prefix is part of the canonical name,
+        #   not a Helm-only override), so they stay as-is.
+        # * KMAIL_ENV is currently unused by the Go binary on
+        #   `main`. PR #31 introduces `getenvKMail("ENV")` on the
+        #   auth path so once #31 lands `KMAIL_ENV=development`
+        #   is what keeps the dev-bypass token alive in CI. Pre-
+        #   setting it now is forward-compatible (harmless today,
+        #   load-bearing post-merge).
+        env:
+          KMAIL_API_ADDR: ":8088"
+          KMAIL_ENV: development
+          KMAIL_DEV_BYPASS_TOKEN: kmail-dev
+          DATABASE_URL: postgresql://kmail:kmail@localhost:5432/kmail
+          VALKEY_URL: redis://localhost:6379
+          STALWART_URL: http://localhost:8080
+          KCHAT_OIDC_ISSUER: ""
+          KCHAT_OIDC_AUDIENCE: ""
+          ZK_FABRIC_S3_URL: http://localhost:9080
+          ZK_FABRIC_ACCESS_KEY: kmail-access-key
+          ZK_FABRIC_SECRET_KEY: kmail-secret-key
+          KMAIL_MEILISEARCH_URL: http://localhost:7700
+          KMAIL_MEILISEARCH_API_KEY: kmail-dev
+        run: |
+          mkdir -p /tmp/kmail-logs
+          nohup ./bin/kmail-api > /tmp/kmail-logs/kmail-api.log 2>&1 &
+          echo $! > /tmp/kmail-api.pid
+
+      - name: Wait for kmail-api /healthz
+        run: |
+          for i in $(seq 1 60); do
+            if curl --silent --fail "$KMAIL_API_URL/healthz" > /dev/null; then
+              echo "kmail-api ready after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "kmail-api did not become ready in 60s" >&2
+          tail -200 /tmp/kmail-logs/kmail-api.log >&2 || true
+          exit 1
+
+      - name: Run e2e smoke (scripts/test-e2e.sh)
+        run: ./scripts/test-e2e.sh
+
+      - name: Dump kmail-api log on failure
+        if: failure()
+        run: |
+          echo "===== kmail-api log ====="
+          cat /tmp/kmail-logs/kmail-api.log || true
+          echo "===== docker compose ps ====="
+          docker compose ps || true
+          echo "===== stalwart log (last 200 lines) ====="
+          docker logs --tail 200 kmail-stalwart || true
+          echo "===== postgres log (last 100 lines) ====="
+          docker logs --tail 100 kmail-postgres || true
+
+      - name: Tear down kmail-api
+        if: always()
+        run: |
+          if [ -f /tmp/kmail-api.pid ]; then
+            kill "$(cat /tmp/kmail-api.pid)" 2>/dev/null || true
+          fi
+
+      - name: docker compose down
+        if: always()
+        run: docker compose down -v --remove-orphans
+
+  # Aggregate guard job for branch protection. The `integration`
+  # job is intentionally skipped on fork-origin PRs (see the
+  # comment block above its `if:` — Stalwart's ~3GB memory
+  # envelope OOMs forked runners). A bare `Integration` required
+  # status check would therefore block every fork PR
+  # indefinitely, because GitHub treats a skipped job as
+  # *neither* pass nor fail — it is simply absent from the
+  # status API, and a required check that never reports cannot
+  # be marked green.
+  #
+  # The canonical fix is a single aggregate job (this one) that:
+  #   1. Depends on go / web / integration.
+  #   2. Runs `if: always()` so it executes even when integration
+  #      is skipped on forks (otherwise IT would inherit the
+  #      skip and the problem cascades upward).
+  #   3. Treats `integration.result == 'skipped'` as a pass —
+  #      legitimate when the fork-skip condition fired — but
+  #      `success` is the only acceptable result for go / web,
+  #      because nothing skips those.
+  #   4. Reports its own pass/fail to the status API.
+  #
+  # Branch protection then requires THIS job (`CI Status`), not
+  # the three underlying ones. Fork PRs report:
+  #   go: success, web: success, integration: skipped, ci-status: success
+  # main-repo PRs report:
+  #   go: success, web: success, integration: success, ci-status: success
+  # A real failure of any job correctly fails ci-status because
+  # the conditional below requires `!= 'failure'` AND
+  # `!= 'cancelled'` for every dependency.
+  #
+  # The bash arithmetic deliberately fails closed: any result
+  # the conditional doesn't recognise (a new GitHub result
+  # string) will be caught by the else-branch and reported as
+  # failure rather than silently passing.
+  ci-status:
+    name: CI Status
+    if: always()
+    needs: [go, web, integration]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify dependent job results
+        run: |
+          set -euo pipefail
+          go_result='${{ needs.go.result }}'
+          web_result='${{ needs.web.result }}'
+          integration_result='${{ needs.integration.result }}'
+          echo "go=${go_result} web=${web_result} integration=${integration_result}"
+          fail=0
+          # go and web have no skip path — anything other than
+          # 'success' must fail the aggregate.
+          if [[ "${go_result}" != "success" ]]; then
+            echo "::error::go job did not succeed (result=${go_result})"
+            fail=1
+          fi
+          if [[ "${web_result}" != "success" ]]; then
+            echo "::error::web job did not succeed (result=${web_result})"
+            fail=1
+          fi
+          # integration is legitimately skipped on fork-origin
+          # PRs by design. Treat 'success' OR 'skipped' as
+          # acceptable; anything else (failure, cancelled,
+          # unknown) fails the aggregate.
+          case "${integration_result}" in
+            success|skipped)
+              ;;
+            *)
+              echo "::error::integration job did not succeed or skip cleanly (result=${integration_result})"
+              fail=1
+              ;;
+          esac
+          exit ${fail}

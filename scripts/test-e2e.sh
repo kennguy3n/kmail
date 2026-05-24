@@ -10,7 +10,7 @@
 # fails).
 #
 # Inputs (all have sensible compose-stack defaults):
-#   KMAIL_API_URL       — BFF base URL (default http://localhost:8080)
+#   KMAIL_API_URL       — BFF base URL (default http://localhost:8088)
 #   KMAIL_DEV_BEARER    — dev-bypass bearer token (default kmail-dev)
 #   KMAIL_E2E_TENANT    — pre-existing tenant id used for read paths
 #                         (auto-discovered if unset)
@@ -19,7 +19,7 @@
 
 set -u
 
-API="${KMAIL_API_URL:-http://localhost:8080}"
+API="${KMAIL_API_URL:-http://localhost:8088}"
 TOK="${KMAIL_DEV_BEARER:-kmail-dev}"
 FAIL=0
 
