@@ -1,0 +1,111 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":semanticCommits",
+    ":semanticCommitTypeAll(chore)",
+    ":timezone(UTC)",
+    ":dependencyDashboard"
+  ],
+  "rangeStrategy": "bump",
+  "labels": ["dependencies", "renovate"],
+  "prConcurrentLimit": 5,
+  "prHourlyLimit": 4,
+  "rebaseWhen": "auto",
+  "stabilityDays": 3,
+  "schedule": [
+    "after 9pm every weekday",
+    "before 6am every weekday",
+    "every weekend"
+  ],
+  "vulnerabilityAlerts": {
+    "enabled": true,
+    "labels": ["dependencies", "security"]
+  },
+  "packageRules": [
+    {
+      "description": "Auto-merge patch updates after CI passes",
+      "matchUpdateTypes": ["patch", "pin", "digest"],
+      "automerge": true,
+      "automergeType": "pr",
+      "platformAutomerge": true,
+      "schedule": ["at any time"]
+    },
+    {
+      "description": "Weekly batched PR for minor versions",
+      "matchUpdateTypes": ["minor"],
+      "groupName": "weekly minor updates",
+      "groupSlug": "weekly-minor",
+      "schedule": ["before 6am on monday"]
+    },
+    {
+      "description": "Weekly batched PR for major versions",
+      "matchUpdateTypes": ["major"],
+      "groupName": "weekly major updates",
+      "groupSlug": "weekly-major",
+      "schedule": ["before 6am on monday"]
+    },
+    {
+      "description": "Stalwart is pinned per docs/STALWART_UPGRADE.md and must NEVER be auto-bumped. Upgrades require the blue/green soak procedure documented in that runbook.",
+      "matchPackageNames": [
+        "stalwartlabs/stalwart",
+        "stalwartlabs/mail-server"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "Postgres and Valkey are state-bearing and must be vetted by hand. Disable major updates; allow minor/patch on a slow cadence.",
+      "matchPackageNames": ["postgres", "valkey/valkey"],
+      "matchUpdateTypes": ["major"],
+      "enabled": false
+    },
+    {
+      "description": "Pin Go module replacements that are runtime-critical to the BFF; do not bump them without a full integration sweep.",
+      "matchManagers": ["gomod"],
+      "matchPackageNames": [
+        "github.com/redis/go-redis/v9",
+        "github.com/jackc/pgx/v5",
+        "github.com/hashicorp/golang-lru/v2"
+      ],
+      "matchUpdateTypes": ["major"],
+      "enabled": false,
+      "description2": "These three power the rate limiter (round-3), the sharded Postgres pool, and the LRU caches respectively. A major bump on any of them must go through manual review."
+    },
+    {
+      "description": "Group Go security patches and apply them immediately.",
+      "matchManagers": ["gomod"],
+      "matchUpdateTypes": ["patch"],
+      "matchPackageNames": ["golang.org/x/**"],
+      "groupName": "golang.org/x security patches",
+      "automerge": true,
+      "schedule": ["at any time"]
+    },
+    {
+      "description": "GitHub Actions versions are pinned by major to follow the upstream stable line.",
+      "matchManagers": ["github-actions"],
+      "matchUpdateTypes": ["major"],
+      "groupName": "github-actions major"
+    },
+    {
+      "description": "Frontend (web/) dev tooling can churn weekly without gating release-day. Group it.",
+      "matchManagers": ["npm"],
+      "matchDepTypes": ["devDependencies"],
+      "groupName": "web devDependencies",
+      "schedule": ["before 6am on monday"]
+    }
+  ],
+  "postUpdateOptions": [
+    "gomodTidy",
+    "gomodUpdateImportPaths"
+  ],
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": ["before 6am on the first day of the month"]
+  },
+  "ignorePaths": [
+    "**/node_modules/**",
+    "**/vendor/**",
+    "**/.snapshots/**",
+    "docs/**"
+  ]
+}

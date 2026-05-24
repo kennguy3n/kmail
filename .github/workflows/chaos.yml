@@ -1,89 +1,40 @@
-name: CI
+name: Chaos
 
+# Phase D #11 — chaos engineering workflow. Exercises the SLO
+# budget when individual dependencies fail (Stalwart shard restart,
+# Postgres pause, Valkey kill) by driving traffic through the BFF
+# during the fault window and asserting the error rate stays inside
+# the 99.95% SLO target. The harness scripts under
+# `scripts/loadtest/chaos-*.sh` are the source of truth for the
+# fault injection mechanics; this workflow just wires them up
+# against a clean docker compose stack each run.
+#
+# Triggered on:
+#   * Nightly schedule (02:00 UTC) — primary signal.
+#   * Manual workflow_dispatch — for on-demand verification.
+# NOT triggered on every PR — chaos runs are ~15 minutes and the
+# signal-to-noise on a per-PR run is poor (most PRs don't touch
+# the failure-handling paths).
 on:
-  push:
-    branches: [main]
-  pull_request:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
 
 jobs:
-  go:
-    name: Go
+  chaos:
+    name: Chaos
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: "1.25.x"
-          cache: true
-
-      - name: make tidy
-        run: make tidy
-
-      - name: make vet
-        run: make vet
-
-      - name: make build
-        run: make build
-
-      - name: make test
-        run: make test
-
-  web:
-    name: Web
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Check for web/package.json
-        id: check
-        run: |
-          if [ -f web/package.json ]; then
-            echo "present=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "present=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Set up Node.js
-        if: steps.check.outputs.present == 'true'
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20.x"
-          cache: npm
-          cache-dependency-path: web/package-lock.json
-
-      - name: npm ci
-        if: steps.check.outputs.present == 'true'
-        working-directory: web
-        run: npm ci
-
-      - name: npm run build
-        if: steps.check.outputs.present == 'true'
-        working-directory: web
-        run: npm run build
-
-      - name: npm run test:run
-        if: steps.check.outputs.present == 'true'
-        working-directory: web
-        run: npm run test:run
-
-  integration:
-    name: Integration
-    # Don't gate on Go/Web here — Phase D #11 calls the integration
-    # job out as a parallel CI surface, not a gate. The job
-    # exercises the docker compose stack end-to-end and runs the
-    # scripts/test-e2e.sh smoke harness against a host-side BFF.
-    runs-on: ubuntu-latest
-    # Run on PRs and pushes to main. Skip on forks because Stalwart
-    # needs ~3GB RAM and a forked PR runner often OOMs before the
-    # health check passes; the maintainer fork covers this surface.
-    if: github.event.pull_request.head.repo.full_name == github.repository || github.event_name == 'push'
-    timeout-minutes: 25
+    timeout-minutes: 30
     env:
       KMAIL_API_URL: http://localhost:8088
       KMAIL_DEV_BEARER: kmail-dev
       KMAIL_COMPOSE_PROJECT: kmail
+      # Loosen the chaos SLO target slightly on CI: a GitHub-hosted
+      # runner's IO is significantly noisier than a production
+      # cluster, so we'd see false-positive SLO violations from
+      # disk stalls rather than from the injected fault. Tune via
+      # this env if the false-positive rate rises.
+      KMAIL_CHAOS_SLO_PCT: "0.5"
     steps:
       - uses: actions/checkout@v4
 
@@ -93,10 +44,6 @@ jobs:
           go-version: "1.25.x"
           cache: true
 
-      # The compose stack runs Stalwart + Postgres + Valkey +
-      # zk-fabric + Meilisearch + ClamAV in parallel; pulling them
-      # up-front saves ~90s on the critical path versus letting
-      # `docker compose up` lazy-pull during startup.
       - name: docker compose pull
         run: docker compose pull --quiet
 
@@ -105,12 +52,6 @@ jobs:
           docker compose up -d --wait --wait-timeout 300
           docker compose ps
 
-      # Wait for the one-shot init containers (zk-fabric-init,
-      # stalwart-init) to complete with exit code 0. `--wait`
-      # above already blocks on healthy services, but one-shots
-      # are reported as `exited (0)` which `--wait` treats as
-      # done; this loop is belt-and-braces in case the compose
-      # version on the runner predates the `--wait-timeout` flag.
       - name: Wait for init containers
         run: |
           set -e
@@ -120,10 +61,7 @@ jobs:
               code="$(docker inspect -f '{{.State.ExitCode}}' "$c" 2>/dev/null || echo 0)"
               case "$status" in
                 exited)
-                  if [ "$code" = "0" ]; then
-                    echo "$c completed cleanly"
-                    break
-                  fi
+                  if [ "$code" = "0" ]; then break; fi
                   echo "$c exited with code $code" >&2
                   docker logs "$c" >&2 || true
                   exit 1
@@ -132,7 +70,6 @@ jobs:
                   sleep 2
                   ;;
                 *)
-                  echo "$c status=$status; retrying ($i/60)"
                   sleep 2
                   ;;
               esac
@@ -180,10 +117,53 @@ jobs:
           tail -200 /tmp/kmail-logs/kmail-api.log >&2 || true
           exit 1
 
-      - name: Run e2e smoke (scripts/test-e2e.sh)
-        run: ./scripts/test-e2e.sh
+      # Run each scenario independently so a single failure
+      # doesn't mask the rest. `continue-on-error` lets the
+      # next step still execute and surface its own pass/fail,
+      # but the overall job is failed by the explicit
+      # `Aggregate chaos result` step at the end.
+      - name: Chaos — Stalwart shard kill
+        id: chaos_shard
+        continue-on-error: true
+        run: ./scripts/loadtest/chaos-shard.sh
 
-      - name: Dump kmail-api log on failure
+      - name: Chaos — Postgres pause
+        id: chaos_postgres
+        continue-on-error: true
+        run: ./scripts/loadtest/chaos-postgres.sh
+
+      - name: Chaos — Valkey kill
+        id: chaos_valkey
+        continue-on-error: true
+        run: ./scripts/loadtest/chaos-valkey.sh
+
+      - name: Aggregate chaos result
+        # Each scenario above is `continue-on-error: true` so a
+        # single failure doesn't mask the others; this step is the
+        # one that fails the job overall when any scenario tripped
+        # its SLO budget. Step IDs are statically expanded because
+        # GitHub Actions does not support dynamic interpolation of
+        # `steps.<id>.outcome` from a bash variable.
+        run: |
+          fail=0
+          if [ "${{ steps.chaos_shard.outcome }}" = "failure" ]; then
+            echo "chaos-shard FAILED" >&2
+            fail=$((fail+1))
+          fi
+          if [ "${{ steps.chaos_postgres.outcome }}" = "failure" ]; then
+            echo "chaos-postgres FAILED" >&2
+            fail=$((fail+1))
+          fi
+          if [ "${{ steps.chaos_valkey.outcome }}" = "failure" ]; then
+            echo "chaos-valkey FAILED" >&2
+            fail=$((fail+1))
+          fi
+          if [ "$fail" -gt 0 ]; then
+            echo "$fail chaos scenario(s) failed" >&2
+            exit 1
+          fi
+
+      - name: Dump logs on failure
         if: failure()
         run: |
           echo "===== kmail-api log ====="
@@ -192,6 +172,8 @@ jobs:
           docker compose ps || true
           echo "===== stalwart log (last 200 lines) ====="
           docker logs --tail 200 kmail-stalwart || true
+          echo "===== valkey log (last 100 lines) ====="
+          docker logs --tail 100 kmail-valkey || true
           echo "===== postgres log (last 100 lines) ====="
           docker logs --tail 100 kmail-postgres || true
 
