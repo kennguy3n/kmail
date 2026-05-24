@@ -13,7 +13,19 @@ export function Compose(): JSX.Element {
   const client = useKMail();
   const navigate = useNavigate();
 
-  const [draftsMailboxId, setDraftsMailboxId] = useState<string | null>(null);
+  // We cache the ids of the three mailboxes the Compose flow
+  // touches: drafts (where the JMAP `Email/set create` writes the
+  // initial record before submission), sent (where Stalwart moves
+  // the email after EmailSubmission/set succeeds — per RFC 8621
+  // §7.4), and inbox (fallback if the account is unusual and
+  // doesn't expose a Sent role). All three are looked up once on
+  // mount from the local cache so the send-success navigation
+  // doesn't need a fresh IPC round-trip.
+  const [mailboxIds, setMailboxIds] = useState<{
+    drafts: string | null;
+    sent: string | null;
+    inbox: string | null;
+  }>({ drafts: null, sent: null, inbox: null });
   const [from, setFrom] = useState({ name: '', email: '' });
   const [to, setTo] = useState('');
   const [subject, setSubject] = useState('');
@@ -33,8 +45,17 @@ export function Compose(): JSX.Element {
       try {
         const mailboxes: JsMailbox[] = await client.cachedMailboxes();
         if (cancelled) return;
-        const drafts = mailboxes.find((m) => m.role === 'drafts');
-        setDraftsMailboxId(drafts?.id ?? null);
+        // Match on JMAP canonical role names emitted by the napi
+        // binding (lowercase 'drafts' / 'sent' / 'inbox'). See
+        // `sdk/kmail-core/src/models.rs::MailboxRole` for the
+        // canonical wire-format list.
+        const findByRole = (role: string) =>
+          mailboxes.find((m) => m.role === role)?.id ?? null;
+        setMailboxIds({
+          drafts: findByRole('drafts'),
+          sent: findByRole('sent'),
+          inbox: findByRole('inbox'),
+        });
       } catch (err) {
         if (cancelled) return;
         // `KMailDesktopClient` already wraps every IPC error in
@@ -54,7 +75,7 @@ export function Compose(): JSX.Element {
     setError(null);
     setSending(true);
     try {
-      if (!draftsMailboxId) {
+      if (!mailboxIds.drafts) {
         setError(
           'No Drafts mailbox in the local cache — run Sync from the header first.',
         );
@@ -76,7 +97,7 @@ export function Compose(): JSX.Element {
         });
 
       const draft: EmailDraft = {
-        mailboxIds: { [draftsMailboxId]: true },
+        mailboxIds: { [mailboxIds.drafts]: true },
         from: [from],
         to: toAddresses,
         subject,
@@ -87,7 +108,17 @@ export function Compose(): JSX.Element {
         'Email sent',
         subject ? `Subject: ${subject}` : 'Your message is on its way.',
       );
-      navigate(`/mailbox/${draftsMailboxId}`, {
+      // Post-send navigation: prefer Sent (where Stalwart routes
+      // the email after EmailSubmission/set), then Inbox, then
+      // Drafts as a last resort. Landing the user on Drafts after
+      // a successful send is confusing UX — the email is no
+      // longer there. The fallback chain handles JMAP accounts
+      // where Sent doesn't exist as a separate role (rare, but
+      // legal per RFC 8621 §2.5 — `role` is optional and the
+      // server may collapse Sent into All-mail).
+      const target =
+        mailboxIds.sent ?? mailboxIds.inbox ?? mailboxIds.drafts;
+      navigate(`/mailbox/${target}`, {
         replace: true,
         state: { lastSentEmailId: id },
       });
