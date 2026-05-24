@@ -260,7 +260,12 @@ public struct ClientConfiguration {
         //                          becoming a UInt32.max-second hang)
         //   - +Infinity      → UInt32.max ("longest possible timeout")
         //   - finite ≥ u32max→ UInt32.max
-        //   - otherwise      → round-half-to-even, cast to UInt32
+        //   - otherwise      → schoolbook rounding (Swift's
+        //                       `Double.rounded()` defaults to
+        //                       `.toNearestOrAwayFromZero`, so
+        //                       0.5 → 1 and 1.5 → 2; this is NOT
+        //                       banker's `.toNearestOrEven`), cast
+        //                       to UInt32
         //
         // The naive `!seconds.isFinite` predicate would conflate NaN,
         // +Inf, and -Inf into the same `0` bucket — which contradicts
