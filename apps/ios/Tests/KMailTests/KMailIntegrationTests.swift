@@ -319,21 +319,35 @@ final class KMailIntegrationTests: XCTestCase {
     }
 
     /// `ClientConfiguration.toFFIWithNoneDefaults()` produces a
-    /// `KMailClientConfig` whose every override field is `nil`. The
-    /// FFI's `Option<T>` ladder in `client_open` MUST interpret this
-    /// as "use Rust defaults for every field" — i.e. a caller that
-    /// passes the all-`nil` record gets the same effective
-    /// configuration as one that passes the `defaultClientConfig`
-    /// record. This is the load-bearing test for the architectural
-    /// drift-prevention layer at the FFI boundary.
+    /// `KMailClientConfig` with every overridable field set to
+    /// `nil`. The shape of that record is what this test verifies.
     ///
-    /// We can't actually open a `KMailClient` in a unit test (no
-    /// sqlite, no real BFF), so the equivalence is checked at the
-    /// FFI record level: the `nil` form and the `defaultClientConfig`
-    /// form must produce identical observable state on the Rust side.
-    /// (The Rust-side test `client_open_lowers_none_to_core_defaults`
-    /// closes the loop by running the actual lowering ladder.)
-    func testNoneDefaultsRecordMatchesExplicitDefaults() {
+    /// **Important: this is NOT equivalent to `defaultClientConfig(...)`
+    /// on the Rust side.** The two records lower to different
+    /// observable `ClientConfig` states because of the two-tier
+    /// `Option<T>` contract baked into
+    /// `ClientConfig::apply_optional_overrides`:
+    ///
+    /// * Tier 1 (numeric) — `nil` means "inherit Rust default", so
+    ///   the all-`nil` record's `attachmentCacheBytes` etc. resolve
+    ///   to the same values as `defaultClientConfig(...)`.
+    /// * Tier 2 (string) — `nil` is verbatim. The all-`nil` record
+    ///   resolves `bootstrapMailboxRole` to `None`, whereas
+    ///   `defaultClientConfig(...).bootstrapMailboxRole` is
+    ///   `Some("inbox")`. So the two records produce different
+    ///   observable configurations.
+    ///
+    /// The Rust-side test `client_open_lowers_none_to_core_defaults`
+    /// (`sdk/kmail-ffi/src/lib.rs`) explicitly documents and asserts
+    /// the divergence — see its body for the canonical statement of
+    /// the contract. This Swift-side test mirrors it: verify the
+    /// shape on the Swift side (all override fields are `nil`,
+    /// non-overridable fields echo the caller's values), and assert
+    /// the tier-2 divergence against `defaultClientConfig(...)` so
+    /// a future contributor who tries to "unify" the two records
+    /// (e.g. making `toFFIWithNoneDefaults` echo `Some("inbox")`)
+    /// has to update this test deliberately.
+    func testNoneDefaultsRecordShapeAndTier2Divergence() {
         let bff = URL(string: "https://kmail.test")!
         let bearer = "test-bearer"
         let dbURL = URL(fileURLWithPath: "/tmp/kmail.sqlite")
@@ -344,15 +358,36 @@ final class KMailIntegrationTests: XCTestCase {
             databaseURL: dbURL
         ).toFFIWithNoneDefaults()
 
+        // Shape: every overridable field is `nil`.
         XCTAssertNil(noneForm.attachmentCacheBytes)
         XCTAssertNil(noneForm.requestTimeoutSecs)
         XCTAssertNil(noneForm.retryBudgetSecs)
         XCTAssertNil(noneForm.initialSyncEmailWindow)
         XCTAssertNil(noneForm.accountId)
         XCTAssertNil(noneForm.bootstrapMailboxRole)
+
+        // Non-overridable: echo the caller's values.
         XCTAssertEqual(noneForm.bffUrl, bff.absoluteString)
         XCTAssertEqual(noneForm.bearerToken, bearer)
         XCTAssertEqual(noneForm.databasePath, dbURL.path)
+
+        // Tier-2 divergence against `defaultClientConfig(...)`. The
+        // all-`nil` record's `bootstrapMailboxRole` is `nil`,
+        // whereas `defaultClientConfig(...)` returns `Some("inbox")`.
+        // A future contributor who tries to make these match (e.g.
+        // by changing `toFFIWithNoneDefaults` to echo `Some("inbox")`
+        // for tier-2 fields) must intentionally update this assertion.
+        let defaultsForm = defaultClientConfig(
+            bffUrl: bff.absoluteString,
+            bearerToken: bearer,
+            databasePath: dbURL.path
+        )
+        XCTAssertNil(noneForm.bootstrapMailboxRole)
+        XCTAssertEqual(defaultsForm.bootstrapMailboxRole, "inbox")
+        XCTAssertNotEqual(
+            noneForm.bootstrapMailboxRole, defaultsForm.bootstrapMailboxRole,
+            "tier-2 fields diverge: all-nil overrides Some(\"inbox\") to nil"
+        )
     }
 
     // MARK: - Timeout clamp

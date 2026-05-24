@@ -302,10 +302,39 @@ public struct ClientConfiguration {
         )
     }
 
-    /// Helper: produce a `KMailClientConfig` that explicitly opts out
-    /// of every overridable field, instructing the FFI to use its own
-    /// canonical defaults from `ClientConfig::new`. Mainly useful for
-    /// tests that exercise the `Option<T>` plumbing in `client_open`.
+    /// Helper: produce a `KMailClientConfig` with every optional
+    /// override field set to `nil`.
+    ///
+    /// **The two field tiers do not behave the same way on the FFI
+    /// side**, so this is NOT equivalent to "use SDK defaults for
+    /// everything":
+    ///
+    /// * **Tier 1 — numeric fields** (`attachmentCacheBytes`,
+    ///   `requestTimeoutSecs`, `retryBudgetSecs`,
+    ///   `initialSyncEmailWindow`). `nil` means "inherit the
+    ///   `ClientConfig::new` default" — the FFI ladder only fires
+    ///   the override when the value is `Some(...)`. So `nil` here
+    ///   produces the same observable value as
+    ///   `defaultClientConfig(...)`'s numeric fields.
+    /// * **Tier 2 — string fields** (`accountId`,
+    ///   `bootstrapMailboxRole`). `nil` is a verbatim "no value"
+    ///   and **overrides** the Rust default. In particular,
+    ///   `bootstrapMailboxRole: nil` overrides the
+    ///   `ClientConfig::new` default of `Some("inbox")` to `None`,
+    ///   so a client opened with this record will skip the
+    ///   inbox-bootstrap step. `accountId: nil` is also verbatim,
+    ///   but its Rust default is already `None` so there's no
+    ///   observable difference.
+    ///
+    /// This helper exists ONLY for the FFI `Option<T>` plumbing
+    /// tests — production callers that want SDK defaults should
+    /// construct a `ClientConfiguration` (whose tier-2 fields are
+    /// seeded from `ClientConfiguration.sdkDefaults`, which sources
+    /// `Some("inbox")` from the Rust side) and call
+    /// `toFFI()` instead. The shared lowering helper in
+    /// `kmail-core` (`ClientConfig::apply_optional_overrides`) is
+    /// where these two tiers are defined; the doc comment there is
+    /// the canonical reference.
     public func toFFIWithNoneDefaults() -> KMailClientConfig {
         KMailClientConfig(
             bffUrl: bffURL.absoluteString,
