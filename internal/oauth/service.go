@@ -285,6 +285,18 @@ func (s *Service) LookupClientForExchange(ctx context.Context, clientID string) 
 // ErrClientSecretMismatch. Public clients (no stored hash) MUST
 // NOT call this — the /oauth/token endpoint enforces PKCE-only
 // auth for public clients instead.
+//
+// RLS interaction: like LookupClientForExchange and ValidateAccessToken
+// above, this query does NOT call middleware.SetTenantGUC before the
+// SELECT — VerifyClientSecret is invoked from the /oauth/token wire
+// path, where the tenant context is derived FROM the resolved client
+// row (which the caller has already obtained via LookupClientForExchange).
+// Cross-tenant access works today because `migrations/046_oauth_clients.sql`
+// does NOT use FORCE ROW LEVEL SECURITY on `oauth_clients`. If a future
+// migration toggles FORCE on, this query (and the two methods named
+// above) will silently return zero rows. Don't enable FORCE on
+// `oauth_clients` without first redesigning the /oauth/token wire
+// protocol to carry tenant scoping before client resolution.
 func (s *Service) VerifyClientSecret(ctx context.Context, c *Client, plaintextSecret string) error {
 	if c == nil || c.ClientType != ClientTypeConfidential {
 		return ErrClientSecretMismatch
