@@ -1,0 +1,27 @@
+[package]
+name = "kmail-napi"
+description = "Node.js / Electron N-API bindings for the KMail SDK."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+# Electron loads the SDK as a native addon (`.node` file). napi-rs
+# emits the .node payload from a cdylib. `rlib` is kept so the
+# crate compiles inside the workspace `cargo test`.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+kmail-core = { path = "../kmail-core" }
+napi = { workspace = true }
+napi-derive = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+chrono = { workspace = true }
+
+[build-dependencies]
+napi-build = { workspace = true }

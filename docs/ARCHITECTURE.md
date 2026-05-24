@@ -27,7 +27,7 @@ with the layer above and below.
 ```mermaid
 flowchart TD
     WebClient["React Web Client"]
-    MobileClient["React Native Mobile"]
+    NativeClient["Rust SDK<br/>(iOS / Android / Desktop)"]
     ThirdParty["Thunderbird / Apple Mail / CalDAV"]
     ExternalMTA["External MTAs (Gmail, M365)"]
 
@@ -51,7 +51,7 @@ flowchart TD
     MLS["KChat MLS Key Tree"]
 
     WebClient --> BFF
-    MobileClient --> BFF
+    NativeClient --> BFF
     ThirdParty --> Stalwart
     ExternalMTA --> Stalwart
 
@@ -535,7 +535,8 @@ and OIDC/RLS middleware stack.
 | Client                         | Protocol              | Notes                                                           |
 | ------------------------------ | --------------------- | --------------------------------------------------------------- |
 | KChat web app                  | JMAP through Go BFF   | Primary UX path.                                                |
-| KChat mobile                   | JMAP + push           | Efficient on mobile, supports push.                             |
+| KChat iOS / Android            | JMAP via Rust SDK     | Cross-platform `kmail-sdk` (UniFFI) + APNs / FCM push.          |
+| KChat desktop (Electron)       | JMAP via Rust SDK     | Same `kmail-sdk` via napi-rs; macOS / Windows / Linux.          |
 | Thunderbird                    | IMAP / SMTP           | Third-party compatibility.                                      |
 | Apple Mail (macOS / iOS)       | IMAP / SMTP / CalDAV  | Third-party compatibility.                                      |
 | Outlook (desktop)              | IMAP / SMTP           | No MAPI or Exchange interop in Phase 2–4.                       |
@@ -629,6 +630,10 @@ kmail/
 ├── internal/         # Go packages (28 packages — see §7.1)
 ├── migrations/       # PostgreSQL migrations (001–045)
 ├── scripts/          # Init, test, bench, load, chaos scripts
+├── sdk/              # Rust SDK workspace (kmail-core / kmail-ffi /
+│                     # kmail-napi / kmail-cli). Powers the iOS,
+│                     # Android, and Electron desktop clients via
+│                     # UniFFI + napi-rs bindings — see §10.
 ├── web/              # React frontend (TypeScript + Vite)
 ├── docker-compose.yml
 ├── Dockerfile
@@ -661,7 +666,90 @@ kmail/
 
 ---
 
-## 10. Search Architecture
+## 10. Client SDK Architecture
+
+The iOS, Android, and Electron desktop KMail clients all share a
+single Rust implementation — the `kmail-sdk` workspace under
+`sdk/`. Native shells are thin presentation layers; every piece
+of protocol state, every byte of crypto, and the entire offline
+cache live in Rust.
+
+### 10.1 Layering
+
+```
+┌───────────────────────────────────────────────────┐
+│  Swift UI (iOS)   Jetpack Compose (Android)   Electron + React  │
+└───┬────────────────┬──────────────────────────┬────────┘
+    │ UniFFI Swift   │ UniFFI Kotlin              │ napi-rs
+┌───┴────────────────┴──────────────────────────┴────────┐
+│  kmail-ffi (UniFFI proc-macros)        kmail-napi (N-API)        │
+└──────────────────────────┬────────────────────────────────┘
+                          │
+┌────────────────────────┴────────────────────────────────┐
+│ kmail-core                                                       │
+│   models   error   crypto (AES-256-GCM / HKDF / KeyStore)        │
+│   sync     cache   push (APNs / FCM / WebPush)                   │
+│   jmap (transport / request / response / ops / client)           │
+│   KMailClient façade (sync, fetch, send, register, decrypt)      │
+└──────────────────────────────────────────────────────┘
+                          │ reqwest (rustls) / rusqlite
+               ┌────────┴───────────┐
+               │  Go BFF → Stalwart  │
+               └───────────────────┘
+```
+
+### 10.2 Crate responsibilities
+
+| Crate            | Owns                                                                                                           |
+| ---------------- | -------------------------------------------------------------------------------------------------------------- |
+| `kmail-core`     | JMAP transport, request/response codecs, typed ops, offline sync engine, crypto primitives, push, blob cache. |
+| `kmail-ffi`      | UniFFI proc-macro bindings (`#[uniffi::Object]`, `#[uniffi::Record]`, `#[uniffi::Error]`) producing Swift + Kotlin packages. |
+| `kmail-napi`     | napi-rs bindings (`#[napi]`) producing a Node-API module consumed by the Electron desktop shell.              |
+| `kmail-cli`      | Internal debug CLI (`session`, `sync`, `mailboxes`, `emails`, `email`, `doctor`) that drives `KMailClient` directly against a real BFF. |
+
+### 10.3 Delta-pull sync
+
+First sync → `Mailbox/get` → `Email/query` (newest window) →
+`Email/get` (hydrate) → `Email/get` with empty `ids` to read the
+canonical Email state token. Subsequent syncs → `Mailbox/get` for
+the mailbox tree (cheap) and `Email/changes` against the saved
+state token. When the BFF surfaces `cannotCalculateChanges`, the
+SDK drops the stale token and re-bootstraps via the initial path
+automatically. All state tokens, mailboxes, emails, blob cache,
+and pending offline actions live in a per-account SQLite database
+opened at the path the platform shell supplies.
+
+### 10.4 Encryption boundary
+
+- AES-256-GCM and HKDF-SHA256 live in `kmail-core::crypto`; both
+  are verified against the NIST CAVS GCM vectors and the RFC 5869
+  HKDF test vectors at build time.
+- The MLS leaf key is supplied by the platform shell through the
+  `KeyStore` trait; the iOS shell bridges to Keychain Services,
+  the Android shell to the Android Keystore, and the desktop
+  shell to the OS keyring (Secret Service / Keychain / Credential
+  Manager).
+- Per-folder DEKs derive from the MLS leaf key + folder label via
+  HKDF; per-message DEKs derive from the folder DEK + message ID.
+  The derivation matches §5 "Encryption Architecture".
+
+### 10.5 Build / distribution
+
+- iOS: `cargo build` for `aarch64-apple-ios` + simulator triples;
+  UniFFI emits the Swift package; XCFramework is bundled in the
+  iOS shell repo (follow-up workstream).
+- Android: `cargo build` for the four Android NDK triples; UniFFI
+  emits Kotlin bindings; the shell consumes them through a
+  Gradle module.
+- Desktop: `napi build` produces platform-specific `.node`
+  binaries; Electron loads them through `@kmail/sdk-native`.
+- CI is wired into `.github/workflows/ci.yml` under the `sdk`
+  job (fmt + clippy + test + release build); per-platform
+  cross-compile sweeps are added in follow-up PRs.
+
+---
+
+## 11. Search Architecture
 
 Tiered search keeps the common case fast and the rare case
 possible:

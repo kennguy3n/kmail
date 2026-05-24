@@ -1,0 +1,28 @@
+[package]
+name = "kmail-ffi"
+description = "UniFFI bindings for the KMail SDK (Swift / Kotlin)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+# UniFFI produces a `cdylib` for runtime FFI plus a `staticlib`
+# variant when the iOS / Android cross-build targets are built.
+# `rlib` is kept so `cargo test` inside the workspace works.
+crate-type = ["cdylib", "staticlib", "rlib"]
+name = "kmail_ffi"
+
+[dependencies]
+kmail-core = { path = "../kmail-core" }
+# `tokio` runtime integration is what lets UniFFI's `Async`
+# annotation route futures through a real executor. `build` is
+# enabled because the proc-macro scaffolding still emits a small
+# `uniffi_bindgen` build helper for the CLI generator.
+uniffi = { workspace = true, features = ["tokio", "build", "cli"] }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }

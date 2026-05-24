@@ -13,3 +13,7 @@ dist/
 .idea/
 .vscode/
 *.swp
+
+# Rust / Cargo (sdk/ workspace)
+target/
+**/*.rs.bk

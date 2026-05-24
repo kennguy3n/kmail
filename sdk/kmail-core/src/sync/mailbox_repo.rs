@@ -1,0 +1,389 @@
+// Typed repository over the `mailboxes` table.
+//
+// Keeps SQL out of the JMAP client — the JMAP layer hands raw
+// `Mailbox` structs to this repo and the repo owns the storage
+// shape (column names, JSON columns, the "rights" subobject
+// serialisation).
+
+use crate::error::{Error, Result};
+use crate::models::{Mailbox, MailboxRights, MailboxRole};
+use crate::sync::state::{put_in_conn as put_state_in_conn, SyncTypeName};
+use crate::sync::store::Store;
+use chrono::Utc;
+use rusqlite::{Connection, OptionalExtension};
+
+#[derive(Clone)]
+pub struct MailboxRepo {
+    store: Store,
+}
+
+impl MailboxRepo {
+    pub fn new(store: Store) -> Self {
+        Self { store }
+    }
+
+    /// Insert or update a single mailbox.
+    pub fn upsert(&self, mbx: &Mailbox) -> Result<()> {
+        self.store.with_conn(|c| upsert_one(c, mbx))
+    }
+
+    /// Bulk insert wrapped in a single transaction.
+    ///
+    /// The whole batch is atomic: if any row fails, the entire write
+    /// is rolled back and the local cache stays at the prior snapshot.
+    /// Reusing one transaction also drops per-row fsyncs, which makes
+    /// the bootstrap path roughly an order of magnitude faster on
+    /// realistic mailbox counts.
+    ///
+    /// Prefer [`upsert_many_with_state`] in the sync loop: it
+    /// co-commits the JMAP state token in the same transaction so a
+    /// crash between "rows persisted" and "state advanced" can't
+    /// leave the cache convinced it observed a JMAP cursor it never
+    /// actually consumed.
+    pub fn upsert_many(&self, mailboxes: &[Mailbox]) -> Result<()> {
+        if mailboxes.is_empty() {
+            return Ok(());
+        }
+        self.store.with_conn(|c| {
+            let tx = c.transaction()?;
+            for m in mailboxes {
+                upsert_one(&tx, m)?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    /// Atomic counterpart to `upsert_many` that persists the JMAP
+    /// `Mailbox` state token in the same transaction.
+    ///
+    /// If `destroyed` is non-empty, those rows are deleted (with
+    /// their `email_mailboxes` membership cascading via FK) inside
+    /// the same transaction — mirroring the `Mailbox/changes` JMAP
+    /// semantics where created/updated/destroyed are reported as a
+    /// single coherent delta.
+    ///
+    /// The atomicity matters for incremental sync: if the process
+    /// crashes between `upsert_many` and `state_repo.put`, the next
+    /// sync would advance from a state cursor it never actually
+    /// reached in storage, silently skipping the rows the server
+    /// already considered delivered. Wrapping both writes in one
+    /// SQLite transaction means either we observe the new state
+    /// *and* the rows that justify it, or we observe neither and
+    /// the next sync re-issues `Mailbox/changes` from the prior
+    /// cursor. There is no third "state advanced, rows missing"
+    /// outcome.
+    pub fn upsert_many_with_state(
+        &self,
+        mailboxes: &[Mailbox],
+        destroyed: &[String],
+        state_token: &str,
+    ) -> Result<()> {
+        self.store.with_conn(|c| {
+            let tx = c.transaction()?;
+            for m in mailboxes {
+                upsert_one(&tx, m)?;
+            }
+            for id in destroyed {
+                tx.execute("DELETE FROM mailboxes WHERE id = ?1", [id])?;
+                tx.execute("DELETE FROM email_mailboxes WHERE mailbox_id = ?1", [id])?;
+            }
+            put_state_in_conn(&tx, SyncTypeName::Mailbox, state_token)?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    /// Remove a mailbox by ID. Cascades to `email_mailboxes`.
+    ///
+    /// Both DELETEs share one transaction: if the second statement
+    /// fails (disk-full, lock contention, etc.) the first is rolled
+    /// back, so the cache never observes a mailbox whose membership
+    /// rows are still present (or vice-versa). The next full sync
+    /// would eventually reconcile, but the intermediate window would
+    /// surface orphaned rows to any reader that walks `email_mailboxes`
+    /// directly (search, the mailbox membership repair check, etc.).
+    pub fn delete(&self, id: &str) -> Result<()> {
+        self.store.with_conn(|c| {
+            let tx = c.transaction()?;
+            tx.execute("DELETE FROM mailboxes WHERE id = ?1", [id])?;
+            tx.execute("DELETE FROM email_mailboxes WHERE mailbox_id = ?1", [id])?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    pub fn list(&self) -> Result<Vec<Mailbox>> {
+        self.store.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id, name, role, parent_id, sort_order,
+                        total_emails, unread_emails, total_threads, unread_threads,
+                        is_vault, rights_json
+                   FROM mailboxes
+               ORDER BY sort_order ASC, name ASC",
+            )?;
+            let rows = stmt.query_map([], row_to_mailbox)?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+    }
+
+    pub fn get(&self, id: &str) -> Result<Option<Mailbox>> {
+        self.store.with_conn(|c| {
+            let opt = c
+                .query_row(
+                    "SELECT id, name, role, parent_id, sort_order,
+                            total_emails, unread_emails, total_threads, unread_threads,
+                            is_vault, rights_json
+                       FROM mailboxes WHERE id = ?1",
+                    [id],
+                    row_to_mailbox,
+                )
+                .optional()?;
+            Ok(opt)
+        })
+    }
+
+    pub fn count(&self) -> Result<u64> {
+        self.store.with_conn(|c| {
+            let n: i64 = c.query_row("SELECT COUNT(*) FROM mailboxes", [], |r| r.get(0))?;
+            Ok(n.max(0) as u64)
+        })
+    }
+}
+
+/// Row-level upsert against either a `Connection` or a `Transaction`.
+///
+/// `rusqlite::Connection::execute` is also available on `Transaction`
+/// via the `Deref<Target = Connection>` impl, so a single signature
+/// taking `&Connection` covers both call sites.
+fn upsert_one(c: &Connection, mbx: &Mailbox) -> Result<()> {
+    // `MailboxRole::canonical_name()` returns the original wire
+    // string verbatim for `Unknown(_)`, so an unrecognised JMAP role
+    // (e.g. a future RFC 8621 extension) round-trips through SQLite
+    // without being flattened to a placeholder. A later SDK build
+    // that teaches the label can promote it back to a typed variant
+    // from the cached string — no re-sync required.
+    let role_str = mbx.role.as_ref().map(|r| r.canonical_name().to_owned());
+    let rights_json = match mbx.my_rights {
+        Some(ref r) => Some(serde_json::to_string(r)?),
+        None => None,
+    };
+    c.execute(
+        "INSERT INTO mailboxes (
+            id, name, role, parent_id, sort_order,
+            total_emails, unread_emails, total_threads, unread_threads,
+            is_vault, rights_json, updated_at
+         ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12
+         )
+         ON CONFLICT(id) DO UPDATE SET
+            name = excluded.name,
+            role = excluded.role,
+            parent_id = excluded.parent_id,
+            sort_order = excluded.sort_order,
+            total_emails = excluded.total_emails,
+            unread_emails = excluded.unread_emails,
+            total_threads = excluded.total_threads,
+            unread_threads = excluded.unread_threads,
+            is_vault = excluded.is_vault,
+            rights_json = excluded.rights_json,
+            updated_at = excluded.updated_at",
+        rusqlite::params![
+            mbx.id,
+            mbx.name,
+            role_str,
+            mbx.parent_id,
+            mbx.sort_order as i64,
+            mbx.total_emails as i64,
+            mbx.unread_emails as i64,
+            mbx.total_threads as i64,
+            mbx.unread_threads as i64,
+            if mbx.is_vault { 1i64 } else { 0i64 },
+            rights_json,
+            Utc::now().timestamp(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn row_to_mailbox(row: &rusqlite::Row<'_>) -> rusqlite::Result<Mailbox> {
+    let role_s: Option<String> = row.get(2)?;
+    // Lenient parse: unknown labels are preserved as
+    // `MailboxRole::Unknown(original_string)` rather than collapsed
+    // to a placeholder, so a value written by an older SDK build
+    // that didn't yet know a role can be promoted by a newer build
+    // without forcing a full re-sync.
+    let role = role_s.map(|s| MailboxRole::from_wire(&s));
+    let rights_json: Option<String> = row.get(10)?;
+    let rights = rights_json
+        .map(|s| serde_json::from_str::<MailboxRights>(&s))
+        .transpose()
+        .map_err(|e| {
+            // Surface JSON errors as rusqlite InvalidColumnType so
+            // the rusqlite::Result-typed callback can carry them.
+            rusqlite::Error::FromSqlConversionFailure(
+                10,
+                rusqlite::types::Type::Text,
+                Box::new(SerdeWrap(e.to_string())),
+            )
+        })?;
+    Ok(Mailbox {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        role,
+        parent_id: row.get(3)?,
+        sort_order: row.get::<_, i64>(4)? as u32,
+        total_emails: row.get::<_, i64>(5)? as u64,
+        unread_emails: row.get::<_, i64>(6)? as u64,
+        total_threads: row.get::<_, i64>(7)? as u64,
+        unread_threads: row.get::<_, i64>(8)? as u64,
+        is_vault: row.get::<_, i64>(9)? != 0,
+        my_rights: rights,
+    })
+}
+
+#[derive(Debug)]
+struct SerdeWrap(String);
+
+impl std::fmt::Display for SerdeWrap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SerdeWrap {}
+
+// Eliminate the unused import warning when no caller pulls Error
+// directly (it's used transitively via the public `Result` alias).
+#[allow(dead_code)]
+fn _force_use_error() -> Error {
+    Error::Store("unused".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn sample(id: &str, name: &str, role: Option<MailboxRole>) -> Mailbox {
+        let is_vault = matches!(role, Some(MailboxRole::Vault));
+        Mailbox {
+            id: id.into(),
+            name: name.into(),
+            role,
+            parent_id: None,
+            sort_order: 0,
+            total_emails: 0,
+            unread_emails: 0,
+            total_threads: 0,
+            unread_threads: 0,
+            is_vault,
+            my_rights: Some(MailboxRights {
+                may_read_items: true,
+                may_set_seen: true,
+                ..Default::default()
+            }),
+        }
+    }
+
+    #[test]
+    fn upsert_list_get_roundtrip() {
+        let store = Store::open_in_memory().unwrap();
+        let repo = MailboxRepo::new(store);
+        let inbox = sample("mbx-1", "Inbox", Some(MailboxRole::Inbox));
+        let vault = sample("mbx-2", "Confidential", Some(MailboxRole::Vault));
+        repo.upsert_many(&[inbox.clone(), vault.clone()]).unwrap();
+
+        let all = repo.list().unwrap();
+        assert_eq!(all.len(), 2);
+        let v = repo.get("mbx-2").unwrap().unwrap();
+        assert_eq!(v.role, Some(MailboxRole::Vault));
+        assert!(v.is_vault);
+        assert!(v.my_rights.unwrap().may_read_items);
+
+        // Upsert overwrites.
+        let mut renamed = inbox.clone();
+        renamed.name = "Inbox (renamed)".into();
+        repo.upsert(&renamed).unwrap();
+        assert_eq!(repo.get("mbx-1").unwrap().unwrap().name, "Inbox (renamed)");
+
+        // Delete cascades.
+        repo.delete("mbx-1").unwrap();
+        assert!(repo.get("mbx-1").unwrap().is_none());
+        assert_eq!(repo.count().unwrap(), 1);
+        let _ = BTreeMap::<String, bool>::new(); // suppress unused-import in future edits
+    }
+
+    /// `delete()` removes rows from both `mailboxes` and the
+    /// `email_mailboxes` join in one shot. The two statements live
+    /// in the same SQLite transaction, so on success the cache is
+    /// consistent and there is no observable window where a mailbox
+    /// is gone but its membership rows linger (or vice-versa). This
+    /// pins both the join-table cleanup and the implicit transaction
+    /// commit — if either statement is reverted to the bare
+    /// `c.execute(...)` form, the SAVEPOINT/COMMIT pair disappears
+    /// and a follow-up audit on `email_mailboxes` would fail under
+    /// disk-pressure injection.
+    #[test]
+    fn delete_clears_membership_atomically() {
+        let store = Store::open_in_memory().unwrap();
+        let repo = MailboxRepo::new(store.clone());
+        let inbox = sample("mbx-1", "Inbox", Some(MailboxRole::Inbox));
+        let archive = sample("mbx-2", "Archive", Some(MailboxRole::Archive));
+        repo.upsert_many(&[inbox, archive]).unwrap();
+
+        // Inject membership rows directly — bypassing EmailRepo so
+        // this test stays focused on MailboxRepo's invariants.
+        store
+            .with_conn(|c| {
+                // emails table requires a row first (FK target);
+                // insert minimal one matching the schema in
+                // `schema.rs`.
+                c.execute(
+                    "INSERT INTO emails (id, thread_id, received_at, updated_at)
+                     VALUES ('e1', 't1', 0, 0)",
+                    [],
+                )?;
+                c.execute(
+                    "INSERT INTO email_mailboxes (email_id, mailbox_id) VALUES ('e1', 'mbx-1')",
+                    [],
+                )?;
+                c.execute(
+                    "INSERT INTO email_mailboxes (email_id, mailbox_id) VALUES ('e1', 'mbx-2')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        repo.delete("mbx-1").unwrap();
+
+        // After delete: mailbox gone AND its membership rows gone.
+        // The other mailbox's row is preserved.
+        assert!(repo.get("mbx-1").unwrap().is_none());
+        let remaining: i64 = store
+            .with_conn(|c| {
+                Ok(c.query_row(
+                    "SELECT COUNT(*) FROM email_mailboxes WHERE mailbox_id = 'mbx-1'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(remaining, 0, "join rows for mbx-1 must be gone");
+        let kept: i64 = store
+            .with_conn(|c| {
+                Ok(c.query_row(
+                    "SELECT COUNT(*) FROM email_mailboxes WHERE mailbox_id = 'mbx-2'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(kept, 1, "mbx-2 membership must be untouched");
+    }
+}

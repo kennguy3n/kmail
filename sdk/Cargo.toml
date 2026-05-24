@@ -1,0 +1,107 @@
+# Cross-platform Rust SDK that powers KMail's native clients
+# (iOS via UniFFI, Android via UniFFI, and Electron desktop via
+# napi-rs). The workspace replaces the previously-planned React
+# Native mobile client (Workstream 5.3) — see docs/ARCHITECTURE.md
+# §10 and docs/SDK.md for the rationale.
+#
+# Every published crate here speaks to the Go BFF the same way the
+# React web client does: Bearer-authenticated JMAP over HTTPS. The
+# split into core / ffi / napi / cli exists so each platform can
+# consume the same Rust core without pulling in foreign-language
+# binding generators it doesn't need:
+#
+#   kmail-core — pure Rust library (JMAP, sync, crypto, models).
+#   kmail-ffi  — UniFFI wrapper for Swift / Kotlin consumers.
+#   kmail-napi — napi-rs wrapper for Electron / Node consumers.
+#   kmail-cli  — minimal debug CLI consuming kmail-core directly.
+#
+# Workspace-level dependency pinning lives below so every crate
+# shares the same versions of reqwest, rusqlite, serde, etc. —
+# avoiding silent ABI drift between the FFI and napi surfaces.
+[workspace]
+resolver = "2"
+members = [
+    "kmail-core",
+    "kmail-ffi",
+    "kmail-napi",
+    "kmail-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.78"
+license = "Proprietary"
+repository = "https://github.com/kennguy3n/kmail"
+
+[workspace.dependencies]
+# Async runtime. Single-flavor Tokio across the workspace so the
+# UniFFI scaffolding and the napi binding can share a runtime
+# without colliding on feature flags.
+tokio = { version = "1.40", default-features = false, features = ["rt-multi-thread", "macros", "sync", "time", "io-util"] }
+
+# HTTP client. rustls-tls is intentional — OpenSSL would force
+# every consumer (iOS, Android, Electron) to ship its own libssl
+# build, whereas rustls statically links and works identically on
+# every target. `json` brings in serde_json wiring.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip", "stream"] }
+
+# JSON + serde.
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Local store. `bundled` compiles SQLite from source so we don't
+# depend on a host system library — important for iOS / Android
+# where libsqlite3 versions are unpredictable. `serde_json`
+# feature wires JSON column helpers we use for keyword arrays.
+rusqlite = { version = "0.32", features = ["bundled", "serde_json"] }
+
+# Crypto. RustCrypto stack is pure-Rust and cross-compiles
+# cleanly to every UniFFI / napi target we care about. AES-GCM
+# for envelope payloads, HKDF-SHA256 for key derivation (matches
+# the MLS exporter contract documented in docs/ARCHITECTURE.md
+# §5).
+aes-gcm = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+hmac = "0.12"
+subtle = "2.6"
+zeroize = { version = "1.8", features = ["zeroize_derive"] }
+rand = "0.8"
+rand_core = "0.6"
+
+# Time + IDs.
+chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
+uuid = { version = "1.10", features = ["v4", "serde"] }
+
+# Errors + logging.
+thiserror = "1.0"
+anyhow = "1.0"
+tracing = "0.1"
+
+# Binding generators.
+uniffi = { version = "0.28" }
+napi = { version = "2.16", default-features = false, features = ["napi8", "serde-json", "tokio_rt"] }
+napi-derive = "2.16"
+napi-build = "2.1"
+
+# Test-only.
+tempfile = "3.10"
+wiremock = "0.6"
+hex = "0.4"
+base64 = "0.22"
+
+[profile.release]
+# napi-rs and UniFFI both produce cdylibs that ship inside larger
+# app bundles, so favour binary size over micro-optimisations.
+opt-level = "z"
+lto = "thin"
+strip = "symbols"
+codegen-units = 1
+
+[profile.dev]
+# rusqlite + reqwest are slow to build at -O0 with debug=2; this
+# keeps cargo-test runtimes acceptable on CI without losing
+# panics-with-symbols.
+opt-level = 1
+debug = 1
