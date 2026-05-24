@@ -210,6 +210,21 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      # napi-rs / `napi-build` need a Node.js toolchain on PATH to
+      # resolve N-API headers when compiling the `kmail-napi`
+      # `cdylib` target. Recent napi-rs versions DO bundle the
+      # N-API headers via the `napi8` feature, but the build script
+      # still shells out to `node -e "process.versions"` to detect
+      # the host ABI when generating linker flags. Installing
+      # Node.js explicitly here means the `cargo build` step below
+      # cannot regress silently if napi-rs ever tightens its host-
+      # toolchain requirements. Ubuntu LTS doesn't ship a recent
+      # Node, so we use `actions/setup-node` rather than apt.
+      - name: Install Node.js toolchain (for napi-rs cdylib build)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
       # `Swatinem/rust-cache` caches the registry + target dir
       # keyed on the workspace `Cargo.lock`, which cuts a cold
       # build (~3 min) down to ~30 seconds on subsequent runs.

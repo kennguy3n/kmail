@@ -71,13 +71,21 @@ impl Serialize for JmapRequest {
     where
         S: Serializer,
     {
-        let mut s = serializer.serialize_struct("JmapRequest", 3)?;
+        // The declared field count must match the number of fields
+        // we will actually emit. `serde_json` treats this argument
+        // as a size hint, but binary formats (bincode, MessagePack,
+        // CBOR with definite-length encoding) decode using the
+        // declared length verbatim, so a 3/2 mismatch would corrupt
+        // the wire output in those formats. JMAP itself is always
+        // JSON, but we still want `JmapRequest` to obey the generic
+        // `Serialize` contract in case anyone ever logs / persists
+        // a request via a non-JSON serializer.
+        let field_count = if self.created_ids.is_empty() { 2 } else { 3 };
+        let mut s = serializer.serialize_struct("JmapRequest", field_count)?;
         s.serialize_field("using", &self.using)?;
         s.serialize_field("methodCalls", &MethodCalls(&self.method_calls))?;
         if !self.created_ids.is_empty() {
             s.serialize_field("createdIds", &self.created_ids)?;
-        } else {
-            s.skip_field("createdIds")?;
         }
         s.end()
     }
