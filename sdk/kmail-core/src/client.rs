@@ -901,10 +901,7 @@ impl KMailClient {
         let batch = self.actions_repo.next_batch(limit)?;
         let total = batch.len() as u64;
         let mut outcome = FlushOutcome::default();
-        let mut processed = 0u64;
         for action in batch {
-            processed += 1;
-
             // Circuit breaker: every retryable failure bumps
             // `attempts`, so if a 5xx (or any other retryable
             // error) keeps coming back we eventually treat the
@@ -953,21 +950,27 @@ impl KMailClient {
                     // not yet processed as deferred so callers see
                     // an accurate queue-state snapshot.
                     //
-                    // `processed - 1` is the count of items the
-                    // loop already settled (applied OR failed
-                    // terminally) BEFORE this action — those are
-                    // off the queue and must not be counted as
-                    // deferred. Everything else, including the
-                    // current action that just bailed, stays
-                    // queued for retry; that's exactly
-                    // `total - (processed - 1)`. The
-                    // `saturating_sub` is defensive only; the
-                    // arithmetic is guaranteed non-negative
-                    // because `processed >= 1` here (we bumped
-                    // it at the top of the loop iteration) and
-                    // `processed <= total` (we only iterate the
-                    // batch once).
-                    outcome.deferred = total.saturating_sub(processed - 1);
+                    // `applied + failed` is the count of items the
+                    // loop has already settled — those are off
+                    // the queue and must NOT be counted as
+                    // deferred. Everything else (the current
+                    // action that just bailed, plus the items not
+                    // yet looped) stays on the queue for retry;
+                    // that's exactly `total - (applied + failed)`.
+                    // We express the count via the outcome
+                    // counters rather than a separate `processed`
+                    // index because the counters are the
+                    // load-bearing invariant the caller observes
+                    // (`applied + failed + deferred == total`)
+                    // and computing `deferred` from them removes
+                    // the cross-coupling between counter
+                    // increment position and the subtraction.
+                    // `saturating_sub` is defensive only — the
+                    // subtrahend is bounded above by `total`
+                    // since each iteration increments at most one
+                    // counter and we haven't iterated more than
+                    // `total` times.
+                    outcome.deferred = total.saturating_sub(outcome.applied + outcome.failed);
                     return Ok(outcome);
                 }
                 Err(e) => {

@@ -94,9 +94,19 @@ pub trait KeyStore: Send + Sync {
 /// multiple `KMailClient`s for multi-account use), but bytes are
 /// never written to disk. Suitable for tests and for the
 /// `kmail-cli` debug binary.
+///
+/// The map values are wrapped in [`KeyMaterial`] so that *any*
+/// path which drops an entry — explicit `delete`, the whole
+/// `InMemoryKeyStore` going out of scope, or a future `clear()`
+/// helper — zeroes the underlying bytes via
+/// [`zeroize::ZeroizeOnDrop`]. Storing raw `Vec<u8>` here would
+/// silently leak material on the `Drop` path even though
+/// `delete` zeroises explicitly, which is the kind of asymmetry
+/// a future contributor would not notice when extending the
+/// store.
 #[derive(Default)]
 pub struct InMemoryKeyStore {
-    inner: Mutex<HashMap<KeyHandle, Vec<u8>>>,
+    inner: Mutex<HashMap<KeyHandle, KeyMaterial>>,
 }
 
 impl InMemoryKeyStore {
@@ -118,7 +128,7 @@ impl KeyStore for InMemoryKeyStore {
             .inner
             .lock()
             .map_err(|_| Error::KeyStore("in-memory keystore poisoned".into()))?;
-        g.insert(handle.clone(), material.to_vec());
+        g.insert(handle.clone(), KeyMaterial::new(material.to_vec()));
         Ok(handle)
     }
 
@@ -127,7 +137,7 @@ impl KeyStore for InMemoryKeyStore {
             .inner
             .lock()
             .map_err(|_| Error::KeyStore("in-memory keystore poisoned".into()))?;
-        Ok(g.get(handle).cloned().map(KeyMaterial::new))
+        Ok(g.get(handle).cloned())
     }
 
     fn delete(&self, handle: &KeyHandle) -> Result<()> {
@@ -135,9 +145,10 @@ impl KeyStore for InMemoryKeyStore {
             .inner
             .lock()
             .map_err(|_| Error::KeyStore("in-memory keystore poisoned".into()))?;
-        if let Some(mut v) = g.remove(handle) {
-            v.zeroize();
-        }
+        // `ZeroizeOnDrop` on `KeyMaterial` handles the wipe when the
+        // removed value goes out of scope at the end of this
+        // statement; no explicit `zeroize()` call needed.
+        g.remove(handle);
         Ok(())
     }
 

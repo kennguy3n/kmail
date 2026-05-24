@@ -52,6 +52,34 @@ impl KdfLabel {
 ///
 /// Returns the PRK (pseudorandom key) — 32 bytes when using
 /// SHA-256. `salt` may be empty (RFC 5869 §2.2 paragraph 3).
+///
+/// # Hash-specific safety note (empty salt)
+///
+/// We always pass `Some(salt)` to the `hkdf` crate, even when
+/// `salt` is empty. RFC 5869 §2.2 says an empty salt is
+/// equivalent to a salt of `HashLen` zero bytes. The `hkdf` crate
+/// implements this by feeding the salt verbatim into HMAC as the
+/// key; HMAC then zero-pads the key to its block size. For
+/// HMAC-SHA-256 the block size (64) is *strictly greater* than
+/// `HashLen` (32), so both an empty salt and a 32-byte zero salt
+/// get padded to the same 64-byte zero block, and `Some(&[])`
+/// and `None` both produce the RFC-mandated output.
+///
+/// **This equivalence is SHA-256-specific.** For hashes where
+/// `HashLen == block_size` (none of the current SHA-2 family,
+/// but a hypothetical hash with HashLen=64 and block_size=64),
+/// or for hashes where the `hkdf` crate distinguishes
+/// `Some(&[])` from `None` differently (it does not today), the
+/// outputs could diverge. RFC 5869 Test Case 3 is pinned in the
+/// tests at the bottom of this file to assert the current
+/// behaviour matches the spec.
+///
+/// If this module ever moves to SHA-384 / SHA-512 / a non-SHA
+/// hash, REVISIT this function: either preserve the `Some(salt)`
+/// form *and* add a regression test that pins the empty-salt
+/// output against an independent reference (e.g. NIST CAVS or a
+/// known-good library), or branch on `salt.is_empty()` and pass
+/// `None` so the crate's hash-aware default kicks in.
 pub fn hkdf_extract(salt: &[u8], ikm: &[u8]) -> [u8; 32] {
     let (prk, _) = Hkdf::<Sha256>::extract(Some(salt), ikm);
     let mut out = [0u8; 32];
