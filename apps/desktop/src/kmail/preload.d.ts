@@ -55,6 +55,22 @@ export interface KMailBridge {
   sendEmail(draftJson: string): Promise<string>;
   enqueueSetKeywords(emailId: string, keywordsJson: string): Promise<void>;
   notify(title: string, body: string): Promise<void>;
+  // Source the SDK's canonical defaults from the napi crate's
+  // `default_client_config` helper. The renderer-side
+  // `useDefaultClientConfig` hook (or any test that wants to
+  // construct a `JsClientConfig` populated with the same defaults
+  // the Rust core uses) MUST go through this method rather than
+  // hard-coding literals — otherwise the Electron shell would
+  // re-introduce the cross-binding drift bug that the napi helper
+  // was designed to eliminate. See
+  // `sdk/kmail-napi/src/lib.rs::default_client_config` and its
+  // `default_client_config_mirrors_core_defaults` test for the
+  // load-bearing rationale.
+  defaultClientConfig(
+    bffUrl: string,
+    bearerToken: string,
+    databasePath: string,
+  ): Promise<JsClientConfig>;
 }
 
 declare global {

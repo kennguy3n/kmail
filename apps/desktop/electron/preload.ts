@@ -41,6 +41,18 @@ export interface KMailBridge {
   sendEmail(draftJson: string): Promise<string>;
   enqueueSetKeywords(emailId: string, keywordsJson: string): Promise<void>;
   notify(title: string, body: string): Promise<void>;
+  // Return the SDK's canonical defaults sourced from
+  // `ClientConfig::new(...)` via the napi `default_client_config`
+  // helper. The renderer SHOULD use this instead of hard-coding
+  // literal defaults — see
+  // `sdk/kmail-napi/src/lib.rs::default_client_config` for the
+  // cross-binding-parity rationale and the
+  // `default_client_config_mirrors_core_defaults` test.
+  defaultClientConfig(
+    bffUrl: string,
+    bearerToken: string,
+    databasePath: string,
+  ): Promise<JsClientConfig>;
 }
 
 const bridge: KMailBridge = {
@@ -57,6 +69,13 @@ const bridge: KMailBridge = {
   enqueueSetKeywords: (emailId, keywordsJson) =>
     ipcRenderer.invoke('kmail:enqueue-set-keywords', emailId, keywordsJson),
   notify: (title, body) => ipcRenderer.invoke('kmail:notify', title, body),
+  defaultClientConfig: (bffUrl, bearerToken, databasePath) =>
+    ipcRenderer.invoke(
+      'kmail:default-client-config',
+      bffUrl,
+      bearerToken,
+      databasePath,
+    ),
 };
 
 contextBridge.exposeInMainWorld('kmail', bridge);

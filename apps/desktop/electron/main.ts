@@ -53,6 +53,17 @@ const nativeSdk = require('@kmail/sdk-native') as {
   KMailClientJs: {
     open(config: JsClientConfig): KMailClientJs;
   };
+  // Mirror of `default_client_config(...)` exposed by the napi
+  // crate. The Rust side derives every default from a fresh
+  // `ClientConfig::new(...)`, so this is the single source of
+  // truth for "what does the SDK default to?" on the desktop —
+  // see `sdk/kmail-napi/src/lib.rs::default_client_config` and
+  // its `default_client_config_mirrors_core_defaults` test.
+  defaultClientConfig(
+    bffUrl: string,
+    bearerToken: string,
+    databasePath: string,
+  ): JsClientConfig;
 };
 
 // Electron main is always compiled to CommonJS (see
@@ -447,6 +458,28 @@ function registerIpc(): void {
       return inSession((s) => {
         s.client.enqueueSetKeywords(emailId, keywordsJson);
       });
+    },
+  );
+
+  // Read the SDK's canonical default config — used by the renderer
+  // to seed a config object instead of hard-coding literals (which
+  // would replicate the cross-binding drift bug the napi helper was
+  // designed to eliminate). Sync — the underlying napi function is
+  // a pure constructor of a `JsClientConfig` from a fresh
+  // `ClientConfig::new(...)`, no I/O.
+  ipcMain.handle(
+    'kmail:default-client-config',
+    async (
+      _evt,
+      bffUrl: string,
+      bearerToken: string,
+      databasePath: string,
+    ): Promise<JsClientConfig> => {
+      try {
+        return nativeSdk.defaultClientConfig(bffUrl, bearerToken, databasePath);
+      } catch (err) {
+        throw new Error(sanitiseError(err));
+      }
     },
   );
 

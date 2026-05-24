@@ -166,6 +166,33 @@ export class KMailDesktopClient {
       throw parseKMailError(err);
     }
   }
+
+  /**
+   * Fetch the SDK's canonical default config, sourced from the
+   * napi crate's `default_client_config` helper (which in turn
+   * reads `ClientConfig::new(...)` in `kmail-core`).
+   *
+   * Use this when constructing a `JsClientConfig` in renderer
+   * code so the desktop shell picks up SDK-level default changes
+   * automatically on the next napi rebuild. Do NOT hard-code
+   * literal defaults in JS — that re-introduces the cross-binding
+   * drift bug the helper was designed to eliminate.
+   */
+  async defaultClientConfig(
+    bffUrl: string,
+    bearerToken: string,
+    databasePath: string,
+  ): Promise<JsClientConfig> {
+    try {
+      return await this.bridge.defaultClientConfig(
+        bffUrl,
+        bearerToken,
+        databasePath,
+      );
+    } catch (err) {
+      throw parseKMailError(err);
+    }
+  }
 }
 
 /**

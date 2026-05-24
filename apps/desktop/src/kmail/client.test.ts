@@ -46,6 +46,17 @@ function makeStubBridge(
     sendEmail: vi.fn().mockResolvedValue('email-id-1'),
     enqueueSetKeywords: vi.fn().mockResolvedValue(undefined),
     notify: vi.fn().mockResolvedValue(undefined),
+    defaultClientConfig: vi.fn().mockResolvedValue({
+      bffUrl: 'https://kmail.test',
+      bearerToken: 'tok',
+      databasePath: '/tmp/k.sqlite',
+      attachmentCacheBytes: BigInt(256 * 1024 * 1024),
+      requestTimeoutSecs: 30,
+      retryBudgetSecs: 60,
+      initialSyncEmailWindow: 200,
+      accountId: null,
+      bootstrapMailboxRole: 'inbox',
+    }),
     ...overrides,
   };
 }
@@ -198,6 +209,58 @@ describe('KMailDesktopClient', () => {
       'email-1',
       JSON.stringify({ $seen: true, $flagged: false }),
     );
+  });
+
+  it('forwards defaultClientConfig() through the bridge with the canonical SDK defaults', async () => {
+    // Mirrors the Rust-side
+    // `default_client_config_mirrors_core_defaults` test in
+    // `sdk/kmail-napi/src/lib.rs` — a Rust-side default change
+    // flows through napi -> IPC -> bridge -> here without any
+    // JS-side update. If a future renderer change replaced this
+    // round-trip with a hard-coded literal, the next backend
+    // default change would silently drift.
+    const bridge = makeStubBridge();
+    const client = new KMailDesktopClient(bridge);
+    const cfg = await client.defaultClientConfig(
+      'https://kmail.test',
+      'tok',
+      '/tmp/k.sqlite',
+    );
+    expect(bridge.defaultClientConfig).toHaveBeenCalledWith(
+      'https://kmail.test',
+      'tok',
+      '/tmp/k.sqlite',
+    );
+    // Pin the concrete defaults the napi crate emits. If the
+    // Rust-side `ClientConfig::new` defaults change, this test
+    // expects the next napi rebuild to flow through; a CI failure
+    // here means either the rebuild hasn't happened or the
+    // bridge stub is out of sync with the real binding.
+    expect(cfg.attachmentCacheBytes).toBe(BigInt(256 * 1024 * 1024));
+    expect(cfg.requestTimeoutSecs).toBe(30);
+    expect(cfg.retryBudgetSecs).toBe(60);
+    expect(cfg.initialSyncEmailWindow).toBe(200);
+    expect(cfg.bootstrapMailboxRole).toBe('inbox');
+    expect(cfg.accountId).toBeNull();
+  });
+
+  it('translates a bridge.defaultClientConfig rejection into a typed KMailError', async () => {
+    const bridge = makeStubBridge({
+      defaultClientConfig: vi
+        .fn()
+        .mockRejectedValue(new Error('[INTERNAL] napi crate missing')),
+    });
+    const client = new KMailDesktopClient(bridge);
+    await expect(
+      client.defaultClientConfig(
+        'https://kmail.test',
+        'tok',
+        '/tmp/k.sqlite',
+      ),
+    ).rejects.toMatchObject({
+      kind: 'internal',
+      tag: '[INTERNAL]',
+    });
   });
 });
 
