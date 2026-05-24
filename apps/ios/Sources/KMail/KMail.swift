@@ -61,36 +61,47 @@ extension KMailError: LocalizedError {
     /// enums) but `errorDescription` is exhaustive over the
     /// known cases at binding-generation time. A new variant
     /// will surface as a missing-case compile error.
+    ///
+    /// The local pattern-binding names below match the actual
+    /// FFI field labels (`description` for the single-string
+    /// variants, `retryAfterSeconds` for `RateLimit`, etc.). Swift
+    /// pattern matching uses positional binding for enum
+    /// associated values, so the local name is just a local
+    /// variable — but choosing names that match the FFI labels
+    /// (as defined in `sdk/kmail-ffi/src/lib.rs:69-98`) keeps
+    /// this site grep-friendly: a future contributor searching
+    /// for `description` will find both the Rust-side declaration
+    /// AND the Swift-side consumer.
     public var errorDescription: String? {
         switch self {
-        case .Store(let message):
-            return "KMail local store error: \(message)"
-        case .Transport(let message):
-            return "KMail transport error: \(message)"
-        case .Auth(let message):
-            return "KMail authentication failed: \(message)"
-        case .Forbidden(let message):
-            return "KMail forbidden: \(message)"
-        case .NotFound(let message):
-            return "KMail not found: \(message)"
+        case .Store(let description):
+            return "KMail local store error: \(description)"
+        case .Transport(let description):
+            return "KMail transport error: \(description)"
+        case .Auth(let description):
+            return "KMail authentication failed: \(description)"
+        case .Forbidden(let description):
+            return "KMail forbidden: \(description)"
+        case .NotFound(let description):
+            return "KMail not found: \(description)"
         case .RateLimit(let retryAfterSeconds):
             return "KMail rate limited: retry after \(retryAfterSeconds)s"
         case .JmapMethod(let code, let description):
             return "KMail JMAP method error [\(code)]: \(description)"
-        case .Protocol(let message):
-            return "KMail protocol error: \(message)"
+        case .Protocol(let description):
+            return "KMail protocol error: \(description)"
         case .HttpClient(let status, let body):
             return "KMail HTTP \(status) error: \(body)"
         case .SyncStateDiverged:
             return "KMail sync state diverged"
-        case .Decryption(let message):
-            return "KMail decryption error: \(message)"
-        case .KeyDerivation(let message):
-            return "KMail key derivation error: \(message)"
-        case .KeyStore(let message):
-            return "KMail keystore error: \(message)"
-        case .InvalidArgument(let message):
-            return "KMail invalid argument: \(message)"
+        case .Decryption(let description):
+            return "KMail decryption error: \(description)"
+        case .KeyDerivation(let description):
+            return "KMail key derivation error: \(description)"
+        case .KeyStore(let description):
+            return "KMail keystore error: \(description)"
+        case .InvalidArgument(let description):
+            return "KMail invalid argument: \(description)"
         case .Cancelled:
             return "KMail operation cancelled"
         }
