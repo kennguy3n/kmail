@@ -566,16 +566,40 @@ pub fn default_client_config(
     }
 }
 
-#[uniffi::export]
-pub fn client_open(config: KMailClientConfig) -> Result<Arc<KMailClientHandle>, KMailError> {
+/// Lower a `KMailClientConfig` (the FFI-shaped record received
+/// from a foreign caller) into a `kmail_core::ClientConfig`.
+///
+/// This is the **single source of truth** for the UniFFI lowering
+/// ladder. Both [`client_open`] (production entry-point) and the
+/// `lower_client_open_test` helper used by the unit tests call
+/// this function — the tests therefore exercise the *exact same*
+/// per-field plumbing the production path uses, not a copy of it.
+/// Before this refactor a parallel re-implementation lived inline
+/// in `lower_client_open_test`; the two ladders were documented
+/// to stay in lockstep "by convention", which is the kind of
+/// drift-prone arrangement Devin Review correctly flagged. The
+/// extraction makes the lockstep invariant compiler-enforced —
+/// adding a new field to this function automatically flows into
+/// both `client_open` AND every test that calls it.
+///
+/// Two-tier semantics:
+///
+///   * **Tier 1** (numeric / cache-size): `None` means "inherit
+///     Rust default from `ClientConfig::new`". The `if let Some(_)`
+///     ladder below skips the assignment so the default stays.
+///   * **Tier 2** (string `Option<T>` — `account_id`,
+///     `bootstrap_mailbox_role`): the core type already declares
+///     these as `Option<String>`, so a foreign-side `None` is a
+///     legitimate "no value", different from "inherit default".
+///     Assign verbatim. This matches the napi binding's
+///     `kmail_napi::client_open` exactly, locked down by
+///     `client_open_matches_napi_lowering_for_string_tier`.
+fn lower_kmail_config_to_core(config: &KMailClientConfig) -> ClientConfig {
     let mut core_cfg = ClientConfig::new(
-        config.bff_url,
-        config.bearer_token,
-        PathBuf::from(config.database_path),
+        config.bff_url.clone(),
+        config.bearer_token.clone(),
+        PathBuf::from(config.database_path.clone()),
     );
-    // Only override SDK defaults for fields the foreign caller
-    // explicitly set. `None` means "inherit Rust default" — see
-    // the [`KMailClientConfig`] docs for the design rationale.
     if let Some(b) = config.attachment_cache_bytes {
         core_cfg.attachment_cache_bytes = b;
     }
@@ -588,18 +612,17 @@ pub fn client_open(config: KMailClientConfig) -> Result<Arc<KMailClientHandle>, 
     if let Some(w) = config.initial_sync_email_window {
         core_cfg.initial_sync_email_window = w;
     }
-    // Tier-2 string fields (`account_id`, `bootstrap_mailbox_role`):
-    // the core type already declares these as `Option<String>`, so a
-    // foreign-side `None` is a legitimate "no value" — different
-    // from the tier-1 numeric fields above. Assign verbatim, matching
-    // the napi binding (`sdk/kmail-napi/src/lib.rs`) exactly so that a
-    // record built from `default_client_config(...).bootstrap_mailbox_role`
-    // (`Some("inbox")`) and a record with `bootstrap_mailbox_role: None`
-    // produce different observable states on the Rust side. See the
-    // [`KMailClientConfig`] doc for the two-tier semantics.
-    core_cfg.account_id = config.account_id;
-    core_cfg.bootstrap_mailbox_role = config.bootstrap_mailbox_role;
+    core_cfg.account_id = config.account_id.clone();
+    core_cfg.bootstrap_mailbox_role = config.bootstrap_mailbox_role.clone();
+    core_cfg
+}
 
+#[uniffi::export]
+pub fn client_open(config: KMailClientConfig) -> Result<Arc<KMailClientHandle>, KMailError> {
+    // The lowering ladder lives in `lower_kmail_config_to_core`
+    // so the unit tests can exercise the same per-field plumbing
+    // without opening a real SQLite database here.
+    let core_cfg = lower_kmail_config_to_core(&config);
     let inner = KMailClient::open(core_cfg)?;
     Ok(Arc::new(KMailClientHandle { inner }))
 }
@@ -983,13 +1006,41 @@ mod tests {
             ffi.attachment_cache_bytes,
             Some(core.attachment_cache_bytes)
         );
+        // Verify duration parity at *millisecond* precision rather
+        // than just `as_secs()`. The FFI helper lowers via `as_secs()`,
+        // which silently truncates any sub-second component — and the
+        // bot correctly pointed out that comparing the FFI output to
+        // `core.request_timeout.as_secs()` would not catch a future
+        // fractional default (e.g. `Duration::from_millis(30500)`
+        // would round down to 30s on both sides and pass).
+        //
+        // Multiplying the FFI seconds by 1000 and comparing to
+        // `core.*.as_millis()` makes that drift observable: if a
+        // future `ClientConfig::new` introduces a fractional second,
+        // the FFI helper would round down and this assertion would
+        // fail loudly with the exact ms difference, prompting either
+        // (a) rounding the Rust-side default back to a whole second,
+        // or (b) migrating the FFI fields from `u32` seconds to
+        // `u64` milliseconds.
+        let ffi_request_ms = ffi
+            .request_timeout_secs
+            .map(|s| u128::from(s) * 1000)
+            .expect("default_client_config must always emit Some(request_timeout_secs)");
+        let ffi_retry_ms = ffi
+            .retry_budget_secs
+            .map(|s| u128::from(s) * 1000)
+            .expect("default_client_config must always emit Some(retry_budget_secs)");
         assert_eq!(
-            ffi.request_timeout_secs.map(u64::from),
-            Some(core.request_timeout.as_secs())
+            ffi_request_ms,
+            core.request_timeout.as_millis(),
+            "request_timeout drifts: FFI lowers via as_secs() which would silently truncate \
+             any sub-second component of ClientConfig::new's default. Either round the Rust \
+             default back to whole seconds or migrate the FFI field to milliseconds."
         );
         assert_eq!(
-            ffi.retry_budget_secs.map(u64::from),
-            Some(core.retry_budget.as_secs())
+            ffi_retry_ms,
+            core.retry_budget.as_millis(),
+            "retry_budget drifts: see request_timeout assertion for guidance."
         );
         assert_eq!(
             ffi.initial_sync_email_window,
@@ -1015,32 +1066,15 @@ mod tests {
         assert_eq!(ffi.account_id, None);
     }
 
-    /// Helper that re-implements the `client_open` lowering ladder
-    /// in a unit-test-friendly form (no sqlite open). The body MUST
-    /// stay in lockstep with the real `client_open` so the tests
-    /// below actually exercise the same per-field plumbing.
+    /// Thin wrapper around the production lowering helper for use
+    /// in unit tests. Calls `super::lower_kmail_config_to_core`
+    /// directly — there is no parallel re-implementation here. If
+    /// you find yourself tempted to inline the ladder here for
+    /// "testability", resist: the entire point of extracting the
+    /// helper is that the tests exercise the same code path
+    /// `client_open` does.
     fn lower_client_open_test(config: &KMailClientConfig) -> ClientConfig {
-        let mut core_cfg = ClientConfig::new(
-            config.bff_url.clone(),
-            config.bearer_token.clone(),
-            PathBuf::from(config.database_path.clone()),
-        );
-        if let Some(b) = config.attachment_cache_bytes {
-            core_cfg.attachment_cache_bytes = b;
-        }
-        if let Some(t) = config.request_timeout_secs {
-            core_cfg.request_timeout = Duration::from_secs(u64::from(t));
-        }
-        if let Some(t) = config.retry_budget_secs {
-            core_cfg.retry_budget = Duration::from_secs(u64::from(t));
-        }
-        if let Some(w) = config.initial_sync_email_window {
-            core_cfg.initial_sync_email_window = w;
-        }
-        // Tier-2 string fields: verbatim assignment (matches napi).
-        core_cfg.account_id = config.account_id.clone();
-        core_cfg.bootstrap_mailbox_role = config.bootstrap_mailbox_role.clone();
-        core_cfg
+        super::lower_kmail_config_to_core(config)
     }
 
     /// `client_open` with every override field set to `None` must
