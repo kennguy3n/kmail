@@ -426,35 +426,68 @@ func (s *Service) ExchangeAuthorizationCode(
 	codeHash := hashToken(plaintextCode)
 	now := s.now()
 
-	var (
-		codeID, codeUserID, codeRedirect string
-		codeChallenge                    *string
-		codeChallengeMethod              *string
-		scopesRaw                        []byte
-		expiresAt                        time.Time
-		codeClientID, codeTenantID       string
-	)
-
-	// Step 1: consume the code in a single transaction. The
-	// UPDATE ... RETURNING pattern atomically marks the code
-	// consumed AND returns its fields, so a concurrent
-	// /oauth/token exchange with the same code can only succeed
-	// once.
+	// Single-transaction code exchange: claim the code, validate
+	// it matches the presenting client / redirect_uri / PKCE
+	// verifier, decode its granted scopes, and mint the access +
+	// refresh token pair — all under one `pgx.BeginFunc`.
 	//
-	// The WHERE clause filters BOTH `consumed_at IS NULL` AND
-	// `expires_at > $2` so an expired code is never "consumed"
-	// in the first place. If we only filtered on consumed_at and
-	// checked expiry post-consumption (the prior shape), an
-	// expired-but-fresh code would still get its consumed_at
-	// stamp — harmless functionally (it can't be reused
-	// anyway), but it muddies forensic audits and means a
-	// retried exchange returns "already consumed" instead of
-	// the more accurate "expired". Filtering in the WHERE
-	// clause also keeps the index probe single-pass.
+	// Why everything in one tx? On any failure between the
+	// UPDATE-consume and the mint INSERTs, the rollback unwinds
+	// the consumed_at stamp so the legit client can retry with
+	// the same code. The previous shape (consume in tx #1,
+	// validate + mint outside in tx #2) had two bad failure
+	// modes:
+	//
+	//   (a) A transient DB / pool failure between the two txs
+	//       left the code consumed without ever returning tokens
+	//       to the caller. The legit client had to restart the
+	//       entire /authorize flow even though no security
+	//       violation occurred.
+	//   (b) A validation failure (client_id mismatch,
+	//       redirect_uri mismatch, PKCE verifier mismatch) burned
+	//       the code so a third-party attacker who somehow had
+	//       intercepted the redirect could DoS the legit client.
+	//       PKCE already protects the exchange (256 bits of
+	//       verifier entropy, infeasible to brute-force inside
+	//       the 60-second code TTL even at line rate), and the
+	//       /oauth/token endpoint is rate-limited, so burning the
+	//       code on failed validation adds no security — just a
+	//       DoS lever for an attacker who learned the code.
+	//
+	// Mirrors the pattern in RefreshAccessToken (lines ~617-745)
+	// which is structured the same way and explicitly documents:
+	// "Mint the new pair INSIDE this tx so a partial failure
+	// rolls back both the claim and the new rows — never
+	// leaving orphaned tokens whose plaintext was never returned
+	// to a caller."
+	//
+	// The atomic `UPDATE ... WHERE consumed_at IS NULL AND
+	// expires_at > $2 RETURNING ...` is still load-bearing: a
+	// concurrent /oauth/token call presenting the same plaintext
+	// code cannot both pass through the WHERE filter, so only
+	// one of them claims and mints. The other gets pgx.ErrNoRows.
+	var resp *TokenResponse
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		if err := middleware.SetTenantGUC(ctx, tx, client.TenantID); err != nil {
 			return err
 		}
+
+		var (
+			codeID, codeUserID, codeRedirect string
+			codeChallenge                    *string
+			codeChallengeMethod              *string
+			scopesRaw                        []byte
+			expiresAt                        time.Time
+			codeClientID, codeTenantID       string
+		)
+
+		// Step 1: atomically consume the code. UPDATE ...
+		// RETURNING marks consumed_at AND returns the row's
+		// fields in one statement. The WHERE clause filters
+		// BOTH `consumed_at IS NULL` AND `expires_at > $2` so
+		// expired codes are never "consumed" in the first place
+		// (avoids ambiguous "expired vs already consumed" wire
+		// envelopes on a forensic-audit retry).
 		err := tx.QueryRow(ctx, `
 			UPDATE oauth_authorization_codes
 			SET consumed_at = $2
@@ -468,7 +501,116 @@ func (s *Service) ExchangeAuthorizationCode(
 			&codeID, &codeClientID, &codeTenantID, &codeUserID,
 			&codeRedirect, &scopesRaw, &codeChallenge, &codeChallengeMethod, &expiresAt,
 		)
-		return err
+		if err != nil {
+			return err
+		}
+		_ = codeID
+
+		// Step 2: code-to-client binding. A code issued for
+		// client A cannot be exchanged by client B. Returning
+		// an OAuthError here rolls back the consume.
+		if codeClientID != client.ID {
+			return &OAuthError{
+				Code:        ErrCodeInvalidGrant,
+				Description: "code was issued to a different client",
+				HTTPStatus:  400,
+			}
+		}
+		if codeTenantID != client.TenantID {
+			// Defence-in-depth — should be impossible given RLS,
+			// but belt-and-braces in case the policy is ever
+			// loosened.
+			return &OAuthError{
+				Code:        ErrCodeInvalidGrant,
+				Description: "code tenant mismatch",
+				HTTPStatus:  400,
+			}
+		}
+
+		// Step 3: redirect URI must match the one used at
+		// /authorize.
+		if codeRedirect != redirectURI {
+			return &OAuthError{
+				Code:        ErrCodeInvalidGrant,
+				Description: "redirect_uri does not match the value used at /authorize",
+				HTTPStatus:  400,
+			}
+		}
+
+		// Step 4: PKCE verification.
+		//
+		// Expiry is no longer checked here because Step 1's
+		// WHERE clause already filtered expired codes —
+		// reaching this point implies `expires_at > now()` at
+		// the moment of consumption. expiresAt is kept on the
+		// return path so a caller-side guard (e.g. a future
+		// audit hook) can still reason about lifetime if
+		// needed.
+		_ = expiresAt
+		if codeChallenge != nil && *codeChallenge != "" {
+			if codeVerifier == "" {
+				return &OAuthError{
+					Code:        ErrCodeInvalidRequest,
+					Description: "code_verifier required (PKCE in use)",
+					HTTPStatus:  400,
+				}
+			}
+			// RFC 7636 §4.3: default method is 'plain' when
+			// omitted. This mirrors the IssueAuthorizationCode
+			// default — if a pre-RFC-7636-compliance code was
+			// persisted before this fix, the stored methodPtr
+			// will be 'S256' (the old default) and that wire
+			// value will still win below; the default only
+			// applies to legacy stored rows where the method
+			// column is NULL (those don't exist after the
+			// IssueAuthorizationCode change, but we keep the
+			// defensive default for grandfather safety).
+			method := CodeChallengeMethodPlain
+			if codeChallengeMethod != nil {
+				method = *codeChallengeMethod
+			}
+			if !verifyPKCE(*codeChallenge, codeVerifier, method) {
+				return &OAuthError{
+					Code:        ErrCodeInvalidGrant,
+					Description: "code_verifier does not match challenge",
+					HTTPStatus:  400,
+				}
+			}
+		} else if client.ClientType == ClientTypePublic {
+			// Public client without PKCE — should have been
+			// rejected at /authorize. Refuse the exchange just in
+			// case.
+			return &OAuthError{
+				Code:        ErrCodeInvalidGrant,
+				Description: "public clients must use PKCE",
+				HTTPStatus:  400,
+			}
+		}
+
+		var grantedScopes []string
+		// JSONB columns enforce well-formed JSON at the storage
+		// layer, so this scopesRaw is structurally guaranteed to
+		// decode. We still check the error to match the explicit-
+		// check pattern used in RefreshAccessToken — a silent
+		// fallthrough to an empty slice would mint a zero-scope
+		// access token, which is the worst possible failure mode
+		// (call succeeds, caller has no scopes, every downstream
+		// resource access returns 403). Better to fail closed
+		// and surface the surprise; the rollback also unwinds
+		// the consume so a corrupted-JSON row doesn't burn an
+		// otherwise-valid code.
+		if err := json.Unmarshal(scopesRaw, &grantedScopes); err != nil {
+			return fmt.Errorf("oauth: decode granted_scopes from authorization_code: %w", err)
+		}
+
+		// Step 5: mint access + refresh tokens INSIDE this tx so
+		// a partial failure rolls back the consume too.
+		minted, _, mintErr := s.mintTokensTx(ctx, tx, client, codeUserID, grantedScopes, "" /* no parent refresh */, now)
+		if mintErr != nil {
+			return mintErr
+		}
+		resp = minted
+		return nil
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -478,100 +620,13 @@ func (s *Service) ExchangeAuthorizationCode(
 				HTTPStatus:  400,
 			}
 		}
+		var oerr *OAuthError
+		if errors.As(err, &oerr) {
+			return nil, oerr
+		}
 		return nil, err
 	}
-
-	// Step 2: validate the code matches THIS client (a code
-	// issued for client A cannot be exchanged by client B).
-	if codeClientID != client.ID {
-		return nil, &OAuthError{
-			Code:        ErrCodeInvalidGrant,
-			Description: "code was issued to a different client",
-			HTTPStatus:  400,
-		}
-	}
-	if codeTenantID != client.TenantID {
-		// Defence-in-depth — should be impossible given RLS, but
-		// belt-and-braces in case the policy is ever loosened.
-		return nil, &OAuthError{
-			Code:        ErrCodeInvalidGrant,
-			Description: "code tenant mismatch",
-			HTTPStatus:  400,
-		}
-	}
-
-	// Step 3: redirect URI must match the one used at /authorize.
-	if codeRedirect != redirectURI {
-		return nil, &OAuthError{
-			Code:        ErrCodeInvalidGrant,
-			Description: "redirect_uri does not match the value used at /authorize",
-			HTTPStatus:  400,
-		}
-	}
-
-	// Step 4: PKCE verification.
-	//
-	// Expiry is no longer checked here because Step 1's WHERE
-	// clause already filtered expired codes — reaching this
-	// point implies `expires_at > now()` at the moment of
-	// consumption. expiresAt is kept on the return path so a
-	// caller-side guard (e.g. a future audit hook) can still
-	// reason about lifetime if needed.
-	_ = expiresAt
-	if codeChallenge != nil && *codeChallenge != "" {
-		if codeVerifier == "" {
-			return nil, &OAuthError{
-				Code:        ErrCodeInvalidRequest,
-				Description: "code_verifier required (PKCE in use)",
-				HTTPStatus:  400,
-			}
-		}
-		// RFC 7636 §4.3: default method is 'plain' when omitted.
-		// This mirrors the IssueAuthorizationCode default — if a
-		// pre-RFC-7636-compliance code was persisted before this
-		// fix, the stored methodPtr will be 'S256' (the old
-		// default) and that wire value will still win below; the
-		// default only applies to legacy stored rows where the
-		// method column is NULL (those don't exist after the
-		// IssueAuthorizationCode change, but we keep the
-		// defensive default for grandfather safety).
-		method := CodeChallengeMethodPlain
-		if codeChallengeMethod != nil {
-			method = *codeChallengeMethod
-		}
-		if !verifyPKCE(*codeChallenge, codeVerifier, method) {
-			return nil, &OAuthError{
-				Code:        ErrCodeInvalidGrant,
-				Description: "code_verifier does not match challenge",
-				HTTPStatus:  400,
-			}
-		}
-	} else if client.ClientType == ClientTypePublic {
-		// Public client without PKCE — should have been rejected
-		// at /authorize. Refuse the exchange just in case.
-		return nil, &OAuthError{
-			Code:        ErrCodeInvalidGrant,
-			Description: "public clients must use PKCE",
-			HTTPStatus:  400,
-		}
-	}
-
-	var grantedScopes []string
-	// JSONB columns enforce well-formed JSON at the storage layer,
-	// so this scopesRaw is structurally guaranteed to decode. We
-	// still check the error to match the explicit-check pattern
-	// used in RefreshAccessToken (`service.go:709`) — a silent
-	// fallthrough to an empty slice would mint a zero-scope
-	// access token, which is the worst possible failure mode
-	// (call succeeds, caller has no scopes, every downstream
-	// resource access returns 403). Better to fail closed and
-	// surface the surprise.
-	if err := json.Unmarshal(scopesRaw, &grantedScopes); err != nil {
-		return nil, fmt.Errorf("oauth: decode granted_scopes from authorization_code: %w", err)
-	}
-
-	// Step 6: mint access + refresh tokens.
-	return s.mintTokens(ctx, client, codeUserID, grantedScopes, "" /* no parent refresh */)
+	return resp, nil
 }
 
 // RefreshAccessToken performs the /oauth/token refresh_token
