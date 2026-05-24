@@ -76,10 +76,10 @@
       "enabled": false
     },
     {
-      "description": "Group Go security patches and apply them immediately.",
+      "description": "Group Go security patches for golang.org/x/* and apply them immediately. Renovate's matchPackageNames historically used exact-string matching; the regex form below is the version-agnostic way to match every golang.org/x/ subpath (crypto, net, sync, sys, text, etc.) regardless of which Renovate version is running.",
       "matchManagers": ["gomod"],
       "matchUpdateTypes": ["patch"],
-      "matchPackageNames": ["golang.org/x/**"],
+      "matchPackagePatterns": ["^golang\\.org/x/"],
       "groupName": "golang.org/x security patches",
       "automerge": true,
       "schedule": ["at any time"]

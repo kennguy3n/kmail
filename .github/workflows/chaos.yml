@@ -136,20 +136,29 @@ jobs:
         run: make build
 
       - name: Start kmail-api (background, port 8088)
+        # See ci.yml — config.go reads most KMail vars under bare
+        # names on `main` today (the `getenvKMail` two-form lookup
+        # is on PR #31's branch and not yet merged). A chaos run
+        # with `KMAIL_*`-prefixed values would silently fall back
+        # to defaults — Valkey -> `valkey:6379` (unresolvable from
+        # the host), Stalwart -> `localhost:18080` (no listener) —
+        # so the chaos scenarios would measure connection-refused
+        # from a broken baseline rather than the injected fault.
+        # Stay on bare names until PR #31 lands on `main`.
         env:
           KMAIL_API_ADDR: ":8088"
           KMAIL_ENV: development
           KMAIL_DEV_BYPASS_TOKEN: kmail-dev
-          KMAIL_DATABASE_URL: postgresql://kmail:kmail@localhost:5432/kmail
-          KMAIL_VALKEY_URL: redis://localhost:6379
-          KMAIL_STALWART_URL: http://localhost:8080
-          KMAIL_KCHAT_OIDC_ISSUER: ""
-          KMAIL_KCHAT_OIDC_AUDIENCE: ""
-          KMAIL_ZK_FABRIC_S3_URL: http://localhost:9080
-          KMAIL_ZK_FABRIC_ACCESS_KEY: kmail-access-key
-          KMAIL_ZK_FABRIC_SECRET_KEY: kmail-secret-key
-          KMAIL_MEILISEARCH_URL: http://localhost:7700
-          KMAIL_MEILISEARCH_API_KEY: kmail-dev
+          DATABASE_URL: postgresql://kmail:kmail@localhost:5432/kmail
+          VALKEY_URL: redis://localhost:6379
+          STALWART_URL: http://localhost:8080
+          KCHAT_OIDC_ISSUER: ""
+          KCHAT_OIDC_AUDIENCE: ""
+          ZK_FABRIC_S3_URL: http://localhost:9080
+          ZK_FABRIC_ACCESS_KEY: kmail-access-key
+          ZK_FABRIC_SECRET_KEY: kmail-secret-key
+          MEILISEARCH_URL: http://localhost:7700
+          MEILISEARCH_API_KEY: kmail-dev
         run: |
           mkdir -p /tmp/kmail-logs
           nohup ./bin/kmail-api > /tmp/kmail-logs/kmail-api.log 2>&1 &

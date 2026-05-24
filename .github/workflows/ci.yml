@@ -198,20 +198,29 @@ jobs:
         run: make build
 
       - name: Start kmail-api (background, port 8088)
+        # `internal/config/config.go` reads most KMail config env
+        # vars under their bare names today (`DATABASE_URL`,
+        # `STALWART_URL`, `VALKEY_URL`, etc.). The Helm chart sets
+        # them with a `KMAIL_` prefix, and PR #31 introduces a
+        # `getenvKMail` helper that accepts BOTH the prefixed and
+        # bare forms — but until that lands on `main`, the workflow
+        # has to use the bare names the binary actually reads.
+        # KMAIL_API_ADDR / KMAIL_ENV / KMAIL_DEV_BYPASS_TOKEN are
+        # already `KMAIL_`-native and stay as-is.
         env:
           KMAIL_API_ADDR: ":8088"
           KMAIL_ENV: development
           KMAIL_DEV_BYPASS_TOKEN: kmail-dev
-          KMAIL_DATABASE_URL: postgresql://kmail:kmail@localhost:5432/kmail
-          KMAIL_VALKEY_URL: redis://localhost:6379
-          KMAIL_STALWART_URL: http://localhost:8080
-          KMAIL_KCHAT_OIDC_ISSUER: ""
-          KMAIL_KCHAT_OIDC_AUDIENCE: ""
-          KMAIL_ZK_FABRIC_S3_URL: http://localhost:9080
-          KMAIL_ZK_FABRIC_ACCESS_KEY: kmail-access-key
-          KMAIL_ZK_FABRIC_SECRET_KEY: kmail-secret-key
-          KMAIL_MEILISEARCH_URL: http://localhost:7700
-          KMAIL_MEILISEARCH_API_KEY: kmail-dev
+          DATABASE_URL: postgresql://kmail:kmail@localhost:5432/kmail
+          VALKEY_URL: redis://localhost:6379
+          STALWART_URL: http://localhost:8080
+          KCHAT_OIDC_ISSUER: ""
+          KCHAT_OIDC_AUDIENCE: ""
+          ZK_FABRIC_S3_URL: http://localhost:9080
+          ZK_FABRIC_ACCESS_KEY: kmail-access-key
+          ZK_FABRIC_SECRET_KEY: kmail-secret-key
+          MEILISEARCH_URL: http://localhost:7700
+          MEILISEARCH_API_KEY: kmail-dev
         run: |
           mkdir -p /tmp/kmail-logs
           nohup ./bin/kmail-api > /tmp/kmail-logs/kmail-api.log 2>&1 &
