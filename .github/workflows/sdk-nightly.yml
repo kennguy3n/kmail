@@ -1,0 +1,218 @@
+name: SDK Nightly
+
+# Nightly end-to-end exerciser for the kmail Rust SDK against the
+# live docker compose stack. The per-PR `SDK` job in `ci.yml`
+# already runs `cargo test --workspace` with wiremock-backed
+# stubs; the gap that surface leaves is BFF↔SDK wire-format
+# regressions where the stub's recorded response is in sync with
+# the SDK's expectations but Stalwart's *actual* response shape
+# has drifted (or vice versa). This workflow closes that gap by
+# spinning up the full stack (Postgres + Stalwart + zk-fabric +
+# Valkey + Meilisearch + kmail-api) and running the SDK's debug
+# CLI against it.
+#
+# Triggered on:
+#   * Nightly schedule (03:00 UTC) — primary signal. Runs an hour
+#     after the chaos workflow at 02:00 so the two don't compete
+#     for the same runners.
+#   * Manual `workflow_dispatch` — for on-demand verification, e.g.
+#     after a wire-format change in the BFF that needs validation
+#     against an actual Stalwart instance.
+# NOT triggered on PRs. The per-PR `SDK` job covers the wiremock
+# surface and is far cheaper; a full stack boot adds ~5-7 min of
+# wall time per PR with diminishing marginal coverage. Riskier
+# wire-format changes can use `workflow_dispatch` from the PR
+# branch as an opt-in pre-merge check.
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  sdk-nightly:
+    name: SDK Nightly
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      KMAIL_API_URL: http://localhost:8088
+      KMAIL_DEV_BEARER: kmail-dev
+      KMAIL_COMPOSE_PROJECT: kmail
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same toolchain pin as the per-PR SDK job in ci.yml.
+      # Keeping these in lock-step matters: a drift between the
+      # toolchain used to build kmail-cli here vs. the toolchain
+      # that runs `cargo test` in PR CI would let stable-only
+      # features land in the SDK that nightly silently tolerates.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # Cache cargo registry + the workspace target dir so a
+      # rerun reuses the previous build artefacts. Scoped to the
+      # `sdk/` workspace to avoid colliding with any future
+      # in-repo Rust workspaces.
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sdk -> target
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+          cache: true
+
+      # See `.github/workflows/ci.yml` for the rationale: the
+      # compose file's `zk-fabric` service builds from a sibling
+      # `../zk-object-fabric` path that doesn't exist on a fresh
+      # runner. Clone it before any compose command runs.
+      - name: Clone zk-object-fabric sibling for compose build context
+        run: |
+          git clone --depth 1 --branch main \
+            https://github.com/kennguy3n/zk-object-fabric.git \
+            ../zk-object-fabric
+          ls -la ../zk-object-fabric | head -10
+
+      - name: docker compose pull
+        run: docker compose pull --quiet
+
+      - name: docker compose up -d
+        run: |
+          docker compose up -d --wait --wait-timeout 300
+          docker compose ps
+
+      # Same belt-and-braces wait pattern as ci.yml — the
+      # one-shot init containers exit cleanly with code 0, but
+      # `compose up --wait` treats that as done before all the
+      # downstream services are actually ready to take requests.
+      - name: Wait for init containers
+        run: |
+          set -e
+          for c in kmail-zk-fabric-init kmail-stalwart-init; do
+            completed=0
+            for i in $(seq 1 60); do
+              status="$(docker inspect -f '{{.State.Status}}' "$c" 2>/dev/null || echo missing)"
+              code="$(docker inspect -f '{{.State.ExitCode}}' "$c" 2>/dev/null || echo 0)"
+              case "$status" in
+                exited)
+                  if [ "$code" = "0" ]; then
+                    completed=1
+                    break
+                  fi
+                  echo "$c exited with code $code" >&2
+                  docker logs "$c" >&2 || true
+                  exit 1
+                  ;;
+                running|created|restarting)
+                  sleep 2
+                  ;;
+                *)
+                  sleep 2
+                  ;;
+              esac
+            done
+            if [ "$completed" != "1" ]; then
+              final_status="$(docker inspect -f '{{.State.Status}}' "$c" 2>/dev/null || echo missing)"
+              echo "$c did not finish within 120s (final status=$final_status)" >&2
+              docker logs "$c" >&2 || true
+              exit 1
+            fi
+          done
+
+      - name: Apply migrations
+        run: ./scripts/migrate.sh
+        env:
+          DATABASE_URL: postgresql://kmail:kmail@localhost:5432/kmail
+
+      # The SDK's dev-bypass flow lands on the synthesised default
+      # `(tenant_id="00000000-...", kchat_user_id="dev-user")`
+      # identity. Without a matching row in Postgres the JMAP
+      # proxy returns `urn:ietf:params:jmap:error:accountNotFound`
+      # on every SDK call. Seed both rows via the idempotent
+      # `scripts/seed-dev-tenant.sql` fixture so the probes below
+      # exercise the SDK contract, not the missing-fixture error
+      # path. Applied AFTER `scripts/migrate.sh` because the seed
+      # references the `tenants` / `users` tables that migration
+      # 001 creates.
+      - name: Seed default dev tenant + user
+        run: |
+          psql "postgresql://kmail:kmail@localhost:5432/kmail" \
+            -v ON_ERROR_STOP=1 \
+            -f ./scripts/seed-dev-tenant.sql
+
+      - name: Build kmail-api
+        run: make build
+
+      - name: Start kmail-api (background, port 8088)
+        # See ci.yml integration job for the full env-var
+        # spelling rationale. Keeping the same set of vars in
+        # sync across all three workflows (ci.yml integration,
+        # chaos.yml, this one) prevents the SDK nightly from
+        # silently degrading to a different baseline than the
+        # other live-stack exercisers.
+        env:
+          KMAIL_API_ADDR: ":8088"
+          KMAIL_ENV: development
+          KMAIL_DEV_BYPASS_TOKEN: kmail-dev
+          DATABASE_URL: postgresql://kmail:kmail@localhost:5432/kmail
+          VALKEY_URL: redis://localhost:6379
+          STALWART_URL: http://localhost:8080
+          KCHAT_OIDC_ISSUER: ""
+          KCHAT_OIDC_AUDIENCE: ""
+          ZK_FABRIC_S3_URL: http://localhost:9080
+          ZK_FABRIC_ACCESS_KEY: kmail-access-key
+          ZK_FABRIC_SECRET_KEY: kmail-secret-key
+          KMAIL_MEILISEARCH_URL: http://localhost:7700
+          KMAIL_MEILISEARCH_API_KEY: kmail-dev
+        run: |
+          mkdir -p /tmp/kmail-logs
+          nohup ./bin/kmail-api > /tmp/kmail-logs/kmail-api.log 2>&1 &
+          echo $! > /tmp/kmail-api.pid
+
+      - name: Wait for kmail-api /healthz
+        run: |
+          for i in $(seq 1 60); do
+            if curl --silent --fail "$KMAIL_API_URL/healthz" > /dev/null; then
+              echo "kmail-api ready after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "kmail-api did not become ready in 60s" >&2
+          tail -200 /tmp/kmail-logs/kmail-api.log >&2 || true
+          exit 1
+
+      # The actual SDK exerciser. Builds kmail-cli once, then
+      # runs the four-step probe against the live BFF. Sister
+      # to `scripts/test-e2e.sh` which exercises the BFF over
+      # plain curl; this one drives the same backend through the
+      # real SDK so the BFF↔SDK contract is the surface under
+      # test, not the BFF API alone.
+      - name: Run SDK e2e (scripts/test-e2e-sdk.sh)
+        run: ./scripts/test-e2e-sdk.sh
+
+      - name: Dump logs on failure
+        if: failure()
+        run: |
+          echo "===== kmail-api log ====="
+          cat /tmp/kmail-logs/kmail-api.log || true
+          echo "===== docker compose ps ====="
+          docker compose ps || true
+          echo "===== stalwart log (last 200 lines) ====="
+          docker logs --tail 200 kmail-stalwart || true
+          echo "===== postgres log (last 100 lines) ====="
+          docker logs --tail 100 kmail-postgres || true
+          echo "===== valkey log (last 100 lines) ====="
+          docker logs --tail 100 kmail-valkey || true
+
+      - name: Tear down kmail-api
+        if: always()
+        run: |
+          if [ -f /tmp/kmail-api.pid ]; then
+            kill "$(cat /tmp/kmail-api.pid)" 2>/dev/null || true
+          fi
+
+      - name: docker compose down
+        if: always()
+        run: docker compose down -v --remove-orphans
