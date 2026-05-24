@@ -212,10 +212,15 @@ final class KMailIntegrationTests: XCTestCase {
             XCTFail("writeVaultMessage should have thrown on wrong-length secret")
         } catch let error as KMailError {
             switch error {
-            case .KeyStore(let message):
+            case .KeyStore(let description):
+                // Local binding matches the FFI field label `description`
+                // (see `sdk/kmail-ffi/src/lib.rs::KMailError::KeyStore`).
+                // Swift pattern matching uses positional binding for enum
+                // associated values, so the local name is grep-friendly,
+                // not semantically required.
                 XCTAssertTrue(
-                    message.contains("31") || message.contains("Vault"),
-                    "expected wrong-length / Vault scope in message, got: \(message)"
+                    description.contains("31") || description.contains("Vault"),
+                    "expected wrong-length / Vault scope in description, got: \(description)"
                 )
             default:
                 XCTFail("expected KeyStore error, got \(error)")

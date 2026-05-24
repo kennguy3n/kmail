@@ -194,7 +194,12 @@ impl From<tokio::task::JoinError> for KMailError {
 /// autocomplete) SHOULD source those defaults from
 /// [`default_client_config`] rather than hardcoding numeric literals
 /// — see the Swift `ClientConfiguration.init` for the pattern.
-#[derive(uniffi::Record)]
+// `Clone` is derived purely for the unit-test path: `lower_client_open_test`
+// hands a fresh owned clone to the production helper while keeping the input
+// record around for subsequent assertions. Production callers (`client_open`)
+// always move the record straight through, so the derive costs nothing at
+// runtime in foreign-binding code paths.
+#[derive(Clone, uniffi::Record)]
 pub struct KMailClientConfig {
     pub bff_url: String,
     pub bearer_token: String,
@@ -592,6 +597,15 @@ pub fn default_client_config(
 /// adding a new field to this function automatically flows into
 /// both `client_open` AND every test that calls it.
 ///
+/// Takes `KMailClientConfig` by value so the production caller
+/// (`client_open`, which already owns the foreign-bound record)
+/// moves every owned `String` field straight into `ClientConfig`
+/// without an extra allocation. The test adapter
+/// `lower_client_open_test` clones the record itself when the
+/// caller wants to keep it for follow-up assertions. The clone
+/// cost is confined to the test binary, never to the production
+/// FFI hot path.
+///
 /// Two-tier semantics:
 ///
 ///   * **Tier 1** (numeric / cache-size): `None` means "inherit
@@ -604,11 +618,11 @@ pub fn default_client_config(
 ///     Assign verbatim. This matches the napi binding's
 ///     `kmail_napi::client_open` exactly, locked down by
 ///     `client_open_matches_napi_lowering_for_string_tier`.
-fn lower_kmail_config_to_core(config: &KMailClientConfig) -> ClientConfig {
+fn lower_kmail_config_to_core(config: KMailClientConfig) -> ClientConfig {
     let mut core_cfg = ClientConfig::new(
-        config.bff_url.clone(),
-        config.bearer_token.clone(),
-        PathBuf::from(config.database_path.clone()),
+        config.bff_url,
+        config.bearer_token,
+        PathBuf::from(config.database_path),
     );
     // Delegate the two-tier optional-override lowering to the shared
     // helper in `kmail-core`. This is the canonical lowering ladder
@@ -619,18 +633,21 @@ fn lower_kmail_config_to_core(config: &KMailClientConfig) -> ClientConfig {
     // sites until they're updated together. See the function's doc
     // comment for the tier-1 vs tier-2 contract.
     //
-    // The `.clone()` calls on the two `Option<String>` fields are
-    // load-bearing: this function takes `config` by reference (so
-    // unit tests can call it without consuming the record), and
-    // `apply_optional_overrides` takes ownership of the tier-2
-    // strings to avoid forcing the production call site to clone.
+    // We take `config` by value so the production `client_open` path
+    // moves all four owned `String` fields (`bff_url`, `bearer_token`,
+    // `database_path`) and the two tier-2 `Option<String>`s into the
+    // core config without any extra heap allocations. Earlier revisions
+    // accepted `&KMailClientConfig` to spare callers a clone, but the
+    // production path is the *only* hot caller — tests run rarely and
+    // can pay the trivial `config.clone()` cost themselves. See
+    // `lower_client_open_test` for the test-side adapter.
     core_cfg.apply_optional_overrides(
         config.attachment_cache_bytes,
         config.request_timeout_secs,
         config.retry_budget_secs,
         config.initial_sync_email_window,
-        config.account_id.clone(),
-        config.bootstrap_mailbox_role.clone(),
+        config.account_id,
+        config.bootstrap_mailbox_role,
     );
     core_cfg
 }
@@ -639,8 +656,11 @@ fn lower_kmail_config_to_core(config: &KMailClientConfig) -> ClientConfig {
 pub fn client_open(config: KMailClientConfig) -> Result<Arc<KMailClientHandle>, KMailError> {
     // The lowering ladder lives in `lower_kmail_config_to_core`
     // so the unit tests can exercise the same per-field plumbing
-    // without opening a real SQLite database here.
-    let core_cfg = lower_kmail_config_to_core(&config);
+    // without opening a real SQLite database here. We move `config`
+    // straight through — the helper consumes it and reuses every
+    // owned `String` allocation, so there is no production-side
+    // clone overhead.
+    let core_cfg = lower_kmail_config_to_core(config);
     let inner = KMailClient::open(core_cfg)?;
     Ok(Arc::new(KMailClientHandle { inner }))
 }
@@ -1097,8 +1117,15 @@ mod tests {
     /// `lower_kmail_config_to_core` is the ONLY ladder; the
     /// compiler enforces parameter-list parity with
     /// `apply_optional_overrides`.
+    ///
+    /// The production helper consumes `KMailClientConfig` by value so
+    /// `client_open` can move every owned `String` field straight into
+    /// the core config without any extra allocations. Tests prefer to
+    /// keep the input record around for subsequent assertions, so this
+    /// adapter takes a reference and clones — the clone cost is
+    /// confined to the test binary, never the foreign-binding hot path.
     fn lower_client_open_test(config: &KMailClientConfig) -> ClientConfig {
-        super::lower_kmail_config_to_core(config)
+        super::lower_kmail_config_to_core(config.clone())
     }
 
     /// `client_open` with every override field set to `None` must
