@@ -26,11 +26,13 @@ use crate::crypto::{self, AeadEnvelope, ConfidentialEnvelope, MlsKeyProvider};
 use crate::error::{Error, Result};
 use crate::jmap::transport::TransportConfig;
 use crate::jmap::JmapClient;
-use crate::models::{Email, EmailDraft, EmailSummary, JmapSession, Mailbox};
+use crate::models::{
+    BootstrapRequest, BootstrapResponse, Email, EmailDraft, EmailSummary, JmapSession, Mailbox,
+};
 use crate::push::{PushSubscriptionRequest, PushTransport, WebPushKeys};
 use crate::sync::{
-    ActionsRepo, EmailRepo, MailboxRepo, PendingAction, PendingActionKind, StateRepo, Store,
-    SyncTypeName,
+    ActionsRepo, EmailMutation, EmailRepo, MailboxRepo, PendingAction, PendingActionKind,
+    StateRepo, Store, SyncTypeName,
 };
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -910,6 +912,103 @@ impl KMailClient {
         // platform shell's choice.
         let _ = resp;
         Ok(())
+    }
+
+    /// One-shot bootstrap sync via the BFF's
+    /// `POST /api/v1/sync/bootstrap` endpoint.
+    ///
+    /// Replaces the cold-start path of [`sync()`] (JMAP session
+    /// discovery → `Mailbox/get` → atomic `Email/query`+`Email/get`
+    /// → bulk hydration) with a single SDK-side HTTP round-trip.
+    /// The BFF composes the same JMAP request internally and
+    /// returns a flat envelope that the SDK persists in one
+    /// transaction per type, so the local SQLite snapshot ends in
+    /// exactly the same shape as a normal first-launch `sync()`
+    /// would — minus two extra BFF↔Stalwart round-trips and the
+    /// session-discovery hop.
+    ///
+    /// Use this on:
+    ///   * First launch / device-restore (no local DB yet).
+    ///   * Recovery after a long offline gap when the saved state
+    ///     token is known to be stale.
+    ///
+    /// Steady-state delta syncs should keep using [`sync()`].
+    ///
+    /// The optional `mailbox_role` restricts the email window to
+    /// the named mailbox (`"inbox"`, `"sent"`, ...). When `None`,
+    /// the window is account-wide newest-first. The optional
+    /// `limit` caps the returned email count; see
+    /// `internal/sync/sync.go::MaxBootstrapLimit` for the BFF cap.
+    pub async fn bootstrap_sync(
+        &self,
+        mailbox_role: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<SyncSummary> {
+        let req = BootstrapRequest {
+            limit: limit.unwrap_or(0),
+            mailbox_role: mailbox_role.unwrap_or("").to_string(),
+        };
+        let resp: BootstrapResponse = self.jmap.post_json("/api/v1/sync/bootstrap", &req).await?;
+
+        // Adopt the BFF-resolved account ID eagerly. The normal
+        // `account_id()` path resolves it via the JMAP session
+        // document, which would force a separate `GET /jmap/session`
+        // round-trip on the cold-start path — defeating the point
+        // of this endpoint. Caching it here means subsequent calls
+        // within the session reuse the value without going back
+        // out over the network.
+        if let Ok(mut guard) = self.account_id.lock() {
+            if guard.is_none() {
+                *guard = Some(resp.account_id.clone());
+            }
+        }
+
+        // Deserialize the JSON-typed mailboxes / emails into the
+        // SDK's typed models. The BFF passes the JMAP wire shapes
+        // through verbatim, so the same Serde deserialisers used
+        // by the JMAP path apply here.
+        let mut mailboxes: Vec<Mailbox> = Vec::with_capacity(resp.mailboxes.len());
+        for raw in resp.mailboxes {
+            let mb: Mailbox = serde_json::from_value(raw)
+                .map_err(|e| Error::Protocol(format!("bootstrap: deserialise mailbox: {e}")))?;
+            mailboxes.push(mb);
+        }
+
+        let mut email_mutations: Vec<EmailMutation> = Vec::with_capacity(resp.emails.len());
+        for raw in resp.emails {
+            let summary: EmailSummary = serde_json::from_value(raw)
+                .map_err(|e| Error::Protocol(format!("bootstrap: deserialise email: {e}")))?;
+            email_mutations.push(EmailMutation::Upsert(Box::new(summary)));
+        }
+
+        let mut summary = SyncSummary::default();
+        // Mailboxes — the bootstrap response is by definition a
+        // complete snapshot, so `upsert_many_with_state` with no
+        // destroys is the correct write (we don't have a
+        // `replace_all_with_state` on `MailboxRepo` because
+        // mailbox deletions are rare and the upsert path already
+        // covers the steady-state delta semantics).
+        self.mailbox_repo
+            .upsert_many_with_state(&mailboxes, &[], &resp.mailbox_state)?;
+        summary.mailboxes_upserted = mailboxes.len() as u64;
+
+        // Emails — the response is the canonical window, so stale
+        // local rows outside it must be evicted. The
+        // `replace_all_with_state` path co-commits the wipe +
+        // upserts + state token in one SQLite transaction so
+        // observers never see a half-purged cache. The repo
+        // returns the *destroyed* row count (rows that existed
+        // before the wipe); the *created* count is the length of
+        // the mutation batch — same accounting as the
+        // `SyncStateDiverged` branch of `sync()` at
+        // `client.rs:528-530`.
+        let destroyed = self
+            .email_repo
+            .replace_all_with_state(&email_mutations, &resp.email_state)?;
+        summary.emails_destroyed = destroyed;
+        summary.emails_created = email_mutations.len() as u64;
+
+        Ok(summary)
     }
 
     /// Seal `plaintext` into a Zero-Access Vault envelope under
@@ -2009,6 +2108,177 @@ mod tests {
             .register_push_token(PushTransport::Apns, "apns-device-token", None)
             .await
             .expect("push registration should succeed with the live token");
+    }
+
+    /// `bootstrap_sync` hits the BFF's
+    /// `POST /api/v1/sync/bootstrap` and persists the response in
+    /// one transaction per type so the local snapshot matches a
+    /// full first-launch `sync()` minus two extra round-trips.
+    /// The mock encodes the contract:
+    ///
+    ///   * Request body shape matches
+    ///     `internal/sync/sync.go::BootstrapRequest`
+    ///     (`mailbox_role`, `limit`).
+    ///   * Response shape matches `BootstrapResponse`
+    ///     (`account_id`, `mailboxes`, `mailbox_state`,
+    ///     `emails`, `email_state`).
+    ///   * After the call: mailboxes + emails are in the local
+    ///     store, both state tokens are persisted as JMAP
+    ///     cursors, and the cached `account_id` is set so the
+    ///     next operation doesn't have to discover the session.
+    #[tokio::test]
+    async fn bootstrap_sync_persists_full_snapshot() {
+        use wiremock::matchers::{body_string_contains, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("kmail-bootstrap.db");
+
+        let response = serde_json::json!({
+            "account_id": "acc-1",
+            "mailboxes": [
+                {"id": "mbx-inbox", "name": "Inbox", "role": "inbox"},
+                {"id": "mbx-sent", "name": "Sent", "role": "sent"}
+            ],
+            "mailbox_state": "ms-100",
+            "emails": [
+                {
+                    "id": "e-1",
+                    "blobId": "b-1",
+                    "threadId": "t-1",
+                    "mailboxIds": {"mbx-inbox": true},
+                    "keywords": {"$seen": true},
+                    "subject": "Hello",
+                    "preview": "world",
+                    "from": [{"name": "Alice", "email": "alice@x.test"}],
+                    "to": [{"name": "Bob", "email": "bob@x.test"}],
+                    "receivedAt": "2025-01-02T03:04:05Z"
+                }
+            ],
+            "email_state": "es-100",
+            "bootstrapped_at": "2025-01-02T03:04:05Z"
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/api/v1/sync/bootstrap"))
+            .and(header("authorization", "Bearer tok"))
+            .and(body_string_contains("\"mailbox_role\":\"inbox\""))
+            .and(body_string_contains("\"limit\":50"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let cfg = ClientConfig::new(server.uri(), "tok", db);
+        let client = KMailClient::open(cfg).unwrap();
+
+        let summary = client
+            .bootstrap_sync(Some("inbox"), Some(50))
+            .await
+            .expect("bootstrap_sync should succeed");
+
+        assert_eq!(summary.mailboxes_upserted, 2);
+        assert_eq!(summary.emails_created, 1);
+
+        // Mailboxes are persisted.
+        let mbs = client.cached_mailboxes().unwrap();
+        assert_eq!(mbs.len(), 2);
+        assert!(mbs.iter().any(|m| m.id == "mbx-inbox"));
+
+        // Emails are persisted in the inbox.
+        let inbox = client.cached_emails_in_mailbox("mbx-inbox", 10).unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].id, "e-1");
+
+        // State tokens are persisted on the canonical cursor keys.
+        let email_state = client
+            .state_repo
+            .get(SyncTypeName::Email)
+            .unwrap()
+            .expect("email state should be persisted");
+        assert_eq!(email_state, "es-100");
+        let mailbox_state = client
+            .state_repo
+            .get(SyncTypeName::Mailbox)
+            .unwrap()
+            .expect("mailbox state should be persisted");
+        assert_eq!(mailbox_state, "ms-100");
+
+        // Account ID is eagerly cached.
+        let cached_acc = client.account_id.lock().unwrap().clone();
+        assert_eq!(cached_acc.as_deref(), Some("acc-1"));
+    }
+
+    /// Without `email_id`, an `EmailDeliveryHint` is meaningless
+    /// — the SDK falls back to a full `sync()` rather than insert
+    /// a row keyed by an empty string. Pin the gate: any
+    /// `from_data` call without `email_id` MUST return `None`.
+    #[test]
+    fn email_delivery_hint_requires_email_id() {
+        use crate::push::EmailDeliveryHint;
+        let mut data = std::collections::BTreeMap::new();
+        data.insert("account_id".into(), "acc-1".into());
+        assert!(EmailDeliveryHint::from_data(&data).is_none());
+        data.insert("email_id".into(), "e-1".into());
+        let hint = EmailDeliveryHint::from_data(&data).expect("present");
+        assert_eq!(hint.email_id.as_deref(), Some("e-1"));
+        assert_eq!(hint.account_id.as_deref(), Some("acc-1"));
+    }
+
+    /// `EmailDeliveryHint::from_data` parses every BFF-emitted
+    /// field into its typed accessor. Wire-format keys are pinned
+    /// in `internal/push/email_delivery.go::EmailDeliveryKey*` —
+    /// rename one without updating both sides and this test fires.
+    #[test]
+    fn email_delivery_hint_parses_full_payload() {
+        use crate::push::EmailDeliveryHint;
+        let mut data = std::collections::BTreeMap::new();
+        data.insert("email_id".into(), "e-42".into());
+        data.insert("account_id".into(), "acc-7".into());
+        data.insert("mailbox_id".into(), "mbx-inbox".into());
+        data.insert("thread_id".into(), "t-9".into());
+        data.insert("subject".into(), "Hi".into());
+        data.insert("snippet".into(), "world".into());
+        data.insert("from".into(), "Alice <a@x.test>".into());
+        data.insert("received_at_unix".into(), "1735787045".into());
+        data.insert("has_attachment".into(), "true".into());
+        data.insert("email_state".into(), "es-1".into());
+        data.insert("mailbox_state".into(), "ms-1".into());
+        data.insert("keywords".into(), "$seen,$important".into());
+
+        let h = EmailDeliveryHint::from_data(&data).expect("present");
+        assert_eq!(h.email_id.as_deref(), Some("e-42"));
+        assert_eq!(h.account_id.as_deref(), Some("acc-7"));
+        assert_eq!(h.mailbox_id.as_deref(), Some("mbx-inbox"));
+        assert_eq!(h.thread_id.as_deref(), Some("t-9"));
+        assert_eq!(h.subject.as_deref(), Some("Hi"));
+        assert_eq!(h.snippet.as_deref(), Some("world"));
+        assert_eq!(h.from.as_deref(), Some("Alice <a@x.test>"));
+        assert_eq!(h.received_at_unix, Some(1_735_787_045));
+        assert_eq!(h.has_attachment, Some(true));
+        assert_eq!(h.email_state.as_deref(), Some("es-1"));
+        assert_eq!(h.mailbox_state.as_deref(), Some("ms-1"));
+        assert_eq!(
+            h.keywords,
+            vec!["$seen".to_string(), "$important".to_string()]
+        );
+    }
+
+    /// Malformed numeric / boolean fields are dropped silently —
+    /// the SDK degrades gracefully rather than poisoning the
+    /// whole hint. `email_id` still has to be present, so callers
+    /// still get useful metadata back from the surviving fields.
+    #[test]
+    fn email_delivery_hint_degrades_on_malformed_fields() {
+        use crate::push::EmailDeliveryHint;
+        let mut data = std::collections::BTreeMap::new();
+        data.insert("email_id".into(), "e-1".into());
+        data.insert("received_at_unix".into(), "not-an-integer".into());
+        data.insert("has_attachment".into(), "maybe".into());
+        let h = EmailDeliveryHint::from_data(&data).expect("present");
+        assert_eq!(h.received_at_unix, None);
+        assert_eq!(h.has_attachment, None);
     }
 
     /// `enqueue_set_keywords` MUST shape its payload as a JMAP

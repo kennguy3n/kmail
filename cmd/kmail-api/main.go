@@ -48,6 +48,7 @@ import (
 	"github.com/kennguy3n/kmail/internal/search"
 	"github.com/kennguy3n/kmail/internal/sharedinbox"
 	"github.com/kennguy3n/kmail/internal/sieve"
+	syncsvc "github.com/kennguy3n/kmail/internal/sync"
 	"github.com/kennguy3n/kmail/internal/tenant"
 	"github.com/kennguy3n/kmail/internal/valkeyurl"
 	"github.com/kennguy3n/kmail/internal/vault"
@@ -515,6 +516,25 @@ func main() {
 		Transport:   pushTransport,
 	})
 	push.NewHandlers(pushSvc, logger).Register(mux, authMW)
+
+	// SDK bootstrap (one-shot mailbox + email window + JMAP state
+	// tokens for the native clients' first-launch hydration). The
+	// internal JMAP client reuses the proxy's mTLS transport +
+	// account-resolution cache so the cold-start request rate
+	// matches the proxied path without double-charging Postgres on
+	// every miss.
+	internalJmap, err := jmap.NewInternalClient(proxy)
+	if err != nil {
+		logger.Fatalf("jmap.NewInternalClient: %v", err)
+	}
+	syncSvc, err := syncsvc.NewService(syncsvc.Config{
+		Client: internalJmap,
+		Logger: logger,
+	})
+	if err != nil {
+		logger.Fatalf("sync.NewService: %v", err)
+	}
+	syncsvc.NewHandlers(syncSvc, logger).Register(mux, authMW)
 
 	// kmail-secrets envelope. KMAIL_SECRETS_KEY is the single
 	// master key from which every BFF-side at-rest encryption key
