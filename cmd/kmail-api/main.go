@@ -877,7 +877,7 @@ func main() {
 		Logger:       logger,
 	})
 	if err != nil {
-		log.Fatalf("integrations: %v", err)
+		logger.Fatalf("integrations: %v", err)
 	}
 	integrations.NewHandlers(integSvc, logger).Register(mux, oauthAuthMW)
 
