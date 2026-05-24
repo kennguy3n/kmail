@@ -263,7 +263,16 @@ func TestFilterEventsForClient_AllAllowed_DeniedIsEmpty(t *testing.T) {
 // read:mail) must surface that scope ONCE in the eligibility
 // list.
 func TestIntegrationEligibleScopes_NoDuplicates(t *testing.T) {
-	got := integrationEligibleScopes()
+	// integrationEligibleScopes() returns a slice cached by
+	// sync.OnceValue at handlers.go:117 — every call site receives
+	// the same backing array, and the contract at handlers.go:104-107
+	// is "MUST NOT mutate". A direct sort.Strings(got) would
+	// (a) mutate that shared cache (already sorted, so values
+	// don't change today, but the precedent is wrong) and (b)
+	// race against any future caller / test that adds
+	// t.Parallel(). Copy first so this test has its own backing
+	// array.
+	got := append([]string(nil), integrationEligibleScopes()...)
 	sort.Strings(got)
 	seen := make(map[string]struct{}, len(got))
 	for _, sc := range got {

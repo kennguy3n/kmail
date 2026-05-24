@@ -859,6 +859,15 @@ func main() {
 	// surface in one place rather than spread across goroutines
 	// of subtly-different env probes.
 	oauthHandlers.SetSecureCookies(!middleware.IsDevEnv(cfg.Env))
+	// Wire the prefixed (`kmail-api `) BFF logger into the OAuth2
+	// handler set so its 5xx error paths land in the same
+	// log-aggregation channel the rest of the BFF uses. Without
+	// this, server-side failures in writeTokenError / the revoke
+	// fallback would be emitted via `log.Default()` and miss the
+	// `kmail-api ` prefix that structured log pipelines key on
+	// for service-correlation — making OAuth2 outages harder to
+	// triage than equivalent failures in jmap / cmk / webhooks.
+	oauthHandlers.SetLogger(logger)
 	// `RegisterRoutes` selectively wraps the two browser-facing
 	// endpoints (`/authorize`, `/authorize/approve`) with the OIDC
 	// middleware so the kchat-user context is populated before the

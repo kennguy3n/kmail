@@ -700,12 +700,54 @@ func (h *Handlers) redirectWithError(w http.ResponseWriter, r *http.Request, red
 	http.Redirect(w, r, u.String(), http.StatusFound)
 }
 
-// redirectWithOAuthError unwraps an OAuthError (if present) and
-// dispatches to redirectWithError with the right code.
+// redirectWithOAuthError converts the service-layer error into the
+// RFC 6749 §4.1.2.1 redirect-error wire envelope and dispatches to
+// redirectWithError.
+//
+// The lookup order mirrors mapTokenError (the /token-endpoint
+// equivalent) so the two paths agree on which sentinel maps to
+// which wire code. Without this, plain sentinels returned by
+// IssueAuthorizationCode — `ErrScopeNotAllowed`,
+// `ErrInvalidRedirectURI`, `ErrPKCERequiredButMissing`,
+// `ErrInvalidCodeVerifier` — would fall through to `server_error`
+// even though they are user-correctable client mistakes per spec.
+// An integration developer seeing `error=server_error` would
+// retry blindly when the actual fix is a re-consent flow with a
+// narrower scope set.
+//
+// Triggers for the scope-mismatch case are real: a client's
+// `allowed_scopes` could narrow between the GET /authorize render
+// and the POST /authorize/approve submit (admin revoked a scope
+// while the user sat on the consent screen), or a tampering user
+// could widen the hidden form field past what the consent screen
+// displayed. Either way the right wire shape is `invalid_scope`
+// + the spec-defined redirect — never `server_error`.
+//
+// Unrecognised errors still map to `server_error`/500 so the
+// on-call SLO catches the regression rather than masking a
+// genuine infrastructure failure as a 400. The mapping is kept
+// here rather than reaching into mapTokenError because the two
+// callers have different default semantics (mapTokenError builds
+// a JSON envelope with HTTPStatus, redirectWithOAuthError builds
+// a redirect with just `error=` + `error_description=`).
 func (h *Handlers) redirectWithOAuthError(w http.ResponseWriter, r *http.Request, redirectURI, state string, err error) {
 	var oerr *OAuthError
 	if errors.As(err, &oerr) {
 		h.redirectWithError(w, r, redirectURI, state, oerr.Code, oerr.Description)
+		return
+	}
+	switch {
+	case errors.Is(err, ErrScopeNotAllowed):
+		h.redirectWithError(w, r, redirectURI, state, ErrCodeInvalidScope, "requested scope not allowed for this client")
+		return
+	case errors.Is(err, ErrInvalidRedirectURI):
+		h.redirectWithError(w, r, redirectURI, state, ErrCodeInvalidRequest, "redirect_uri does not match client allow-list")
+		return
+	case errors.Is(err, ErrPKCERequiredButMissing):
+		h.redirectWithError(w, r, redirectURI, state, ErrCodeInvalidRequest, "PKCE required for public clients")
+		return
+	case errors.Is(err, ErrInvalidCodeVerifier):
+		h.redirectWithError(w, r, redirectURI, state, ErrCodeInvalidRequest, "code_verifier does not match challenge")
 		return
 	}
 	h.redirectWithError(w, r, redirectURI, state, ErrCodeServerError, "internal error issuing authorization code")
