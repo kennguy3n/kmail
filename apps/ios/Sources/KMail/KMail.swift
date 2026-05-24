@@ -61,36 +61,47 @@ extension KMailError: LocalizedError {
     /// enums) but `errorDescription` is exhaustive over the
     /// known cases at binding-generation time. A new variant
     /// will surface as a missing-case compile error.
+    ///
+    /// The local pattern-binding names below match the actual
+    /// FFI field labels (`description` for the single-string
+    /// variants, `retryAfterSeconds` for `RateLimit`, etc.). Swift
+    /// pattern matching uses positional binding for enum
+    /// associated values, so the local name is just a local
+    /// variable — but choosing names that match the FFI labels
+    /// (as defined in `sdk/kmail-ffi/src/lib.rs:69-98`) keeps
+    /// this site grep-friendly: a future contributor searching
+    /// for `description` will find both the Rust-side declaration
+    /// AND the Swift-side consumer.
     public var errorDescription: String? {
         switch self {
-        case .Store(let message):
-            return "KMail local store error: \(message)"
-        case .Transport(let message):
-            return "KMail transport error: \(message)"
-        case .Auth(let message):
-            return "KMail authentication failed: \(message)"
-        case .Forbidden(let message):
-            return "KMail forbidden: \(message)"
-        case .NotFound(let message):
-            return "KMail not found: \(message)"
+        case .Store(let description):
+            return "KMail local store error: \(description)"
+        case .Transport(let description):
+            return "KMail transport error: \(description)"
+        case .Auth(let description):
+            return "KMail authentication failed: \(description)"
+        case .Forbidden(let description):
+            return "KMail forbidden: \(description)"
+        case .NotFound(let description):
+            return "KMail not found: \(description)"
         case .RateLimit(let retryAfterSeconds):
             return "KMail rate limited: retry after \(retryAfterSeconds)s"
         case .JmapMethod(let code, let description):
             return "KMail JMAP method error [\(code)]: \(description)"
-        case .Protocol(let message):
-            return "KMail protocol error: \(message)"
+        case .Protocol(let description):
+            return "KMail protocol error: \(description)"
         case .HttpClient(let status, let body):
             return "KMail HTTP \(status) error: \(body)"
         case .SyncStateDiverged:
             return "KMail sync state diverged"
-        case .Decryption(let message):
-            return "KMail decryption error: \(message)"
-        case .KeyDerivation(let message):
-            return "KMail key derivation error: \(message)"
-        case .KeyStore(let message):
-            return "KMail keystore error: \(message)"
-        case .InvalidArgument(let message):
-            return "KMail invalid argument: \(message)"
+        case .Decryption(let description):
+            return "KMail decryption error: \(description)"
+        case .KeyDerivation(let description):
+            return "KMail key derivation error: \(description)"
+        case .KeyStore(let description):
+            return "KMail keystore error: \(description)"
+        case .InvalidArgument(let description):
+            return "KMail invalid argument: \(description)"
         case .Cancelled:
             return "KMail operation cancelled"
         }
@@ -173,6 +184,52 @@ extension FfiEmailAddress: Codable {
         case name
         case email
     }
+}
+
+/// Canonical `JSONEncoder` for the SDK's wire-format payloads
+/// (`EmailDraft`, keyword maps, etc.).
+///
+/// **The configuration here is load-bearing for cross-binding
+/// parity with Kotlin.** Kotlin's `wireFormatJson` at
+/// `apps/android/kmail-sdk/src/main/kotlin/com/kmail/sdk/KMail.kt`
+/// sets `encodeDefaults = true` explicitly because
+/// kotlinx-serialization's default `Json` *elides* fields that
+/// match their declared default (e.g. an `EmailDraft` with empty
+/// `cc` / `bcc` / `inReplyTo` would emit an object missing those
+/// keys). Swift's `JSONEncoder` always emits every `Codable`
+/// property regardless of value, so the parity *happens to hold*
+/// today without any explicit configuration — but that's the
+/// kind of "implicit guarantee" Devin Review correctly flagged.
+///
+/// By plumbing every encode call through this factory, the
+/// invariant is documented in code: a future contributor who
+/// wants to add (say) `keyEncodingStrategy = .convertToSnakeCase`
+/// will see this comment block and the cross-binding parity test
+/// (`testEmailDraftEncodesToRustWireFormat`) and understand that
+/// Kotlin's `wireFormatJson` MUST be kept in lockstep with this
+/// factory. Today both encoders are configured to emit:
+///
+///   - Every property, regardless of default-equality.
+///   - JSON keys in property-declaration order (Swift `Codable`'s
+///     synthesized order; kotlinx-serialization's declaration
+///     order — they coincide because both bindings declare the
+///     fields in RFC 8621 wire-format order).
+///   - camelCase keys (matches RFC 8621 and the React web client).
+///
+/// Used by:
+///   - `KMailClient.sendEmail(_ draft:)`
+///   - `KMailClient.enqueueSetKeywords(emailID:keywords:)`
+internal func makeKMailWireFormatJSONEncoder() -> JSONEncoder {
+    let encoder = JSONEncoder()
+    // No `.outputFormatting = .sortedKeys` here on purpose: Swift's
+    // synthesized `Codable` encoder uses property-declaration order,
+    // kotlinx-serialization's default emitter does the same, and
+    // both bindings declare `EmailDraft` fields in identical
+    // declaration order. Sorting keys would diverge from Kotlin
+    // (which doesn't sort by default) and force the Kotlin side
+    // to adopt the same opt-in, expanding the surface area of the
+    // parity contract.
+    return encoder
 }
 
 // MARK: - Client configuration
@@ -448,9 +505,13 @@ public final class KMailClient {
     /// email. The action is persisted in the outbound-action
     /// queue and replayed against JMAP on the next `sync()`.
     public func enqueueSetKeywords(emailID: String, keywords: [String: Bool]) throws {
-        let json = try JSONEncoder().encode(keywords)
+        // Routed through `makeKMailWireFormatJSONEncoder()` so the
+        // cross-binding parity invariant with Kotlin's
+        // `wireFormatJson` is documented at every call site rather
+        // than relying on Swift's implicit default-emission behaviour.
+        let json = try makeKMailWireFormatJSONEncoder().encode(keywords)
         guard let str = String(data: json, encoding: .utf8) else {
-            throw KMailError.InvalidArgument(message: "keywords dictionary did not encode to UTF-8")
+            throw KMailError.InvalidArgument(description: "keywords dictionary did not encode to UTF-8")
         }
         try handle.enqueueSetKeywords(emailId: emailID, keywordsJson: str)
     }
@@ -459,10 +520,16 @@ public final class KMailClient {
     /// email id. Internally encodes the draft to JSON and threads
     /// it through the FFI's string-based interface.
     public func sendEmail(_ draft: EmailDraft) async throws -> String {
-        let encoder = JSONEncoder()
+        // Routed through `makeKMailWireFormatJSONEncoder()` so the
+        // cross-binding parity invariant with Kotlin's
+        // `wireFormatJson` is documented at the call site. A future
+        // contributor changing this configuration must also change
+        // the Kotlin side or break the byte-for-byte JMAP payload
+        // parity that the BFF observability dashboards rely on.
+        let encoder = makeKMailWireFormatJSONEncoder()
         let data = try encoder.encode(draft)
         guard let json = String(data: data, encoding: .utf8) else {
-            throw KMailError.InvalidArgument(message: "EmailDraft did not encode to UTF-8")
+            throw KMailError.InvalidArgument(description: "EmailDraft did not encode to UTF-8")
         }
         return try await handle.sendEmail(draftJson: json)
     }

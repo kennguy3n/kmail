@@ -54,36 +54,50 @@ fn runtime() -> &'static tokio::runtime::Runtime {
 // Error mapping
 // ---------------------------------------------------------------
 
+// NOTE on field naming: every variant uses `description` rather
+// than `message`. The natural-feeling `message` is a footgun in
+// the Kotlin binding — UniFFI 0.28's Kotlin code generator emits
+// each variant as a subclass of `kotlin.Exception` (which itself
+// inherits `Throwable.message: String?`) and a constructor field
+// named `message: String` shadows that supertype property,
+// producing duplicate-declaration compile errors. Using
+// `description` sidesteps the collision and reads naturally on
+// both bindings: `error.description` on Swift / Kotlin and the
+// usual `Throwable.message` virtual getter (formatted via the
+// `#[error("...")]` Display impl) is still available for log
+// messages. The napi binding constructs error strings from
+// `kmail_core::Error` directly (`sdk/kmail-napi/src/lib.rs::napi_err`)
+// and is unaffected by this field renaming.
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum KMailError {
-    #[error("local store error: {message}")]
-    Store { message: String },
-    #[error("transport error: {message}")]
-    Transport { message: String },
-    #[error("authentication failed: {message}")]
-    Auth { message: String },
-    #[error("forbidden: {message}")]
-    Forbidden { message: String },
-    #[error("not found: {message}")]
-    NotFound { message: String },
+    #[error("local store error: {description}")]
+    Store { description: String },
+    #[error("transport error: {description}")]
+    Transport { description: String },
+    #[error("authentication failed: {description}")]
+    Auth { description: String },
+    #[error("forbidden: {description}")]
+    Forbidden { description: String },
+    #[error("not found: {description}")]
+    NotFound { description: String },
     #[error("rate limited: retry after {retry_after_seconds}s")]
     RateLimit { retry_after_seconds: u64 },
     #[error("jmap method error [{code}]: {description}")]
     JmapMethod { code: String, description: String },
-    #[error("protocol error: {message}")]
-    Protocol { message: String },
+    #[error("protocol error: {description}")]
+    Protocol { description: String },
     #[error("http client error [{status}]: {body}")]
     HttpClient { status: u16, body: String },
     #[error("sync state diverged")]
     SyncStateDiverged,
-    #[error("decryption: {message}")]
-    Decryption { message: String },
-    #[error("key derivation: {message}")]
-    KeyDerivation { message: String },
-    #[error("keystore: {message}")]
-    KeyStore { message: String },
-    #[error("invalid argument: {message}")]
-    InvalidArgument { message: String },
+    #[error("decryption: {description}")]
+    Decryption { description: String },
+    #[error("key derivation: {description}")]
+    KeyDerivation { description: String },
+    #[error("keystore: {description}")]
+    KeyStore { description: String },
+    #[error("invalid argument: {description}")]
+    InvalidArgument { description: String },
     #[error("operation cancelled")]
     Cancelled,
 }
@@ -92,24 +106,24 @@ impl From<kmail_core::Error> for KMailError {
     fn from(value: kmail_core::Error) -> Self {
         use kmail_core::Error as E;
         match value {
-            E::Store(message) => KMailError::Store { message },
-            E::Transport(message) => KMailError::Transport { message },
-            E::Auth(message) => KMailError::Auth { message },
-            E::Forbidden(message) => KMailError::Forbidden { message },
-            E::NotFound(message) => KMailError::NotFound { message },
+            E::Store(description) => KMailError::Store { description },
+            E::Transport(description) => KMailError::Transport { description },
+            E::Auth(description) => KMailError::Auth { description },
+            E::Forbidden(description) => KMailError::Forbidden { description },
+            E::NotFound(description) => KMailError::NotFound { description },
             E::RateLimit {
                 retry_after_seconds,
             } => KMailError::RateLimit {
                 retry_after_seconds,
             },
             E::JmapMethod { code, description } => KMailError::JmapMethod { code, description },
-            E::Protocol(message) => KMailError::Protocol { message },
+            E::Protocol(description) => KMailError::Protocol { description },
             E::HttpClient { status, body } => KMailError::HttpClient { status, body },
             E::SyncStateDiverged => KMailError::SyncStateDiverged,
-            E::Decryption(message) => KMailError::Decryption { message },
-            E::KeyDerivation(message) => KMailError::KeyDerivation { message },
-            E::KeyStore(message) => KMailError::KeyStore { message },
-            E::InvalidArgument(message) => KMailError::InvalidArgument { message },
+            E::Decryption(description) => KMailError::Decryption { description },
+            E::KeyDerivation(description) => KMailError::KeyDerivation { description },
+            E::KeyStore(description) => KMailError::KeyStore { description },
+            E::InvalidArgument(description) => KMailError::InvalidArgument { description },
             E::Cancelled => KMailError::Cancelled,
         }
     }
@@ -121,7 +135,7 @@ impl From<tokio::task::JoinError> for KMailError {
             KMailError::Cancelled
         } else {
             KMailError::Transport {
-                message: format!("background task panicked: {value}"),
+                description: format!("background task panicked: {value}"),
             }
         }
     }
@@ -180,7 +194,12 @@ impl From<tokio::task::JoinError> for KMailError {
 /// autocomplete) SHOULD source those defaults from
 /// [`default_client_config`] rather than hardcoding numeric literals
 /// — see the Swift `ClientConfiguration.init` for the pattern.
-#[derive(uniffi::Record)]
+// `Clone` is derived purely for the unit-test path: `lower_client_open_test`
+// hands a fresh owned clone to the production helper while keeping the input
+// record around for subsequent assertions. Production callers (`client_open`)
+// always move the record straight through, so the derive costs nothing at
+// runtime in foreign-binding code paths.
+#[derive(Clone, uniffi::Record)]
 pub struct KMailClientConfig {
     pub bff_url: String,
     pub bearer_token: String,
@@ -274,7 +293,7 @@ impl TryFrom<FfiAeadEnvelope> for AeadEnvelope {
     fn try_from(env: FfiAeadEnvelope) -> Result<Self, Self::Error> {
         if env.nonce.len() != kmail_core::crypto::NONCE_LEN {
             return Err(KMailError::InvalidArgument {
-                message: format!(
+                description: format!(
                     "AEAD nonce must be {} bytes, got {}",
                     kmail_core::crypto::NONCE_LEN,
                     env.nonce.len()
@@ -317,7 +336,7 @@ impl TryFrom<FfiConfidentialEnvelope> for ConfidentialEnvelope {
     fn try_from(env: FfiConfidentialEnvelope) -> Result<Self, Self::Error> {
         if env.kek_salt.len() != kmail_core::crypto::KEK_SALT_LEN {
             return Err(KMailError::InvalidArgument {
-                message: format!(
+                description: format!(
                     "Confidential KEK salt must be {} bytes, got {}",
                     kmail_core::crypto::KEK_SALT_LEN,
                     env.kek_salt.len()
@@ -562,8 +581,44 @@ pub fn default_client_config(
     }
 }
 
-#[uniffi::export]
-pub fn client_open(config: KMailClientConfig) -> Result<Arc<KMailClientHandle>, KMailError> {
+/// Lower a `KMailClientConfig` (the FFI-shaped record received
+/// from a foreign caller) into a `kmail_core::ClientConfig`.
+///
+/// This is the **single source of truth** for the UniFFI lowering
+/// ladder. Both [`client_open`] (production entry-point) and the
+/// `lower_client_open_test` helper used by the unit tests call
+/// this function — the tests therefore exercise the *exact same*
+/// per-field plumbing the production path uses, not a copy of it.
+/// Before this refactor a parallel re-implementation lived inline
+/// in `lower_client_open_test`; the two ladders were documented
+/// to stay in lockstep "by convention", which is the kind of
+/// drift-prone arrangement Devin Review correctly flagged. The
+/// extraction makes the lockstep invariant compiler-enforced —
+/// adding a new field to this function automatically flows into
+/// both `client_open` AND every test that calls it.
+///
+/// Takes `KMailClientConfig` by value so the production caller
+/// (`client_open`, which already owns the foreign-bound record)
+/// moves every owned `String` field straight into `ClientConfig`
+/// without an extra allocation. The test adapter
+/// `lower_client_open_test` clones the record itself when the
+/// caller wants to keep it for follow-up assertions. The clone
+/// cost is confined to the test binary, never to the production
+/// FFI hot path.
+///
+/// Two-tier semantics:
+///
+///   * **Tier 1** (numeric / cache-size): `None` means "inherit
+///     Rust default from `ClientConfig::new`". The `if let Some(_)`
+///     ladder below skips the assignment so the default stays.
+///   * **Tier 2** (string `Option<T>` — `account_id`,
+///     `bootstrap_mailbox_role`): the core type already declares
+///     these as `Option<String>`, so a foreign-side `None` is a
+///     legitimate "no value", different from "inherit default".
+///     Assign verbatim. This matches the napi binding's
+///     `kmail_napi::client_open` exactly, locked down by
+///     `client_open_matches_napi_lowering_for_string_tier`.
+fn lower_kmail_config_to_core(config: KMailClientConfig) -> ClientConfig {
     let mut core_cfg = ClientConfig::new(
         config.bff_url,
         config.bearer_token,
@@ -577,6 +632,15 @@ pub fn client_open(config: KMailClientConfig) -> Result<Arc<KMailClientHandle>, 
     // `apply_optional_overrides` will fail to compile in both call
     // sites until they're updated together. See the function's doc
     // comment for the tier-1 vs tier-2 contract.
+    //
+    // We take `config` by value so the production `client_open` path
+    // moves all four owned `String` fields (`bff_url`, `bearer_token`,
+    // `database_path`) and the two tier-2 `Option<String>`s into the
+    // core config without any extra heap allocations. Earlier revisions
+    // accepted `&KMailClientConfig` to spare callers a clone, but the
+    // production path is the *only* hot caller — tests run rarely and
+    // can pay the trivial `config.clone()` cost themselves. See
+    // `lower_client_open_test` for the test-side adapter.
     core_cfg.apply_optional_overrides(
         config.attachment_cache_bytes,
         config.request_timeout_secs,
@@ -585,7 +649,18 @@ pub fn client_open(config: KMailClientConfig) -> Result<Arc<KMailClientHandle>, 
         config.account_id,
         config.bootstrap_mailbox_role,
     );
+    core_cfg
+}
 
+#[uniffi::export]
+pub fn client_open(config: KMailClientConfig) -> Result<Arc<KMailClientHandle>, KMailError> {
+    // The lowering ladder lives in `lower_kmail_config_to_core`
+    // so the unit tests can exercise the same per-field plumbing
+    // without opening a real SQLite database here. We move `config`
+    // straight through — the helper consumes it and reuses every
+    // owned `String` allocation, so there is no production-side
+    // clone overhead.
+    let core_cfg = lower_kmail_config_to_core(config);
     let inner = KMailClient::open(core_cfg)?;
     Ok(Arc::new(KMailClientHandle { inner }))
 }
@@ -665,7 +740,7 @@ impl KMailClientHandle {
     ) -> Result<(), KMailError> {
         let keywords: serde_json::Value =
             serde_json::from_str(&keywords_json).map_err(|e| KMailError::InvalidArgument {
-                message: format!("invalid keywords json: {e}"),
+                description: format!("invalid keywords json: {e}"),
             })?;
         self.inner.enqueue_set_keywords(&email_id, &keywords)?;
         Ok(())
@@ -674,7 +749,7 @@ impl KMailClientHandle {
     pub async fn send_email(&self, draft_json: String) -> Result<String, KMailError> {
         let draft: EmailDraft =
             serde_json::from_str(&draft_json).map_err(|e| KMailError::InvalidArgument {
-                message: format!("invalid draft json: {e}"),
+                description: format!("invalid draft json: {e}"),
             })?;
         let inner = self.inner.clone();
         let id = runtime()
@@ -969,13 +1044,41 @@ mod tests {
             ffi.attachment_cache_bytes,
             Some(core.attachment_cache_bytes)
         );
+        // Verify duration parity at *millisecond* precision rather
+        // than just `as_secs()`. The FFI helper lowers via `as_secs()`,
+        // which silently truncates any sub-second component — and the
+        // bot correctly pointed out that comparing the FFI output to
+        // `core.request_timeout.as_secs()` would not catch a future
+        // fractional default (e.g. `Duration::from_millis(30500)`
+        // would round down to 30s on both sides and pass).
+        //
+        // Multiplying the FFI seconds by 1000 and comparing to
+        // `core.*.as_millis()` makes that drift observable: if a
+        // future `ClientConfig::new` introduces a fractional second,
+        // the FFI helper would round down and this assertion would
+        // fail loudly with the exact ms difference, prompting either
+        // (a) rounding the Rust-side default back to a whole second,
+        // or (b) migrating the FFI fields from `u32` seconds to
+        // `u64` milliseconds.
+        let ffi_request_ms = ffi
+            .request_timeout_secs
+            .map(|s| u128::from(s) * 1000)
+            .expect("default_client_config must always emit Some(request_timeout_secs)");
+        let ffi_retry_ms = ffi
+            .retry_budget_secs
+            .map(|s| u128::from(s) * 1000)
+            .expect("default_client_config must always emit Some(retry_budget_secs)");
         assert_eq!(
-            ffi.request_timeout_secs.map(u64::from),
-            Some(core.request_timeout.as_secs())
+            ffi_request_ms,
+            core.request_timeout.as_millis(),
+            "request_timeout drifts: FFI lowers via as_secs() which would silently truncate \
+             any sub-second component of ClientConfig::new's default. Either round the Rust \
+             default back to whole seconds or migrate the FFI field to milliseconds."
         );
         assert_eq!(
-            ffi.retry_budget_secs.map(u64::from),
-            Some(core.retry_budget.as_secs())
+            ffi_retry_ms,
+            core.retry_budget.as_millis(),
+            "retry_budget drifts: see request_timeout assertion for guidance."
         );
         assert_eq!(
             ffi.initial_sync_email_window,
@@ -1001,30 +1104,28 @@ mod tests {
         assert_eq!(ffi.account_id, None);
     }
 
-    /// Test helper that mirrors the `client_open` lowering exactly
-    /// by calling the same shared `ClientConfig::apply_optional_overrides`
-    /// the production entry point calls. The body is intentionally a
-    /// thin glue layer (build `ClientConfig::new`, call the shared
-    /// helper) so there's no per-field lowering logic that could
-    /// drift out of sync with `client_open` — the only thing the
-    /// test "duplicates" is the call shape, which the compiler
-    /// enforces because `apply_optional_overrides` takes a fixed
-    /// parameter list.
+    /// Thin wrapper around the production lowering helper for use
+    /// in unit tests. Calls `super::lower_kmail_config_to_core`
+    /// directly — which itself delegates to the shared
+    /// `ClientConfig::apply_optional_overrides` in `kmail-core` — so
+    /// there is no parallel re-implementation here. If you find
+    /// yourself tempted to inline the ladder here for
+    /// "testability", resist: the entire point of extracting the
+    /// helper is that the tests exercise the same code path
+    /// `client_open` does. Per-field lowering drift between this
+    /// test path and production is structurally impossible because
+    /// `lower_kmail_config_to_core` is the ONLY ladder; the
+    /// compiler enforces parameter-list parity with
+    /// `apply_optional_overrides`.
+    ///
+    /// The production helper consumes `KMailClientConfig` by value so
+    /// `client_open` can move every owned `String` field straight into
+    /// the core config without any extra allocations. Tests prefer to
+    /// keep the input record around for subsequent assertions, so this
+    /// adapter takes a reference and clones — the clone cost is
+    /// confined to the test binary, never the foreign-binding hot path.
     fn lower_client_open_test(config: &KMailClientConfig) -> ClientConfig {
-        let mut core_cfg = ClientConfig::new(
-            config.bff_url.clone(),
-            config.bearer_token.clone(),
-            PathBuf::from(config.database_path.clone()),
-        );
-        core_cfg.apply_optional_overrides(
-            config.attachment_cache_bytes,
-            config.request_timeout_secs,
-            config.retry_budget_secs,
-            config.initial_sync_email_window,
-            config.account_id.clone(),
-            config.bootstrap_mailbox_role.clone(),
-        );
-        core_cfg
+        super::lower_kmail_config_to_core(config.clone())
     }
 
     /// `client_open` with every override field set to `None` must
@@ -1151,6 +1252,20 @@ mod tests {
     /// (`sdk/kmail-napi/src/lib.rs` test module) would diverge.
     /// The pair of tests, one per binding crate, is the actual
     /// guard rail.
+    ///
+    /// **This test also covers the Kotlin/Android binding parity by
+    /// extension**: the Kotlin foreign code generated by UniFFI calls
+    /// the exact same `client_open` entry-point as the Swift code, so
+    /// the lowering ladder this test exercises is the ONE ladder
+    /// shared by every UniFFI consumer. A separate
+    /// `client_open_matches_kotlin_lowering_for_string_tier` would
+    /// just rename this test. The load-bearing Kotlin-specific
+    /// drift-prevention test lives on the Kotlin side at
+    /// `apps/android/kmail-sdk/src/test/.../KMailIntegrationTests.kt`
+    /// (`kotlinDefaultsMatchRustDefaults`), which checks that the
+    /// Kotlin `ClientConfiguration` data class sources its defaults
+    /// from `defaultClientConfig(...)` rather than hardcoded Kotlin
+    /// literals.
     #[test]
     fn client_open_lowering_matches_shared_helper() {
         for case in [
