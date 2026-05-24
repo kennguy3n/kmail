@@ -405,15 +405,31 @@ func (s *Service) DispatchEvent(ctx context.Context, tenantID, eventType string,
 	enqueued := 0
 
 	// Step 1: admin-owned webhook fan-out (legacy path,
-	// unaffected by scope filtering).
-	admin, err := s.dispatchAdminOwned(ctx, tenantID, eventType, body)
+	// unaffected by scope filtering). `dispatchAdminOwned`
+	// delegates directly to `webhooks.Service.DeliverEvent`
+	// so the single source of truth for admin-owned
+	// semantics — `oauth_client_id IS NULL` filter (added
+	// round-8), `events` matching, and listener fan-out for
+	// `EventListener` registrations like
+	// `onboarding.AutoTriggerService` wired at
+	// `cmd/kmail-api/main.go:928` — stays inside the
+	// webhooks package. Pass the unmarshaled payload
+	// (not pre-marshaled body) because DeliverEvent both
+	// json.Marshals it for the INSERT and passes the map
+	// itself to each listener's OnWebhookEvent callback;
+	// listeners receive the structured map, not bytes.
+	admin, err := s.dispatchAdminOwned(ctx, tenantID, eventType, payload)
 	if err != nil {
 		return enqueued, fmt.Errorf("integrations: admin-owned dispatch: %w", err)
 	}
 	enqueued += admin
 
 	// Step 2: integration-owned subscribers, with per-client
-	// scope and quota enforcement.
+	// scope and quota enforcement. Keeps the pre-marshaled
+	// body so each subscriber INSERT can reuse the same JSON
+	// bytes (no per-subscriber re-marshal) — the integration
+	// path runs N independent inserts where N is typically
+	// >1, so amortising the marshal pays off.
 	integ, err := s.dispatchIntegrationOwned(ctx, tenantID, eventType, body)
 	if err != nil {
 		return enqueued, fmt.Errorf("integrations: integration-owned dispatch: %w", err)
@@ -423,75 +439,42 @@ func (s *Service) DispatchEvent(ctx context.Context, tenantID, eventType string,
 	return enqueued, nil
 }
 
-// dispatchAdminOwned inserts deliveries for webhook_endpoints
-// rows that have NULL oauth_client_id (legacy / admin-owned).
-// Behaviour matches the pre-Phase-E webhooks.Service.DeliverEvent
-// path; no scope filter, no per-client rate limit.
-func (s *Service) dispatchAdminOwned(ctx context.Context, tenantID, eventType string, body []byte) (int, error) {
-	var enqueued int
-	err := pgx.BeginFunc(ctx, s.cfg.Pool, func(tx pgx.Tx) error {
-		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
-			return err
-		}
-		// Buffer IDs in-memory before the INSERT loop so the
-		// rows.Close() can run inside the same logical scope as
-		// the Query (via defer) without holding the result set
-		// open across N tx.Exec calls. pgx v5's pgx.Rows.Next()
-		// auto-closes on natural-end-of-iteration, but a Scan
-		// error or context cancellation between Query and the
-		// loop terminator would otherwise leave the rows open
-		// until the GC finalizer fires — fragile against future
-		// edits that add code paths between Query and Close.
-		// `defer rows.Close()` is idempotent (pgx.Rows.Close
-		// guards a closed flag internally) and handles every
-		// exit path uniformly.
-		ids, err := func() ([]string, error) {
-			rows, err := tx.Query(ctx, `
-				SELECT id::text FROM webhook_endpoints
-				WHERE tenant_id = $1::uuid AND active = true
-				  AND oauth_client_id IS NULL
-				  AND (jsonb_array_length(events) = 0 OR events ? $2)
-			`, tenantID, eventType)
-			if err != nil {
-				return nil, err
-			}
-			defer rows.Close()
-			var collected []string
-			for rows.Next() {
-				var id string
-				if err := rows.Scan(&id); err != nil {
-					return nil, err
-				}
-				collected = append(collected, id)
-			}
-			// pgx surfaces driver-level iteration errors
-			// (network reset, partial result) on rows.Err()
-			// after the loop terminates. Without this check
-			// a transport-level failure mid-scan would
-			// silently truncate the subscriber list and the
-			// dispatcher would under-deliver — a silent
-			// at-least-once violation. Treat as fatal: the
-			// outer BeginFunc retries the whole dispatch.
-			if err := rows.Err(); err != nil {
-				return nil, fmt.Errorf("integrations: scan admin-owned subscribers: %w", err)
-			}
-			return collected, nil
-		}()
-		if err != nil {
-			return err
-		}
-		for _, id := range ids {
-			if _, err := tx.Exec(ctx, `
-				INSERT INTO webhook_deliveries (tenant_id, endpoint_id, event_type, payload)
-				VALUES ($1::uuid, $2::uuid, $3, $4::jsonb)
-			`, tenantID, id, eventType, string(body)); err != nil {
-				return err
-			}
-			enqueued++
-		}
-		return nil
-	})
-	return enqueued, err
+// dispatchAdminOwned enqueues deliveries for admin-owned
+// webhook endpoints (oauth_client_id IS NULL).
+//
+// IMPLEMENTATION — delegates to webhooks.Service.DeliverEvent
+// rather than reimplementing the query inline. This is the
+// canonical entry point for the admin-owned path and is the
+// single source of truth for THREE pieces of behaviour the
+// integration framework MUST not diverge from:
+//
+//  1. The `oauth_client_id IS NULL` predicate (round-8 fix)
+//     that confines DeliverEvent's fan-out to admin-owned
+//     rows. Reimplementing the query here risked drift the
+//     moment the canonical query changed — exactly the
+//     scope-bypass class of bug round-8 was guarding against.
+//  2. The active-flag filter (`active = true`) so deactivated
+//     endpoints stop receiving fan-out without admin
+//     intervention. Symmetric with the integration-owned
+//     filter in loadIntegrationSubscribers (round-7 added
+//     `oc.active = true`).
+//  3. The `EventListener` fan-out (`OnWebhookEvent`) so
+//     in-process subscribers — currently
+//     `onboarding.AutoTriggerService` wired at
+//     `cmd/kmail-api/main.go:928` (which auto-completes
+//     onboarding-checklist steps from webhook events) — fire
+//     when admin-owned events ship. The previous inline
+//     reimplementation here silently dropped this listener
+//     notification: any future event source that migrated
+//     from calling webhooks.DeliverEvent directly to calling
+//     integrations.DispatchEvent (the intended single entry
+//     point per doc.go) would have caused the onboarding
+//     auto-trigger to silently stop firing. The bug was
+//     latent today (no event source currently calls
+//     DispatchEvent) but exactly the class of regression
+//     defence-in-depth listener wiring is supposed to prevent.
+func (s *Service) dispatchAdminOwned(ctx context.Context, tenantID, eventType string, payload map[string]any) (int, error) {
+	return s.cfg.Webhooks.DeliverEvent(ctx, tenantID, eventType, payload)
 }
 
 // integrationSubscriber bundles the row data we need to apply
