@@ -152,8 +152,21 @@ func main() {
 	// sets only one (or only CAFile / ServerName) would otherwise
 	// see the proxy silently fall through to plain HTTP with no
 	// hint at boot. `Validate()` reports the specific mismatch.
+	//
+	// In dev we log a warning so a developer mid-mTLS-setup
+	// doesn't get blocked from booting the BFF. In any non-dev
+	// environment (staging, production, or anything the auth
+	// middleware would treat as production by default) this is
+	// fatal — the alternative is a deployment that says it's
+	// running with mTLS in its config but actually talks plain
+	// HTTP to Stalwart, which is the misconfiguration the
+	// production-fail-closed rule exists to catch.
 	if err := cfg.StalwartMTLS.Validate(); err != nil {
-		logger.Printf("jmap proxy: WARNING %v", err)
+		if middleware.IsDevEnv(cfg.Env) {
+			logger.Printf("jmap proxy: WARNING partial mTLS config (dev): %v", err)
+		} else {
+			logger.Fatalf("jmap proxy: partial mTLS config in env=%q (fail-closed): %v", cfg.Env, err)
+		}
 	}
 	var stalwartTLS *jmap.ClientTLSConfig
 	if cfg.StalwartMTLS.Enabled() {
@@ -389,7 +402,15 @@ func main() {
 	// makes future KMS-backed rotations a single swap).
 	secretsEnvelope, secretsEnvelopeErr := cmk.LoadEnvelope()
 	if secretsEnvelopeErr != nil {
-		logger.Printf("secrets: KMAIL_SECRETS_KEY unset (%v) — DKIM/TOTP/HSM secrets will be stored unwrapped (DEV ONLY)", secretsEnvelopeErr)
+		// DKIM and TOTP fall back to plaintext-on-disk when the
+		// envelope is unset (the legacy behaviour, kept for dev).
+		// HSM credential registration is *refused* in this state by
+		// the `ErrEnvelopeNotConfigured` guard in cmk/hsm.go — the
+		// API will return 503 for HSM registration. Keep the log
+		// message honest about that asymmetry so an operator who
+		// reads only this line doesn't believe HSM credentials are
+		// silently stored plaintext.
+		logger.Printf("secrets: KMAIL_SECRETS_KEY unset (%v) — DKIM/TOTP secrets will be stored unwrapped, HSM registration will be refused (DEV ONLY)", secretsEnvelopeErr)
 		secretsEnvelope = nil
 	}
 

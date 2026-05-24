@@ -59,7 +59,16 @@ type Key struct {
 
 // CMKService is the service implementation.
 type CMKService struct {
-	pool     *pgxpool.Pool
+	pool *pgxpool.Pool
+
+	// envMu serialises access to the envelope pointer. The read
+	// side (HSM credential wrap/unwrap on every request) is the
+	// hot path; the write side (SetEnvelope / NewCMKService*) is
+	// almost always init-time, but key rotation will eventually
+	// swap the envelope at runtime, so the synchronisation is the
+	// load-bearing piece that lets that future change land
+	// without a refactor here.
+	envMu    sync.RWMutex
 	envelope SecretsEnvelope
 
 	// logger receives operational notices (e.g. legacy-plaintext
@@ -72,6 +81,19 @@ type CMKService struct {
 	// warning per (tenant, config) so a hot read path doesn't
 	// fill the log with the same notice.
 	legacyPlaintextSeen sync.Map
+}
+
+// getEnvelope returns the currently configured envelope (which
+// may be nil). All read paths in this package MUST go through
+// this helper so a concurrent SetEnvelope cannot race the field
+// read. Callers should pull the envelope once at function entry
+// into a local variable and use that local for the rest of the
+// function so a runtime swap doesn't interleave wrap/unwrap
+// operations on the same logical row.
+func (s *CMKService) getEnvelope() SecretsEnvelope {
+	s.envMu.RLock()
+	defer s.envMu.RUnlock()
+	return s.envelope
 }
 
 // NewCMKService returns a service. No envelope is configured, so
@@ -101,17 +123,23 @@ func (s *CMKService) SetLogger(logger *log.Logger) {
 }
 
 // SetEnvelope wires the secrets envelope onto an existing
-// service. Provided for the cmd/* binaries that build the
-// service before they have resolved the envelope.
+// service. The write is serialised through envMu so concurrent
+// readers (HSM credential wrap/unwrap) never see a torn
+// interface value; this also makes the method safe to call from
+// a future key-rotation worker that swaps the envelope at
+// runtime, not just from init.
 func (s *CMKService) SetEnvelope(envelope SecretsEnvelope) {
+	s.envMu.Lock()
 	s.envelope = envelope
+	s.envMu.Unlock()
 }
 
 // Envelope returns the configured envelope or nil. Exposed for
 // callers that need to wrap secondary fields the same way (e.g.
-// migration code).
+// migration code). The read goes through the same lock used by
+// SetEnvelope so concurrent rotations are safe.
 func (s *CMKService) Envelope() SecretsEnvelope {
-	return s.envelope
+	return s.getEnvelope()
 }
 
 // ErrPlanNotEligible is returned when a non-privacy tenant tries

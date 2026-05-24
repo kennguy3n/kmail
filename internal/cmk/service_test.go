@@ -100,3 +100,43 @@ func TestNilPoolGuards(t *testing.T) {
 		t.Errorf("Revoke nil-pool expected error")
 	}
 }
+
+// TestSetEnvelope_ConcurrentSafe verifies the RWMutex around the
+// envelope field actually protects concurrent SetEnvelope vs.
+// Envelope() reads. The race detector flags an unsynchronised
+// interface write against a concurrent read, so this test
+// regresses to the pre-RWMutex version of CMKService if the lock
+// is ever removed.
+func TestSetEnvelope_ConcurrentSafe(t *testing.T) {
+	// 64 hex chars = 32-byte master key, the format accepted by
+	// the envelope constructor.
+	envA, err := NewAESGCMEnvelopeFromKeyMaterial(strings.Repeat("a", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	envB, err := NewAESGCMEnvelopeFromKeyMaterial(strings.Repeat("b", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := NewCMKService(nil)
+
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < 1000; i++ {
+			if i%2 == 0 {
+				svc.SetEnvelope(envA)
+			} else {
+				svc.SetEnvelope(envB)
+			}
+		}
+		close(done)
+	}()
+	for i := 0; i < 1000; i++ {
+		_ = svc.Envelope()
+	}
+	<-done
+	// Final state is one of the two envelopes; nil-or-typed.
+	if svc.Envelope() == nil {
+		t.Fatalf("Envelope() returned nil after concurrent stores; expected envA or envB")
+	}
+}

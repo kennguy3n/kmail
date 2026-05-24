@@ -105,17 +105,35 @@ var envAliases = map[string]string{
 // checks see only canonical names, so the alias table is the one
 // place an operator-facing string is interpreted.
 func (c OIDCConfig) normalizedEnv() string {
-	raw := strings.ToLower(strings.TrimSpace(c.Env))
-	if canonical, ok := envAliases[raw]; ok {
-		return canonical
-	}
-	return raw
+	return normalizeEnvString(c.Env)
 }
 
 // isDevEnv reports whether the configured environment string
 // unlocks dev-only auth shortcuts.
 func (c OIDCConfig) isDevEnv() bool {
-	return c.normalizedEnv() == EnvDevelopment
+	return IsDevEnv(c.Env)
+}
+
+// IsDevEnv reports whether the supplied environment string
+// resolves (after trim / lowercase / alias) to the development
+// environment. Exposed so non-middleware callers — cmd/* binaries
+// in particular — can gate fail-closed vs. fail-open behaviour
+// against the same alias table the auth middleware uses, rather
+// than maintaining a parallel copy.
+func IsDevEnv(env string) bool {
+	return normalizeEnvString(env) == EnvDevelopment
+}
+
+// normalizeEnvString centralises the trim/lowercase/alias
+// resolution. Both OIDCConfig.normalizedEnv and the package-level
+// IsDevEnv go through it so the alias map is the single source
+// of truth.
+func normalizeEnvString(env string) string {
+	raw := strings.ToLower(strings.TrimSpace(env))
+	if canonical, ok := envAliases[raw]; ok {
+		return canonical
+	}
+	return raw
 }
 
 // isKnownEnv reports whether the configured environment is one

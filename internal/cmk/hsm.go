@@ -139,7 +139,10 @@ func (s *CMKService) RegisterHSMKey(ctx context.Context, tenantID, plan string, 
 	if s.pool == nil {
 		return nil, errors.New("cmk: pool not configured")
 	}
-	if s.envelope == nil {
+	// Snapshot the envelope once so a concurrent SetEnvelope
+	// cannot interleave the nil-check and the Wrap call below.
+	envelope := s.getEnvelope()
+	if envelope == nil {
 		return nil, ErrEnvelopeNotConfigured
 	}
 	provider, ok := providers[reg.Provider]
@@ -154,7 +157,7 @@ func (s *CMKService) RegisterHSMKey(ctx context.Context, tenantID, plan string, 
 	if err := provider.Validate(ctx, cfg, reg.Credentials); err != nil {
 		return nil, err
 	}
-	wrapped, err := s.envelope.Wrap([]byte(reg.Credentials))
+	wrapped, err := envelope.Wrap([]byte(reg.Credentials))
 	if err != nil {
 		return nil, fmt.Errorf("cmk: wrap HSM credentials: %w", err)
 	}
@@ -317,11 +320,12 @@ func (s *CMKService) loadHSMConfig(ctx context.Context, tenantID, configID strin
 	if err != nil {
 		return nil, nil, err
 	}
-	plain, wasEncrypted, err := s.unwrapHSMCredentials(creds)
+	envelope := s.getEnvelope()
+	plain, wasEncrypted, err := s.unwrapHSMCredentialsWith(envelope, creds)
 	if err != nil {
 		return nil, nil, err
 	}
-	if !wasEncrypted && s.envelope != nil && len(creds) > 0 {
+	if !wasEncrypted && envelope != nil && len(creds) > 0 {
 		s.warnLegacyPlaintextHSM(tenantID, configID)
 	}
 	return &cfg, plain, nil
@@ -349,10 +353,20 @@ func (s *CMKService) loadHSMConfig(ctx context.Context, tenantID, configID strin
 // read compatibility, but writes still require the envelope — see
 // RegisterHSMKey.
 func (s *CMKService) unwrapHSMCredentials(blob []byte) ([]byte, bool, error) {
-	if s.envelope == nil {
+	return s.unwrapHSMCredentialsWith(s.getEnvelope(), blob)
+}
+
+// unwrapHSMCredentialsWith is the same as unwrapHSMCredentials
+// but takes a pre-snapshotted envelope so a caller that has
+// already pulled the envelope at function entry doesn't acquire
+// the read lock a second time and can be sure the same envelope
+// instance is used for both the nil-check at the call site and
+// the Unwrap call here.
+func (s *CMKService) unwrapHSMCredentialsWith(envelope SecretsEnvelope, blob []byte) ([]byte, bool, error) {
+	if envelope == nil {
 		return blob, false, nil
 	}
-	plain, wasEncrypted, err := s.envelope.Unwrap(blob)
+	plain, wasEncrypted, err := envelope.Unwrap(blob)
 	if err != nil {
 		return nil, false, fmt.Errorf("cmk: unwrap HSM credentials: %w", err)
 	}
@@ -429,11 +443,12 @@ func (s *CMKService) TestHSMConnection(ctx context.Context, tenantID, configID s
 		if !ok {
 			return fmt.Errorf("cmk: unsupported provider_type %q", out.Provider)
 		}
-		plain, wasEncrypted, err := s.unwrapHSMCredentials(creds)
+		envelope := s.getEnvelope()
+		plain, wasEncrypted, err := s.unwrapHSMCredentialsWith(envelope, creds)
 		if err != nil {
 			return err
 		}
-		if !wasEncrypted && s.envelope != nil && len(creds) > 0 {
+		if !wasEncrypted && envelope != nil && len(creds) > 0 {
 			s.warnLegacyPlaintextHSM(tenantID, configID)
 		}
 		validateErr := provider.Validate(ctx, out, string(plain))
