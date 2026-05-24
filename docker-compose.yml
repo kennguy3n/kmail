@@ -142,7 +142,8 @@ services:
     #      domains, DKIM keys, …) lives inside the data store and
     #      is written by Stalwart's first-boot setup wizard, served
     #      from the `http-recovery` listener on container port 8080
-    #      (host port 18080).
+    #      (also published to host port 8080 — see the `ports:`
+    #      block below for the rationale on the matched mapping).
     #
     # `STALWART_RECOVERY_ADMIN` pins the bootstrap administrator to
     # a deterministic value so the setup wizard is reproducible

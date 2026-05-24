@@ -55,11 +55,17 @@ jobs:
       KMAIL_SHARD_CONTAINER: kmail-stalwart
       KMAIL_PG_CONTAINER: kmail-postgres
       KMAIL_VALKEY_CONTAINER: kmail-valkey
-      # Loosen the chaos SLO target slightly on CI: a GitHub-hosted
-      # runner's IO is significantly noisier than a production
-      # cluster, so we'd see false-positive SLO violations from
-      # disk stalls rather than from the injected fault. Tune via
-      # this env if the false-positive rate rises.
+      # Loosen the chaos-shard SLO target slightly on CI: a
+      # GitHub-hosted runner's IO is significantly noisier than a
+      # production cluster, so we'd see false-positive SLO
+      # violations from disk stalls rather than from the injected
+      # fault. ONLY `scripts/loadtest/chaos-shard.sh` reads this
+      # env var; chaos-postgres.sh has its own hardcoded ≥50%
+      # success threshold and chaos-valkey.sh has ≥95%, both of
+      # which are already CI-friendly so they don't need an
+      # override here. Tune this value if the shard scenario's
+      # false-positive rate rises; raise a follow-up issue if the
+      # postgres/valkey scripts ever need similar knobs.
       KMAIL_CHAOS_SLO_PCT: "0.5"
     steps:
       - uses: actions/checkout@v4
@@ -136,15 +142,18 @@ jobs:
         run: make build
 
       - name: Start kmail-api (background, port 8088)
-        # See ci.yml — config.go reads most KMail vars under bare
-        # names on `main` today (the `getenvKMail` two-form lookup
-        # is on PR #31's branch and not yet merged). A chaos run
-        # with `KMAIL_*`-prefixed values would silently fall back
-        # to defaults — Valkey -> `valkey:6379` (unresolvable from
-        # the host), Stalwart -> `localhost:18080` (no listener) —
-        # so the chaos scenarios would measure connection-refused
-        # from a broken baseline rather than the injected fault.
-        # Stay on bare names until PR #31 lands on `main`.
+        # See ci.yml for the full env-var spelling rationale. Short
+        # form: config.go reads bare names today; main.go reads
+        # `KMAIL_MEILISEARCH_*` directly via os.Getenv; KMAIL_ENV is
+        # set in anticipation of PR #31's `getenvKMail("ENV")` path.
+        # A chaos run with the wrong spelling would silently fall
+        # back to defaults — Valkey -> `valkey:6379` (unresolvable
+        # from the host runner), Meilisearch -> off entirely — so
+        # the chaos scenarios would measure connection-refused from
+        # a broken baseline rather than the injected fault. Even
+        # though config.go's STALWART_URL default now matches the
+        # docker-compose publish (host :8080), the pinned override
+        # below documents the contract explicitly.
         env:
           KMAIL_API_ADDR: ":8088"
           KMAIL_ENV: development
@@ -157,8 +166,8 @@ jobs:
           ZK_FABRIC_S3_URL: http://localhost:9080
           ZK_FABRIC_ACCESS_KEY: kmail-access-key
           ZK_FABRIC_SECRET_KEY: kmail-secret-key
-          MEILISEARCH_URL: http://localhost:7700
-          MEILISEARCH_API_KEY: kmail-dev
+          KMAIL_MEILISEARCH_URL: http://localhost:7700
+          KMAIL_MEILISEARCH_API_KEY: kmail-dev
         run: |
           mkdir -p /tmp/kmail-logs
           nohup ./bin/kmail-api > /tmp/kmail-logs/kmail-api.log 2>&1 &

@@ -198,15 +198,28 @@ jobs:
         run: make build
 
       - name: Start kmail-api (background, port 8088)
-        # `internal/config/config.go` reads most KMail config env
-        # vars under their bare names today (`DATABASE_URL`,
-        # `STALWART_URL`, `VALKEY_URL`, etc.). The Helm chart sets
-        # them with a `KMAIL_` prefix, and PR #31 introduces a
-        # `getenvKMail` helper that accepts BOTH the prefixed and
-        # bare forms — but until that lands on `main`, the workflow
-        # has to use the bare names the binary actually reads.
-        # KMAIL_API_ADDR / KMAIL_ENV / KMAIL_DEV_BYPASS_TOKEN are
-        # already `KMAIL_`-native and stay as-is.
+        # Env vars split by which code path reads them:
+        #
+        # * Vars handled by `internal/config/config.go`'s `getenv`
+        #   helper today read the BARE name (no `KMAIL_` prefix).
+        #   PR #31 introduces a `getenvKMail` two-form lookup that
+        #   accepts both prefixed and bare, but until #31 reaches
+        #   `main` the workflow must use the bare name.
+        # * Vars handled directly via `os.Getenv("KMAIL_...")` in
+        #   `cmd/kmail-api/main.go` (e.g. KMAIL_MEILISEARCH_URL
+        #   at main.go:356) have only one accepted spelling: the
+        #   `KMAIL_`-prefixed form. Strip the prefix and the
+        #   search backend silently disappears at startup.
+        # * KMAIL_API_ADDR / KMAIL_DEV_BYPASS_TOKEN are read via
+        #   `getenv("KMAIL_...")` in config.go's network/auth
+        #   sections (the prefix is part of the canonical name,
+        #   not a Helm-only override), so they stay as-is.
+        # * KMAIL_ENV is currently unused by the Go binary on
+        #   `main`. PR #31 introduces `getenvKMail("ENV")` on the
+        #   auth path so once #31 lands `KMAIL_ENV=development`
+        #   is what keeps the dev-bypass token alive in CI. Pre-
+        #   setting it now is forward-compatible (harmless today,
+        #   load-bearing post-merge).
         env:
           KMAIL_API_ADDR: ":8088"
           KMAIL_ENV: development
@@ -219,8 +232,8 @@ jobs:
           ZK_FABRIC_S3_URL: http://localhost:9080
           ZK_FABRIC_ACCESS_KEY: kmail-access-key
           ZK_FABRIC_SECRET_KEY: kmail-secret-key
-          MEILISEARCH_URL: http://localhost:7700
-          MEILISEARCH_API_KEY: kmail-dev
+          KMAIL_MEILISEARCH_URL: http://localhost:7700
+          KMAIL_MEILISEARCH_API_KEY: kmail-dev
         run: |
           mkdir -p /tmp/kmail-logs
           nohup ./bin/kmail-api > /tmp/kmail-logs/kmail-api.log 2>&1 &
