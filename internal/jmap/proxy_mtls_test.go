@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -608,6 +609,142 @@ func TestNewClientTLSTransport_TLSClientConfigPointerEqualsBaseForHTTP2(t *testi
 		t.Errorf("perConnConfig clone did not inherit \"h2\" from the shared base; "+
 			"NextProtos = %v; HTTP/2 negotiation would silently fall back to HTTP/1.1",
 			perConn.NextProtos)
+	}
+}
+
+// TestNewClientTLSTransport_HonoursTLSHandshakeTimeout pins the
+// behaviour that the DialTLSContext closure inside
+// `newClientTLSTransport` enforces `tr.TLSHandshakeTimeout` even
+// though the stdlib's `http.Transport.TLSHandshakeTimeout` is
+// silently ignored when `DialTLSContext` is set. Without this
+// regression test a future refactor that switches to the legacy
+// `DialTLS` variant — or that "simplifies" the manual
+// `context.WithTimeout(ctx, tr.TLSHandshakeTimeout)` line — would
+// silently drop the handshake deadline, leaving every
+// BFF→Stalwart request hung on a stuck or malicious peer until
+// the per-request HTTP client timeout (which may be unset)
+// finally fires.
+//
+// The test stands up a TCP listener that ACCEPTS connections but
+// NEVER writes a TLS ServerHello, then issues a single request
+// through a transport whose TLSHandshakeTimeout has been tuned
+// down to 250ms so the test completes in <1s. The expected
+// outcome is that the request errors out within a small slack
+// window of the configured timeout; if instead the call hangs
+// for many seconds the test fails the slack assertion.
+func TestNewClientTLSTransport_HonoursTLSHandshakeTimeout(t *testing.T) {
+	dir := t.TempDir()
+
+	ca := issueCert(t, "kmail-ca", nil, true, nil)
+	client := issueCert(t, "kmail-bff", nil, false, ca)
+	cfg := &ClientTLSConfig{
+		CertFile: writeTempPEM(t, dir, "tls.crt", client.certPEM),
+		KeyFile:  writeTempPEM(t, dir, "tls.key", client.keyPEM),
+		CAFile:   writeTempPEM(t, dir, "ca.pem", ca.certPEM),
+	}
+	built, err := cfg.build(testLogger(t))
+	if err != nil {
+		t.Fatalf("build TLS: %v", err)
+	}
+
+	// Silent listener: accepts every incoming TCP connection but
+	// never writes a single byte, so the TLS handshake stalls in
+	// the client's `tls.Conn.Handshake` waiting for the
+	// ServerHello.  Closed conns are tracked so the deferred
+	// cleanup hangs up everything, including the stalled one(s).
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	// Buffered so the listener goroutine's non-blocking signal
+	// is not lost if the acceptance happens before the test
+	// reaches the receive below.
+	stalledMu := make(chan struct{}, 1)
+	stalled := make([]net.Conn, 0, 2)
+	stalledMuLock := &sync.Mutex{}
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			stalledMuLock.Lock()
+			stalled = append(stalled, conn)
+			stalledMuLock.Unlock()
+			// Signal the first acceptance so the test can
+			// observe that the dial reached the server before
+			// the handshake stalled.
+			select {
+			case stalledMu <- struct{}{}:
+			default:
+			}
+			// Hold the connection open without writing.
+			// The client's TLS handshake will time out on
+			// its end; we just keep the socket alive so
+			// the kernel does not RST it.
+		}
+	}()
+	defer func() {
+		stalledMuLock.Lock()
+		defer stalledMuLock.Unlock()
+		for _, c := range stalled {
+			_ = c.Close()
+		}
+	}()
+
+	tr := newClientTLSTransport(built)
+	// Tune the handshake timeout down so the test runs in <1s.
+	// The DialTLSContext closure reads `tr.TLSHandshakeTimeout`
+	// at dial time, so this post-construction mutation is the
+	// supported way to exercise the timeout path.  If a future
+	// refactor freezes the timeout at construction time (e.g.
+	// closes over a const), this assignment will silently no-op
+	// and the assertion below will catch the regression by
+	// failing the upper-bound timing check.
+	tr.TLSHandshakeTimeout = 250 * time.Millisecond
+
+	httpClient := &http.Client{
+		Transport: tr,
+		// Generous overall timeout so the assertion is on the
+		// HANDSHAKE deadline, not the request deadline.
+		Timeout: 5 * time.Second,
+	}
+	url := "https://" + ln.Addr().String() + "/jmap"
+
+	start := time.Now()
+	resp, err := httpClient.Get(url)
+	elapsed := time.Since(start)
+	if err == nil {
+		_ = resp.Body.Close()
+		t.Fatalf("expected handshake-timeout error against silent peer, got nil error after %s", elapsed)
+	}
+
+	// Wait briefly for the listener goroutine to have accepted
+	// at least one connection — otherwise we did not actually
+	// exercise the TLS handshake path.
+	select {
+	case <-stalledMu:
+	case <-time.After(time.Second):
+		t.Fatalf("listener never observed an inbound connection; the dial likely failed before TCP handshake")
+	}
+
+	// Upper bound: handshake-timeout (250ms) + some slack for
+	// CI host scheduling jitter.  500ms of slack is generous
+	// for a CI box and far short of the 5s client.Timeout
+	// fallback, so any regression that drops the deadline
+	// would push elapsed >> 1s.
+	if elapsed > 1500*time.Millisecond {
+		t.Errorf("TLSHandshakeTimeout was not honoured: dial against silent peer took %s "+
+			"(expected ~250ms + slack); future refactor likely dropped the "+
+			"`context.WithTimeout(ctx, tr.TLSHandshakeTimeout)` in DialTLSContext", elapsed)
+	}
+	// Lower bound (sanity): the handshake should NOT return in
+	// nanoseconds.  If it does, the test is broken — e.g. the
+	// listener RST'd before the client even sent ClientHello.
+	if elapsed < 100*time.Millisecond {
+		t.Errorf("handshake returned suspiciously fast (%s); the silent peer setup may be broken — "+
+			"check listener accepted the conn instead of RSTing it", elapsed)
 	}
 }
 
