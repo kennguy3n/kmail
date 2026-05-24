@@ -192,24 +192,34 @@ mod tests {
     /// stop the `TempDir` `Drop` from racing the `Store`'s
     /// SQLite `Connection`, but that leaked every temporary
     /// directory the test suite created. Holding the `TempDir`
-    /// in the struct produces the same lifetime guarantee
-    /// without the leak: when the field goes out of scope, the
-    /// store is dropped first (which closes the SQLite
-    /// connection), then the directory is unlinked.
+    /// here makes the cleanup deterministic: the explicit
+    /// `Drop` impl below closes the SQLite connection BEFORE
+    /// the `TempDir` field is implicitly dropped (and unlinks
+    /// the on-disk database file).
+    ///
+    /// **Drop-order robustness.** The previous shape of this
+    /// helper relied on declaration order of the `store` /
+    /// `_dir` struct fields (Rust drops fields top-to-bottom).
+    /// That contract is real but fragile: a future refactor
+    /// that "sorts the fields alphabetically" or "groups
+    /// public fields first" would silently flip the drop
+    /// order, unlink the database while the connection is
+    /// still open, and produce platform-dependent test flakes
+    /// (especially on Windows, where unlinking an open file
+    /// is forbidden). Wrapping `store` in `Option` and
+    /// dropping it explicitly in `Drop` makes the ordering
+    /// guarantee independent of the struct layout — the
+    /// manual `Drop::drop` runs BEFORE the compiler-generated
+    /// field drops, so `store.take()` shuts the connection
+    /// while the directory is still alive regardless of how
+    /// the fields are ordered.
     struct StoreEnv {
-        // Field declaration order matters: Rust drops struct
-        // fields in declaration order, and we need the
-        // `Store` (which holds an open `rusqlite::Connection`
-        // to a file inside the TempDir) to be dropped BEFORE
-        // the `TempDir` unlinks the directory. Reversing the
-        // order would unlink the directory out from under a
-        // live connection.
-        store: Store,
-        // Held only to keep the directory alive — never read,
-        // hence the underscore-prefixed binding. The
-        // `#[allow(dead_code)]` is defensive against future
-        // clippy versions that don't recognise the prefix
-        // convention.
+        store: Option<Store>,
+        // Held only to keep the directory alive — never read
+        // directly, hence the underscore-prefixed binding.
+        // The `#[allow(dead_code)]` is defensive against
+        // future clippy versions that don't recognise the
+        // prefix convention.
         #[allow(dead_code)]
         _dir: TempDir,
     }
@@ -219,7 +229,33 @@ mod tests {
             let _dir = tempdir().unwrap();
             let path = _dir.path().join("kmail.db");
             let store = Store::open(&path).unwrap();
-            Self { store, _dir }
+            Self {
+                store: Some(store),
+                _dir,
+            }
+        }
+
+        /// Reach the inner `Store`. Panics only if accessed
+        /// after `Drop::drop` has already taken the value,
+        /// which would mean a use-after-free in the test
+        /// harness and should fail loudly.
+        fn store(&self) -> &Store {
+            self.store
+                .as_ref()
+                .expect("StoreEnv::store accessed after Drop")
+        }
+    }
+
+    impl Drop for StoreEnv {
+        fn drop(&mut self) {
+            // Run BEFORE the compiler drops `_dir`. Taking the
+            // `Store` out of the `Option` drops its
+            // `Arc<Mutex<Connection>>`; when that's the last
+            // outstanding clone of the connection (the test
+            // clones are scoped to the closing `}`), SQLite
+            // closes the file handle here. THEN `_dir` runs
+            // and unlinks the (now-closed) database file.
+            drop(self.store.take());
         }
     }
 
@@ -230,7 +266,7 @@ mod tests {
     #[test]
     fn put_get_roundtrip_updates_lru() {
         let env = fresh_env();
-        let store = env.store.clone();
+        let store = env.store().clone();
         let cache = AttachmentCache::new(store, 1024 * 1024);
         cache
             .put("blob-a", Some("text/plain"), b"hello world")
@@ -248,7 +284,7 @@ mod tests {
     #[test]
     fn eviction_respects_lru_order() {
         let env = fresh_env();
-        let store = env.store.clone();
+        let store = env.store().clone();
         let cache = AttachmentCache::new(store, 20); // hold ~2 small blobs
 
         cache.put("a", None, &[1u8; 8]).unwrap();
@@ -272,7 +308,7 @@ mod tests {
     #[test]
     fn purge_clears_cache() {
         let env = fresh_env();
-        let store = env.store.clone();
+        let store = env.store().clone();
         let cache = AttachmentCache::new(store, 1024);
         cache.put("a", None, &[0u8; 8]).unwrap();
         cache.put("b", None, &[0u8; 8]).unwrap();
@@ -286,7 +322,7 @@ mod tests {
     #[test]
     fn empty_blob_id_rejected() {
         let env = fresh_env();
-        let store = env.store.clone();
+        let store = env.store().clone();
         let cache = AttachmentCache::new(store, 1024);
         let err = cache.put("", None, b"x").unwrap_err();
         assert!(matches!(err, Error::InvalidArgument(_)));
@@ -299,7 +335,7 @@ mod tests {
     #[test]
     fn oversized_payload_rejected() {
         let env = fresh_env();
-        let store = env.store.clone();
+        let store = env.store().clone();
         let cache = AttachmentCache::new(store, 16);
         let err = cache.put("too-big", None, &[0u8; 64]).unwrap_err();
         assert!(matches!(err, Error::InvalidArgument(_)));
@@ -314,7 +350,7 @@ mod tests {
     #[test]
     fn just_inserted_blob_survives_eviction_at_boundary() {
         let env = fresh_env();
-        let store = env.store.clone();
+        let store = env.store().clone();
         // Capacity holds exactly two 8-byte entries.
         let cache = AttachmentCache::new(store, 16);
 

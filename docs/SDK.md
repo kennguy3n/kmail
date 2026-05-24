@@ -107,10 +107,12 @@ Error tagging convention: errors cross the FFI boundary as
 `napi::Error` with `reason = "[TYPE] description"` where `[TYPE]`
 is one of `[STORE]`, `[TRANSPORT]`, `[AUTH]`, `[FORBIDDEN]`,
 `[NOT_FOUND]`, `[RATE_LIMIT]`, `[JMAP]`, `[PROTOCOL]`,
-`[SYNC_DIVERGED]`, `[DECRYPTION]`, `[KDF]`, `[KEYSTORE]`,
-`[ARG]`, `[CANCELLED]`. The Electron side parses the prefix to
-construct typed exception classes. A unit test
-(`error_prefixes_are_stable`) keeps the contract from drifting.
+`[HTTP_CLIENT]`, `[SYNC_DIVERGED]`, `[DECRYPTION]`, `[KDF]`,
+`[KEYSTORE]`, `[ARG]`, `[CANCELLED]`. The Electron side parses
+the prefix to construct typed exception classes. A unit test
+(`error_prefixes_are_stable`) keeps the contract from drifting,
+so adding a new prefix here requires adding the matching arm in
+`kmail-napi/src/lib.rs` and the assertion in the unit test.
 
 ## Debug CLI
 

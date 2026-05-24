@@ -383,7 +383,15 @@ impl JmapClient {
             CAP_SUBMISSION.into(),
         ]);
 
-        let draft_value = serde_json::to_value(draft)?;
+        // `to_jmap_email_set_create_value` produces an RFC 8621
+        // §4.1.4 compliant create payload — `bodyValues` keyed by
+        // partId plus `textBody`/`htmlBody` arrays. Calling
+        // `serde_json::to_value(draft)` directly would emit the
+        // SDK-internal shape (`textBody`/`htmlBody` as plain
+        // strings, no `bodyValues`), which Stalwart would
+        // reject. See `models::EmailDraft` doc-comment for the
+        // wire-format rationale.
+        let draft_value = draft.to_jmap_email_set_create_value();
         let mut create_map = serde_json::Map::new();
         create_map.insert("draft1".to_string(), draft_value);
 

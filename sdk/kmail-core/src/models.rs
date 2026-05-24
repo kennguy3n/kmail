@@ -323,6 +323,21 @@ pub struct EmailBodyValue {
 }
 
 /// Outbound draft used by `KMailClient::send_email`.
+///
+/// **Wire-format note.** The on-disk / IPC shape uses the same
+/// field names as the React web client's `EmailDraft` TS
+/// interface (`web/src/types/index.ts:192`) so the Electron and
+/// platform shells can pass through the same JSON without
+/// translation. In particular, `text_body` and `html_body` are
+/// **plain strings**, not RFC 8621 `EmailBodyPart` arrays — they
+/// are the user's draft content. The SDK converts them to the
+/// canonical RFC 8621 `Email/set create` payload (with
+/// `bodyValues` + `textBody`/`htmlBody` array properties) inside
+/// [`EmailDraft::to_jmap_email_set_create_value`]; that
+/// conversion is what is actually sent over JMAP. This mirrors
+/// the web client's `buildEmailCreate` helper at
+/// `web/src/api/jmap.ts:1091-1117` so the BFF sees byte-identical
+/// payloads from the web and native SDKs.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct EmailDraft {
     /// Source mailbox (e.g. Drafts). Required by JMAP.
@@ -340,16 +355,126 @@ pub struct EmailDraft {
     pub reply_to: Vec<EmailAddress>,
     #[serde(default)]
     pub subject: String,
-    #[serde(rename = "bodyText", default)]
-    pub body_text: Option<String>,
-    #[serde(rename = "bodyHtml", default)]
-    pub body_html: Option<String>,
-    /// `inReplyTo` header value (Message-ID being replied to).
+    /// Plain-text body string. Converted to an `EmailBodyValue`
+    /// keyed `"text"` plus a `textBody: [{partId: "text",
+    /// type: "text/plain"}]` entry inside
+    /// [`EmailDraft::to_jmap_email_set_create_value`].
+    #[serde(rename = "textBody", default)]
+    pub text_body: Option<String>,
+    /// HTML body string. Same conversion shape as `text_body`
+    /// but keyed `"html"` / `type: "text/html"`.
+    #[serde(rename = "htmlBody", default)]
+    pub html_body: Option<String>,
+    /// `inReplyTo` Message-IDs (RFC 8621 §4.1.1: `String[]|null`).
+    /// Single-value parents are still wrapped in a 1-element vec.
     #[serde(rename = "inReplyTo", default)]
-    pub in_reply_to: Option<String>,
+    pub in_reply_to: Vec<String>,
     /// `references` header (parent thread Message-IDs).
     #[serde(default)]
     pub references: Vec<String>,
+}
+
+impl EmailDraft {
+    /// Render this draft as the value that should go inside an
+    /// `Email/set` `create` map entry.
+    ///
+    /// RFC 8621 §4.1.4 requires that bodies be expressed as
+    /// `EmailBodyPart` entries referencing `bodyValues` keys —
+    /// you can't just put a `bodyText` string on the email
+    /// directly. The web client (`buildEmailCreate` in
+    /// `web/src/api/jmap.ts:1091-1117`) does the conversion
+    /// client-side; we do the same here so the SDK doesn't
+    /// depend on an undocumented BFF translation step (and so
+    /// the wire payload is byte-identical to the one the React
+    /// client emits).
+    ///
+    /// Behavioural notes:
+    ///   * If `html_body` is set, a `htmlBody` part keyed
+    ///     `"html"` is emitted.
+    ///   * A `textBody` part keyed `"text"` is **always**
+    ///     emitted (when neither body is set, an empty string
+    ///     is used) so RFC 8621 §4.1.4 clients always see a
+    ///     plain-text fallback.
+    ///   * `keywords/$draft = true` is set unconditionally so
+    ///     the just-created email lives in the `Drafts`
+    ///     mailbox's draft state until
+    ///     `EmailSubmission/set` clears it.
+    ///   * `in_reply_to` / `references` are passed through as
+    ///     JMAP top-level properties (per RFC 8621 §4.1.1
+    ///     they're `String[]|null`, so empty vecs serialise as
+    ///     `[]` which the spec accepts).
+    pub fn to_jmap_email_set_create_value(&self) -> serde_json::Value {
+        use serde_json::{json, Map, Value};
+
+        let mut body_values: Map<String, Value> = Map::new();
+        let mut body_structure: Map<String, Value> = Map::new();
+
+        if let Some(html) = self.html_body.as_ref() {
+            body_values.insert(
+                "html".into(),
+                json!({ "value": html, "isEncodingProblem": false, "isTruncated": false }),
+            );
+            body_structure.insert(
+                "htmlBody".into(),
+                json!([{ "partId": "html", "type": "text/html" }]),
+            );
+        }
+        // textBody is always present so the email never goes
+        // out without an RFC 2045 fallback part; if the caller
+        // gave us nothing, emit an empty string.
+        let text = self.text_body.as_deref().unwrap_or("");
+        body_values.insert(
+            "text".into(),
+            json!({ "value": text, "isEncodingProblem": false, "isTruncated": false }),
+        );
+        body_structure.insert(
+            "textBody".into(),
+            json!([{ "partId": "text", "type": "text/plain" }]),
+        );
+
+        let mut out = Map::new();
+        out.insert(
+            "mailboxIds".into(),
+            serde_json::to_value(&self.mailbox_ids)
+                .expect("BTreeMap<String,bool> always serialises"),
+        );
+        out.insert("keywords".into(), json!({ "$draft": true }));
+        out.insert(
+            "from".into(),
+            serde_json::to_value(&self.from).expect("Vec<EmailAddress> always serialises"),
+        );
+        out.insert(
+            "to".into(),
+            serde_json::to_value(&self.to).expect("Vec<EmailAddress> always serialises"),
+        );
+        out.insert(
+            "cc".into(),
+            serde_json::to_value(&self.cc).expect("Vec<EmailAddress> always serialises"),
+        );
+        out.insert(
+            "bcc".into(),
+            serde_json::to_value(&self.bcc).expect("Vec<EmailAddress> always serialises"),
+        );
+        out.insert(
+            "replyTo".into(),
+            serde_json::to_value(&self.reply_to).expect("Vec<EmailAddress> always serialises"),
+        );
+        out.insert("subject".into(), Value::String(self.subject.clone()));
+        out.insert(
+            "inReplyTo".into(),
+            serde_json::to_value(&self.in_reply_to).expect("Vec<String> always serialises"),
+        );
+        out.insert(
+            "references".into(),
+            serde_json::to_value(&self.references).expect("Vec<String> always serialises"),
+        );
+        out.insert("bodyValues".into(), Value::Object(body_values));
+        for (k, v) in body_structure {
+            out.insert(k, v);
+        }
+
+        Value::Object(out)
+    }
 }
 
 fn default_epoch() -> DateTime<Utc> {
@@ -571,5 +696,171 @@ mod tests {
         assert!(MailboxRole::from_canonical_name("a").is_none());
         assert!(MailboxRole::from_canonical_name("INBOX").is_none());
         assert!(MailboxRole::from_canonical_name("").is_none());
+    }
+
+    /// Regression: `EmailDraft::to_jmap_email_set_create_value`
+    /// must emit an RFC 8621 §4.1.4 compliant `Email/set create`
+    /// payload — i.e. `bodyValues` keyed by partId plus
+    /// `textBody`/`htmlBody` ARRAYS of body-part descriptors,
+    /// NOT the SDK-internal `textBody: "..."` plain-string
+    /// shape. Direct `serde_json::to_value(draft)` would emit
+    /// the wrong format and rely on an undocumented BFF
+    /// translation step.
+    #[test]
+    fn email_draft_jmap_create_emits_rfc8621_body_structure() {
+        let mut mailbox_ids = BTreeMap::new();
+        mailbox_ids.insert("mbx-drafts".to_string(), true);
+        let draft = EmailDraft {
+            mailbox_ids,
+            from: vec![EmailAddress {
+                name: "Alice".into(),
+                email: "alice@example.com".into(),
+            }],
+            to: vec![EmailAddress {
+                name: "Bob".into(),
+                email: "bob@example.com".into(),
+            }],
+            subject: "Hi".into(),
+            text_body: Some("plain text".into()),
+            html_body: Some("<p>html text</p>".into()),
+            in_reply_to: vec!["<parent@example.com>".into()],
+            references: vec!["<a@example.com>".into(), "<b@example.com>".into()],
+            ..EmailDraft::default()
+        };
+
+        let v = draft.to_jmap_email_set_create_value();
+        let obj = v.as_object().expect("create payload must be an object");
+
+        // `bodyValues` is the canonical RFC 8621 §4.1.4 home for
+        // the actual body bytes. Top-level `textBody`/`htmlBody`
+        // are descriptor ARRAYS — not strings.
+        let body_values = obj.get("bodyValues").and_then(|v| v.as_object()).expect(
+            "bodyValues must be an object — RFC 8621 §4.1.4 requires this even for one-part bodies",
+        );
+        assert_eq!(
+            body_values
+                .get("text")
+                .and_then(|v| v.get("value"))
+                .and_then(|v| v.as_str()),
+            Some("plain text"),
+            "bodyValues['text']['value'] must carry the text_body string verbatim"
+        );
+        assert_eq!(
+            body_values
+                .get("html")
+                .and_then(|v| v.get("value"))
+                .and_then(|v| v.as_str()),
+            Some("<p>html text</p>"),
+            "bodyValues['html']['value'] must carry the html_body string verbatim"
+        );
+
+        let text_body = obj.get("textBody").and_then(|v| v.as_array()).expect(
+            "textBody must be an array of EmailBodyPart descriptors (NOT a string) per RFC 8621",
+        );
+        assert_eq!(text_body.len(), 1);
+        assert_eq!(
+            text_body[0].get("partId").and_then(|v| v.as_str()),
+            Some("text")
+        );
+        assert_eq!(
+            text_body[0].get("type").and_then(|v| v.as_str()),
+            Some("text/plain")
+        );
+
+        let html_body = obj
+            .get("htmlBody")
+            .and_then(|v| v.as_array())
+            .expect("htmlBody must be an array of EmailBodyPart descriptors per RFC 8621");
+        assert_eq!(html_body.len(), 1);
+        assert_eq!(
+            html_body[0].get("partId").and_then(|v| v.as_str()),
+            Some("html")
+        );
+        assert_eq!(
+            html_body[0].get("type").and_then(|v| v.as_str()),
+            Some("text/html")
+        );
+
+        // `keywords/$draft = true` is set automatically so the
+        // freshly-created Email lives in `Drafts` state until
+        // EmailSubmission/set clears it.
+        assert_eq!(
+            obj.get("keywords")
+                .and_then(|v| v.get("$draft"))
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "keywords/$draft must be true on freshly-created drafts"
+        );
+
+        // Standard JMAP top-level header properties (RFC 8621
+        // §4.1.1) are pass-throughs as arrays — even a single
+        // `inReplyTo` parent goes in as a 1-element array.
+        assert_eq!(
+            obj.get("inReplyTo")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len()),
+            Some(1)
+        );
+        assert_eq!(
+            obj.get("references")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len()),
+            Some(2)
+        );
+
+        // And the SDK-internal `textBody: "..."` / `bodyHtml: "..."`
+        // plain-string shape must NEVER leak into the JMAP wire
+        // form — those are input ergonomics only.
+        assert!(
+            !obj.get("textBody").map(|v| v.is_string()).unwrap_or(false),
+            "textBody must not serialise as a plain string on the JMAP wire"
+        );
+        assert!(
+            !obj.get("htmlBody").map(|v| v.is_string()).unwrap_or(false),
+            "htmlBody must not serialise as a plain string on the JMAP wire"
+        );
+        assert!(
+            obj.get("bodyText").is_none(),
+            "bodyText is not an RFC 8621 property"
+        );
+        assert!(
+            obj.get("bodyHtml").is_none(),
+            "bodyHtml is not an RFC 8621 property"
+        );
+    }
+
+    /// Regression: even when neither `text_body` nor
+    /// `html_body` is set, the create payload must still
+    /// include a `textBody` part referencing an (empty)
+    /// `bodyValues['text']` — RFC 8621 §4.1.4 clients reject
+    /// bodyless emails, and matching the web client's
+    /// `buildEmailCreate` empty-fallback prevents the BFF and
+    /// the SDK from diverging.
+    #[test]
+    fn email_draft_jmap_create_always_emits_text_fallback() {
+        let mut mailbox_ids = BTreeMap::new();
+        mailbox_ids.insert("mbx-drafts".to_string(), true);
+        let draft = EmailDraft {
+            mailbox_ids,
+            to: vec![EmailAddress {
+                name: String::new(),
+                email: "bob@example.com".into(),
+            }],
+            ..EmailDraft::default()
+        };
+
+        let v = draft.to_jmap_email_set_create_value();
+        let obj = v.as_object().unwrap();
+        assert_eq!(
+            obj.get("bodyValues")
+                .and_then(|v| v.get("text"))
+                .and_then(|v| v.get("value"))
+                .and_then(|v| v.as_str()),
+            Some(""),
+            "missing text_body must fall back to an empty string"
+        );
+        // No html part when html_body is absent.
+        assert!(obj.get("bodyValues").and_then(|v| v.get("html")).is_none());
+        assert!(obj.get("htmlBody").is_none());
     }
 }
