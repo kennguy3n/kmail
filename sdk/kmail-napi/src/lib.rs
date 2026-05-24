@@ -42,6 +42,9 @@ fn napi_err(e: kmail_core::Error) -> Error {
         }
         kmail_core::Error::JmapMethod { .. } => (Status::GenericFailure, format!("[JMAP] {e}")),
         kmail_core::Error::Protocol(_) => (Status::GenericFailure, format!("[PROTOCOL] {e}")),
+        kmail_core::Error::HttpClient { .. } => {
+            (Status::GenericFailure, format!("[HTTP_CLIENT] {e}"))
+        }
         kmail_core::Error::SyncStateDiverged => {
             (Status::GenericFailure, format!("[SYNC_DIVERGED] {e}"))
         }
@@ -358,6 +361,13 @@ mod tests {
                 "[JMAP]",
             ),
             (kmail_core::Error::Protocol("x".into()), "[PROTOCOL]"),
+            (
+                kmail_core::Error::HttpClient {
+                    status: 422,
+                    body: "malformed".into(),
+                },
+                "[HTTP_CLIENT]",
+            ),
             (kmail_core::Error::SyncStateDiverged, "[SYNC_DIVERGED]"),
             (kmail_core::Error::Decryption("x".into()), "[DECRYPTION]"),
             (kmail_core::Error::KeyDerivation("x".into()), "[KDF]"),

@@ -48,6 +48,24 @@ pub enum Error {
     #[error("invalid jmap response: {0}")]
     Protocol(String),
 
+    /// HTTP 4xx response that does NOT fall into one of the
+    /// dedicated 4xx variants above (`Auth` for 401,
+    /// `Forbidden` for 403, `NotFound` for 404, `RateLimit` for
+    /// 429). Carries the raw status code and body so platform
+    /// shells can surface the server's explanation verbatim
+    /// (e.g. "413: attachment exceeds 25 MiB", "422: malformed
+    /// `Email/set` patch").
+    ///
+    /// **Not retryable.** This is the load-bearing distinction
+    /// from `Transport(_)`: a 400/405/409/413/422 means the
+    /// server has examined the request and explicitly refused
+    /// it. Retrying the same request will deterministically
+    /// produce the same 4xx, so spinning through
+    /// `with_retries` with exponential backoff only delays the
+    /// error surfacing without changing the outcome.
+    #[error("http client error [{status}]: {body}")]
+    HttpClient { status: u16, body: String },
+
     /// Local state token diverged from the server; caller must
     /// re-bootstrap. The SDK raises this when JMAP returns
     /// `cannotCalculateChanges` per RFC 8620 §5.6.

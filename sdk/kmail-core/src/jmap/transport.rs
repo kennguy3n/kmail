@@ -265,6 +265,20 @@ async fn classify_response<T: serde::de::DeserializeOwned>(resp: reqwest::Respon
             "upstream {s}: {}",
             read_text(resp).await
         ))),
+        // Any remaining 4xx (400 Bad Request, 405 Method Not
+        // Allowed, 409 Conflict, 413 Payload Too Large, 415
+        // Unsupported Media Type, 422 Unprocessable Entity, …)
+        // is a deterministic refusal from the server. Route to
+        // `Error::HttpClient` so `with_retries` exits immediately
+        // instead of burning the full retry budget on a request
+        // the BFF has already examined and rejected. Pre-fix this
+        // landed in `Error::Transport` and `is_retryable()`
+        // unconditionally retried, taking ~6s of wall-clock
+        // before surfacing the same error.
+        s if s.is_client_error() => Err(Error::HttpClient {
+            status: s.as_u16(),
+            body: read_text(resp).await,
+        }),
         s => Err(Error::Transport(format!(
             "unexpected {s}: {}",
             read_text(resp).await
@@ -332,6 +346,64 @@ mod tests {
         assert_eq!(
             t.absolute_url("https://other.example.com/jmap/api"),
             "https://other.example.com/jmap/api"
+        );
+    }
+
+    /// `classify_response` MUST route generic 4xx responses
+    /// (those not already special-cased into `Auth`/`Forbidden`/
+    /// `NotFound`/`RateLimit`) to `Error::HttpClient`, NOT
+    /// `Error::Transport`. The retry loop in `with_retries`
+    /// consults `is_retryable()`; `Error::Transport` is
+    /// retryable and would spend the full retry budget on a
+    /// request the BFF has already deterministically rejected,
+    /// `Error::HttpClient` is not retryable so the error
+    /// surfaces immediately.
+    #[tokio::test]
+    async fn classify_response_routes_4xx_to_non_retryable_http_client_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/jmap/api"))
+            .respond_with(ResponseTemplate::new(422).set_body_string("malformed Email/set patch"))
+            // .expect(1) is load-bearing here: if a regression
+            // re-routed 4xx through `Error::Transport` the retry
+            // loop would fire `max_attempts` (4) requests
+            // against the mock instead of one. The mock's drop
+            // verifier catches that bug for free.
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let cfg = TransportConfig::new(server.uri(), "tok");
+        let t = JmapTransport::new(cfg).unwrap();
+
+        #[derive(serde::Serialize)]
+        struct DummyBody {
+            using: Vec<String>,
+        }
+
+        let err = t
+            .post_json::<DummyBody, serde_json::Value>(
+                "/jmap/api",
+                &DummyBody {
+                    using: vec!["urn:ietf:params:jmap:core".into()],
+                },
+            )
+            .await
+            .expect_err("4xx must be an Err");
+
+        match &err {
+            Error::HttpClient { status, body } => {
+                assert_eq!(*status, 422);
+                assert_eq!(body, "malformed Email/set patch");
+            }
+            other => panic!("expected Error::HttpClient, got {other:?}"),
+        }
+        assert!(
+            !err.is_retryable(),
+            "Error::HttpClient MUST NOT be retryable — otherwise `with_retries` spends the full retry budget on a request the server has already explicitly refused"
         );
     }
 }

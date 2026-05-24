@@ -67,6 +67,8 @@ pub enum KMailError {
     JmapMethod { code: String, description: String },
     #[error("protocol error: {message}")]
     Protocol { message: String },
+    #[error("http client error [{status}]: {body}")]
+    HttpClient { status: u16, body: String },
     #[error("sync state diverged")]
     SyncStateDiverged,
     #[error("decryption: {message}")]
@@ -97,6 +99,7 @@ impl From<kmail_core::Error> for KMailError {
             },
             E::JmapMethod { code, description } => KMailError::JmapMethod { code, description },
             E::Protocol(message) => KMailError::Protocol { message },
+            E::HttpClient { status, body } => KMailError::HttpClient { status, body },
             E::SyncStateDiverged => KMailError::SyncStateDiverged,
             E::Decryption(message) => KMailError::Decryption { message },
             E::KeyDerivation(message) => KMailError::KeyDerivation { message },
@@ -419,6 +422,22 @@ mod tests {
 
         let cancelled = KMailError::from(kmail_core::Error::Cancelled);
         assert!(matches!(cancelled, KMailError::Cancelled));
+
+        // `HttpClient` MUST carry both status + body through so
+        // the platform shell can surface the server's
+        // explanation verbatim (e.g. "413: attachment too
+        // large") instead of a generic "transport error".
+        let http_client = KMailError::from(kmail_core::Error::HttpClient {
+            status: 422,
+            body: "malformed Email/set patch".into(),
+        });
+        assert!(matches!(
+            http_client,
+            KMailError::HttpClient {
+                status: 422,
+                ref body,
+            } if body == "malformed Email/set patch"
+        ));
     }
 
     /// `MailboxRole` round-trips through the FFI string label.

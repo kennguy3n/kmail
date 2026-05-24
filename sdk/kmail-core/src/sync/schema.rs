@@ -131,6 +131,18 @@ pub(crate) fn migrate(conn: &mut Connection) -> Result<u32> {
     // so we need a probing query that survives the table not
     // existing yet. SQLite returns SQLITE_ERROR with the "no such
     // table" message; treat that as "version 0".
+    //
+    // We deliberately match ONLY the "no such table" case and let
+    // every other `SqliteFailure` (extended_code != SQLITE_ERROR,
+    // OR SQLITE_ERROR with a different message) propagate.
+    // Previously this had a defensive `SqliteFailure(_, _) => 0`
+    // catch-all that swallowed disk-full / permission-denied /
+    // corruption errors and silently re-ran the migrations.
+    // While `CREATE TABLE IF NOT EXISTS` made the re-run a no-op
+    // on a healthy DB, it masked genuine I/O failures behind a
+    // confusing "schema was somehow rolled back" symptom on the
+    // next write — see the third-round Devin Review finding on
+    // this file.
     let current: u32 = match conn.query_row(
         "SELECT COALESCE(MAX(version), 0) FROM schema_version",
         [],
@@ -140,7 +152,6 @@ pub(crate) fn migrate(conn: &mut Connection) -> Result<u32> {
             u32::try_from(v).map_err(|e| Error::Store(format!("schema version overflow: {e}")))?
         }
         Err(rusqlite::Error::SqliteFailure(_, Some(msg))) if msg.contains("no such table") => 0,
-        Err(rusqlite::Error::SqliteFailure(_, _)) => 0,
         Err(other) => return Err(Error::Store(format!("schema probe failed: {other}"))),
     };
 
@@ -191,6 +202,59 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(count, 1, "table {name} missing");
+        }
+    }
+
+    /// The schema-version probe MUST surface non-"no such table"
+    /// SQLite failures rather than silently treating them as
+    /// "fresh database" — otherwise a transient disk-full /
+    /// permission-denied / corruption error would re-run all
+    /// migrations on a healthy DB and mask the underlying I/O
+    /// fault.
+    ///
+    /// We simulate the corruption case by renaming the
+    /// `version` column AFTER a successful migrate. A
+    /// subsequent `migrate()` call's probe statement
+    /// (`SELECT COALESCE(MAX(version), 0) FROM schema_version`)
+    /// then hits "no such column: version" — a SqliteFailure
+    /// whose message is NOT "no such table".
+    ///
+    /// Pre-fix (catch-all arm): the probe silently treated this
+    /// as "version 0" and re-ran all migrations, which then
+    /// blew up later inside the migration transaction with a
+    /// confusing "table mailboxes already exists" error,
+    /// masking the original schema corruption.
+    ///
+    /// Post-fix: the probe propagates as `Error::Store("schema
+    /// probe failed: ...")` so the underlying SQLite condition
+    /// surfaces immediately.
+    #[test]
+    fn migration_probe_surfaces_unrelated_sqlite_failures() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        // First, migrate the DB so `schema_version` exists.
+        migrate(&mut conn).unwrap();
+
+        // Corrupt the schema_version table: rename the
+        // `version` column so the probe's SELECT statement
+        // fails with "no such column" — a SqliteFailure that
+        // is NOT "no such table".
+        conn.execute_batch("ALTER TABLE schema_version RENAME COLUMN version TO version_renamed")
+            .unwrap();
+
+        // Now migrate() should surface the SqliteFailure
+        // instead of swallowing it and re-running migrations.
+        let err = migrate(&mut conn).expect_err(
+            "probe must propagate non-'no such table' SqliteFailure rather than treat it as version 0",
+        );
+        match &err {
+            Error::Store(msg) => {
+                assert!(
+                    msg.contains("schema probe failed")
+                        && (msg.contains("no such column") || msg.contains("version")),
+                    "expected error to identify the underlying SQLite failure, got: {msg}"
+                );
+            }
+            other => panic!("expected Error::Store, got {other:?}"),
         }
     }
 }
