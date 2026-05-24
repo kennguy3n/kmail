@@ -102,7 +102,22 @@ jobs:
               - 'Makefile'
               - 'docker-compose.yml'
               - 'Dockerfile*'
-              - 'scripts/test-e2e.sh'
+              # Scripts the integration job invokes directly OR
+              # mounts into the compose stack. `scripts/migrate.sh`
+              # is called as an explicit CI step (the "Apply
+              # migrations" step below); `scripts/stalwart-init.sh`
+              # and `scripts/postgres-init-stalwart.sql` are bind-
+              # mounted into the Stalwart / Postgres containers and
+              # define their initial state. A PR that only changed
+              # one of these would still alter how the integration
+              # sweep runs, so listing them explicitly preserves
+              # the "False negatives MUST be impossible" invariant
+              # documented above. Use a glob over `scripts/**`
+              # rather than enumerating individual files so future
+              # additions to the integration harness don't silently
+              # drift out of CI coverage — the alternative (an
+              # ever-growing allow-list) is brittle.
+              - 'scripts/**'
               - 'configs/**'
               - '.github/workflows/ci.yml'
             # Helm template changes trigger a `helm template`
