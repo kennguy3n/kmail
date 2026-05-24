@@ -1039,8 +1039,22 @@ func (s *Service) ValidateAccessToken(ctx context.Context, plaintextToken string
 	// failure modes (revoked, expired) collapse to ErrAccessToken-
 	// NotFound — RFC 6750 §3.1 requires `invalid_token` for both,
 	// and the caller cannot distinguish them anyway.
+	// Project `t.client_id::text` (the UUID FK on
+	// oauth_access_tokens that references oauth_clients.id), NOT
+	// `c.client_id` (the TEXT public identifier from
+	// oauth_clients). AccessTokenContext.ClientID is consumed by
+	// downstream handlers (e.g. internal/integrations) that pass
+	// it to SQL queries which cast the value `::uuid` to scope
+	// webhook_endpoints / oauth_access_tokens rows by their
+	// owning client. The TEXT public identifier (`dBjftJeZ4CVP...`)
+	// is NOT a valid UUID, so every such cast would fail at
+	// runtime — the wrong projection would 500 every integration
+	// webhook operation. RevokeToken below uses the same UUID
+	// projection from `oauth_access_tokens.client_id::text`
+	// (lines ~1054 / 1076) for the same reason: the bearer-token
+	// → client identity link is the UUID, not the text label.
 	err := s.pool.QueryRow(ctx, `
-		SELECT t.id::text, t.tenant_id::text, t.user_id::text, c.client_id,
+		SELECT t.id::text, t.tenant_id::text, t.user_id::text, t.client_id::text,
 		       t.scopes, t.expires_at
 		FROM oauth_access_tokens t
 		JOIN oauth_clients c ON c.id = t.client_id
