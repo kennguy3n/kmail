@@ -40,7 +40,9 @@
 
 use crate::crypto::{aead, aes_gcm_decrypt, aes_gcm_encrypt, hkdf_derive, AeadEnvelope, KdfLabel};
 use crate::error::{Error, Result};
+use rand::rngs::OsRng;
 use rand::RngCore;
+use zeroize::Zeroize;
 
 /// Length of the per-folder master key (matches AES-256 key size).
 ///
@@ -73,9 +75,11 @@ pub fn seal(folder_master_key: &[u8], plaintext: &[u8], aad: &[u8]) -> Result<Ae
         )));
     }
     let mut nonce = [0u8; aead::NONCE_LEN];
-    rand::thread_rng().fill_bytes(&mut nonce);
-    let dek = hkdf_derive(&nonce, folder_master_key, KdfLabel::VaultFolderMaster, 32)?;
-    aes_gcm_encrypt(&dek, &nonce, plaintext, aad)
+    OsRng.fill_bytes(&mut nonce);
+    let mut dek = hkdf_derive(&nonce, folder_master_key, KdfLabel::VaultFolderMaster, 32)?;
+    let result = aes_gcm_encrypt(&dek, &nonce, plaintext, aad);
+    dek.zeroize();
+    result
 }
 
 /// Inverse of [`seal`].
@@ -96,13 +100,15 @@ pub fn open(folder_master_key: &[u8], envelope: &AeadEnvelope) -> Result<Vec<u8>
             folder_master_key.len()
         )));
     }
-    let dek = hkdf_derive(
+    let mut dek = hkdf_derive(
         &envelope.nonce,
         folder_master_key,
         KdfLabel::VaultFolderMaster,
         32,
     )?;
-    aes_gcm_decrypt(&dek, envelope)
+    let result = aes_gcm_decrypt(&dek, envelope);
+    dek.zeroize();
+    result
 }
 
 #[cfg(test)]

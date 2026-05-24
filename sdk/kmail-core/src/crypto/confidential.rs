@@ -52,6 +52,7 @@
 
 use crate::crypto::{aead, aes_gcm_decrypt, aes_gcm_encrypt, hkdf_derive, AeadEnvelope, KdfLabel};
 use crate::error::{Error, Result};
+use rand::rngs::OsRng;
 use rand::RngCore;
 use zeroize::Zeroize;
 
@@ -126,37 +127,46 @@ pub fn seal(
             mls_leaf_secret.len()
         )));
     }
-    let mut rng = rand::thread_rng();
-
     let mut dek = [0u8; DEK_LEN];
-    rng.fill_bytes(&mut dek);
+    OsRng.fill_bytes(&mut dek);
 
     let mut kek_salt = [0u8; KEK_SALT_LEN];
-    rng.fill_bytes(&mut kek_salt);
+    OsRng.fill_bytes(&mut kek_salt);
 
     let mut nonce_kek = [0u8; aead::NONCE_LEN];
-    rng.fill_bytes(&mut nonce_kek);
+    OsRng.fill_bytes(&mut nonce_kek);
 
     let mut nonce_payload = [0u8; aead::NONCE_LEN];
-    rng.fill_bytes(&mut nonce_payload);
+    OsRng.fill_bytes(&mut nonce_payload);
 
-    let kek = hkdf_derive(
+    let mut kek = hkdf_derive(
         &kek_salt,
         mls_leaf_secret,
         KdfLabel::ConfidentialSendDekWrap,
         32,
     )?;
 
-    let wrapped_dek = aes_gcm_encrypt(&kek, &nonce_kek, &dek, wrap_aad)?;
-    let payload = aes_gcm_encrypt(&dek, &nonce_payload, plaintext, payload_aad)?;
-
-    // Zeroise the DEK on the stack — we copied it into the
-    // payload's key derivation already, so the only remaining
-    // path to the plaintext through this scope is the local
-    // `dek` array. Zeroising prevents a panic-unwind or
-    // optimiser leak from spilling 32 bytes of secret onto the
-    // stack frame.
+    // Wrap the DEK, then encrypt the payload. The DEK and KEK
+    // are zeroised below so neither secret outlives this scope
+    // on the heap (for the KEK `Vec<u8>`) or on the stack (for
+    // the `[u8; DEK_LEN]` array). The stack array is the more
+    // critical of the two because its bytes never leave the
+    // page that gets reused by subsequent calls, but the heap
+    // Vec is zeroised symmetrically so a future attacker with
+    // freed-heap read cannot reconstruct one half of the two-
+    // layer envelope.
+    let wrap_result = aes_gcm_encrypt(&kek, &nonce_kek, &dek, wrap_aad);
+    kek.zeroize();
+    let wrapped_dek = match wrap_result {
+        Ok(env) => env,
+        Err(e) => {
+            dek.zeroize();
+            return Err(e);
+        }
+    };
+    let payload_result = aes_gcm_encrypt(&dek, &nonce_payload, plaintext, payload_aad);
     dek.zeroize();
+    let payload = payload_result?;
 
     Ok(ConfidentialEnvelope {
         kek_salt,
@@ -181,7 +191,7 @@ pub fn open(mls_leaf_secret: &[u8], env: &ConfidentialEnvelope) -> Result<Vec<u8
         )));
     }
 
-    let kek = hkdf_derive(
+    let mut kek = hkdf_derive(
         &env.kek_salt,
         mls_leaf_secret,
         KdfLabel::ConfidentialSendDekWrap,
@@ -193,7 +203,12 @@ pub fn open(mls_leaf_secret: &[u8], env: &ConfidentialEnvelope) -> Result<Vec<u8
     // tampered with, or both. We treat all three uniformly so
     // the UX can render "this message is not for you / corrupt"
     // without leaking which condition fired.
-    let mut dek = aes_gcm_decrypt(&kek, &env.wrapped_dek)?;
+    //
+    // The KEK is zeroised immediately after the unwrap; the DEK
+    // is zeroised below after the payload decrypt.
+    let unwrap_result = aes_gcm_decrypt(&kek, &env.wrapped_dek);
+    kek.zeroize();
+    let mut dek = unwrap_result?;
     if dek.len() != DEK_LEN {
         // A well-formed wrap must produce exactly 32 bytes. If
         // it doesn't, the wrap was forged by an attacker that
