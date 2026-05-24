@@ -7,7 +7,7 @@
 // Usage:
 //
 //	go run ./scripts/bench/bench-jmap.go \
-//	  --jmap-url http://localhost:8080 \
+//	  --jmap-url http://localhost:8088 \
 //	  --auth-token kmail-dev \
 //	  --iterations 200 \
 //	  --warmup 20 \
@@ -52,7 +52,7 @@ type summary struct {
 
 func main() {
 	var (
-		jmapURL     = flag.String("jmap-url", "http://localhost:8080", "JMAP proxy URL")
+		jmapURL     = flag.String("jmap-url", "http://localhost:8088", "JMAP proxy URL (BFF, not Stalwart)")
 		token       = flag.String("auth-token", "kmail-dev", "Bearer token")
 		iter        = flag.Int("iterations", 100, "Measured iterations per op")
 		warm        = flag.Int("warmup", 10, "Warm-up iterations (discarded)")

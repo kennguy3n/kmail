@@ -217,7 +217,9 @@ type AuditConfig struct {
 // ZKFabricConfig is the connection surface for the zk-object-fabric
 // S3 gateway. In local compose the gateway is reachable at the
 // `zk-fabric` service name; host ports `9080` (S3) and `9081`
-// (console) avoid colliding with the BFF on `:8080`.
+// (console) avoid colliding with Stalwart on host `:8080` and with
+// the BFF on host `:8088` (see HTTPConfig.Addr for the rationale on
+// the BFF's :8088 default).
 type ZKFabricConfig struct {
 	// S3URL is the zk-object-fabric S3 endpoint for direct blob
 	// operations (presigned URLs, attachment links).
@@ -347,7 +349,10 @@ func Load() (*Config, error) {
 		ZKFabric: ZKFabricConfig{
 			// Host-mapped defaults match docker-compose.yml, which
 			// publishes zk-fabric on host `:9080` (S3) and `:9081`
-			// (console) to avoid collision with the BFF on :8080.
+			// (console). These are chosen to avoid collision with
+			// Stalwart on host `:8080` (matched 8080:8080 publish)
+			// AND with the BFF on host `:8088` (see HTTPConfig.Addr
+			// for the rationale on the BFF's :8088 default).
 			// Inside compose, override with
 			// `ZK_FABRIC_S3_URL=http://zk-fabric:8080`.
 			S3URL:      getenv("ZK_FABRIC_S3_URL", "http://localhost:9080"),

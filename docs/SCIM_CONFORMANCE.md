@@ -9,7 +9,7 @@ The harness that produces the matrix below lives at
 `scripts/test-scim.sh`; run it with:
 
 ```sh
-make scim-test KMAIL_API_URL=http://localhost:8080
+make scim-test KMAIL_API_URL=http://localhost:8088
 ```
 
 The harness provisions a fresh tenant, mints a SCIM bearer token
@@ -71,7 +71,7 @@ docker compose up -d
 make migrate
 
 # Run the harness:
-make scim-test KMAIL_API_URL=http://localhost:8080
+make scim-test KMAIL_API_URL=http://localhost:8088
 
 # Optional: run against a remote BFF (uses the same dev-bypass
 # bearer; do NOT use this against production).

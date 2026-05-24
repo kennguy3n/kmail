@@ -31,7 +31,7 @@ read/write ratio published in `docs/SLO_TRACKER.md`.
 
 ```bash
 go run ./scripts/loadtest/load-jmap.go \
-  --jmap-url http://localhost:8080 \
+  --jmap-url http://localhost:8088 \
   --auth-token kmail-dev \
   --concurrency 16 \
   --rampup 30s --steady 120s --cooldown 30s \

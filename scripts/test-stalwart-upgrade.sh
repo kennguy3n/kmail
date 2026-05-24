@@ -14,7 +14,7 @@
 #                       (override to a release-candidate image
 #                        until v1.0.0 publishes a stable tag).
 #   COMPOSE_PROJECT    — defaults to kmail-upgrade-test
-#   KMAIL_API_URL      — defaults to http://localhost:8080
+#   KMAIL_API_URL      — defaults to http://localhost:8088
 #
 # Exit code:
 #   0  — both versions passed e2e.
@@ -30,7 +30,7 @@ set -u
 V0_IMAGE="${STALWART_V0_IMAGE:-stalwartlabs/stalwart:v0.16.0}"
 V1_IMAGE="${STALWART_V1_IMAGE:-stalwartlabs/stalwart:v1.0.0}"
 PROJECT="${COMPOSE_PROJECT:-kmail-upgrade-test}"
-API_URL="${KMAIL_API_URL:-http://localhost:8080}"
+API_URL="${KMAIL_API_URL:-http://localhost:8088}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 

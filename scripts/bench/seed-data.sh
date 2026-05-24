@@ -6,12 +6,12 @@
 #   ./scripts/bench/seed-data.sh [N] [JMAP_URL] [AUTH_TOKEN] [ACCOUNT_ID]
 #
 # Example:
-#   ./scripts/bench/seed-data.sh 1000 http://localhost:8080 kmail-dev dev
+#   ./scripts/bench/seed-data.sh 1000 http://localhost:8088 kmail-dev dev
 
 set -euo pipefail
 
 N="${1:-1000}"
-JMAP_URL="${2:-http://localhost:8080}"
+JMAP_URL="${2:-http://localhost:8088}"
 TOKEN="${3:-kmail-dev}"
 ACCOUNT_ID="${4:-dev}"
 

@@ -12,7 +12,7 @@
 // Usage:
 //
 //      go run ./scripts/loadtest/load-jmap.go \
-//        --jmap-url http://localhost:8080 \
+//        --jmap-url http://localhost:8088 \
 //        --auth-token kmail-dev \
 //        --concurrency 16 \
 //        --rampup 30s --steady 120s --cooldown 30s \
@@ -48,7 +48,7 @@ type opResult struct {
 }
 
 var (
-	jmapURL     = flag.String("jmap-url", "http://localhost:8080", "BFF base URL")
+	jmapURL     = flag.String("jmap-url", "http://localhost:8088", "BFF base URL")
 	authToken   = flag.String("auth-token", "kmail-dev", "Bearer token (dev bypass by default)")
 	iterations  = flag.Int("iterations", 1000, "Total request budget")
 	concurrency = flag.Int("concurrency", 16, "Parallel worker count")

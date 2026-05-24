@@ -41,7 +41,7 @@ Seeds 1 000 messages into the dev tenant's inbox via JMAP
 
 ```
 go run ./scripts/bench/bench-jmap.go \
-  --jmap-url http://localhost:8080 \
+  --jmap-url http://localhost:8088 \
   --auth-token kmail-dev \
   --iterations 200 --warmup 20 --concurrency 4
 ```

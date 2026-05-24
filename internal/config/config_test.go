@@ -198,7 +198,9 @@ func TestRedactDSN(t *testing.T) {
 
 func TestConfigString_RedactsPassword(t *testing.T) {
 	cfg := &Config{
-		HTTP:           HTTPConfig{Addr: ":8080"},
+		// Mirror the production default (`:8088`) so this test
+		// doesn't accidentally encode an obsolete port layout.
+		HTTP:           HTTPConfig{Addr: ":8088"},
 		DatabaseURL:    "postgresql://kmail:hunter2@localhost:5432/kmail",
 		StalwartURL:    "http://stalwart:8080",
 		ValkeyURL:      "valkey:6379",
