@@ -106,11 +106,40 @@ func (s *Service) AddListener(l EventListener) {
 	s.listeners = append(s.listeners, l)
 }
 
+// Owner is the optional (OAuth2-client, user) pair that
+// integration-framework subscribers carry on
+// `webhook_endpoints.oauth_client_id` / `.user_id`. Both fields
+// are written in the SAME INSERT as the rest of the row when
+// non-empty, so a subscribe never observes a half-stamped
+// (oauth_client_id IS NULL during the transient window) row.
+// Admin-owned / legacy callers pass the zero-value Owner and the
+// columns stay NULL.
+type Owner struct {
+	OAuthClientID string
+	UserID        string
+}
+
 // RegisterWebhook inserts a new endpoint, returning the plaintext
-// secret (only available once).
-func (s *Service) RegisterWebhook(ctx context.Context, tenantID, urlStr string, events []string, signingVersion string) (*Endpoint, string, error) {
+// secret (only available once). The variadic `owner` argument
+// preserves backward compatibility for callers that don't care
+// about ownership (`RegisterWebhook(ctx, tenantID, url, events,
+// signingVersion)` still compiles), while integration-framework
+// callers may pass a single non-zero Owner to atomically stamp
+// the row with its OAuth2-client + user ownership.
+//
+// Why the variadic / optional Owner rather than two methods:
+// callers consistently route through `RegisterWebhook` for the
+// secret-minting + INSERT logic; carving out a second method
+// would duplicate that code and let the two paths drift on
+// e.g. signing-version validation. The variadic keeps the
+// single-source-of-truth INSERT and lets the test suite cover
+// both modes through one method.
+func (s *Service) RegisterWebhook(ctx context.Context, tenantID, urlStr string, events []string, signingVersion string, owner ...Owner) (*Endpoint, string, error) {
 	if tenantID == "" || urlStr == "" {
 		return nil, "", errors.New("webhooks: tenant + url required")
+	}
+	if len(owner) > 1 {
+		return nil, "", errors.New("webhooks: at most one Owner is allowed")
 	}
 	if signingVersion == "" {
 		signingVersion = SigningV1
@@ -128,16 +157,38 @@ func (s *Service) RegisterWebhook(ctx context.Context, tenantID, urlStr string, 
 	}
 	eventsJSON, _ := json.Marshal(events)
 	var ep Endpoint
+	// `oauthClientArg` and `userArg` carry the optional owner
+	// columns; nil pgtype values render as SQL NULL so the
+	// admin-owned path keeps emitting the same INSERT shape it
+	// did before the integrations framework existed.
+	var oauthClientArg, userArg any
+	if len(owner) == 1 {
+		o := owner[0]
+		if s := o.OAuthClientID; s != "" {
+			oauthClientArg = s
+		}
+		if s := o.UserID; s != "" {
+			userArg = s
+		}
+	}
 	err = pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
 			return err
 		}
 		var rawEvents []byte
 		err := tx.QueryRow(ctx, `
-			INSERT INTO webhook_endpoints (tenant_id, url, events, secret_hash, signing_version)
-			VALUES ($1::uuid, $2, $3::jsonb, $4, $5)
+			INSERT INTO webhook_endpoints (
+			    tenant_id, url, events, secret_hash, signing_version,
+			    oauth_client_id, user_id
+			)
+			VALUES (
+			    $1::uuid, $2, $3::jsonb, $4, $5,
+			    NULLIF($6, '')::uuid, NULLIF($7, '')::uuid
+			)
 			RETURNING id::text, tenant_id::text, url, events, active, signing_version, created_at, updated_at
-		`, tenantID, urlStr, string(eventsJSON), hash, signingVersion).Scan(
+		`, tenantID, urlStr, string(eventsJSON), hash, signingVersion,
+			coerceStr(oauthClientArg), coerceStr(userArg),
+		).Scan(
 			&ep.ID, &ep.TenantID, &ep.URL, &rawEvents, &ep.Active, &ep.SigningVersion, &ep.CreatedAt, &ep.UpdatedAt,
 		)
 		if err != nil {
@@ -150,6 +201,21 @@ func (s *Service) RegisterWebhook(ctx context.Context, tenantID, urlStr string, 
 		return nil, "", err
 	}
 	return &ep, secret, nil
+}
+
+// coerceStr returns the underlying string for `any` values that
+// the optional-Owner path uses to pass to pgx. `nil` becomes the
+// empty string, which the INSERT's NULLIF($6, '')::uuid wraps
+// renders as SQL NULL — so the admin-owned (zero-value Owner)
+// path stays semantically identical to the pre-Owner schema.
+func coerceStr(v any) string {
+	if v == nil {
+		return ""
+	}
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return ""
 }
 
 // UpdateSigningVersion flips the signing version on an endpoint.
@@ -259,8 +325,38 @@ func (s *Service) DeleteWebhook(ctx context.Context, tenantID, id string) error 
 	})
 }
 
-// DeliverEvent enqueues a delivery for every endpoint subscribed
-// to the event type. Returns the number of deliveries enqueued.
+// DeliverEvent enqueues a delivery for every ADMIN-OWNED endpoint
+// subscribed to the event type. Returns the number of deliveries
+// enqueued.
+//
+// SCOPE NOTE — admin-owned only. Migration 047 added the
+// `oauth_client_id` column to `webhook_endpoints` so a row can be
+// either:
+//   - admin-owned (`oauth_client_id IS NULL`): BFF-internal webhook
+//     wired by an operator, no per-client scope filtering applies.
+//   - integration-owned (`oauth_client_id IS NOT NULL`): owned by a
+//     third-party OAuth2 client, MUST go through the dispatch-time
+//     `EventAllowedForClient` defense-in-depth check in
+//     `integrations.Service.DispatchEvent`.
+//
+// The WHERE clause below filters `oauth_client_id IS NULL` so this
+// legacy entry point only fans out to admin-owned endpoints. Any
+// future caller that needs to deliver to integration-owned
+// endpoints MUST go through `integrations.Service.DispatchEvent`,
+// which:
+//   - calls dispatchAdminOwned (this code path, equivalent semantics)
+//     for admin-owned rows, AND
+//   - calls dispatchIntegrationOwned for integration-owned rows,
+//     applying the per-client scope check that closes the
+//     post-subscribe-time scope revocation window.
+//
+// Without the `oauth_client_id IS NULL` filter, a future call to
+// DeliverEvent (e.g. from a new event source that doesn't know
+// about the integration framework) would silently bypass scope
+// enforcement and deliver to integration-owned endpoints whose
+// owning client may have lost the scope since subscribe time.
+// That's the exact gap the dispatch-time scope check was designed
+// to close.
 func (s *Service) DeliverEvent(ctx context.Context, tenantID, eventType string, payload map[string]any) (int, error) {
 	if s.pool == nil || tenantID == "" || eventType == "" {
 		return 0, nil
@@ -275,9 +371,14 @@ func (s *Service) DeliverEvent(ctx context.Context, tenantID, eventType string, 
 			return err
 		}
 		// Filter: events array is empty (-> all) OR contains the event.
+		// `oauth_client_id IS NULL` confines this legacy fan-out to
+		// admin-owned endpoints; integration-owned rows are reached
+		// via `integrations.Service.DispatchEvent` instead, which
+		// applies the per-client scope check (see SCOPE NOTE above).
 		rows, err := tx.Query(ctx, `
 			SELECT id::text FROM webhook_endpoints
 			WHERE tenant_id = $1::uuid AND active = true
+			  AND oauth_client_id IS NULL
 			  AND (jsonb_array_length(events) = 0 OR events ? $2)
 		`, tenantID, eventType)
 		if err != nil {

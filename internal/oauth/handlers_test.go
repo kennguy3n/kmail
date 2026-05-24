@@ -630,7 +630,7 @@ func TestAuthorize_FormActionRespectsRoutePrefix(t *testing.T) {
 	mux := http.NewServeMux()
 	// Mount under a non-default prefix to verify the consent form
 	// action threads the prefix through.
-	h.RegisterRoutes(mux, "/api/v1/oauth")
+	h.RegisterRoutes(mux, "/api/v1/oauth", nil)
 
 	q := url.Values{}
 	q.Set("response_type", "code")
@@ -999,7 +999,7 @@ func TestRegisterRoutes_AllFourEndpointsBound(t *testing.T) {
 	svc := newFakeService()
 	svc.clients["client-conf-1"] = makeConfidentialClient()
 	h := newHandlersWithAPI(svc, userResolverOK)
-	h.RegisterRoutes(mux, "/oauth")
+	h.RegisterRoutes(mux, "/oauth", nil)
 
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
@@ -1016,6 +1016,114 @@ func TestRegisterRoutes_AllFourEndpointsBound(t *testing.T) {
 		// any POST without a matched cookie+form pair is now
 		// rejected. This is the desired ordering: cheap deny
 		// before any service-layer work.
+		{"POST", "/oauth/authorize/approve", http.StatusForbidden},
+		{"POST", "/oauth/token", http.StatusUnauthorized},
+		{"POST", "/oauth/revoke", http.StatusUnauthorized},
+	}
+	for _, c := range cases {
+		req, _ := http.NewRequest(c.method, srv.URL+c.path, nil)
+		resp, err := srv.Client().Do(req)
+		if err != nil {
+			t.Fatalf("%s %s: %v", c.method, c.path, err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != c.wantStatus {
+			t.Errorf("%s %s: expected %d, got %d", c.method, c.path, c.wantStatus, resp.StatusCode)
+		}
+	}
+}
+
+// TestRegisterRoutes_BrowserMiddlewareSelective pins the routing
+// invariant that the consent-flow endpoints (`/authorize` and
+// `/authorize/approve`) MUST be wrapped with the supplied
+// browserAuthMW, while the machine-facing endpoints (`/token` and
+// `/revoke`) MUST NOT be wrapped.
+//
+// This is the regression guard for the PR #36 round-1 critical
+// finding: dropping the wrap on `/authorize`+`/approve` makes the
+// consent screen 401-dead because UserResolver has no
+// (tenant, user) context to read; conversely, accidentally
+// wrapping `/token`+`/revoke` would 401 every Zapier/n8n token
+// exchange because there's no end-user JWT on those wire calls.
+//
+// We assert by counting middleware invocations per route — the
+// test middleware records the path it saw on a shared map, and
+// the test then asserts only the two consent routes were stamped.
+func TestRegisterRoutes_BrowserMiddlewareSelective(t *testing.T) {
+	svc := newFakeService()
+	h := newHandlersWithAPI(svc, userResolverOK)
+
+	stamped := map[string]int{}
+	browserMW := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			stamped[r.URL.Path]++
+			next.ServeHTTP(w, r)
+		})
+	}
+
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux, "/oauth", browserMW)
+
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	// Hit each of the four endpoints with valid-shaped requests
+	// so the mux dispatches and the (possibly-wrapped) handler
+	// runs. We don't care about the response status — we only
+	// care which paths the middleware saw.
+	calls := []struct{ method, path string }{
+		{"GET", "/oauth/authorize"},
+		{"POST", "/oauth/authorize/approve"},
+		{"POST", "/oauth/token"},
+		{"POST", "/oauth/revoke"},
+	}
+	for _, c := range calls {
+		req, _ := http.NewRequest(c.method, srv.URL+c.path, nil)
+		resp, err := srv.Client().Do(req)
+		if err != nil {
+			t.Fatalf("%s %s: %v", c.method, c.path, err)
+		}
+		_ = resp.Body.Close()
+	}
+
+	wantStamped := []string{"/oauth/authorize", "/oauth/authorize/approve"}
+	wantUnstamped := []string{"/oauth/token", "/oauth/revoke"}
+	for _, p := range wantStamped {
+		if stamped[p] != 1 {
+			t.Errorf("browserAuthMW should have wrapped %s (expected 1 invocation, got %d)", p, stamped[p])
+		}
+	}
+	for _, p := range wantUnstamped {
+		if stamped[p] != 0 {
+			t.Errorf("browserAuthMW must NOT wrap %s (got %d invocations) — machine endpoints take client_credentials, not user JWT", p, stamped[p])
+		}
+	}
+}
+
+// TestRegisterRoutes_NilBrowserMiddleware verifies the backward-
+// compatible nil-middleware path — used by the pure-unit-test
+// callers that don't have an OIDC chain — registers all four
+// endpoints without wrapping. The in-handler UserResolver guard
+// still produces a 401 on `/authorize` / `/approve`, so we just
+// confirm the mux dispatches to the bare handlers.
+func TestRegisterRoutes_NilBrowserMiddleware(t *testing.T) {
+	svc := newFakeService()
+	svc.clients["client-conf-1"] = makeConfidentialClient()
+	h := newHandlersWithAPI(svc, userResolverOK)
+
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux, "/oauth", nil)
+
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	// Same shape as TestRegisterRoutes_AllFourEndpointsBound —
+	// each path should dispatch (not 404 from the mux).
+	cases := []struct {
+		method, path string
+		wantStatus   int
+	}{
+		{"GET", "/oauth/authorize", http.StatusBadRequest},
 		{"POST", "/oauth/authorize/approve", http.StatusForbidden},
 		{"POST", "/oauth/token", http.StatusUnauthorized},
 		{"POST", "/oauth/revoke", http.StatusUnauthorized},

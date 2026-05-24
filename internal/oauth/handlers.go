@@ -194,11 +194,45 @@ func randomCSRFNonce() (string, error) {
 // prefix — without this, the approve POST hardcoded to
 // `/oauth/authorize/approve` would 404 when the BFF mounted
 // these routes under e.g. `/api/v1/oauth`.
-func (h *Handlers) RegisterRoutes(mux *http.ServeMux, prefix string) {
+//
+// `browserAuthMW`, when non-nil, is applied to the two
+// browser-facing endpoints (`/authorize` and `/authorize/approve`)
+// but NOT to the two machine-facing endpoints (`/token` and
+// `/revoke`). The split is mandatory:
+//
+//   - `/authorize` + `/approve` are consent-flow endpoints driven
+//     by a *user* in a browser. Authorize.UserResolver pulls the
+//     (tenant_id, kchat_user_id) tuple out of `r.Context()` — which
+//     only gets populated by the OIDC middleware. Without that
+//     middleware the resolver returns ("", "", false) and both
+//     handlers short-circuit to HTTP 401 ("authentication required").
+//     The end result is a dead-on-arrival consent flow: every
+//     browser request 401s, no access token is ever issued, no
+//     integration can be wired. This was the critical Devin-Review
+//     finding on PR #36 round-1.
+//   - `/token` + `/revoke` are RFC 6749 §4.1.3 / RFC 7009
+//     client-credentialed machine endpoints. They MUST NOT be
+//     wrapped with OIDC because the caller is an OAuth2 *client*
+//     (Zapier, n8n, …) authenticating with `client_id + client_secret`
+//     or Basic auth — there is no end-user JWT to validate. Wrapping
+//     them with OIDC would 401 every token exchange and break every
+//     integration on the wire.
+//
+// Callers that don't need a middleware (pure-unit-test paths) can
+// pass `nil` for `browserAuthMW`; in that case the four endpoints
+// are registered without wrapping and the in-handler 401 acts as
+// the safety net.
+func (h *Handlers) RegisterRoutes(mux *http.ServeMux, prefix string, browserAuthMW func(http.Handler) http.Handler) {
 	prefix = strings.TrimRight(prefix, "/")
 	h.routePrefix = prefix
-	mux.HandleFunc(prefix+"/authorize", h.Authorize)
-	mux.HandleFunc(prefix+"/authorize/approve", h.Approve)
+	authorize := http.Handler(http.HandlerFunc(h.Authorize))
+	approve := http.Handler(http.HandlerFunc(h.Approve))
+	if browserAuthMW != nil {
+		authorize = browserAuthMW(authorize)
+		approve = browserAuthMW(approve)
+	}
+	mux.Handle(prefix+"/authorize", authorize)
+	mux.Handle(prefix+"/authorize/approve", approve)
 	mux.HandleFunc(prefix+"/token", h.Token)
 	mux.HandleFunc(prefix+"/revoke", h.Revoke)
 }
@@ -666,12 +700,71 @@ func (h *Handlers) redirectWithError(w http.ResponseWriter, r *http.Request, red
 	http.Redirect(w, r, u.String(), http.StatusFound)
 }
 
-// redirectWithOAuthError unwraps an OAuthError (if present) and
-// dispatches to redirectWithError with the right code.
+// redirectWithOAuthError converts the service-layer error into the
+// RFC 6749 §4.1.2.1 redirect-error wire envelope and dispatches to
+// redirectWithError.
+//
+// The lookup order mirrors mapTokenError (the /token-endpoint
+// equivalent) so the two paths agree on which sentinel maps to
+// which wire code. Without this, plain sentinels returned by
+// IssueAuthorizationCode — `ErrScopeNotAllowed`,
+// `ErrInvalidRedirectURI`, `ErrPKCERequiredButMissing`,
+// `ErrInvalidCodeVerifier` — would fall through to `server_error`
+// even though they are user-correctable client mistakes per spec.
+// An integration developer seeing `error=server_error` would
+// retry blindly when the actual fix is a re-consent flow with a
+// narrower scope set.
+//
+// Triggers for the scope-mismatch case are real: a client's
+// `allowed_scopes` could narrow between the GET /authorize render
+// and the POST /authorize/approve submit (admin revoked a scope
+// while the user sat on the consent screen), or a tampering user
+// could widen the hidden form field past what the consent screen
+// displayed. Either way the right wire shape is `invalid_scope`
+// + the spec-defined redirect — never `server_error`.
+//
+// Unrecognised errors still map to `server_error`/500 so the
+// on-call SLO catches the regression rather than masking a
+// genuine infrastructure failure as a 400. The mapping is kept
+// here rather than reaching into mapTokenError because the two
+// callers have different default semantics (mapTokenError builds
+// a JSON envelope with HTTPStatus, redirectWithOAuthError builds
+// a redirect with just `error=` + `error_description=`).
 func (h *Handlers) redirectWithOAuthError(w http.ResponseWriter, r *http.Request, redirectURI, state string, err error) {
 	var oerr *OAuthError
 	if errors.As(err, &oerr) {
 		h.redirectWithError(w, r, redirectURI, state, oerr.Code, oerr.Description)
+		return
+	}
+	switch {
+	case errors.Is(err, ErrScopeNotAllowed):
+		h.redirectWithError(w, r, redirectURI, state, ErrCodeInvalidScope, "requested scope not allowed for this client")
+		return
+	case errors.Is(err, ErrInvalidRedirectURI):
+		// RFC 6749 §3.1.2.4: "If the request fails due to a
+		// missing, invalid, or mismatching redirection URI, the
+		// authorization server SHOULD inform the resource owner
+		// of the error and MUST NOT automatically redirect the
+		// user-agent to the invalid redirection URI."
+		//
+		// This case is unreachable today (`Approve` validates
+		// `redirectURIInAllowList` before calling IssueAuthorizationCode
+		// at handlers.go:455, so the service-layer
+		// `redirectURIInAllowList` check at service.go:357 cannot
+		// diverge), but if a future refactor caused
+		// `IssueAuthorizationCode` to surface this sentinel
+		// directly we would otherwise redirect the user-agent
+		// to whatever (potentially attacker-supplied) URI we
+		// have in hand — that's the exact failure mode the spec
+		// forbids. Returning an HTTP error keeps the defensive
+		// mapping AND stays spec-compliant.
+		http.Error(w, "redirect_uri does not match client allow-list", http.StatusBadRequest)
+		return
+	case errors.Is(err, ErrPKCERequiredButMissing):
+		h.redirectWithError(w, r, redirectURI, state, ErrCodeInvalidRequest, "PKCE required for public clients")
+		return
+	case errors.Is(err, ErrInvalidCodeVerifier):
+		h.redirectWithError(w, r, redirectURI, state, ErrCodeInvalidRequest, "code_verifier does not match challenge")
 		return
 	}
 	h.redirectWithError(w, r, redirectURI, state, ErrCodeServerError, "internal error issuing authorization code")

@@ -72,6 +72,29 @@ func (f *fakeStore) Allow(_ context.Context, tenantKey, userKey string, window t
 	return true, true, nil
 }
 
+// IncrWithTTL satisfies the RateLimiterStore interface for the
+// bucket-counter primitive (used by downstream consumers like
+// the integrations dispatcher). The middleware-level RateLimiter
+// tests in this file do NOT exercise IncrWithTTL — those live
+// against the integrations package's own fake. We keep a simple
+// in-memory counter here so tests that wire the same fake into
+// both Allow and IncrWithTTL call sites still observe meaningful
+// behaviour, and honour f.fail so failure injection works
+// uniformly across both surfaces.
+func (f *fakeStore) IncrWithTTL(_ context.Context, key string, _ time.Duration) (int64, error) {
+	if f.fail != nil {
+		return 0, f.fail
+	}
+	if f.log == nil {
+		f.log = map[string][]time.Time{}
+	}
+	// Reuse f.log as a side-effect-free count: number of
+	// entries == number of increments. Use a zero-time
+	// placeholder since we don't need the timestamp.
+	f.log[key] = append(f.log[key], time.Time{})
+	return int64(len(f.log[key])), nil
+}
+
 // authedRequest returns an httptest request with tenant + user
 // context applied so the limiter can extract the identity.
 func authedRequest(tenant, user string) *http.Request {

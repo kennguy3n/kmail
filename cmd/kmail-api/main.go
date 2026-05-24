@@ -26,26 +26,28 @@ import (
 	"github.com/kennguy3n/kmail/internal/audit"
 	"github.com/kennguy3n/kmail/internal/billing"
 	"github.com/kennguy3n/kmail/internal/calendarbridge"
-	"github.com/kennguy3n/kmail/internal/contactbridge"
 	"github.com/kennguy3n/kmail/internal/chatbridge"
 	"github.com/kennguy3n/kmail/internal/cmk"
-	"github.com/kennguy3n/kmail/internal/config"
 	"github.com/kennguy3n/kmail/internal/confidentialsend"
+	"github.com/kennguy3n/kmail/internal/config"
+	"github.com/kennguy3n/kmail/internal/contactbridge"
 	"github.com/kennguy3n/kmail/internal/deliverability"
 	"github.com/kennguy3n/kmail/internal/dns"
 	"github.com/kennguy3n/kmail/internal/export"
+	"github.com/kennguy3n/kmail/internal/integrations"
 	"github.com/kennguy3n/kmail/internal/jmap"
 	"github.com/kennguy3n/kmail/internal/malware"
 	"github.com/kennguy3n/kmail/internal/middleware"
 	"github.com/kennguy3n/kmail/internal/migration"
 	"github.com/kennguy3n/kmail/internal/monitoring"
+	"github.com/kennguy3n/kmail/internal/oauth"
 	"github.com/kennguy3n/kmail/internal/onboarding"
 	"github.com/kennguy3n/kmail/internal/push"
 	"github.com/kennguy3n/kmail/internal/retention"
 	"github.com/kennguy3n/kmail/internal/scim"
 	"github.com/kennguy3n/kmail/internal/search"
-	"github.com/kennguy3n/kmail/internal/sieve"
 	"github.com/kennguy3n/kmail/internal/sharedinbox"
+	"github.com/kennguy3n/kmail/internal/sieve"
 	"github.com/kennguy3n/kmail/internal/tenant"
 	"github.com/kennguy3n/kmail/internal/valkeyurl"
 	"github.com/kennguy3n/kmail/internal/vault"
@@ -87,18 +89,52 @@ func main() {
 		logger.Fatalf("middleware.NewOIDC: %v", err)
 	}
 
+	// Shared Valkey-backed rate-limit store. ONE underlying
+	// `*RedisStore` is built here and reused by every package
+	// that needs a rate-limit counter:
+	//   * `middleware.RateLimiter` (auth/JMAP request limiter)
+	//   * `integrations.Service` (per-OAuth2-client outbound
+	//     dispatch quota, plumbed below)
+	//
+	// Reusing one store is mandatory in production — each
+	// `middleware.NewRedisStore` call opens its own
+	// `go-redis.Client` with its own pool, so building a second
+	// one here would double the open file descriptors / Valkey
+	// connection budget without any functional benefit. The
+	// store is built unconditionally (even when
+	// `cfg.RateLimit.Enabled = false` for the auth limiter)
+	// because the integrations dispatcher quota is governed by
+	// its own per-client `dispatch_quota_per_hour` setting and
+	// is enabled independently of `cfg.RateLimit`.
+	limiterStore, err := middleware.NewRedisStore(cfg.ValkeyURL)
+	if err != nil {
+		logger.Fatalf("middleware.NewRedisStore: %v", err)
+	}
+	// Release the limiter store's connection pool on shutdown.
+	// `middleware.NewRedisStore` constructs its own `*redis.Client`
+	// with its own pool (separate from the `valkeyClient` pool
+	// closed at the analogous block ~135 lines below — see the
+	// "Two separate Redis client pools" doc block at the top of
+	// this function for the design rationale on why the two pools
+	// stay separate). Without this defer the pool's TCP
+	// connections would only be reclaimed by the GC finalizer at
+	// process exit; CI leak detectors and graceful-shutdown
+	// drains both treat that as a regression. `*redis.Client.Close`
+	// is idempotent and safe from defer.
+	defer func() {
+		if cerr := limiterStore.Client.Close(); cerr != nil {
+			logger.Printf("limiter store: close: %v", cerr)
+		}
+	}()
+
 	// Valkey-backed rate limiter. Enabled via config; when
 	// disabled the limiter is a no-op and the middleware passes
 	// the request through untouched. Plumbed in between the OIDC
 	// gate (needs identity) and the JMAP + tenant handlers.
 	var rateLimiter *middleware.RateLimiter
 	if cfg.RateLimit.Enabled {
-		store, err := middleware.NewRedisStore(cfg.ValkeyURL)
-		if err != nil {
-			logger.Fatalf("middleware.NewRedisStore: %v", err)
-		}
 		rateLimiter = middleware.NewRateLimiter(middleware.RateLimiterConfig{
-			Client:    store,
+			Client:    limiterStore,
 			TenantRPM: cfg.RateLimit.TenantRPM,
 			UserRPM:   cfg.RateLimit.UserRPM,
 			Window:    cfg.RateLimit.Window,
@@ -798,6 +834,91 @@ func main() {
 	webhookSvc := webhooks.NewService(pool)
 	webhooks.NewHandlers(webhookSvc, logger).Register(mux, authMW)
 	go webhooks.NewWorker(webhookSvc, logger).Run(ctx)
+
+	// Phase E #14 — OAuth2 authorization server for third-party
+	// integrations. Mounted at /api/v1/oauth/* (so all four
+	// endpoints: authorize / authorize/approve / token / revoke
+	// share a stable prefix). The user-JWT-aware resolver
+	// extracts the consenting user from the OIDC token attached
+	// by the BFF's existing auth chain; without it the consent
+	// screen has nothing to bind the access token to.
+	oauthSvc := oauth.NewService(pool)
+	oauthHandlers := oauth.NewHandlers(oauthSvc, func(r *http.Request) (userID, tenantID string, ok bool) {
+		// The consenting user is the kchat user authenticated by
+		// the BFF's OIDC chain (middleware.OIDC). That chain
+		// stashes (tenant_id, kchat_user_id) in the request
+		// context; both must be present — an OAuth2 consent
+		// without an authenticated user is meaningless.
+		uid := middleware.KChatUserIDFrom(r.Context())
+		tid := middleware.TenantIDFrom(r.Context())
+		if uid == "" || tid == "" {
+			return "", "", false
+		}
+		return uid, tid, true
+	})
+	// In production the consent CSRF cookie MUST be Secure; the
+	// local-dev path serves plain HTTP so the Secure flag would
+	// suppress the cookie on the redirect, breaking the
+	// /authorize/approve POST with a CSRF mismatch.
+	//
+	// Resolution goes through `middleware.IsDevEnv(cfg.Env)`
+	// (NOT a raw `KMAIL_ENV != "development"` string compare),
+	// because `docker-compose.yml` ships `KMAIL_ENV: dev` and the
+	// canonical alias table in `internal/middleware/auth.go`
+	// (`envAliases`) maps `"dev" -> "development"`. A literal
+	// comparison would treat the standard compose value as
+	// production and set Secure: true on the CSRF cookie, which
+	// the dev-mode browser would then refuse to send back over
+	// plain HTTP — every consent screen would fail closed with a
+	// 403. The OIDC middleware already routes dev / staging /
+	// prod through this same helper; reusing it keeps the alias
+	// surface in one place rather than spread across goroutines
+	// of subtly-different env probes.
+	oauthHandlers.SetSecureCookies(!middleware.IsDevEnv(cfg.Env))
+	// Wire the prefixed (`kmail-api `) BFF logger into the OAuth2
+	// handler set so its 5xx error paths land in the same
+	// log-aggregation channel the rest of the BFF uses. Without
+	// this, server-side failures in writeTokenError / the revoke
+	// fallback would be emitted via `log.Default()` and miss the
+	// `kmail-api ` prefix that structured log pipelines key on
+	// for service-correlation — making OAuth2 outages harder to
+	// triage than equivalent failures in jmap / cmk / webhooks.
+	oauthHandlers.SetLogger(logger)
+	// `RegisterRoutes` selectively wraps the two browser-facing
+	// endpoints (`/authorize`, `/authorize/approve`) with the OIDC
+	// middleware so the kchat-user context is populated before the
+	// consent handlers read it via UserResolver. The two
+	// machine-facing endpoints (`/token`, `/revoke`) are LEFT
+	// UNWRAPPED because their callers authenticate as OAuth2
+	// clients (client_id + client_secret), not as end users —
+	// applying OIDC there would 401 every token exchange. See the
+	// RegisterRoutes doc comment in internal/oauth/handlers.go for
+	// the full split rationale.
+	oauthHandlers.RegisterRoutes(mux, "/api/v1/oauth", authMW.Wrap)
+
+	// Phase E #15-17 — Integration framework. Wraps webhookSvc
+	// with OAuth2-client scope filtering and per-client rate-
+	// limited dispatch. The boundary AuthMiddleware lives in
+	// the oauth package (verifies Bearer token against
+	// oauth_access_tokens, attaches AccessTokenContext).
+	oauthAuthMW := oauth.NewAuthMiddleware(oauthSvc)
+	// `limiterStore` is the SAME *RedisStore built once at the
+	// top of main() for the auth rate limiter. Threading it
+	// here (instead of calling NewRedisStore again) keeps the
+	// process's Valkey connection budget bounded to a single
+	// go-redis pool — see the limiterStore declaration for the
+	// full rationale.
+	integSvc, err := integrations.NewService(integrations.ServiceConfig{
+		Pool:         pool,
+		Webhooks:     webhookSvc,
+		OAuth:        oauthSvc,
+		LimiterStore: limiterStore,
+		Logger:       logger,
+	})
+	if err != nil {
+		logger.Fatalf("integrations: %v", err)
+	}
+	integrations.NewHandlers(integSvc, logger).Register(mux, oauthAuthMW)
 
 	// Phase 5 closeout — Onboarding checklist.
 	onboardingSvc := onboarding.NewService(pool)

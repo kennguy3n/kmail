@@ -91,6 +91,26 @@ type RateLimiterStore interface {
 		tenantLimit, userLimit int,
 		now time.Time,
 	) (tenantAdmitted, userAdmitted bool, err error)
+
+	// IncrWithTTL atomically increments a counter at `key` and
+	// sets a TTL of `ttl` on the FIRST increment only (subsequent
+	// calls within the window leave the existing TTL untouched).
+	// This is the bucket-counter primitive used by hourly /
+	// per-period quota checks where the bucket key is derived
+	// from a time-truncated timestamp (so a new key is created
+	// at each window boundary and the old one expires).
+	//
+	// Returns the post-increment count. Callers MUST compare
+	// against the quota threshold themselves — this store is the
+	// dumb counter, not the policy engine.
+	//
+	// The two-step (INCR then EXPIRE-on-first) is wrapped in a
+	// single atomic Lua script so a process crashing between
+	// the two operations cannot leave a TTL-less key that lives
+	// forever and skews future periods. ttl MUST be positive;
+	// implementations should reject zero / negative ttl rather
+	// than silently creating a no-expiry key.
+	IncrWithTTL(ctx context.Context, key string, ttl time.Duration) (int64, error)
 }
 
 // RateLimiter is the HTTP middleware. Construct once at boot and
@@ -298,6 +318,14 @@ type RedisStore struct {
 	// callers see `scriptOnce.Do` short-circuit immediately.
 	scriptOnce sync.Once
 	script     *redis.Script
+
+	// incrScriptOnce / incrScript serve the same role for the
+	// `IncrWithTTL` bucket-counter primitive. Kept separate from
+	// the sliding-window script so the two surfaces can evolve
+	// independently (e.g. tightening EXPIRE-only-on-first
+	// semantics for one without re-hashing the other's SHA).
+	incrScriptOnce sync.Once
+	incrScript     *redis.Script
 }
 
 // NewRedisStore is a convenience constructor that dials Valkey at
@@ -320,6 +348,7 @@ func NewRedisStore(url string) (*RedisStore, error) {
 func NewRedisStoreFromClient(c *redis.Client) *RedisStore {
 	s := &RedisStore{Client: c}
 	s.ensureScript()
+	s.ensureIncrScript()
 	return s
 }
 
@@ -331,6 +360,34 @@ func NewRedisStoreFromClient(c *redis.Client) *RedisStore {
 func (s *RedisStore) ensureScript() {
 	s.scriptOnce.Do(func() {
 		s.script = redis.NewScript(slidingWindowScript)
+	})
+}
+
+// incrWithTTLScript: atomic INCR + EXPIRE-on-first-call. The
+// `n == 1` branch fires only when the INCR created the key (no
+// prior value); subsequent calls within the window short-circuit
+// past the PEXPIRE so the original TTL is preserved exactly. This
+// keeps the bucket window true to its truncation boundary rather
+// than sliding forward with every increment.
+//
+// ARGV[1] is the TTL in milliseconds (PEXPIRE precision).
+// KEYS[1] is the counter key.
+// Returns the post-increment count as a Redis integer.
+const incrWithTTLScript = `
+local n = redis.call('INCR', KEYS[1])
+if n == 1 then
+  redis.call('PEXPIRE', KEYS[1], ARGV[1])
+end
+return n
+`
+
+// ensureIncrScript mirrors ensureScript for the bucket-counter
+// Lua primitive. Compiled lazily so the constructor's eager
+// `NewRedisStoreFromClient` path pays it up-front, and any
+// struct-literal callers compile it on first use.
+func (s *RedisStore) ensureIncrScript() {
+	s.incrScriptOnce.Do(func() {
+		s.incrScript = redis.NewScript(incrWithTTLScript)
 	})
 }
 
@@ -381,6 +438,38 @@ func (s *RedisStore) Allow(
 	tenantI, _ := pair[0].(int64)
 	userI, _ := pair[1].(int64)
 	return tenantI == 1, userI == 1, nil
+}
+
+// IncrWithTTL atomically increments a counter at `key` and sets
+// a TTL of `ttl` on the FIRST increment only. Subsequent calls
+// within the window leave the existing TTL untouched, so the
+// counter expires exactly `ttl` after its first observation
+// rather than sliding forward.
+//
+// Used by the integrations dispatcher's per-OAuth2-client
+// hourly quota check: the key is
+// `kmail:integ:dispatch:<client_id>:<bucket-start-ts>` where
+// `bucket-start-ts = now.Truncate(time.Hour).Unix()`, so each
+// hour boundary creates a fresh key and the previous one
+// expires automatically.
+//
+// Returns the post-increment count. Errors out on a nil client
+// or non-positive TTL rather than silently creating a key with
+// no expiry (which would skew every subsequent period's count).
+func (s *RedisStore) IncrWithTTL(ctx context.Context, key string, ttl time.Duration) (int64, error) {
+	if s.Client == nil {
+		return 0, errors.New("RedisStore: Client is nil")
+	}
+	ttlMs := ttl.Milliseconds()
+	if ttlMs <= 0 {
+		return 0, fmt.Errorf("RedisStore.IncrWithTTL: ttl must be positive, got %v", ttl)
+	}
+	s.ensureIncrScript()
+	res, err := s.incrScript.Run(ctx, s.Client, []string{key}, ttlMs).Int64()
+	if err != nil {
+		return 0, fmt.Errorf("ratelimit: incr-with-ttl: %w", err)
+	}
+	return res, nil
 }
 
 // newUniqueMember produces a per-request ZSET member that won't

@@ -116,6 +116,16 @@ type Client struct {
 // the bearer-token middleware. Downstream handlers consume it
 // via the package-level `FromContext` helper to know which
 // tenant / user / scopes a request was authorized for.
+//
+// ClientID is the UUID primary key of the issuing OAuth2 client
+// row (`oauth_clients.id`), NOT the public TEXT identifier on
+// `oauth_clients.client_id` (the base64url string that lives
+// on the wire). Downstream consumers cast this value `::uuid`
+// when scoping queries against tables that hold UUID FKs
+// (e.g. `webhook_endpoints.oauth_client_id`,
+// `oauth_access_tokens.client_id`). Anyone wanting the
+// human-readable / wire-form identifier MUST look it up via
+// `Service.GetClient` and use `Client.ClientID` instead.
 type AccessTokenContext struct {
 	TokenID   string
 	TenantID  string
@@ -130,7 +140,20 @@ type AccessTokenContext struct {
 // future scope-hierarchy change (e.g. `write:mail` implies
 // `read:mail`) lands in one place.
 func (a *AccessTokenContext) HasScope(want string) bool {
-	for _, s := range a.Scopes {
+	return ScopesInclude(a.Scopes, want)
+}
+
+// ScopesInclude reports whether `granted` satisfies a `want`
+// scope requirement, accounting for the write:* → read:*
+// implication. This is the canonical scope-subset helper —
+// downstream packages (e.g. internal/integrations) that need to
+// re-check scopes outside the request-context flow (e.g.
+// dispatch-time defence-in-depth on stored subscription rows)
+// MUST call this rather than open-coding a string slice walk,
+// so a future hierarchy change lands once. HasScope above
+// delegates here.
+func ScopesInclude(granted []string, want string) bool {
+	for _, s := range granted {
 		if s == want {
 			return true
 		}
