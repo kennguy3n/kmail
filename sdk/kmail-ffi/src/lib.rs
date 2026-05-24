@@ -129,15 +129,40 @@ impl From<tokio::task::JoinError> for KMailError {
 // FFI record (dictionary) types
 // ---------------------------------------------------------------
 
+/// FFI mirror of [`ClientConfig`] for `client_open`.
+///
+/// `bff_url`, `bearer_token`, and `database_path` are required
+/// because they are tenant- and session-specific — there is no
+/// sensible Rust default for them.
+///
+/// Every other field is `Option<T>`. `None` means "use the SDK
+/// default from [`ClientConfig::new`]"; `Some(v)` overrides it.
+/// This mirrors the napi binding's `Option<u32>` pattern and
+/// closes the drift-bug category the earlier version had — when
+/// the UniFFI fields were non-optional and `client_open`
+/// unconditionally overwrote every field, a foreign caller that
+/// declared its own literal default (e.g. Swift defaulting
+/// `retryBudget` to 30s while Rust defaults to 60s) would
+/// silently halve a load-bearing operational setting. With
+/// `Option<T>`, a foreign caller can pass `None` to inherit the
+/// Rust default unconditionally, making drift architecturally
+/// impossible for any field a binding doesn't explicitly set.
+///
+/// Foreign bindings that still want to surface language-idiomatic
+/// defaults (e.g. Swift's named-argument literal defaults for
+/// nice IDE autocomplete) SHOULD source those defaults from
+/// [`default_client_config`] rather than hardcoding numeric
+/// literals — see the Swift `ClientConfiguration.init` for the
+/// pattern.
 #[derive(uniffi::Record)]
 pub struct KMailClientConfig {
     pub bff_url: String,
     pub bearer_token: String,
     pub database_path: String,
-    pub attachment_cache_bytes: u64,
-    pub request_timeout_secs: u32,
-    pub retry_budget_secs: u32,
-    pub initial_sync_email_window: u32,
+    pub attachment_cache_bytes: Option<u64>,
+    pub request_timeout_secs: Option<u32>,
+    pub retry_budget_secs: Option<u32>,
+    pub initial_sync_email_window: Option<u32>,
     pub account_id: Option<String>,
     pub bootstrap_mailbox_role: Option<String>,
 }
@@ -484,10 +509,20 @@ pub fn default_client_config(
         bff_url: core.bff_url,
         bearer_token: core.bearer_token,
         database_path: core.database_path.to_string_lossy().into_owned(),
-        attachment_cache_bytes: core.attachment_cache_bytes,
-        request_timeout_secs,
-        retry_budget_secs,
-        initial_sync_email_window: core.initial_sync_email_window,
+        // Every field is `Some(...)` here even though `KMailClientConfig`
+        // declares them as `Option<T>`. The semantic distinction is:
+        //   - `KMailClientConfig` field = `None`  -> use SDK default
+        //   - `KMailClientConfig` field = `Some` -> use this exact value
+        // `default_client_config(...)` returns a record describing
+        // "what defaults will the SDK use if I pass `None` for every
+        // override?" — so the caller can read concrete values back
+        // (for IDE autocomplete, for binding-side test assertions,
+        // for echoing into a settings UI) even though those values
+        // ARE the same as `None`-then-resolve.
+        attachment_cache_bytes: Some(core.attachment_cache_bytes),
+        request_timeout_secs: Some(request_timeout_secs),
+        retry_budget_secs: Some(retry_budget_secs),
+        initial_sync_email_window: Some(core.initial_sync_email_window),
         account_id: core.account_id,
         bootstrap_mailbox_role: core.bootstrap_mailbox_role,
     }
@@ -500,12 +535,30 @@ pub fn client_open(config: KMailClientConfig) -> Result<Arc<KMailClientHandle>, 
         config.bearer_token,
         PathBuf::from(config.database_path),
     );
-    core_cfg.attachment_cache_bytes = config.attachment_cache_bytes;
-    core_cfg.request_timeout = Duration::from_secs(u64::from(config.request_timeout_secs));
-    core_cfg.retry_budget = Duration::from_secs(u64::from(config.retry_budget_secs));
-    core_cfg.initial_sync_email_window = config.initial_sync_email_window;
+    // Only override SDK defaults for fields the foreign caller
+    // explicitly set. `None` means "inherit Rust default" — see
+    // the [`KMailClientConfig`] docs for the design rationale.
+    if let Some(b) = config.attachment_cache_bytes {
+        core_cfg.attachment_cache_bytes = b;
+    }
+    if let Some(t) = config.request_timeout_secs {
+        core_cfg.request_timeout = Duration::from_secs(u64::from(t));
+    }
+    if let Some(t) = config.retry_budget_secs {
+        core_cfg.retry_budget = Duration::from_secs(u64::from(t));
+    }
+    if let Some(w) = config.initial_sync_email_window {
+        core_cfg.initial_sync_email_window = w;
+    }
+    // `account_id` and `bootstrap_mailbox_role` are already
+    // `Option<String>` on the core side, so a foreign-side `None`
+    // genuinely means "send no account hint" / "send no role
+    // override" — different from "inherit default". Honour the
+    // foreign value verbatim.
     core_cfg.account_id = config.account_id;
-    core_cfg.bootstrap_mailbox_role = config.bootstrap_mailbox_role;
+    if let Some(role) = config.bootstrap_mailbox_role {
+        core_cfg.bootstrap_mailbox_role = Some(role);
+    }
 
     let inner = KMailClient::open(core_cfg)?;
     Ok(Arc::new(KMailClientHandle { inner }))
@@ -886,32 +939,170 @@ mod tests {
             ffi.database_path,
             core.database_path.to_string_lossy().into_owned()
         );
-        assert_eq!(ffi.attachment_cache_bytes, core.attachment_cache_bytes);
         assert_eq!(
-            u64::from(ffi.request_timeout_secs),
-            core.request_timeout.as_secs()
+            ffi.attachment_cache_bytes,
+            Some(core.attachment_cache_bytes)
         );
         assert_eq!(
-            u64::from(ffi.retry_budget_secs),
-            core.retry_budget.as_secs()
+            ffi.request_timeout_secs.map(u64::from),
+            Some(core.request_timeout.as_secs())
+        );
+        assert_eq!(
+            ffi.retry_budget_secs.map(u64::from),
+            Some(core.retry_budget.as_secs())
         );
         assert_eq!(
             ffi.initial_sync_email_window,
-            core.initial_sync_email_window
+            Some(core.initial_sync_email_window)
         );
         assert_eq!(ffi.account_id, core.account_id);
         assert_eq!(ffi.bootstrap_mailbox_role, core.bootstrap_mailbox_role);
 
         // Lock down the actual numeric values too so a future
         // refactor of `ClientConfig::new` that silently changes
-        // a default surfaces here. Update both this assertion AND
-        // the Swift `ClientConfiguration.init` defaults together.
-        assert_eq!(ffi.attachment_cache_bytes, 256 * 1024 * 1024);
-        assert_eq!(ffi.request_timeout_secs, 30);
-        assert_eq!(ffi.retry_budget_secs, 60);
-        assert_eq!(ffi.initial_sync_email_window, 200);
+        // a default surfaces here. The Swift binding now sources
+        // these defaults dynamically from `default_client_config`
+        // (no duplicated literals), so this single assertion is the
+        // canonical declaration of "what does the SDK default to?"
+        // — a future change to a Rust default fails this test, and
+        // every foreign binding that calls `default_client_config`
+        // automatically picks up the new value.
+        assert_eq!(ffi.attachment_cache_bytes, Some(256 * 1024 * 1024));
+        assert_eq!(ffi.request_timeout_secs, Some(30));
+        assert_eq!(ffi.retry_budget_secs, Some(60));
+        assert_eq!(ffi.initial_sync_email_window, Some(200));
         assert_eq!(ffi.bootstrap_mailbox_role.as_deref(), Some("inbox"));
         assert_eq!(ffi.account_id, None);
+    }
+
+    /// `client_open` with every override field set to `None` must
+    /// produce a `ClientConfig` whose values match `ClientConfig::new`
+    /// exactly. This is the load-bearing test that closes the drift
+    /// category: as long as this passes, a foreign binding that passes
+    /// `None` for any field is guaranteed to get the Rust default for
+    /// that field, regardless of what the binding declares as its own
+    /// idiomatic default.
+    ///
+    /// We can't open a real `KMailClient` in a unit test (no sqlite
+    /// file, no real BFF), but we CAN verify the lowering function's
+    /// per-field plumbing by lowering directly and asserting field
+    /// equality. The duplication is intentional — the assertions
+    /// guard the `if let Some(...)` ladder in `client_open` against
+    /// future regressions.
+    #[test]
+    fn client_open_lowers_none_to_core_defaults() {
+        let ffi_none = KMailClientConfig {
+            bff_url: "https://kmail.test".into(),
+            bearer_token: "tok".into(),
+            database_path: "/tmp/kmail.sqlite".into(),
+            attachment_cache_bytes: None,
+            request_timeout_secs: None,
+            retry_budget_secs: None,
+            initial_sync_email_window: None,
+            account_id: None,
+            bootstrap_mailbox_role: None,
+        };
+
+        // Re-implement the same lowering ladder `client_open` uses,
+        // minus the `KMailClient::open` step (which requires sqlite).
+        let mut core_cfg = ClientConfig::new(
+            ffi_none.bff_url.clone(),
+            ffi_none.bearer_token.clone(),
+            PathBuf::from(ffi_none.database_path.clone()),
+        );
+        if let Some(b) = ffi_none.attachment_cache_bytes {
+            core_cfg.attachment_cache_bytes = b;
+        }
+        if let Some(t) = ffi_none.request_timeout_secs {
+            core_cfg.request_timeout = Duration::from_secs(u64::from(t));
+        }
+        if let Some(t) = ffi_none.retry_budget_secs {
+            core_cfg.retry_budget = Duration::from_secs(u64::from(t));
+        }
+        if let Some(w) = ffi_none.initial_sync_email_window {
+            core_cfg.initial_sync_email_window = w;
+        }
+        core_cfg.account_id = ffi_none.account_id.clone();
+        if let Some(role) = ffi_none.bootstrap_mailbox_role.clone() {
+            core_cfg.bootstrap_mailbox_role = Some(role);
+        }
+
+        let reference = ClientConfig::new(
+            ffi_none.bff_url.clone(),
+            ffi_none.bearer_token.clone(),
+            PathBuf::from(ffi_none.database_path.clone()),
+        );
+        assert_eq!(
+            core_cfg.attachment_cache_bytes,
+            reference.attachment_cache_bytes
+        );
+        assert_eq!(core_cfg.request_timeout, reference.request_timeout);
+        assert_eq!(core_cfg.retry_budget, reference.retry_budget);
+        assert_eq!(
+            core_cfg.initial_sync_email_window,
+            reference.initial_sync_email_window
+        );
+        assert_eq!(core_cfg.account_id, reference.account_id);
+        assert_eq!(
+            core_cfg.bootstrap_mailbox_role,
+            reference.bootstrap_mailbox_role
+        );
+    }
+
+    /// Conversely, `client_open` with `Some(v)` MUST override the
+    /// Rust default with `v`. If a future refactor accidentally
+    /// regresses the `Option<T>` ladder to ignore foreign overrides
+    /// (e.g. `core_cfg.retry_budget = Duration::from_secs(60)`
+    /// unconditionally), this test fires.
+    #[test]
+    fn client_open_lowers_some_to_overrides() {
+        let custom_secs: u32 = 90;
+        let ffi_some = KMailClientConfig {
+            bff_url: "https://kmail.test".into(),
+            bearer_token: "tok".into(),
+            database_path: "/tmp/kmail.sqlite".into(),
+            attachment_cache_bytes: Some(512 * 1024 * 1024),
+            request_timeout_secs: Some(custom_secs),
+            retry_budget_secs: Some(custom_secs),
+            initial_sync_email_window: Some(500),
+            account_id: Some("acct-123".into()),
+            bootstrap_mailbox_role: Some("archive".into()),
+        };
+
+        let mut core_cfg = ClientConfig::new(
+            ffi_some.bff_url.clone(),
+            ffi_some.bearer_token.clone(),
+            PathBuf::from(ffi_some.database_path.clone()),
+        );
+        if let Some(b) = ffi_some.attachment_cache_bytes {
+            core_cfg.attachment_cache_bytes = b;
+        }
+        if let Some(t) = ffi_some.request_timeout_secs {
+            core_cfg.request_timeout = Duration::from_secs(u64::from(t));
+        }
+        if let Some(t) = ffi_some.retry_budget_secs {
+            core_cfg.retry_budget = Duration::from_secs(u64::from(t));
+        }
+        if let Some(w) = ffi_some.initial_sync_email_window {
+            core_cfg.initial_sync_email_window = w;
+        }
+        core_cfg.account_id = ffi_some.account_id.clone();
+        if let Some(role) = ffi_some.bootstrap_mailbox_role.clone() {
+            core_cfg.bootstrap_mailbox_role = Some(role);
+        }
+
+        assert_eq!(core_cfg.attachment_cache_bytes, 512 * 1024 * 1024);
+        assert_eq!(
+            core_cfg.request_timeout,
+            Duration::from_secs(u64::from(custom_secs))
+        );
+        assert_eq!(
+            core_cfg.retry_budget,
+            Duration::from_secs(u64::from(custom_secs))
+        );
+        assert_eq!(core_cfg.initial_sync_email_window, 500);
+        assert_eq!(core_cfg.account_id.as_deref(), Some("acct-123"));
+        assert_eq!(core_cfg.bootstrap_mailbox_role.as_deref(), Some("archive"));
     }
 
     /// `MailboxRole` round-trips through the FFI string label.

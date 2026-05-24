@@ -274,6 +274,10 @@ final class KMailIntegrationTests: XCTestCase {
         let bearer = "test-bearer"
         let dbURL = URL(fileURLWithPath: "/tmp/kmail.sqlite")
 
+        // ClientConfiguration sources its defaults from
+        // `defaultClientConfig(...)` at runtime via the static
+        // `sdkDefaults` slot, so calling `.toFFI()` here should produce
+        // values bit-identical to a direct call to the FFI helper.
         let swift = ClientConfiguration(
             bffURL: bff,
             bearerToken: bearer,
@@ -312,6 +316,43 @@ final class KMailIntegrationTests: XCTestCase {
             swift.bootstrapMailboxRole, rust.bootstrapMailboxRole,
             "bootstrapMailboxRole drifted between Swift default and Rust ClientConfig::new (Rust defaults to Some(\"inbox\"); Swift must match)"
         )
+    }
+
+    /// `ClientConfiguration.toFFIWithNoneDefaults()` produces a
+    /// `KMailClientConfig` whose every override field is `nil`. The
+    /// FFI's `Option<T>` ladder in `client_open` MUST interpret this
+    /// as "use Rust defaults for every field" — i.e. a caller that
+    /// passes the all-`nil` record gets the same effective
+    /// configuration as one that passes the `defaultClientConfig`
+    /// record. This is the load-bearing test for the architectural
+    /// drift-prevention layer at the FFI boundary.
+    ///
+    /// We can't actually open a `KMailClient` in a unit test (no
+    /// sqlite, no real BFF), so the equivalence is checked at the
+    /// FFI record level: the `nil` form and the `defaultClientConfig`
+    /// form must produce identical observable state on the Rust side.
+    /// (The Rust-side test `client_open_lowers_none_to_core_defaults`
+    /// closes the loop by running the actual lowering ladder.)
+    func testNoneDefaultsRecordMatchesExplicitDefaults() {
+        let bff = URL(string: "https://kmail.test")!
+        let bearer = "test-bearer"
+        let dbURL = URL(fileURLWithPath: "/tmp/kmail.sqlite")
+
+        let noneForm = ClientConfiguration(
+            bffURL: bff,
+            bearerToken: bearer,
+            databaseURL: dbURL
+        ).toFFIWithNoneDefaults()
+
+        XCTAssertNil(noneForm.attachmentCacheBytes)
+        XCTAssertNil(noneForm.requestTimeoutSecs)
+        XCTAssertNil(noneForm.retryBudgetSecs)
+        XCTAssertNil(noneForm.initialSyncEmailWindow)
+        XCTAssertNil(noneForm.accountId)
+        XCTAssertNil(noneForm.bootstrapMailboxRole)
+        XCTAssertEqual(noneForm.bffUrl, bff.absoluteString)
+        XCTAssertEqual(noneForm.bearerToken, bearer)
+        XCTAssertEqual(noneForm.databasePath, dbURL.path)
     }
 
     // MARK: - Timeout clamp

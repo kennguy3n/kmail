@@ -185,6 +185,15 @@ extension FfiEmailAddress: Codable {
 /// `String` for the BFF endpoint and the database path — invalid
 /// values fail at type-check time on the Swift side instead of at
 /// runtime inside the SDK.
+///
+/// **Defaults are sourced from the Rust SDK at runtime, not
+/// duplicated as Swift literals.** The `init` default parameter
+/// expressions read from `ClientConfiguration.sdkDefaults`, which
+/// is a one-time call to the FFI helper `defaultClientConfig(...)`.
+/// This eliminates the entire category of drift bugs the earlier
+/// version had — a future change to a Rust default automatically
+/// flows into Swift on the next FFI rebuild, without anyone having
+/// to remember to update a Swift literal.
 public struct ClientConfiguration {
     public var bffURL: URL
     public var bearerToken: String
@@ -196,26 +205,48 @@ public struct ClientConfiguration {
     public var accountID: String?
     public var bootstrapMailboxRole: String?
 
+    /// SDK defaults sourced from the Rust core via the FFI helper.
+    ///
+    /// Evaluated once on first access (Swift `static let` is lazy and
+    /// thread-safe). The `bffUrl` / `bearerToken` / `databasePath`
+    /// arguments are placeholders — `defaultClientConfig` echoes them
+    /// back verbatim, but `ClientConfiguration.init` always overwrites
+    /// them with the caller's real values, so the placeholder strings
+    /// are never observable outside this static slot.
+    ///
+    /// The contract of `default_client_config(...)` is that every
+    /// override field comes back as `Some(value)` (it returns "what
+    /// values would I use if you passed `None` for every override?")
+    /// — so the force-unwraps below are safe by FFI contract.
+    public static let sdkDefaults: KMailClientConfig = defaultClientConfig(
+        bffUrl: "https://kmail.placeholder.invalid",
+        bearerToken: "placeholder",
+        databasePath: "/tmp/kmail-placeholder.sqlite"
+    )
+
     public init(
         bffURL: URL,
         bearerToken: String,
         databaseURL: URL,
-        // The literals below must mirror `ClientConfig::new()` in
-        // `sdk/kmail-core/src/client.rs` AND the FFI
-        // `default_client_config(...)` helper in
-        // `sdk/kmail-ffi/src/lib.rs`. The Swift integration test
-        // `testSwiftDefaultsMatchRustDefaults` exercises the FFI
-        // helper and asserts that the values seeded here are
-        // bit-identical to the Rust side — a future change to a
-        // Rust default surfaces immediately as a CI failure on
-        // the macOS runner rather than silently halving (or
-        // doubling) some setting on the iOS surface.
-        attachmentCacheBytes: UInt64 = 256 * 1024 * 1024, // 256 MiB
-        requestTimeout: TimeInterval = 30,
-        retryBudget: TimeInterval = 60,
-        initialSyncEmailWindow: UInt32 = 200,
-        accountID: String? = nil,
-        bootstrapMailboxRole: String? = "inbox"
+        // Defaults come from `ClientConfiguration.sdkDefaults`, which
+        // is a one-shot FFI call to `defaultClientConfig(...)` returning
+        // the canonical Rust `ClientConfig::new` defaults. Swift literal
+        // duplication is impossible here by construction. If
+        // `ClientConfig::new` ever changes a default (e.g. retry budget
+        // from 60 to 90), every iOS caller using default settings picks
+        // up the new value automatically on the next XCFramework rebuild.
+        //
+        // The force-unwraps on `sdkDefaults.*!` are safe by FFI contract:
+        // `default_client_config(...)` always returns `Some(value)` for
+        // every overridable field (see `sdk/kmail-ffi/src/lib.rs` for the
+        // contract). The `Rust unit test default_client_config_mirrors_
+        // core_defaults` locks this down.
+        attachmentCacheBytes: UInt64 = ClientConfiguration.sdkDefaults.attachmentCacheBytes!,
+        requestTimeout: TimeInterval = TimeInterval(ClientConfiguration.sdkDefaults.requestTimeoutSecs!),
+        retryBudget: TimeInterval = TimeInterval(ClientConfiguration.sdkDefaults.retryBudgetSecs!),
+        initialSyncEmailWindow: UInt32 = ClientConfiguration.sdkDefaults.initialSyncEmailWindow!,
+        accountID: String? = ClientConfiguration.sdkDefaults.accountId,
+        bootstrapMailboxRole: String? = ClientConfiguration.sdkDefaults.bootstrapMailboxRole
     ) {
         self.bffURL = bffURL
         self.bearerToken = bearerToken
@@ -230,6 +261,16 @@ public struct ClientConfiguration {
 
     /// Lower the Swift-side config into the FFI-shaped record the
     /// `client_open` factory expects.
+    ///
+    /// Every overridable field is wrapped in `Some(...)` because the
+    /// Swift struct stores non-optional values (resolved from
+    /// `sdkDefaults` at init time). The FFI's `Option<T>` distinction
+    /// between "no override" (`None`) and "explicit override" (`Some`)
+    /// is preserved at the binding boundary for other foreign callers
+    /// (Kotlin / napi / programmatic use) but is collapsed to "always
+    /// `Some`" on the Swift side because Swift's idiom is to expose
+    /// concrete-typed fields with computed defaults rather than nilable
+    /// fields meaning "use SDK default".
     func toFFI() -> KMailClientConfig {
         // Truncation guard: TimeInterval is a Double whose seconds
         // value can legally be fractional, very large, ±Infinity, or
@@ -243,16 +284,39 @@ public struct ClientConfiguration {
         // a UInt32.max-second hang to leak through).
         let requestTimeoutSecs = ClientConfiguration.clampToU32(requestTimeout)
         let retryBudgetSecs = ClientConfiguration.clampToU32(retryBudget)
+        // The FFI fields are `Option<T>` (`T?` in Swift) so `Some(value)`
+        // / `nil` distinguishes "override" from "use SDK default" for
+        // other foreign callers. On the Swift side, every field is
+        // already resolved (to a Rust default or an explicit override),
+        // so we always pass `Some(value)`.
         return KMailClientConfig(
             bffUrl: bffURL.absoluteString,
             bearerToken: bearerToken,
             databasePath: databaseURL.path,
-            attachmentCacheBytes: attachmentCacheBytes,
-            requestTimeoutSecs: requestTimeoutSecs,
-            retryBudgetSecs: retryBudgetSecs,
-            initialSyncEmailWindow: initialSyncEmailWindow,
+            attachmentCacheBytes: Optional(attachmentCacheBytes),
+            requestTimeoutSecs: Optional(requestTimeoutSecs),
+            retryBudgetSecs: Optional(retryBudgetSecs),
+            initialSyncEmailWindow: Optional(initialSyncEmailWindow),
             accountId: accountID,
             bootstrapMailboxRole: bootstrapMailboxRole
+        )
+    }
+
+    /// Helper: produce a `KMailClientConfig` that explicitly opts out
+    /// of every overridable field, instructing the FFI to use its own
+    /// canonical defaults from `ClientConfig::new`. Mainly useful for
+    /// tests that exercise the `Option<T>` plumbing in `client_open`.
+    public func toFFIWithNoneDefaults() -> KMailClientConfig {
+        KMailClientConfig(
+            bffUrl: bffURL.absoluteString,
+            bearerToken: bearerToken,
+            databasePath: databaseURL.path,
+            attachmentCacheBytes: nil,
+            requestTimeoutSecs: nil,
+            retryBudgetSecs: nil,
+            initialSyncEmailWindow: nil,
+            accountId: nil,
+            bootstrapMailboxRole: nil
         )
     }
 
