@@ -840,11 +840,25 @@ func main() {
 		}
 		return uid, tid, true
 	})
-	// In production the consent CSRF cookie MUST be Secure;
-	// the local-dev path (KMAIL_ENV=development) serves plain
-	// HTTP so the Secure flag would suppress the cookie on the
-	// redirect.
-	oauthHandlers.SetSecureCookies(strings.ToLower(strings.TrimSpace(os.Getenv("KMAIL_ENV"))) != "development")
+	// In production the consent CSRF cookie MUST be Secure; the
+	// local-dev path serves plain HTTP so the Secure flag would
+	// suppress the cookie on the redirect, breaking the
+	// /authorize/approve POST with a CSRF mismatch.
+	//
+	// Resolution goes through `middleware.IsDevEnv(cfg.Env)`
+	// (NOT a raw `KMAIL_ENV != "development"` string compare),
+	// because `docker-compose.yml` ships `KMAIL_ENV: dev` and the
+	// canonical alias table in `internal/middleware/auth.go`
+	// (`envAliases`) maps `"dev" -> "development"`. A literal
+	// comparison would treat the standard compose value as
+	// production and set Secure: true on the CSRF cookie, which
+	// the dev-mode browser would then refuse to send back over
+	// plain HTTP — every consent screen would fail closed with a
+	// 403. The OIDC middleware already routes dev / staging /
+	// prod through this same helper; reusing it keeps the alias
+	// surface in one place rather than spread across goroutines
+	// of subtly-different env probes.
+	oauthHandlers.SetSecureCookies(!middleware.IsDevEnv(cfg.Env))
 	// `RegisterRoutes` selectively wraps the two browser-facing
 	// endpoints (`/authorize`, `/authorize/approve`) with the OIDC
 	// middleware so the kchat-user context is populated before the
