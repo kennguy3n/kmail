@@ -107,7 +107,12 @@ jobs:
       # script already produces a loud failure if Info.plist is
       # missing, but a regression in xcodebuild's slice naming
       # would still produce a valid Info.plist with the wrong
-      # contents. Verify the three slice triples by name.
+      # contents. Verify the two LibraryIdentifier entries by name:
+      # one device slice (`ios-arm64`) and one combined simulator
+      # slice (`ios-arm64_x86_64-simulator`) — the two simulator
+      # architectures are lipo'd into a single fat staticlib before
+      # `xcodebuild -create-xcframework` so the assembled
+      # XCFramework declares only one simulator variant.
       - name: Validate XCFramework slices
         run: |
           set -euo pipefail

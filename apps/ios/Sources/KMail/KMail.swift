@@ -222,11 +222,15 @@ public struct ClientConfiguration {
     /// `client_open` factory expects.
     func toFFI() -> KMailClientConfig {
         // Truncation guard: TimeInterval is a Double whose seconds
-        // value can legally be fractional and very large. The FFI
-        // accepts u32 seconds; we round nearest and clamp to the
-        // u32 range so a misconfigured 0.5s timeout is preserved
-        // as 1s and a Double.infinity comes through as the max
-        // u32 instead of silently truncating to 0.
+        // value can legally be fractional, very large, ±Infinity, or
+        // NaN. The FFI accepts u32 seconds; `clampToU32` rounds to the
+        // nearest integer (schoolbook), clamps to the u32 range, and
+        // maps +Infinity to UInt32.max (not 0) so a caller that asks
+        // for the longest possible timeout does NOT silently get a
+        // 0-second deadline that fails every reqwest call immediately.
+        // NaN and negative values are treated as misconfiguration and
+        // collapse to 0 (fail fast on the Rust side rather than allow
+        // a UInt32.max-second hang to leak through).
         let requestTimeoutSecs = ClientConfiguration.clampToU32(requestTimeout)
         let retryBudgetSecs = ClientConfiguration.clampToU32(retryBudget)
         return KMailClientConfig(
@@ -243,7 +247,27 @@ public struct ClientConfiguration {
     }
 
     private static func clampToU32(_ seconds: TimeInterval) -> UInt32 {
-        if !seconds.isFinite || seconds < 0 { return 0 }
+        // `TimeInterval` (Double) admits NaN, ±Infinity, and negative
+        // values. The Rust SDK expects a positive u32 second count;
+        // reqwest interprets `Duration::from_secs(0)` as a zero-deadline
+        // that fails every request immediately, so we must NOT return 0
+        // for `+Infinity` (the caller asked for the longest bounded
+        // timeout, the opposite of "fail fast").
+        //
+        //   - NaN / negative → 0 (invalid configuration — fail fast
+        //                          so the misconfiguration surfaces
+        //                          immediately rather than silently
+        //                          becoming a UInt32.max-second hang)
+        //   - +Infinity      → UInt32.max ("longest possible timeout")
+        //   - finite ≥ u32max→ UInt32.max
+        //   - otherwise      → round-half-to-even, cast to UInt32
+        //
+        // The naive `!seconds.isFinite` predicate would conflate NaN,
+        // +Inf, and -Inf into the same `0` bucket — which contradicts
+        // the +Inf intent. The two-step screen below handles each
+        // case correctly: `.rounded()` and `>=` propagate +Inf through
+        // to the `UInt32.max` branch.
+        if seconds.isNaN || seconds < 0 { return 0 }
         let rounded = seconds.rounded()
         if rounded >= TimeInterval(UInt32.max) { return UInt32.max }
         return UInt32(rounded)

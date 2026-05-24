@@ -252,6 +252,81 @@ final class KMailIntegrationTests: XCTestCase {
         XCTAssertTrue(json.contains("alice@kmail.test"))
     }
 
+    // MARK: - Timeout clamp
+
+    /// `ClientConfiguration.toFFI()` lowers `TimeInterval` (Double)
+    /// timeout fields into u32-second fields the Rust FFI expects.
+    /// The clamp logic must preserve the user's intent across the
+    /// Double → UInt32 narrowing:
+    ///
+    ///   - NaN / negative → 0 (fail fast on invalid configuration)
+    ///   - +Infinity → UInt32.max (caller asked for the longest
+    ///     possible bounded timeout)
+    ///   - finite that overflows u32 → UInt32.max
+    ///   - small fractional values → rounded to nearest u32
+    ///
+    /// The +Infinity → UInt32.max case is load-bearing for the
+    /// "no deadline" idiom — without it, a caller that sets
+    /// `requestTimeout = .infinity` would get `Duration::from_secs(0)`
+    /// on the Rust side, which reqwest interprets as a zero-deadline
+    /// timeout that immediately fails every request.
+    func testClientConfigurationClampsTimeoutsCorrectly() {
+        let baseURL = URL(string: "https://kmail.test")!
+        let bearer = "test-bearer"
+        let dbURL = URL(fileURLWithPath: "/tmp/kmail.sqlite")
+
+        func makeConfig(timeout: TimeInterval, retry: TimeInterval) -> KMailClientConfig {
+            ClientConfiguration(
+                bffURL: baseURL,
+                bearerToken: bearer,
+                databaseURL: dbURL,
+                requestTimeout: timeout,
+                retryBudget: retry
+            ).toFFI()
+        }
+
+        // +Infinity → UInt32.max (longest bounded timeout).
+        let infinite = makeConfig(timeout: .infinity, retry: .infinity)
+        XCTAssertEqual(
+            infinite.requestTimeoutSecs, UInt32.max,
+            "+Infinity must clamp to UInt32.max, not 0 (would cause immediate-fail reqwest)"
+        )
+        XCTAssertEqual(infinite.retryBudgetSecs, UInt32.max)
+
+        // NaN → 0 (invalid input fails fast).
+        let nan = makeConfig(timeout: .nan, retry: .nan)
+        XCTAssertEqual(nan.requestTimeoutSecs, 0, "NaN must clamp to 0 (invalid input fails fast)")
+        XCTAssertEqual(nan.retryBudgetSecs, 0)
+
+        // Negative → 0.
+        let negative = makeConfig(timeout: -5, retry: -100)
+        XCTAssertEqual(negative.requestTimeoutSecs, 0)
+        XCTAssertEqual(negative.retryBudgetSecs, 0)
+
+        // -Infinity → 0 (same as negative).
+        let negInf = makeConfig(timeout: -.infinity, retry: -.infinity)
+        XCTAssertEqual(negInf.requestTimeoutSecs, 0)
+        XCTAssertEqual(negInf.retryBudgetSecs, 0)
+
+        // Fractional → schoolbook rounding (.toNearestOrAwayFromZero).
+        // Swift's `Double.rounded()` defaults to schoolbook rounding,
+        // so 0.5 → 1 (rounded away from zero, *not* banker's rounding
+        // to 0) and 1.4 → 1.
+        let fractional = makeConfig(timeout: 0.5, retry: 1.4)
+        XCTAssertEqual(fractional.requestTimeoutSecs, 1)
+        XCTAssertEqual(fractional.retryBudgetSecs, 1)
+
+        // Large but finite values that exceed UInt32.max → UInt32.max.
+        let huge = makeConfig(timeout: 1e20, retry: 1e30)
+        XCTAssertEqual(huge.requestTimeoutSecs, UInt32.max)
+        XCTAssertEqual(huge.retryBudgetSecs, UInt32.max)
+
+        // Normal values pass through unchanged.
+        let normal = makeConfig(timeout: 30, retry: 60)
+        XCTAssertEqual(normal.requestTimeoutSecs, 30)
+        XCTAssertEqual(normal.retryBudgetSecs, 60)
+    }
+
     /// Sanity-check `KMailError.localizedDescription` for the
     /// common cases. Without `LocalizedError` conformance, Swift
     /// would render the error as something like
