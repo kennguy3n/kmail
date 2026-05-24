@@ -30,8 +30,12 @@ func TestLoadReturnsDefaults(t *testing.T) {
 		t.Fatalf("Load: %v", err)
 	}
 
-	if cfg.HTTP.Addr != ":8080" {
-		t.Errorf("HTTP.Addr = %q, want :8080", cfg.HTTP.Addr)
+	// Default is :8088 (not :8080) so a host-run BFF doesn't
+	// collide with Stalwart, which docker-compose publishes on
+	// host port 8080. See config.go HTTPConfig.Addr comment for
+	// the full rationale.
+	if cfg.HTTP.Addr != ":8088" {
+		t.Errorf("HTTP.Addr = %q, want :8088", cfg.HTTP.Addr)
 	}
 	if cfg.HTTP.ReadHeaderTimeout != 10*time.Second {
 		t.Errorf("HTTP.ReadHeaderTimeout = %v, want 10s", cfg.HTTP.ReadHeaderTimeout)

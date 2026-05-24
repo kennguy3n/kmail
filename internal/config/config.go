@@ -22,7 +22,12 @@ import (
 // All fields are populated from environment variables; defaults are
 // picked to match the local `docker-compose.yml` stack so `go run
 // ./cmd/kmail-api` against a bare `docker compose up` works without
-// additional configuration.
+// additional configuration. In particular `KMAIL_API_ADDR` defaults
+// to `:8088` (NOT `:8080`) because Stalwart's container port 8080 is
+// published to host port 8080 via the matched `8080:8080` mapping;
+// a host-run BFF therefore has to bind a different port to avoid a
+// `bind: address already in use` collision. The StalwartURL default
+// further down keeps the two halves consistent.
 type Config struct {
 	// HTTP controls the BFF HTTP listener.
 	HTTP HTTPConfig
@@ -307,7 +312,13 @@ type HTTPConfig struct {
 func Load() (*Config, error) {
 	return &Config{
 		HTTP: HTTPConfig{
-			Addr:              getenv("KMAIL_API_ADDR", ":8080"),
+			// `:8088` (not `:8080`) so a host-run BFF doesn't collide
+			// with Stalwart, which `docker-compose.yml` publishes on
+			// host port 8080 (matched mapping; see the StalwartURL
+			// default below for the rationale). Override with
+			// `KMAIL_API_ADDR=:80` (etc.) in production where the BFF
+			// is the only process on the host.
+			Addr:              getenv("KMAIL_API_ADDR", ":8088"),
 			ReadHeaderTimeout: getenvDuration("KMAIL_API_READ_HEADER_TIMEOUT", 10*time.Second),
 			ShutdownTimeout:   getenvDuration("KMAIL_API_SHUTDOWN_TIMEOUT", 30*time.Second),
 		},
