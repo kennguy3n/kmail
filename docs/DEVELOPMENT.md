@@ -181,6 +181,37 @@ In production the BFF presents a client certificate to Stalwart
 chart wires this up via cert-manager; local dev keeps using
 plain HTTP against `http://localhost:8080`.
 
+### cert-manager Issuer must emit `ca.crt`
+
+The BFF reads its trust anchor from `/etc/kmail/tls/stalwart-client/ca.crt`
+(via `KMAIL_STALWART_TLS_CA`, set by
+`deploy/helm/kmail/templates/deployment-api.yaml`). The file is
+populated by cert-manager into the client-cert Secret — but only
+when the configured `Issuer` (or `ClusterIssuer`) actually
+provides the CA. Most in-cluster Issuers (`ca`, `vault`, `step-ca`,
+`selfsigned` with `isCA: true`) do; some external ACME Issuers do
+*not* attach a `ca.crt` key to the issued Secret.
+
+If the chosen Issuer does not emit `ca.crt`, the BFF will fail at
+startup with `cmk/jmap: open /etc/kmail/tls/stalwart-client/ca.crt:
+no such file or directory` from `caPoolLoader.load()` in
+`internal/jmap/proxy.go`. This is the intended fail-fast — there
+is no safe default for a trust anchor.
+
+Resolutions, in order of preference:
+
+1. **Switch to an Issuer that bundles the CA**, since trust-anchor
+   management belongs with cert-manager. Most production setups
+   use the in-cluster `ca` Issuer chained to a long-lived root.
+2. **Mount the CA bundle separately**: create a `ConfigMap`
+   holding the internal-PKI root, add it via Helm `extraVolumes` /
+   `extraVolumeMounts` at the same `/etc/kmail/tls/stalwart-client`
+   path. This is the operator-managed escape hatch when the
+   Issuer is fixed by external constraints (compliance, audit).
+
+Either approach yields the same on-disk contract; the BFF does
+not care how the file arrived.
+
 
 ## 4. Automated first-boot configuration
 
