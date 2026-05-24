@@ -1,7 +1,10 @@
 package jmap
 
 import (
+	"bytes"
 	"context"
+	"log"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -343,6 +346,134 @@ func TestRedisCircuitBreaker_ConcurrentTripsExactlyOnce(t *testing.T) {
 func TestRedisCircuitBreaker_NilClient(t *testing.T) {
 	if _, err := NewRedisCircuitBreaker(RedisCircuitBreakerConfig{}); err == nil {
 		t.Fatal("expected error for nil Client")
+	}
+}
+
+// TestClampBreakerWindow_ExtendsWindowWhenShorterThanCooldown pins
+// the contract from clampBreakerWindow: an operator who sets
+// Window < Cooldown should still see correct re-trip semantics
+// because the effective Window is silently extended to Cooldown
+// AND a WARN line is logged so they can fix the misconfiguration.
+func TestClampBreakerWindow_ExtendsWindowWhenShorterThanCooldown(t *testing.T) {
+	var buf bytes.Buffer
+	logger := log.New(&buf, "", 0)
+	got := clampBreakerWindow(90*time.Second, 60*time.Second, "test", logger)
+	if got != 90*time.Second {
+		t.Fatalf("clamp window=60s cooldown=90s -> %s, want 90s", got)
+	}
+	if !strings.Contains(buf.String(), "WARN: test:") {
+		t.Fatalf("expected WARN log line, got %q", buf.String())
+	}
+}
+
+// TestClampBreakerWindow_DoesNotClampWhenWindowSufficient pins the
+// no-op path: with a correctly-configured (window >= cooldown)
+// breaker, clampBreakerWindow must return the original window AND
+// emit no log lines.
+func TestClampBreakerWindow_DoesNotClampWhenWindowSufficient(t *testing.T) {
+	var buf bytes.Buffer
+	logger := log.New(&buf, "", 0)
+	got := clampBreakerWindow(30*time.Second, 60*time.Second, "test", logger)
+	if got != 60*time.Second {
+		t.Fatalf("clamp window=60s cooldown=30s -> %s, want 60s", got)
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("expected no log output, got %q", buf.String())
+	}
+}
+
+// TestClampBreakerWindow_DisabledWhenCooldownZero pins the legacy
+// count-only path: when Cooldown==0 the breaker has no cooldown
+// plateau, so window clamping doesn't apply. clampBreakerWindow
+// returns the window untouched and emits no warning.
+func TestClampBreakerWindow_DisabledWhenCooldownZero(t *testing.T) {
+	var buf bytes.Buffer
+	logger := log.New(&buf, "", 0)
+	got := clampBreakerWindow(0, 0, "test", logger)
+	if got != 0 {
+		t.Fatalf("clamp window=0 cooldown=0 -> %s, want 0", got)
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("expected no log output, got %q", buf.String())
+	}
+}
+
+// TestRedisCircuitBreaker_HalfOpenReTripsAfterTrimmedWindow pins
+// the Lua-side half-open re-trip semantic: when prior failures
+// have already trimmed out of the sliding window but `open_until`
+// is still set, a single failure during the half-open state must
+// re-trip the breaker. Without this guarantee a tight window
+// (e.g., 5s) plus a longer cooldown (10s) would leave the breaker
+// permanently closed after a failed probe — the bug the in-process
+// counterpart was catching.
+func TestRedisCircuitBreaker_HalfOpenReTripsAfterTrimmedWindow(t *testing.T) {
+	clock := &fakeClock{now: time.Unix(1_700_000_000, 0)}
+	b, _ := newSharedBreaker(t, 2, 5*time.Second, 10*time.Second, clock.Now)
+	ctx := context.Background()
+	host := "shard-a:8080"
+
+	// Trip.
+	b.RecordFailure(ctx, host)
+	b.RecordFailure(ctx, host)
+	if !b.Open(ctx, host) {
+		t.Fatal("expected breaker open after 2 failures")
+	}
+
+	// Advance past BOTH the cooldown AND the window so the prior
+	// failures get trimmed out of the ZSET when the next failure
+	// is recorded. (cutoff = 12s - 5s = 7s; the original
+	// failures at t=0 are < 7s.)
+	clock.Advance(12 * time.Second)
+	if b.Open(ctx, host) {
+		t.Fatal("expected half-open (Open=false) after cooldown")
+	}
+
+	// A single failed probe must re-trip even though the window
+	// trim left count=1 < threshold=2.
+	b.RecordFailure(ctx, host)
+	if !b.Open(ctx, host) {
+		t.Fatal("expected breaker re-tripped after failed half-open probe")
+	}
+}
+
+// TestInProcessCircuitBreaker_ClampsWindowAndReTrips proves the
+// end-to-end behavior: with a misconfigured (cooldown=10s,
+// window=5s) breaker, the in-process impl now correctly re-trips
+// on a failed half-open probe — via the half-open re-trip path,
+// not the count threshold, since the window trim removed the
+// pre-trip failures by the time the probe lands.
+func TestInProcessCircuitBreaker_ClampsWindowAndReTrips(t *testing.T) {
+	clock := &fakeClock{now: time.Unix(1_700_000_000, 0)}
+	var buf bytes.Buffer
+	logger := log.New(&buf, "", 0)
+	b := newInProcessCircuitBreaker(inProcessBreakerConfig{
+		Threshold: 2,
+		Cooldown:  10 * time.Second,
+		Window:    5 * time.Second,
+		Now:       clock.Now,
+		Logger:    logger,
+	})
+	ctx := context.Background()
+	host := "shard-a:8080"
+
+	if !strings.Contains(buf.String(), "WARN:") {
+		t.Fatalf("expected clamp warning, got %q", buf.String())
+	}
+
+	b.RecordFailure(ctx, host)
+	b.RecordFailure(ctx, host)
+	if !b.Open(ctx, host) {
+		t.Fatal("expected breaker open after 2 failures")
+	}
+
+	clock.Advance(11 * time.Second)
+	if b.Open(ctx, host) {
+		t.Fatal("expected half-open after cooldown")
+	}
+
+	b.RecordFailure(ctx, host)
+	if !b.Open(ctx, host) {
+		t.Fatal("expected re-trip after failed half-open probe; clamp likely failed")
 	}
 }
 

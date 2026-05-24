@@ -180,6 +180,7 @@ func NewProxy(cfg ProxyConfig) (*Proxy, error) {
 			Threshold: cfg.CircuitBreakThreshold,
 			Cooldown:  cfg.CircuitBreakCooldown,
 			Window:    cfg.CircuitBreakWindow,
+			Logger:    logger,
 		})
 	}
 	p := &Proxy{

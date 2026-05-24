@@ -96,11 +96,22 @@ type hostBreakerState struct {
 // inProcessBreakerConfig parameterises the local breaker so the
 // proxy can thread the same Threshold/Cooldown/Window values into
 // it as the Redis-backed impl. Zero fields take safe defaults.
+//
+// Invariant: the effective sliding `Window` is clamped to >=
+// `Cooldown`. Otherwise an operator misconfiguration like
+// (Cooldown=90s, Window=60s) would let the failure history age out
+// of the window during the cooldown plateau, so after the breaker
+// half-opens a single failed probe wouldn't see enough recent
+// failures to re-trip — the breaker would prematurely fully close
+// despite the host still being unhealthy. The clamp + logger
+// warning (see `clampBreakerWindow`) keeps the re-trip semantics
+// intuitive regardless of how the env vars are set.
 type inProcessBreakerConfig struct {
 	Threshold int
 	Cooldown  time.Duration
 	Window    time.Duration
 	Now       func() time.Time
+	Logger    *log.Logger
 }
 
 func newInProcessCircuitBreaker(cfg inProcessBreakerConfig) *inProcessCircuitBreaker {
@@ -110,6 +121,7 @@ func newInProcessCircuitBreaker(cfg inProcessBreakerConfig) *inProcessCircuitBre
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
+	cfg.Window = clampBreakerWindow(cfg.Cooldown, cfg.Window, "jmap.inProcessCircuitBreaker", cfg.Logger)
 	return &inProcessCircuitBreaker{
 		threshold: cfg.Threshold,
 		cooldown:  cfg.Cooldown,
@@ -117,6 +129,31 @@ func newInProcessCircuitBreaker(cfg inProcessBreakerConfig) *inProcessCircuitBre
 		now:       cfg.Now,
 		state:     map[string]*hostBreakerState{},
 	}
+}
+
+// clampBreakerWindow enforces window >= cooldown so a recovered
+// host that fails its half-open probe re-trips the breaker (i.e.,
+// the prior failure history is still in the sliding window when
+// the probe lands). Returns the clamped value; when clamping
+// actually changes the value it logs a one-time WARN through
+// `logger` (or `log.Default()` if nil) so the operator notices
+// their `KMAIL_BREAKER_WINDOW` / `KMAIL_BREAKER_COOLDOWN`
+// inversion. Zero or negative cooldown disables the clamp (the
+// breaker falls back to the legacy count-only mode).
+func clampBreakerWindow(cooldown, window time.Duration, source string, logger *log.Logger) time.Duration {
+	if cooldown <= 0 || window <= 0 || window >= cooldown {
+		return window
+	}
+	if logger == nil {
+		logger = log.Default()
+	}
+	logger.Printf(
+		"WARN: %s: Window (%s) < Cooldown (%s); clamping effective Window to Cooldown "+
+			"so failed half-open probes can still re-trip the breaker. "+
+			"Set Window >= Cooldown to silence this warning.",
+		source, window, cooldown,
+	)
+	return cooldown
 }
 
 // trimLocked drops failure timestamps older than `now - window`
@@ -174,6 +211,17 @@ func (b *inProcessCircuitBreaker) RecordFailure(_ context.Context, host string) 
 	now := b.now()
 	b.trimLocked(s, now)
 	s.failures = append(s.failures, now)
+	// Half-open re-trip: if the breaker previously tripped
+	// (`openUntil` is set) and the cooldown has elapsed (we're
+	// in the half-open state), a single failure re-trips
+	// immediately regardless of how many failures are in the
+	// sliding window. This is the standard CB pattern and
+	// guarantees the half-open probe correctly latches the
+	// breaker back open even if the trim emptied the window.
+	if b.cooldown > 0 && !s.openUntil.IsZero() && !now.Before(s.openUntil) {
+		s.openUntil = now.Add(b.cooldown)
+		return
+	}
 	if len(s.failures) >= b.threshold {
 		if b.cooldown > 0 {
 			s.openUntil = now.Add(b.cooldown)
@@ -271,6 +319,11 @@ func NewRedisCircuitBreaker(cfg RedisCircuitBreakerConfig) (*RedisCircuitBreaker
 	if b.now == nil {
 		b.now = time.Now
 	}
+	// Mirror the in-process breaker invariant so both impls agree
+	// on re-trip semantics when an operator misconfigures the env
+	// vars (cooldown > window). See clampBreakerWindow for the
+	// detailed rationale.
+	b.window = clampBreakerWindow(b.cooldown, b.window, "jmap.RedisCircuitBreaker", b.logger)
 	// Eagerly compile so the first Open call is a fast Lua
 	// invocation, not a script compile + EVAL.
 	b.ensureAllowScript()
@@ -342,6 +395,22 @@ local count = tonumber(redis.call("ZCARD", fail_key))
 -- doesn't lose its history before the window naturally rolls
 -- forward.
 redis.call("PEXPIRE", fail_key, window + 5000)
+
+-- Half-open re-trip: when open_until exists AND the cooldown
+-- has elapsed (so Open() reports half-open), a single new
+-- failure must immediately re-trip the breaker regardless of
+-- whether the sliding-window count crossed the threshold. This
+-- mirrors the in-process breaker and is the standard CB
+-- pattern — without it, an operator misconfig (window < cooldown)
+-- could let a failed half-open probe leave the breaker closed.
+local raw = redis.call("GET", open_until_key)
+if raw ~= false and raw ~= nil then
+    local open_until = tonumber(raw)
+    if open_until ~= nil and now >= open_until then
+        redis.call("SET", open_until_key, tostring(now + cooldown), "PX", cooldown + 5000)
+        return count
+    end
+end
 
 if count >= threshold then
     redis.call("SET", open_until_key, tostring(now + cooldown), "PX", cooldown + 5000)

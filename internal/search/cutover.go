@@ -120,37 +120,68 @@ type CutoverStore interface {
 	// MarkFailed moves the row to `failed`, increments
 	// `failure_count`, and records `reason`.
 	MarkFailed(ctx context.Context, tenantID, reason string, now time.Time) error
+	// ReconcileCompleted promotes any `in_progress` row to
+	// `completed` when the tenant has ALREADY been flipped to
+	// `targetBackend` (i.e., `Service.SetBackend` succeeded) AND
+	// the row hasn't been updated since `before`. This is the
+	// safety net for the unlucky case where SetBackend committed
+	// but the follow-up MarkCompleted failed (Postgres blip, pod
+	// killed mid-write). Without this, those rows would sit in
+	// `in_progress` forever — they're not retryable via
+	// ListCandidates (the tenant is already on OpenSearch) and
+	// the bookkeeping eventually skews the cutover dashboard.
+	// Idempotent: rows already in another state are left alone.
+	// Returns the count of rows promoted so the worker can log it.
+	ReconcileCompleted(ctx context.Context, targetBackend string, before time.Time) (int64, error)
 }
 
 // CutoverConfig parameterises the auto-cutover worker.
 //
-//	Threshold:    mailbox-size (bytes) at or above which a tenant
-//	              becomes a candidate. Defaults to the per-tenant
-//	              equivalent of 100k messages × ~16 KiB / message.
-//	Interval:     how often the worker scans for eligible tenants.
-//	              Defaults to 1h. The worker also runs once at start.
-//	MaxFailures:  after this many consecutive Reindex failures,
-//	              the worker leaves the tenant in `failed` state
-//	              and stops retrying. Defaults to 5.
-//	MaxRetryGap:  the worker won't retry a `failed` job until this
-//	              long after its last `updated_at`. Defaults to 1h.
-//	              Mostly relevant when a transient OpenSearch
-//	              outage causes a wave of failures the worker
-//	              shouldn't bash on every tick.
+//	Threshold:        mailbox-size (bytes) at or above which a tenant
+//	                  becomes a candidate. Defaults to the per-tenant
+//	                  equivalent of 100k messages × ~16 KiB / message.
+//	Interval:         how often the worker scans for eligible tenants.
+//	                  Defaults to 1h. The worker also runs once at start.
+//	MaxFailures:      after this many consecutive Reindex failures,
+//	                  the worker leaves the tenant in `failed` state
+//	                  and stops retrying. Defaults to 5.
+//	MaxRetryGap:      the worker won't retry a `failed` job until this
+//	                  long after its last `updated_at`. Defaults to 1h.
+//	                  Mostly relevant when a transient OpenSearch
+//	                  outage causes a wave of failures the worker
+//	                  shouldn't bash on every tick.
+//	ReconcileAfter:   how long an `in_progress` row whose tenant is
+//	                  already on OpenSearch is allowed to sit before
+//	                  the worker forcibly promotes it to `completed`.
+//	                  Defaults to 30m. The migration normally finishes
+//	                  within seconds-to-minutes, so 30m is well past
+//	                  any legitimate in-flight migration window.
 type CutoverConfig struct {
-	Pool         *pgxpool.Pool
-	Store        CutoverStore
-	Service      BackendFlipper
-	Sizer        MailboxSizer
-	Source       MessageSource
-	Logger       *log.Logger
-	Threshold    int64
-	Interval     time.Duration
-	MaxFailures  int
-	MaxRetryGap  time.Duration
+	Pool           *pgxpool.Pool
+	Store          CutoverStore
+	Service        BackendFlipper
+	Sizer          MailboxSizer
+	Source         MessageSource
+	Logger         *log.Logger
+	Threshold      int64
+	Interval       time.Duration
+	MaxFailures    int
+	MaxRetryGap    time.Duration
+	ReconcileAfter time.Duration
+	// MarkCompletedRetries bounds the retry loop around the
+	// post-SetBackend MarkCompleted call. Defaults to 3. A bounded
+	// retry covers a Postgres connection blip without spinning the
+	// goroutine on a genuinely-broken store; the periodic
+	// reconciliation pass picks up anything the retry can't.
+	MarkCompletedRetries int
 	// Now is the wall-clock source; defaults to time.Now. Tests
 	// inject a fixed clock so retry-backoff is deterministic.
 	Now func() time.Time
+	// Sleep lets tests skip the retry backoff. Defaults to
+	// time.Sleep. In production this only ever fires on the rare
+	// post-SetBackend MarkCompleted retry path, so the latency
+	// hit (a few hundred ms) is acceptable.
+	Sleep func(time.Duration)
 }
 
 // CutoverWorker auto-promotes tenants from Meilisearch to
@@ -163,10 +194,13 @@ type CutoverWorker struct {
 }
 
 const (
-	defaultCutoverThreshold   = 100_000 * 16 * 1024 // ~100k messages × 16 KiB
-	defaultCutoverInterval    = time.Hour
-	defaultCutoverMaxFailures = 5
-	defaultCutoverMaxRetryGap = time.Hour
+	defaultCutoverThreshold          = 100_000 * 16 * 1024 // ~100k messages × 16 KiB
+	defaultCutoverInterval           = time.Hour
+	defaultCutoverMaxFailures        = 5
+	defaultCutoverMaxRetryGap        = time.Hour
+	defaultCutoverReconcileAfter     = 30 * time.Minute
+	defaultCutoverMarkCompletedTries = 3
+	cutoverMarkCompletedBaseBackoff  = 250 * time.Millisecond
 )
 
 // NewCutoverWorker wires the worker. Validates required deps so a
@@ -202,8 +236,17 @@ func NewCutoverWorker(cfg CutoverConfig) (*CutoverWorker, error) {
 	if cfg.MaxRetryGap <= 0 {
 		cfg.MaxRetryGap = defaultCutoverMaxRetryGap
 	}
+	if cfg.ReconcileAfter <= 0 {
+		cfg.ReconcileAfter = defaultCutoverReconcileAfter
+	}
+	if cfg.MarkCompletedRetries <= 0 {
+		cfg.MarkCompletedRetries = defaultCutoverMarkCompletedTries
+	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
+	}
+	if cfg.Sleep == nil {
+		cfg.Sleep = time.Sleep
 	}
 	return &CutoverWorker{cfg: cfg}, nil
 }
@@ -235,6 +278,16 @@ func (w *CutoverWorker) Run(ctx context.Context) {
 // stop the rest of the fleet from migrating).
 func (w *CutoverWorker) Tick(ctx context.Context) {
 	now := w.cfg.Now()
+	// Reconcile FIRST so any stale `in_progress` row from a
+	// previous tick (post-SetBackend, pre-MarkCompleted crash) is
+	// promoted to `completed` before we scan for new candidates.
+	// Reconciliation failure is logged and ignored — the main
+	// cutover loop is independent of it.
+	if n, err := w.cfg.Store.ReconcileCompleted(ctx, BackendOpenSearch, now.Add(-w.cfg.ReconcileAfter)); err != nil {
+		w.cfg.Logger.Printf("search.cutover: reconcile: %v", err)
+	} else if n > 0 {
+		w.cfg.Logger.Printf("search.cutover: reconcile: promoted %d stale in_progress rows to completed", n)
+	}
 	ids, err := w.cfg.Store.ListCandidates(ctx, CandidateFilter{
 		SourceBackend:    BackendMeilisearch,
 		MaxFailures:      w.cfg.MaxFailures,
@@ -305,11 +358,42 @@ func (w *CutoverWorker) cutoverOne(ctx context.Context, tenantID string, size in
 		_ = w.cfg.Store.MarkFailed(ctx, tenantID, fmt.Sprintf("set backend: %v", err), w.cfg.Now())
 		return fmt.Errorf("set backend: %w", err)
 	}
-	if err := w.cfg.Store.MarkCompleted(ctx, tenantID, w.cfg.Now()); err != nil {
+	// SetBackend committed; the tenant is live on OpenSearch.
+	// MarkCompleted is the bookkeeping update — it must not
+	// cause a re-migration if it transiently fails. Retry with
+	// exponential backoff to absorb a single connection blip; if
+	// the retry budget is exhausted, the next Tick's
+	// ReconcileCompleted pass will promote the row (the tenant
+	// is already on OpenSearch, so the reconcile guard fires).
+	if err := w.markCompletedWithRetry(ctx, tenantID); err != nil {
+		w.cfg.Logger.Printf("search.cutover: tenant=%s SetBackend OK but MarkCompleted persistently failed; will be reconciled on next tick: %v", tenantID, err)
 		return fmt.Errorf("mark completed: %w", err)
 	}
 	w.cfg.Logger.Printf("search.cutover: tenant=%s migrated %d messages to OpenSearch", tenantID, len(msgs))
 	return nil
+}
+
+// markCompletedWithRetry retries MarkCompleted with exponential
+// backoff up to cfg.MarkCompletedRetries times. Ctx-cancellation
+// short-circuits the loop immediately so a pod shutdown isn't
+// delayed by the backoff.
+func (w *CutoverWorker) markCompletedWithRetry(ctx context.Context, tenantID string) error {
+	var lastErr error
+	for attempt := 0; attempt < w.cfg.MarkCompletedRetries; attempt++ {
+		if err := w.cfg.Store.MarkCompleted(ctx, tenantID, w.cfg.Now()); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if attempt < w.cfg.MarkCompletedRetries-1 {
+			backoff := cutoverMarkCompletedBaseBackoff << attempt
+			w.cfg.Sleep(backoff)
+		}
+	}
+	return lastErr
 }
 
 // PostgresCutoverStore is the default CutoverStore wired against
@@ -415,4 +499,29 @@ func (s *PostgresCutoverStore) MarkFailed(ctx context.Context, tenantID, reason 
 		 WHERE tenant_id = $1
 	`, tenantID, reason, now)
 	return err
+}
+
+// ReconcileCompleted implements CutoverStore. The UPDATE joins
+// against `tenants.search_backend` so the promotion is gated on
+// the actual production state: only rows whose tenant is ALREADY
+// on `targetBackend` get promoted. `updated_at` is bumped to the
+// reconcile timestamp so the dashboard reflects the recovery.
+func (s *PostgresCutoverStore) ReconcileCompleted(ctx context.Context, targetBackend string, before time.Time) (int64, error) {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE search_cutover_jobs j
+		   SET cutover_state = 'completed',
+		       completed_at  = $3,
+		       updated_at    = $3,
+		       failure_count = 0,
+		       last_error    = ''
+		  FROM tenants t
+		 WHERE j.tenant_id      = t.id
+		   AND j.cutover_state  = 'in_progress'
+		   AND j.updated_at     < $2
+		   AND t.search_backend = $1
+	`, targetBackend, before, time.Now().UTC())
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
 }

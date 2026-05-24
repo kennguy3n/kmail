@@ -133,6 +133,37 @@ func (s *inMemoryCutoverStore) MarkFailed(_ context.Context, tenantID, reason st
 	return nil
 }
 
+// ReconcileCompleted mirrors the production Postgres impl: walk
+// the rows, promote any `in_progress` row whose tenant is already
+// on `targetBackend` AND whose updated_at predates `before`. The
+// completion timestamp uses time.Now() to match the production
+// query (which uses NOW() so the dashboard reflects when the
+// reconciliation actually fired, not when the migration started).
+func (s *inMemoryCutoverStore) ReconcileCompleted(_ context.Context, targetBackend string, before time.Time) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var n int64
+	now := time.Now()
+	for tenantID, r := range s.rows {
+		if r.state != CutoverInProgress {
+			continue
+		}
+		if !r.updatedAt.Before(before) {
+			continue
+		}
+		if s.tenantBackends[tenantID] != targetBackend {
+			continue
+		}
+		r.state = CutoverCompleted
+		r.completedAt = &now
+		r.updatedAt = now
+		r.failureCount = 0
+		r.lastError = ""
+		n++
+	}
+	return n, nil
+}
+
 // fakeFlipper records ReindexTo / SetBackend invocations so tests
 // can assert what the worker drove and inject per-tenant failures.
 // SetBackend writes back to the linked inMemoryCutoverStore so the
@@ -203,6 +234,11 @@ func buildWorker(t *testing.T, store CutoverStore, flipper BackendFlipper, sizer
 		MaxFailures: 5,
 		MaxRetryGap: time.Hour,
 		Now:         now,
+		// Tests don't want to wait for the bounded retry backoff
+		// inside markCompletedWithRetry; the production default
+		// (time.Sleep) is exercised separately by the dedicated
+		// retry test below.
+		Sleep: func(time.Duration) {},
 	})
 	if err != nil {
 		t.Fatalf("NewCutoverWorker: %v", err)
@@ -527,6 +563,125 @@ func TestCutoverWorker_SetBackendFailureLeavesTenantRetryable(t *testing.T) {
 	if r := store.rows["tenant-a"]; r.state != CutoverCompleted {
 		t.Fatalf("retry did not succeed: state = %s", r.state)
 	}
+}
+
+// TestCutoverWorker_MarkCompletedTransientFailureRetries verifies
+// the retry path: when MarkCompleted fails for the first N-1
+// attempts and succeeds on the Nth, the row ends up in
+// `completed`. This is the headline Postgres-blip recovery case.
+func TestCutoverWorker_MarkCompletedTransientFailureRetries(t *testing.T) {
+	store := newInMemoryStore([]string{"tenant-a"})
+	flipper := newFakeFlipper(store)
+	now := time.Unix(1_700_000_000, 0)
+
+	// Wrap the store to inject N-1 transient MarkCompleted
+	// failures. The Nth call passes through to the real store.
+	wrapped := &flakeyMarkCompleted{CutoverStore: store, failuresLeft: 2}
+	sizer := MailboxSizerFunc(func(context.Context, string) (int64, error) { return 200_000, nil })
+	source := MessageSourceFunc(func(context.Context, string) ([]Message, error) {
+		return []Message{{TenantID: "tenant-a"}}, nil
+	})
+	w, err := NewCutoverWorker(CutoverConfig{
+		Store:                wrapped,
+		Service:              flipper,
+		Sizer:                sizer,
+		Source:               source,
+		Logger:               silentLogger(),
+		Threshold:            100_000,
+		Interval:             time.Hour,
+		MaxFailures:          5,
+		MaxRetryGap:          time.Hour,
+		Now:                  func() time.Time { return now },
+		Sleep:                func(time.Duration) {},
+		MarkCompletedRetries: 3,
+	})
+	if err != nil {
+		t.Fatalf("NewCutoverWorker: %v", err)
+	}
+	w.Tick(context.Background())
+	if r := store.rows["tenant-a"]; r == nil || r.state != CutoverCompleted {
+		t.Fatalf("row = %+v, want completed", r)
+	}
+	if wrapped.calls != 3 {
+		t.Fatalf("MarkCompleted called %d times, want 3 (retries exhausted twice)", wrapped.calls)
+	}
+}
+
+// TestCutoverWorker_MarkCompletedPersistentFailureReconcilesNextTick
+// verifies the safety net: when MarkCompleted fails on every
+// retry, the row sits in `in_progress` after the tick — but the
+// NEXT tick's ReconcileCompleted pass promotes it to `completed`
+// because the tenant is already on OpenSearch (SetBackend
+// succeeded).
+func TestCutoverWorker_MarkCompletedPersistentFailureReconcilesNextTick(t *testing.T) {
+	store := newInMemoryStore([]string{"tenant-a"})
+	flipper := newFakeFlipper(store)
+	clock := &fakeNow{now: time.Unix(1_700_000_000, 0)}
+
+	// Always fail MarkCompleted in the first tick. After the
+	// tick we'll clear the flake so reconciliation can run
+	// cleanly.
+	wrapped := &flakeyMarkCompleted{CutoverStore: store, failuresLeft: 999}
+	sizer := MailboxSizerFunc(func(context.Context, string) (int64, error) { return 200_000, nil })
+	source := MessageSourceFunc(func(context.Context, string) ([]Message, error) {
+		return []Message{{TenantID: "tenant-a"}}, nil
+	})
+	w, err := NewCutoverWorker(CutoverConfig{
+		Store:                wrapped,
+		Service:              flipper,
+		Sizer:                sizer,
+		Source:               source,
+		Logger:               silentLogger(),
+		Threshold:            100_000,
+		Interval:             time.Hour,
+		MaxFailures:          5,
+		MaxRetryGap:          time.Hour,
+		ReconcileAfter:       30 * time.Minute,
+		MarkCompletedRetries: 3,
+		Now:                  clock.Now,
+		Sleep:                func(time.Duration) {},
+	})
+	if err != nil {
+		t.Fatalf("NewCutoverWorker: %v", err)
+	}
+
+	w.Tick(context.Background())
+	if r := store.rows["tenant-a"]; r == nil || r.state != CutoverInProgress {
+		t.Fatalf("after MarkCompleted exhaust, row = %+v, want in_progress", r)
+	}
+	if store.tenantBackends["tenant-a"] != BackendOpenSearch {
+		t.Fatalf("tenant backend = %q, want opensearch (SetBackend ran)", store.tenantBackends["tenant-a"])
+	}
+
+	// Drop the flake so the reconciler can stick.
+	wrapped.failuresLeft = 0
+	// Advance past the ReconcileAfter window so the row is
+	// eligible for promotion.
+	clock.Advance(time.Hour)
+
+	w.Tick(context.Background())
+	if r := store.rows["tenant-a"]; r == nil || r.state != CutoverCompleted {
+		t.Fatalf("after reconcile tick, row = %+v, want completed", r)
+	}
+}
+
+// flakeyMarkCompleted wraps a real CutoverStore and injects
+// transient MarkCompleted failures up to `failuresLeft`. All
+// other methods pass through unchanged so the in-memory store
+// stays the source of truth for the rest of the state machine.
+type flakeyMarkCompleted struct {
+	CutoverStore
+	failuresLeft int
+	calls        int
+}
+
+func (s *flakeyMarkCompleted) MarkCompleted(ctx context.Context, tenantID string, now time.Time) error {
+	s.calls++
+	if s.failuresLeft > 0 {
+		s.failuresLeft--
+		return errors.New("transient: postgres conn reset")
+	}
+	return s.CutoverStore.MarkCompleted(ctx, tenantID, now)
 }
 
 type fakeNow struct {
