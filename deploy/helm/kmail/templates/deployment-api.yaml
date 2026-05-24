@@ -35,6 +35,30 @@ spec:
               # change the BFF's port by editing exactly one line.
               containerPort: {{ .Values.kmailApi.service.targetPort }}
               protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: {{ include "kmail.fullname" . }}-config
+            - secretRef:
+                name: {{ include "kmail.secretName" . }}
+          {{- /*
+            Two surfaces want to inject env vars into the kmail-api
+            container: the unconditional KMAIL_API_ADDR (so the
+            container's listen address is driven by the same value
+            as `containerPort` above and the Service `targetPort`),
+            and the conditional multi-region block (per-pod replica
+            routing). YAML forbids duplicate mapping keys, and Go's
+            parser (used by Helm AND by the kube-apiserver during
+            admission) silently drops all but the LAST `env:` it
+            sees, so the two blocks MUST live under a single `env:`
+            mapping. Putting them in two separate `env:` keys would
+            silently drop KMAIL_API_ADDR whenever multiregion is
+            enabled, leaving the binary on its in-source default
+            (`:8088`) while the Service targets the value of
+            `kmailApi.service.targetPort` — readiness probes would
+            then never succeed.
+          */ -}}
+          {{- $mr := .Values.multiregion }}
+          {{- $needMR := and $mr.enabled (or $mr.region $mr.peerRegions $mr.valkeyReplicaURLs) }}
           env:
             # `KMAIL_API_ADDR` is NOT placed in the ConfigMap
             # (`values.yaml: kmailApi.config`) because it must
@@ -49,22 +73,7 @@ spec:
             # default).
             - name: KMAIL_API_ADDR
               value: ":{{ .Values.kmailApi.service.targetPort }}"
-          envFrom:
-            - configMapRef:
-                name: {{ include "kmail.fullname" . }}-config
-            - secretRef:
-                name: {{ include "kmail.secretName" . }}
-          {{- /*
-            Multi-region env vars are emitted only when at least one
-            of the three is set; otherwise we skip the `env:` key
-            entirely so the manifest doesn't render `env: null`,
-            which strict admission webhooks reject. Each {{- with }}
-            block is still falsy-safe so a single unset value just
-            omits its entry.
-          */ -}}
-          {{- $mr := .Values.multiregion }}
-          {{- if and $mr.enabled (or $mr.region $mr.peerRegions $mr.valkeyReplicaURLs) }}
-          env:
+            {{- if $needMR }}
             {{- with $mr.region }}
             - name: KMAIL_REGION
               value: {{ . | quote }}
@@ -77,7 +86,7 @@ spec:
             - name: KMAIL_VALKEY_REPLICA_URLS
               value: {{ . | quote }}
             {{- end }}
-          {{- end }}
+            {{- end }}
           readinessProbe:
             httpGet:
               path: /readyz
