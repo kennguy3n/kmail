@@ -22,16 +22,31 @@ export function Compose(): JSX.Element {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    // The `cancelled` guard prevents the drafts-mailbox lookup
+    // from writing state on a stale closure if the component
+    // unmounts (or React StrictMode double-invokes the effect)
+    // mid-flight. The cache call is local-only today, but the
+    // guard future-proofs against any latency increase in
+    // `cachedMailboxes()`.
+    let cancelled = false;
     void (async () => {
       try {
         const mailboxes: JsMailbox[] = await client.cachedMailboxes();
+        if (cancelled) return;
         const drafts = mailboxes.find((m) => m.role === 'drafts');
         setDraftsMailboxId(drafts?.id ?? null);
       } catch (err) {
+        if (cancelled) return;
+        // `KMailDesktopClient` already wraps every IPC error in
+        // `parseKMailError`, so `e.message` already starts with
+        // the tag prefix. Don't double-stamp it here.
         const e = err as KMailError;
-        setError(`${e.tag} ${e.message}`);
+        setError(e.message);
       }
     })();
+    return () => {
+      cancelled = true;
+    };
   }, [client]);
 
   const handleSubmit = async (event: React.FormEvent) => {
@@ -78,7 +93,9 @@ export function Compose(): JSX.Element {
       });
     } catch (err) {
       const e = err as KMailError;
-      setError(`${e.tag} ${e.message}`);
+      // `e.message` already contains the tag prefix; see the
+      // matching comment in the mount effect above.
+      setError(e.message);
     } finally {
       setSending(false);
     }

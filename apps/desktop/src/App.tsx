@@ -72,7 +72,15 @@ export function App(): JSX.Element {
   // Open the SDK once on mount. Strict mode runs effects twice
   // in dev — the IPC handler is idempotent for the same config,
   // so the second open() is a no-op.
+  //
+  // The `cancelled` guard prevents the state setters from firing
+  // on a stale closure when the effect re-runs (StrictMode double
+  // invoke, or future hot-reload). Without it, the in-flight
+  // open()/cachedMailboxes() from the first invocation would race
+  // the cleanup of the second, potentially overwriting freshly
+  // computed state with stale data.
   useEffect(() => {
+    let cancelled = false;
     const params = readSessionParams();
     if (!params) {
       setSetupError(
@@ -88,13 +96,26 @@ export function App(): JSX.Element {
           databasePath: params.databasePath,
           accountId: params.accountId,
         });
+        if (cancelled) return;
         const m = await client.cachedMailboxes();
+        if (cancelled) return;
         setMailboxes(m);
       } catch (err) {
+        if (cancelled) return;
+        // `KMailDesktopClient` already wraps every IPC error in
+        // `parseKMailError`, so `err` is guaranteed to be a
+        // `KMailError` whose `.message` already starts with the
+        // tag (e.g. `[STORE] sqlite locked`). Rendering
+        // `${e.tag} ${e.message}` here would double-stamp the
+        // tag — see `parseKMailError` in `kmail/errors.ts` for
+        // the underlying contract.
         const e = err as KMailError;
-        setSetupError(`${e.tag} ${e.message}`);
+        setSetupError(e.message);
       }
     })();
+    return () => {
+      cancelled = true;
+    };
   }, [client]);
 
   const runSync = useCallback(async () => {
@@ -107,7 +128,9 @@ export function App(): JSX.Element {
       setSyncError(null);
     } catch (err) {
       const e = err as KMailError;
-      setSyncError(`${e.tag} ${e.message}`);
+      // `e.message` already includes the tag prefix; see the
+      // matching comment in the mount effect above.
+      setSyncError(e.message);
     } finally {
       setSyncing(false);
     }

@@ -25,17 +25,35 @@ export function Inbox(): JSX.Element {
       setEmails([]);
       return;
     }
+    // The `cancelled` guard prevents stale closures when the user
+    // navigates between mailboxes faster than the local SQLite
+    // cache can respond. Without it, a resolved fetch from
+    // mailbox A could overwrite the freshly-rendered list for
+    // mailbox B. Cache reads are sub-millisecond today, but the
+    // guard future-proofs the component against any IPC-level
+    // latency increase (e.g. if the cached path ever wraps an
+    // SDK call that hits the JMAP server).
+    let cancelled = false;
     void (async () => {
       try {
         const list = await client.cachedEmails(mailboxId, DEFAULT_LIMIT);
+        if (cancelled) return;
         setEmails(list);
         setSelected(list[0] ?? null);
         setError(null);
       } catch (err) {
+        if (cancelled) return;
+        // `KMailDesktopClient` already wraps every IPC error in
+        // `parseKMailError`, so `e.message` already starts with
+        // the tag prefix. Don't prepend `e.tag` here or it gets
+        // double-stamped.
         const e = err as KMailError;
-        setError(`${e.tag} ${e.message}`);
+        setError(e.message);
       }
     })();
+    return () => {
+      cancelled = true;
+    };
   }, [client, mailboxId]);
 
   if (!mailboxId) {

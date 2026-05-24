@@ -1,4 +1,5 @@
 import { defineConfig } from 'vitest/config';
+import path from 'node:path';
 
 // Vitest config for the renderer-side unit tests.
 //
@@ -9,7 +10,24 @@ import { defineConfig } from 'vitest/config';
 // to exercise main-process behaviour, runs as an Electron
 // integration test (those land in a follow-up PR alongside an
 // electron-mocha runner).
+//
+// The `resolve.alias` block MUST be kept in sync with
+// `vite.config.ts`'s alias — vitest doesn't automatically
+// inherit from the sibling vite config when neither is the
+// `defineProject` / merge form. Keeping the alias here means a
+// test file that accidentally `import`s from `@kmail/sdk-native`
+// fails loudly at module-load time (with the block module's
+// "this is the renderer, you can't do that" error) instead of
+// silently pulling a real .node addon into Node's require cache.
 export default defineConfig({
+  resolve: {
+    alias: {
+      '@kmail/sdk-native': path.resolve(
+        __dirname,
+        'src/kmail/sdk-native.block.ts',
+      ),
+    },
+  },
   test: {
     globals: true,
     environment: 'jsdom',
