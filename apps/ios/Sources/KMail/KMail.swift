@@ -200,12 +200,22 @@ public struct ClientConfiguration {
         bffURL: URL,
         bearerToken: String,
         databaseURL: URL,
+        // The literals below must mirror `ClientConfig::new()` in
+        // `sdk/kmail-core/src/client.rs` AND the FFI
+        // `default_client_config(...)` helper in
+        // `sdk/kmail-ffi/src/lib.rs`. The Swift integration test
+        // `testSwiftDefaultsMatchRustDefaults` exercises the FFI
+        // helper and asserts that the values seeded here are
+        // bit-identical to the Rust side — a future change to a
+        // Rust default surfaces immediately as a CI failure on
+        // the macOS runner rather than silently halving (or
+        // doubling) some setting on the iOS surface.
         attachmentCacheBytes: UInt64 = 256 * 1024 * 1024, // 256 MiB
         requestTimeout: TimeInterval = 30,
-        retryBudget: TimeInterval = 30,
+        retryBudget: TimeInterval = 60,
         initialSyncEmailWindow: UInt32 = 200,
         accountID: String? = nil,
-        bootstrapMailboxRole: String? = nil
+        bootstrapMailboxRole: String? = "inbox"
     ) {
         self.bffURL = bffURL
         self.bearerToken = bearerToken

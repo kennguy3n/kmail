@@ -445,6 +445,54 @@ impl From<kmail_core::SyncSummary> for FfiSyncSummary {
 // Entry point + Object surface
 // ---------------------------------------------------------------
 
+/// Return a `KMailClientConfig` pre-populated with the SDK's
+/// canonical defaults for every non-required field.
+///
+/// This exists to give foreign bindings (Swift / Kotlin / Node)
+/// a single source of truth for "what does the SDK default to?".
+/// Without it, each binding would have to duplicate the literal
+/// defaults from [`ClientConfig::new`], which is a recurring
+/// source of drift bugs (e.g. Swift defaulting `retryBudget` to
+/// 30s instead of the Rust-side 60s, halving the retry budget
+/// for every iOS client that uses default settings).
+///
+/// Foreign bindings that want to expose their own
+/// language-idiomatic defaults SHOULD still seed those defaults
+/// from this function — either by calling it at config
+/// construction time, or by adding a test that compares the
+/// binding-side defaults against the values this function
+/// returns. The Swift binding takes the test-based approach
+/// (see `testSwiftDefaultsMatchRustDefaults`) so a future
+/// change to a Rust default surfaces immediately as a test
+/// failure on the macOS CI runner rather than silently
+/// drifting on the iOS surface.
+///
+/// The returned record has `account_id = None` and uses the
+/// caller-supplied `bff_url` / `bearer_token` / `database_path`
+/// because there is no sensible default for those — they are
+/// always tenant-specific.
+#[uniffi::export]
+pub fn default_client_config(
+    bff_url: String,
+    bearer_token: String,
+    database_path: String,
+) -> KMailClientConfig {
+    let core = ClientConfig::new(bff_url, bearer_token, PathBuf::from(database_path));
+    let request_timeout_secs = u32::try_from(core.request_timeout.as_secs()).unwrap_or(u32::MAX);
+    let retry_budget_secs = u32::try_from(core.retry_budget.as_secs()).unwrap_or(u32::MAX);
+    KMailClientConfig {
+        bff_url: core.bff_url,
+        bearer_token: core.bearer_token,
+        database_path: core.database_path.to_string_lossy().into_owned(),
+        attachment_cache_bytes: core.attachment_cache_bytes,
+        request_timeout_secs,
+        retry_budget_secs,
+        initial_sync_email_window: core.initial_sync_email_window,
+        account_id: core.account_id,
+        bootstrap_mailbox_role: core.bootstrap_mailbox_role,
+    }
+}
+
 #[uniffi::export]
 pub fn client_open(config: KMailClientConfig) -> Result<Arc<KMailClientHandle>, KMailError> {
     let mut core_cfg = ClientConfig::new(
@@ -813,6 +861,57 @@ mod tests {
                 ref body,
             } if body == "malformed Email/set patch"
         ));
+    }
+
+    /// `default_client_config` must mirror `ClientConfig::new`
+    /// byte-for-byte. If a Rust-side default changes (e.g. the
+    /// retry budget moves from 60s to 90s), this test ensures
+    /// every foreign binding that calls `defaultClientConfig`
+    /// picks up the new default instead of silently drifting.
+    #[test]
+    fn default_client_config_mirrors_core_defaults() {
+        let core = ClientConfig::new(
+            "https://kmail.test",
+            "test-bearer",
+            PathBuf::from("/tmp/k.sqlite"),
+        );
+        let ffi = default_client_config(
+            "https://kmail.test".into(),
+            "test-bearer".into(),
+            "/tmp/k.sqlite".into(),
+        );
+        assert_eq!(ffi.bff_url, core.bff_url);
+        assert_eq!(ffi.bearer_token, core.bearer_token);
+        assert_eq!(
+            ffi.database_path,
+            core.database_path.to_string_lossy().into_owned()
+        );
+        assert_eq!(ffi.attachment_cache_bytes, core.attachment_cache_bytes);
+        assert_eq!(
+            u64::from(ffi.request_timeout_secs),
+            core.request_timeout.as_secs()
+        );
+        assert_eq!(
+            u64::from(ffi.retry_budget_secs),
+            core.retry_budget.as_secs()
+        );
+        assert_eq!(
+            ffi.initial_sync_email_window,
+            core.initial_sync_email_window
+        );
+        assert_eq!(ffi.account_id, core.account_id);
+        assert_eq!(ffi.bootstrap_mailbox_role, core.bootstrap_mailbox_role);
+
+        // Lock down the actual numeric values too so a future
+        // refactor of `ClientConfig::new` that silently changes
+        // a default surfaces here. Update both this assertion AND
+        // the Swift `ClientConfiguration.init` defaults together.
+        assert_eq!(ffi.attachment_cache_bytes, 256 * 1024 * 1024);
+        assert_eq!(ffi.request_timeout_secs, 30);
+        assert_eq!(ffi.retry_budget_secs, 60);
+        assert_eq!(ffi.initial_sync_email_window, 200);
+        assert_eq!(ffi.bootstrap_mailbox_role.as_deref(), Some("inbox"));
+        assert_eq!(ffi.account_id, None);
     }
 
     /// `MailboxRole` round-trips through the FFI string label.

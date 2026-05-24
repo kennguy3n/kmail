@@ -252,6 +252,68 @@ final class KMailIntegrationTests: XCTestCase {
         XCTAssertTrue(json.contains("alice@kmail.test"))
     }
 
+    // MARK: - Default contract
+
+    /// `ClientConfiguration`'s Swift-side defaults must be
+    /// bit-identical to the SDK's Rust-side `ClientConfig::new`
+    /// defaults exposed through the FFI helper
+    /// `default_client_config(...)`. This is the load-bearing
+    /// drift-prevention test — if a Rust default changes (e.g.
+    /// `retry_budget` moves from 60s to 90s) the new value flows
+    /// out through `defaultClientConfig` and this test fails
+    /// loudly until the Swift literal is updated to match.
+    ///
+    /// Without this test, prior to its addition, the Swift
+    /// `retryBudget` defaulted to 30s while Rust defaulted to
+    /// 60s — every iOS client got half the intended retry budget
+    /// because the FFI `client_open` unconditionally overwrites
+    /// `core_cfg.retry_budget` with whatever the Swift side
+    /// passes in.
+    func testSwiftDefaultsMatchRustDefaults() {
+        let bff = URL(string: "https://kmail.test")!
+        let bearer = "test-bearer"
+        let dbURL = URL(fileURLWithPath: "/tmp/kmail.sqlite")
+
+        let swift = ClientConfiguration(
+            bffURL: bff,
+            bearerToken: bearer,
+            databaseURL: dbURL
+        ).toFFI()
+        let rust = defaultClientConfig(
+            bffUrl: bff.absoluteString,
+            bearerToken: bearer,
+            databasePath: dbURL.path
+        )
+
+        XCTAssertEqual(swift.bffUrl, rust.bffUrl)
+        XCTAssertEqual(swift.bearerToken, rust.bearerToken)
+        XCTAssertEqual(swift.databasePath, rust.databasePath)
+        XCTAssertEqual(
+            swift.attachmentCacheBytes, rust.attachmentCacheBytes,
+            "attachmentCacheBytes drifted between Swift default and Rust ClientConfig::new"
+        )
+        XCTAssertEqual(
+            swift.requestTimeoutSecs, rust.requestTimeoutSecs,
+            "requestTimeout drifted between Swift default and Rust ClientConfig::new"
+        )
+        XCTAssertEqual(
+            swift.retryBudgetSecs, rust.retryBudgetSecs,
+            "retryBudget drifted between Swift default and Rust ClientConfig::new (was 30 vs 60 — every iOS client got half the intended retry budget)"
+        )
+        XCTAssertEqual(
+            swift.initialSyncEmailWindow, rust.initialSyncEmailWindow,
+            "initialSyncEmailWindow drifted between Swift default and Rust ClientConfig::new"
+        )
+        XCTAssertEqual(
+            swift.accountId, rust.accountId,
+            "accountID drifted between Swift default and Rust ClientConfig::new"
+        )
+        XCTAssertEqual(
+            swift.bootstrapMailboxRole, rust.bootstrapMailboxRole,
+            "bootstrapMailboxRole drifted between Swift default and Rust ClientConfig::new (Rust defaults to Some(\"inbox\"); Swift must match)"
+        )
+    }
+
     // MARK: - Timeout clamp
 
     /// `ClientConfiguration.toFFI()` lowers `TimeInterval` (Double)
