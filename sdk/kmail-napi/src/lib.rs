@@ -24,7 +24,7 @@ use std::time::Duration;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
-use kmail_core::{ClientConfig, EmailDraft, KMailClient, MailboxRole};
+use kmail_core::{ClientConfig, EmailDraft, KMailClient};
 
 // ---------------------------------------------------------------
 // Error mapping
@@ -126,27 +126,11 @@ fn bigint_u64(v: u64) -> BigInt {
     BigInt::from(v)
 }
 
-fn role_to_str(role: MailboxRole) -> &'static str {
-    match role {
-        MailboxRole::Inbox => "inbox",
-        MailboxRole::Archive => "archive",
-        MailboxRole::Drafts => "drafts",
-        MailboxRole::Sent => "sent",
-        MailboxRole::Trash => "trash",
-        MailboxRole::Junk => "junk",
-        MailboxRole::Important => "important",
-        MailboxRole::All => "all",
-        MailboxRole::Flagged => "flagged",
-        MailboxRole::Vault => "vault",
-        MailboxRole::Unknown => "unknown",
-    }
-}
-
 fn mailbox_to_js(m: kmail_core::Mailbox) -> JsMailbox {
     JsMailbox {
         id: m.id,
         name: m.name,
-        role: m.role.map(|r| role_to_str(r).to_string()),
+        role: m.role.map(|r| r.canonical_name().to_string()),
         parent_id: m.parent_id,
         sort_order: m.sort_order,
         total_emails: bigint_u64(m.total_emails),
@@ -246,6 +230,14 @@ impl KMailClientJs {
         let inner = (*self.inner).clone();
         let summary = inner.sync().await.map_err(napi_err)?;
         Ok(sync_summary_to_js(summary))
+    }
+
+    /// Hot-swap the OIDC bearer token. Electron should call this from
+    /// whatever refresh-token flow it owns, rather than recreating the
+    /// SDK instance.
+    #[napi]
+    pub fn set_bearer_token(&self, token: String) -> Result<()> {
+        self.inner.set_bearer_token(token).map_err(napi_err)
     }
 
     #[napi]

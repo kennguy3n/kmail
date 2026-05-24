@@ -51,12 +51,19 @@ use tokio::sync::OnceCell;
 const MAX_EMAIL_CHANGES_BATCHES_PER_SYNC: u32 = 64;
 
 /// SDK configuration.
-#[derive(Clone, Debug)]
+///
+/// `Debug` is implemented by hand so that `bearer_token` is
+/// **never** rendered verbatim, even via `tracing::debug!(?cfg, ...)`.
+/// The struct still derives `Clone`; the redaction is purely a
+/// defence-in-depth measure to keep OIDC tokens out of crash logs,
+/// breadcrumbs, and telemetry pipelines.
+#[derive(Clone)]
 pub struct ClientConfig {
     /// Absolute BFF base URL (e.g. `https://kmail.example.com`).
     pub bff_url: String,
-    /// OIDC bearer token. The platform shell refreshes it; the SDK
-    /// does not run OAuth flows itself.
+    /// OIDC bearer token. The platform shell refreshes it via
+    /// [`KMailClient::set_bearer_token`]; the SDK does not run OAuth
+    /// flows itself.
     pub bearer_token: String,
     /// Path to the per-account SQLite database.
     pub database_path: PathBuf,
@@ -92,6 +99,22 @@ impl ClientConfig {
             initial_sync_email_window: 200,
             bootstrap_mailbox_role: Some("inbox".into()),
         }
+    }
+}
+
+impl std::fmt::Debug for ClientConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientConfig")
+            .field("bff_url", &self.bff_url)
+            .field("bearer_token", &"<redacted>")
+            .field("database_path", &self.database_path)
+            .field("account_id", &self.account_id)
+            .field("attachment_cache_bytes", &self.attachment_cache_bytes)
+            .field("request_timeout", &self.request_timeout)
+            .field("retry_budget", &self.retry_budget)
+            .field("initial_sync_email_window", &self.initial_sync_email_window)
+            .field("bootstrap_mailbox_role", &self.bootstrap_mailbox_role)
+            .finish()
     }
 }
 
@@ -163,6 +186,21 @@ impl KMailClient {
             session: Arc::new(OnceCell::new()),
             account_id: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// Hot-swap the OIDC bearer token used for every future JMAP
+    /// request, without rebuilding the SDK.
+    ///
+    /// OIDC access tokens typically expire after 5-60 minutes. The
+    /// platform shell (iOS / Android / Electron) is responsible for
+    /// running the refresh flow and pushing the new token down via
+    /// this method. Refresh is observed by every existing clone of
+    /// `KMailClient` — no reconnect, no in-flight request failure,
+    /// and no need to close+reopen the SQLite store (which would
+    /// otherwise mean re-running migrations and dropping the
+    /// attachment cache).
+    pub fn set_bearer_token(&self, token: impl Into<String>) -> Result<()> {
+        self.jmap.set_bearer_token(token)
     }
 
     /// Fetch (or return the cached) JMAP session resource.
@@ -1188,5 +1226,51 @@ mod tests {
         let in_inbox = client.cached_emails_in_mailbox("mbx-inbox", 50).unwrap();
         assert!(in_inbox.iter().any(|e| e.id == "e-batch1"));
         assert!(in_inbox.iter().any(|e| e.id == "e-batch2"));
+    }
+
+    /// Regression: `ClientConfig::Debug` MUST NOT render the bearer
+    /// token. A future `tracing::debug!(?config, ...)` should print
+    /// `<redacted>` instead of leaking the OIDC token into structured
+    /// logs.
+    #[test]
+    fn client_config_debug_redacts_bearer_token() {
+        let cfg = ClientConfig::new(
+            "https://kmail.example.com",
+            "eyJhbGciOiJSUzI1NiJ9.this-is-a-real-looking-jwt",
+            PathBuf::from("/tmp/kmail-redact.db"),
+        );
+        let dbg = format!("{cfg:?}");
+        assert!(!dbg.contains("eyJhbGciOiJSUzI1NiJ9"), "token leaked: {dbg}");
+        assert!(!dbg.contains("real-looking-jwt"), "token leaked: {dbg}");
+        assert!(
+            dbg.contains("<redacted>"),
+            "expected redaction marker, got: {dbg}"
+        );
+        // Non-secret fields should still be visible for debuggability.
+        assert!(dbg.contains("kmail.example.com"));
+    }
+
+    /// Regression: `KMailClient::set_bearer_token` must be observable
+    /// by sibling clones of the same client, since the FFI / napi
+    /// layers freely clone the inner `KMailClient`. The transport
+    /// holds the token behind `Arc<RwLock<String>>`; this test pins
+    /// that contract.
+    #[tokio::test]
+    async fn set_bearer_token_is_visible_to_clones() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("kmail-token.db");
+        let mut cfg = ClientConfig::new("https://kmail.example.com", "v0-token", db);
+        cfg.account_id = Some("acct-fixed".into());
+        let client = KMailClient::open(cfg).unwrap();
+        let cloned = client.clone();
+
+        client.set_bearer_token("v1-token").unwrap();
+
+        // Any path that reads the live token must see the new value.
+        // The transport is the source of truth; both clones share it.
+        let live_via_origin = client.jmap.current_bearer_token_for_test().unwrap();
+        let live_via_clone = cloned.jmap.current_bearer_token_for_test().unwrap();
+        assert_eq!(live_via_origin, "v1-token");
+        assert_eq!(live_via_clone, "v1-token");
     }
 }

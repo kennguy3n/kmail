@@ -54,6 +54,19 @@ impl JmapClient {
         self
     }
 
+    /// Hot-swap the OIDC bearer token. Delegates to the underlying
+    /// transport — see [`JmapTransport::set_bearer_token`] for the
+    /// atomicity / cross-clone visibility guarantees.
+    pub fn set_bearer_token(&self, token: impl Into<String>) -> Result<()> {
+        self.transport.set_bearer_token(token)
+    }
+
+    /// Test-only accessor for the live bearer token.
+    #[doc(hidden)]
+    pub fn current_bearer_token_for_test(&self) -> Result<String> {
+        self.transport.current_bearer_token_for_test()
+    }
+
     /// `GET /jmap/session` → `JmapSession`.
     pub async fn session(&self) -> Result<JmapSession> {
         self.transport.get_json(&self.session_path).await

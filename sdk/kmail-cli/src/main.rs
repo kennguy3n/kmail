@@ -180,7 +180,7 @@ fn run_mailboxes(args: LocalDbArgs) -> Result<()> {
             serde_json::json!({
                 "id": m.id,
                 "name": m.name,
-                "role": m.role.map(|r| format!("{r:?}").to_lowercase()),
+                "role": m.role.map(|r| r.canonical_name()),
                 "total": m.total_emails,
                 "unread": m.unread_emails,
                 "vault": m.is_vault,

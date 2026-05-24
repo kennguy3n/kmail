@@ -33,9 +33,27 @@ impl AttachmentCache {
 
     /// Insert or refresh a blob in the cache, evicting LRU entries
     /// if the total cached bytes would exceed `max_bytes`.
+    ///
+    /// Payloads larger than `max_bytes` are rejected up-front with
+    /// `Error::InvalidArgument` — caching them would be a no-op (the
+    /// eviction sweep would immediately reclaim the just-inserted row
+    /// after `get()` returns `None`), so we fail loudly instead of
+    /// silently dropping the write.
+    ///
+    /// Eviction never targets the just-inserted blob; the candidate
+    /// SELECT explicitly excludes `blob_id`. This guarantees that any
+    /// successful `put(id, ...)` followed by `get(id)` returns the
+    /// payload, no matter how many other entries get evicted.
     pub fn put(&self, blob_id: &str, content_type: Option<&str>, payload: &[u8]) -> Result<()> {
         if blob_id.is_empty() {
             return Err(Error::InvalidArgument("blob_id is empty".into()));
+        }
+        let payload_len = payload.len() as u64;
+        if payload_len > self.max_bytes {
+            return Err(Error::InvalidArgument(format!(
+                "payload of {payload_len} bytes exceeds attachment_cache_bytes ({})",
+                self.max_bytes,
+            )));
         }
         let now = Utc::now().timestamp();
         let max_bytes = self.max_bytes;
@@ -58,7 +76,9 @@ impl AttachmentCache {
                     payload,
                 ],
             )?;
-            // Evict LRU rows until total cached bytes fit.
+            // Evict LRU rows until total cached bytes fit. Exclude the
+            // just-inserted row so a payload at the capacity boundary
+            // never kicks itself out.
             let total: i64 =
                 tx.query_row("SELECT COALESCE(SUM(size), 0) FROM blob_cache", [], |r| {
                     r.get(0)
@@ -68,9 +88,11 @@ impl AttachmentCache {
                 let mut victims: Vec<String> = Vec::new();
                 {
                     let mut stmt = tx.prepare(
-                        "SELECT blob_id, size FROM blob_cache ORDER BY last_accessed_at ASC",
+                        "SELECT blob_id, size FROM blob_cache \
+                         WHERE blob_id != ?1 \
+                         ORDER BY last_accessed_at ASC",
                     )?;
-                    let mut rows = stmt.query([])?;
+                    let mut rows = stmt.query([blob_id])?;
                     while let Some(row) = rows.next()? {
                         if over == 0 {
                             break;
@@ -210,5 +232,49 @@ mod tests {
         let cache = AttachmentCache::new(store, 1024);
         let err = cache.put("", None, b"x").unwrap_err();
         assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    /// Regression: a payload larger than `max_bytes` must be rejected
+    /// up-front rather than silently inserted then immediately evicted
+    /// by the LRU sweep (which would leave the caller observing
+    /// `Ok(())` from `put` followed by `None` from `get`).
+    #[test]
+    fn oversized_payload_rejected() {
+        let store = fresh_store();
+        let cache = AttachmentCache::new(store, 16);
+        let err = cache.put("too-big", None, &[0u8; 64]).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+        // And nothing was written.
+        assert_eq!(cache.total_bytes().unwrap(), 0);
+    }
+
+    /// Regression: when the cache is already saturated, inserting a
+    /// new blob right at the capacity boundary must keep the new blob
+    /// retrievable (eviction targets older entries, not the row we
+    /// just wrote).
+    #[test]
+    fn just_inserted_blob_survives_eviction_at_boundary() {
+        let store = fresh_store();
+        // Capacity holds exactly two 8-byte entries.
+        let cache = AttachmentCache::new(store, 16);
+
+        cache.put("old-1", None, &[0u8; 8]).unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        cache.put("old-2", None, &[0u8; 8]).unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        // Inserting a third 8-byte blob would push total to 24, so
+        // the cache must evict the oldest (`old-1`) — and must NOT
+        // evict `new` itself.
+        cache.put("new", None, &[1u8; 8]).unwrap();
+
+        assert!(
+            cache.get("new").unwrap().is_some(),
+            "just-inserted blob must never be the eviction victim"
+        );
+        assert!(
+            cache.get("old-1").unwrap().is_none(),
+            "oldest LRU entry must be evicted to make room"
+        );
+        assert!(cache.get("old-2").unwrap().is_some());
     }
 }

@@ -19,9 +19,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use kmail_core::{
-    ClientConfig, EmailAddress, EmailDraft, EmailSummary, KMailClient, Mailbox, MailboxRole,
-};
+use kmail_core::{ClientConfig, EmailAddress, EmailDraft, EmailSummary, KMailClient, Mailbox};
 
 uniffi::setup_scaffolding!();
 
@@ -188,28 +186,12 @@ pub struct FfiSyncSummary {
 // Conversions
 // ---------------------------------------------------------------
 
-fn role_to_str(role: MailboxRole) -> &'static str {
-    match role {
-        MailboxRole::Inbox => "inbox",
-        MailboxRole::Archive => "archive",
-        MailboxRole::Drafts => "drafts",
-        MailboxRole::Sent => "sent",
-        MailboxRole::Trash => "trash",
-        MailboxRole::Junk => "junk",
-        MailboxRole::Important => "important",
-        MailboxRole::All => "all",
-        MailboxRole::Flagged => "flagged",
-        MailboxRole::Vault => "vault",
-        MailboxRole::Unknown => "unknown",
-    }
-}
-
 impl From<Mailbox> for FfiMailbox {
     fn from(m: Mailbox) -> Self {
         FfiMailbox {
             id: m.id,
             name: m.name,
-            role: m.role.map(|r| role_to_str(r).to_string()),
+            role: m.role.map(|r| r.canonical_name().to_string()),
             parent_id: m.parent_id,
             sort_order: m.sort_order,
             total_emails: m.total_emails,
@@ -305,6 +287,13 @@ impl KMailClientHandle {
         Ok(summary.into())
     }
 
+    /// Hot-swap the OIDC bearer token. iOS / Android shells should
+    /// call this whenever they refresh the access token, instead of
+    /// closing and reopening the client.
+    pub fn set_bearer_token(&self, token: String) -> Result<(), KMailError> {
+        self.inner.set_bearer_token(token).map_err(Into::into)
+    }
+
     pub fn cached_mailboxes(&self) -> Result<Vec<FfiMailbox>, KMailError> {
         Ok(self
             .inner
@@ -380,6 +369,7 @@ impl KMailClientHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kmail_core::MailboxRole;
 
     /// Trip every `kmail_core::Error` variant through the FFI
     /// `From` impl and assert the variant tag is preserved. A
@@ -432,8 +422,19 @@ mod tests {
             MailboxRole::Vault,
             MailboxRole::Unknown,
         ] {
-            let s = role_to_str(r);
+            let s = r.canonical_name();
             assert!(!s.is_empty());
+            // Round-trip via canonical name proves the FFI label
+            // matches the JMAP wire form (no Debug-derive coupling).
+            // `Unknown` is the catch-all sentinel and has no real
+            // wire spelling, so it intentionally does NOT round-trip
+            // back through `from_canonical_name` — match the contract
+            // pinned in `models::tests::mailbox_role_canonical_name_matches_wire`.
+            if matches!(r, MailboxRole::Unknown) {
+                assert!(MailboxRole::from_canonical_name(s).is_none());
+            } else {
+                assert_eq!(MailboxRole::from_canonical_name(s), Some(r));
+            }
         }
     }
 }

@@ -18,16 +18,21 @@
 use crate::error::{Error, Result};
 use reqwest::{header, Client, StatusCode};
 use serde::Serialize;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 /// Tunable knobs for the transport. Defaults mirror the React web
 /// client's reqwest equivalents — same timeouts, same retry policy.
-#[derive(Clone, Debug)]
+///
+/// `Debug` is implemented by hand so that `bearer_token` is **never**
+/// rendered verbatim, even via `tracing::debug!(?cfg, ...)`.
+#[derive(Clone)]
 pub struct TransportConfig {
     /// Absolute base URL of the BFF (e.g. `https://kmail.example.com`).
     pub base_url: String,
-    /// OIDC bearer token presented on every request. Refreshed by
-    /// the platform shell; the SDK does not run OAuth itself.
+    /// OIDC bearer token presented on every request. Hot-swappable
+    /// via [`JmapTransport::set_bearer_token`]; the SDK does not run
+    /// OAuth itself.
     pub bearer_token: String,
     /// Per-request timeout. Default 30s, matches the BFF's
     /// 30s circuit-breaker open window.
@@ -56,9 +61,33 @@ impl TransportConfig {
     }
 }
 
+impl std::fmt::Debug for TransportConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TransportConfig")
+            .field("base_url", &self.base_url)
+            .field("bearer_token", &"<redacted>")
+            .field("request_timeout", &self.request_timeout)
+            .field("retry_budget", &self.retry_budget)
+            .field("max_attempts", &self.max_attempts)
+            .field("user_agent", &self.user_agent)
+            .finish()
+    }
+}
+
+/// Reqwest-backed JMAP transport.
+///
+/// The bearer token lives in `Arc<RwLock<String>>` so that
+/// [`set_bearer_token`] is visible to every clone of this transport
+/// (and therefore to every clone of `JmapClient` / `KMailClient`).
+/// Read-lock acquisition on the request path is uncontended in
+/// steady state — the writer is the platform shell calling refresh
+/// once every few minutes when the OIDC access token rotates.
 #[derive(Clone)]
 pub struct JmapTransport {
-    config: TransportConfig,
+    base_url: String,
+    bearer_token: Arc<RwLock<String>>,
+    retry_budget: Duration,
+    max_attempts: u32,
     client: Client,
 }
 
@@ -79,17 +108,56 @@ impl JmapTransport {
             .tcp_keepalive(Duration::from_secs(60))
             .build()
             .map_err(|e| Error::Transport(format!("client build failed: {e}")))?;
-        Ok(Self { config, client })
+        Ok(Self {
+            base_url: config.base_url,
+            bearer_token: Arc::new(RwLock::new(config.bearer_token)),
+            retry_budget: config.retry_budget,
+            max_attempts: config.max_attempts,
+            client,
+        })
+    }
+
+    /// Hot-swap the OIDC bearer token. The new value is observed by
+    /// every existing clone of this transport on the next request
+    /// — no reconnect, no client rebuild, no in-flight request
+    /// failure. Returns `Err(Error::Store("poisoned"))` if the
+    /// internal lock has been poisoned by a panicking writer (a
+    /// near-impossible failure mode, surfaced as a recoverable error
+    /// rather than a process-wide panic).
+    pub fn set_bearer_token(&self, token: impl Into<String>) -> Result<()> {
+        let mut guard = self
+            .bearer_token
+            .write()
+            .map_err(|_| Error::Store("transport bearer-token lock poisoned".into()))?;
+        *guard = token.into();
+        Ok(())
+    }
+
+    fn current_token(&self) -> Result<String> {
+        let guard = self
+            .bearer_token
+            .read()
+            .map_err(|_| Error::Store("transport bearer-token lock poisoned".into()))?;
+        Ok(guard.clone())
+    }
+
+    /// Test-only accessor. Exposes the live bearer token without
+    /// issuing a network request, so unit tests can assert that
+    /// [`set_bearer_token`] is observed by cloned transports.
+    #[doc(hidden)]
+    pub fn current_bearer_token_for_test(&self) -> Result<String> {
+        self.current_token()
     }
 
     /// GET a JSON resource. Used for `/jmap/session`.
     pub async fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
         let url = self.absolute_url(path);
         self.with_retries(|| async {
+            let token = self.current_token()?;
             let resp = self
                 .client
                 .get(&url)
-                .bearer_auth(&self.config.bearer_token)
+                .bearer_auth(&token)
                 .header(header::ACCEPT, "application/json")
                 .send()
                 .await?;
@@ -106,10 +174,11 @@ impl JmapTransport {
     ) -> Result<T> {
         let url = self.absolute_url(path);
         self.with_retries(|| async {
+            let token = self.current_token()?;
             let resp = self
                 .client
                 .post(&url)
-                .bearer_auth(&self.config.bearer_token)
+                .bearer_auth(&token)
                 .header(header::CONTENT_TYPE, "application/json")
                 .header(header::ACCEPT, "application/json")
                 .json(body)
@@ -124,9 +193,9 @@ impl JmapTransport {
         if path.starts_with("http://") || path.starts_with("https://") {
             path.to_string()
         } else if path.starts_with('/') {
-            format!("{}{}", self.config.base_url.trim_end_matches('/'), path)
+            format!("{}{}", self.base_url.trim_end_matches('/'), path)
         } else {
-            format!("{}/{}", self.config.base_url.trim_end_matches('/'), path)
+            format!("{}/{}", self.base_url.trim_end_matches('/'), path)
         }
     }
 
@@ -145,8 +214,7 @@ impl JmapTransport {
                 Ok(value) => return Ok(value),
                 Err(e) => {
                     let elapsed = start.elapsed();
-                    let last_attempt =
-                        attempt >= self.config.max_attempts || elapsed >= self.config.retry_budget;
+                    let last_attempt = attempt >= self.max_attempts || elapsed >= self.retry_budget;
                     if !e.is_retryable() || last_attempt {
                         return Err(e);
                     }
