@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"errors"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -502,13 +503,23 @@ func TestMapTokenError_PassesThroughOAuthError(t *testing.T) {
 	}
 }
 
-func TestMapTokenError_UnknownErrorCollapsesToInvalidGrant(t *testing.T) {
-	// Unknown errors must collapse to invalid_grant (not
-	// server_error) so we don't leak internal error text to a
-	// third-party client.
+func TestMapTokenError_UnknownErrorMapsToServerError(t *testing.T) {
+	// Unknown / infrastructure errors must surface as
+	// server_error / 500 so the 5xx-rate SLO catches outages and
+	// clients retry. Previously these collapsed to invalid_grant
+	// / 400, which (a) caused clients to give up on transient
+	// DB failures and (b) hid real backend incidents from
+	// monitoring. RFC 6749 §5.2 reserves invalid_grant for grants
+	// the client could legitimately have known were invalid —
+	// not for "the server blew up looking up the grant". The
+	// description still does NOT echo the inner error text so
+	// schema details don't leak to third-party apps.
 	got := mapTokenError(errors.New("some internal db error"))
-	if got.Code != ErrCodeInvalidGrant {
-		t.Errorf("unknown error: got code %s, want %s", got.Code, ErrCodeInvalidGrant)
+	if got.Code != ErrCodeServerError {
+		t.Errorf("unknown error: got code %s, want %s", got.Code, ErrCodeServerError)
+	}
+	if got.HTTPStatus != http.StatusInternalServerError {
+		t.Errorf("unknown error: got status %d, want %d", got.HTTPStatus, http.StatusInternalServerError)
 	}
 	if strings.Contains(got.Description, "db") {
 		t.Errorf("description leaked internal text: %q", got.Description)

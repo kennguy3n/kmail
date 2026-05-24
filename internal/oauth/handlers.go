@@ -311,7 +311,18 @@ func (h *Handlers) Approve(w http.ResponseWriter, r *http.Request) {
 	}
 
 	userID, tenantID, ok := h.UserResolver(r)
-	if !ok {
+	if !ok || userID == "" || tenantID == "" {
+		// Mirror the Authorize guard: an OIDC resolver that returns
+		// ok=true with an empty userID or tenantID is a configuration
+		// bug, not an authentication failure of the third-party app.
+		// Treat it as an unauthenticated request rather than letting
+		// the empty-string flow downstream and surface either as a
+		// confused "unknown or inactive client" 400 (empty tenantID
+		// path hitting GetClient) or as a generic server_error
+		// returned via redirectWithOAuthError after
+		// IssueAuthorizationCode rejects the empty user_id —
+		// neither of which matches the spec's required redirect
+		// semantics. The client app sees a clean 401 instead.
 		http.Error(w, "authentication required", http.StatusUnauthorized)
 		return
 	}
@@ -617,30 +628,38 @@ func (h *Handlers) redirectWithOAuthError(w http.ResponseWriter, r *http.Request
 // right Code + HTTPStatus already populated, and `errors.As`
 // unwraps that here. The sentinel checks below are the secondary
 // path: a handful of service functions (specifically
-// RefreshAccessToken) return plain `errors.New(...)` sentinels
-// instead of *OAuthError so the inner Postgres transaction can
-// roll back via a typed return and the outer caller still gets a
-// stable wire shape.
+// RefreshAccessToken and the Exchange code path) return plain
+// `errors.New(...)` sentinels instead of *OAuthError so the
+// inner Postgres transaction can roll back via a typed return and
+// the outer caller still gets a stable wire shape.
 //
-// Only the sentinels actually returned to mapTokenError are kept
-// in the switch. The others (ErrCodeNotFound, ErrCodeAlreadyConsumed,
-// ErrInvalidRedirectURI, ErrInvalidCodeVerifier, ErrPKCERequiredButMissing)
-// would also map to invalid_grant if they ever appeared, but no
-// /oauth/token code path returns them today — they're either
-// returned via *OAuthError (and unwrapped above) or returned from
-// IssueAuthorizationCode (which is called from /oauth/authorize,
-// not /oauth/token). Adding them defensively was masking a real
-// gap in test coverage; remove them so any future regression that
-// routes one through here is caught by the default branch's
-// "authorization grant invalid" reply (which is the right
-// fallback for /oauth/token anyway per RFC 6749 §5.2).
+// Every sentinel that is a *client mistake* is enumerated below.
+// Anything that falls through to the default branch is, by
+// definition, NOT a recognised client mistake — it is either an
+// infrastructure failure (a pgx connection error, a pool
+// exhaustion, a panicked driver) or a future sentinel that was
+// added without updating this map. Both deserve a 5xx so the
+// client retries and operator alerting fires. Misclassifying them
+// as invalid_grant/400 (the previous default) would cause clients
+// to give up on requests that are actually server-side failures
+// AND would hide outages from the 5xx-rate SLOs. See RFC 6749
+// §5.2: invalid_grant is reserved for grants the client could
+// have legitimately known were invalid — not for "the server
+// blew up while looking up the grant".
 func mapTokenError(err error) *OAuthError {
 	var oerr *OAuthError
 	if errors.As(err, &oerr) {
 		return oerr
 	}
 	switch {
-	case errors.Is(err, ErrRefreshTokenNotFound),
+	// Client mistakes: invalid_grant per RFC 6749 §5.2. Stable
+	// wire shape regardless of which inner check tripped.
+	case errors.Is(err, ErrCodeNotFound),
+		errors.Is(err, ErrCodeAlreadyConsumed),
+		errors.Is(err, ErrInvalidRedirectURI),
+		errors.Is(err, ErrInvalidCodeVerifier),
+		errors.Is(err, ErrPKCERequiredButMissing),
+		errors.Is(err, ErrRefreshTokenNotFound),
 		errors.Is(err, ErrRefreshTokenReplay):
 		return &OAuthError{Code: ErrCodeInvalidGrant, Description: "authorization grant invalid", HTTPStatus: http.StatusBadRequest}
 	case errors.Is(err, ErrScopeNotAllowed):
@@ -648,7 +667,16 @@ func mapTokenError(err error) *OAuthError {
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
 		return &OAuthError{Code: ErrCodeServerError, Description: "request cancelled", HTTPStatus: http.StatusServiceUnavailable}
 	default:
-		return &OAuthError{Code: ErrCodeInvalidGrant, Description: "authorization grant invalid", HTTPStatus: http.StatusBadRequest}
+		// Anything else is a server-side failure: DB unreachable,
+		// pool exhausted, driver panic, a new sentinel that nobody
+		// remembered to add above, etc. Reply 500 so the client
+		// retries and the on-call SLO catches the regression. The
+		// description deliberately does NOT echo err.Error() —
+		// surfacing the raw pgx / driver message to third-party
+		// apps would leak schema details; the structured log
+		// emitted by the surrounding handler is the channel that
+		// keeps the diagnostic info.
+		return &OAuthError{Code: ErrCodeServerError, Description: "internal error issuing token", HTTPStatus: http.StatusInternalServerError}
 	}
 }
 

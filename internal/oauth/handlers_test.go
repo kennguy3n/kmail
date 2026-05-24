@@ -149,6 +149,19 @@ func userResolverFail(_ *http.Request) (string, string, bool) {
 	return "", "", false
 }
 
+// userResolverEmptyUserID models a misconfigured OIDC middleware
+// that returns ok=true but with an empty userID string. The
+// handler MUST treat this as unauthenticated rather than letting
+// the empty value flow downstream — see TestApprove_RejectsEmptyUserID
+// and TestAuthorize_RejectsEmptyUserID below.
+func userResolverEmptyUserID(_ *http.Request) (string, string, bool) {
+	return "", "tenant-1", true
+}
+
+func userResolverEmptyTenantID(_ *http.Request) (string, string, bool) {
+	return "user-1", "", true
+}
+
 // makeConfidentialClient is the shape RegisterClient produces
 // in the real Service, abbreviated to the fields handlers read.
 func makeConfidentialClient() *Client {
@@ -359,6 +372,51 @@ func TestApprove_RejectsUnauthenticated(t *testing.T) {
 	h.Approve(rr, req)
 	if rr.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %d", rr.Code)
+	}
+}
+
+// TestApprove_RejectsEmptyUserID pins the guard against a
+// misconfigured OIDC resolver returning ok=true but with empty
+// userID. Without this guard the request would flow into
+// IssueAuthorizationCode where service.go:327 emits a plain
+// errors.New("oauth: user_id required") that the handler's
+// redirectWithOAuthError fallback wraps in a generic server_error
+// redirect — the caller sees a confused "server is broken"
+// response when the actual root cause is "your auth middleware
+// never resolved the user".
+func TestApprove_RejectsEmptyUserID(t *testing.T) {
+	svc := newFakeService()
+	svc.clients["client-conf-1"] = makeConfidentialClient()
+	h := newHandlersWithAPI(svc, userResolverEmptyUserID)
+	form := url.Values{}
+	form.Set("client_id", "client-conf-1")
+	form.Set("redirect_uri", "https://app.example.com/cb")
+	form.Set("decision", "approve")
+	rr := httptest.NewRecorder()
+	h.Approve(rr, newApproveRequest(form))
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("empty userID: expected 401, got %d (body=%q)", rr.Code, rr.Body.String())
+	}
+	if svc.calls["IssueAuthorizationCode"] != 0 {
+		t.Errorf("must not reach IssueAuthorizationCode on empty userID, got %d calls", svc.calls["IssueAuthorizationCode"])
+	}
+}
+
+func TestApprove_RejectsEmptyTenantID(t *testing.T) {
+	svc := newFakeService()
+	svc.clients["client-conf-1"] = makeConfidentialClient()
+	h := newHandlersWithAPI(svc, userResolverEmptyTenantID)
+	form := url.Values{}
+	form.Set("client_id", "client-conf-1")
+	form.Set("redirect_uri", "https://app.example.com/cb")
+	form.Set("decision", "approve")
+	rr := httptest.NewRecorder()
+	h.Approve(rr, newApproveRequest(form))
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("empty tenantID: expected 401, got %d (body=%q)", rr.Code, rr.Body.String())
+	}
+	if svc.calls["IssueAuthorizationCode"] != 0 {
+		t.Errorf("must not reach IssueAuthorizationCode on empty tenantID, got %d calls", svc.calls["IssueAuthorizationCode"])
 	}
 }
 

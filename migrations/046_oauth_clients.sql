@@ -128,7 +128,11 @@ CREATE TABLE IF NOT EXISTS oauth_access_tokens (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     -- The refresh_token row that this access token is bound to,
     -- so revoking a refresh token cascades to all access tokens
-    -- it ever issued (rotation safety).
+    -- it ever issued (rotation safety). The FK constraint is
+    -- added via ALTER TABLE below — declaring it inline would
+    -- forward-reference oauth_refresh_tokens (created later in
+    -- the same migration). See the constraint definition near
+    -- the end of this file for the ON DELETE semantics.
     refresh_token_id UUID
 );
 CREATE INDEX IF NOT EXISTS idx_oauth_tokens_expires ON oauth_access_tokens(expires_at);
@@ -171,5 +175,54 @@ ALTER TABLE oauth_refresh_tokens ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS rls_oauth_refresh ON oauth_refresh_tokens;
 CREATE POLICY rls_oauth_refresh ON oauth_refresh_tokens
     USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
+
+-- Bind oauth_access_tokens.refresh_token_id to its parent refresh
+-- token. The constraint is declared here (post-CREATE of both
+-- tables) because oauth_refresh_tokens didn't exist when
+-- oauth_access_tokens was defined above.
+--
+-- ON DELETE SET NULL is the right semantic for this column:
+--   * CASCADE would mass-delete access tokens whenever a refresh
+--     token row is hard-deleted (e.g. a DBA-run retention job).
+--     Until expires_at fires, those access tokens are valid
+--     bearer credentials — dropping the rows behind their back
+--     would yield unexpected 401s without an audit trail.
+--   * RESTRICT would block legitimate cleanup of expired
+--     refresh-token rows whenever any old access token still
+--     pointed at them, even though revoked_at had already done
+--     the security work.
+--   * SET NULL preserves the access-token row, breaks the
+--     orphaned linkage, and makes the orphan visible (the
+--     access token's revocation cascade can no longer find a
+--     parent — operationally, the audit pipeline can flag any
+--     unrevoked access_token with refresh_token_id IS NULL that
+--     post-dates the deployment of this constraint).
+--
+-- NOT VALID is omitted: this migration runs on an empty table on
+-- first deploy (047_* hasn't been backfilled yet) and the FK
+-- check is cheap. On subsequent deploys, the constraint already
+-- exists and ALTER TABLE ... ADD CONSTRAINT IF NOT EXISTS is a
+-- no-op. The DO block below makes the ADD CONSTRAINT idempotent
+-- because Postgres has no native IF NOT EXISTS form for FK
+-- constraints.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'oauth_access_tokens_refresh_token_id_fkey'
+    ) THEN
+        ALTER TABLE oauth_access_tokens
+            ADD CONSTRAINT oauth_access_tokens_refresh_token_id_fkey
+            FOREIGN KEY (refresh_token_id)
+            REFERENCES oauth_refresh_tokens(id)
+            ON DELETE SET NULL;
+    END IF;
+END
+$$;
+
+-- Speed up the revocation cascade (UPDATE ... WHERE refresh_token_id = $1)
+-- and the orphan-detection query referenced above.
+CREATE INDEX IF NOT EXISTS idx_oauth_tokens_refresh_token_id
+    ON oauth_access_tokens(refresh_token_id);
 
 COMMIT;

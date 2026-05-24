@@ -618,6 +618,7 @@ func (s *Service) RefreshAccessToken(
 			   SET revoked_at = $2
 			 WHERE token_hash = $1
 			   AND revoked_at IS NULL
+			   AND expires_at  > $2
 			RETURNING id::text, client_id::text, user_id::text,
 			          scopes, expires_at
 		`, refreshHash, now).Scan(
@@ -625,27 +626,61 @@ func (s *Service) RefreshAccessToken(
 			&scopesRaw, &expiresAt,
 		)
 		if errors.Is(err, pgx.ErrNoRows) {
-			// Either the token doesn't exist at all, or some
-			// other in-flight call already revoked it (legit
-			// rotation race OR genuine replay of a leaked old
-			// token). A second SELECT in the same tx
-			// distinguishes the two cases. We don't run the
-			// chain revocation here — it has to happen in a
-			// fresh tx because this one is going to roll back
-			// (the atomic UPDATE didn't move anything but we
-			// still want clean tx semantics).
-			var existingID string
+			// The atomic UPDATE didn't match. Three reasons —
+			// distinguish them with a single follow-up SELECT
+			// so the caller gets a precise wire envelope:
+			//
+			//   (a) the token row genuinely doesn't exist →
+			//       ErrRefreshTokenNotFound (caller learned
+			//       the wrong secret or replayed after a hard
+			//       revoke).
+			//   (b) the row exists but revoked_at IS NOT NULL
+			//       (someone else consumed it, OR the chain
+			//       was already revoked because of an earlier
+			//       replay attempt) → ErrRefreshTokenReplay,
+			//       which triggers chain revocation outside
+			//       this tx.
+			//   (c) the row exists, is not revoked, but is
+			//       already past expires_at → typed OAuthError
+			//       "refresh token expired". No chain
+			//       revocation: an expired-but-unconsumed
+			//       token is the legitimate user's own token
+			//       that timed out, not a leaked replay.
+			//
+			// Doing the UPDATE WHERE expires_at > $2 (instead
+			// of accepting the row and bouncing it on a
+			// post-claim check) means an expired row stays
+			// available for the (c) detection path here, and
+			// also keeps the auth-code and refresh-token
+			// patterns symmetric — they both refuse to consume
+			// an expired row atomically.
+			var (
+				existingID    string
+				existingRev   *time.Time
+				existingExp   time.Time
+			)
 			selErr := tx.QueryRow(ctx, `
-				SELECT id::text FROM oauth_refresh_tokens WHERE token_hash = $1
-			`, refreshHash).Scan(&existingID)
+				SELECT id::text, revoked_at, expires_at
+				  FROM oauth_refresh_tokens
+				 WHERE token_hash = $1
+			`, refreshHash).Scan(&existingID, &existingRev, &existingExp)
 			if errors.Is(selErr, pgx.ErrNoRows) {
 				return ErrRefreshTokenNotFound
 			}
 			if selErr != nil {
 				return selErr
 			}
-			replayRowID = existingID
-			return ErrRefreshTokenReplay
+			if existingRev != nil {
+				replayRowID = existingID
+				return ErrRefreshTokenReplay
+			}
+			// (c) — expired but never revoked.
+			_ = existingExp
+			return &OAuthError{
+				Code:        ErrCodeInvalidGrant,
+				Description: "refresh token expired",
+				HTTPStatus:  400,
+			}
 		}
 		if err != nil {
 			return err
@@ -661,13 +696,14 @@ func (s *Service) RefreshAccessToken(
 				HTTPStatus:  400,
 			}
 		}
-		if now.After(expiresAt) {
-			return &OAuthError{
-				Code:        ErrCodeInvalidGrant,
-				Description: "refresh token expired",
-				HTTPStatus:  400,
-			}
-		}
+		// The UPDATE filter (`AND expires_at > $2`) already refused
+		// to consume an expired row, so by this point expiresAt is
+		// guaranteed to be in the future. The previous post-claim
+		// `now.After(expiresAt)` guard would have been triggered by
+		// the rollback path, leaving the revoked_at stamp undone —
+		// the new atomic filter avoids the lock-and-rollback churn
+		// entirely.
+		_ = expiresAt
 
 		var grantedScopes []string
 		if err := json.Unmarshal(scopesRaw, &grantedScopes); err != nil {
