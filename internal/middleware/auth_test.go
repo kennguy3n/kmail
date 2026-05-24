@@ -347,6 +347,20 @@ func TestNewOIDC_RefusesMissingJWKSInProduction(t *testing.T) {
 	if !strings.Contains(err.Error(), "JWKS") {
 		t.Errorf("expected JWKS error, got %v", err)
 	}
+	// Pin both env var names in the error so an operator landing
+	// here from a Helm-deployed cluster (KMAIL_-prefixed form) AND
+	// an operator landing here from a docker-compose / shell
+	// invocation (bare form) both find the right knob in the
+	// message. `getenvKMail` in internal/config/config.go resolves
+	// both forms, so the error message MUST advertise both.
+	for _, want := range []string{
+		"KMAIL_KCHAT_OIDC_ISSUER",
+		"KCHAT_OIDC_ISSUER",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("expected error to advertise %q, got %v", want, err)
+		}
+	}
 }
 
 func TestNewOIDC_RefusesEmptyEnvForJWKSlessConfig(t *testing.T) {
@@ -354,6 +368,30 @@ func TestNewOIDC_RefusesEmptyEnvForJWKSlessConfig(t *testing.T) {
 	// downgrade to the unverified-JWT fallback.
 	if _, err := NewOIDC(OIDCConfig{}); err == nil {
 		t.Fatal("expected NewOIDC to refuse empty Env with no JWKS")
+	}
+}
+
+// TestAuthenticate_NoJWKSInProductionAdvertisesBothEnvVarForms exercises
+// the runtime error path: a deployment that managed to construct an
+// OIDC instance with no JWKS (e.g. by mutating the config after
+// NewOIDC) must still surface BOTH env var names when authenticate
+// reaches the "no JWKS issuer configured" branch. Otherwise an
+// operator who hits this in a live cluster grep's the wrong name.
+func TestAuthenticate_NoJWKSInProductionAdvertisesBothEnvVarForms(t *testing.T) {
+	o := &OIDC{cfg: OIDCConfig{Env: EnvProduction}}
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Bearer some-token-that-is-not-the-dev-bypass")
+	_, err := o.authenticate(req)
+	if err == nil {
+		t.Fatal("expected authenticate to fail with no JWKS configured")
+	}
+	for _, want := range []string{
+		"KMAIL_KCHAT_OIDC_ISSUER",
+		"KCHAT_OIDC_ISSUER",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("expected runtime auth error to advertise %q, got %v", want, err)
+		}
 	}
 }
 

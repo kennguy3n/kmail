@@ -189,7 +189,15 @@ func NewOIDC(cfg OIDCConfig) (*OIDC, error) {
 		// unverified-claims fallback or a dev bypass token at
 		// runtime.
 		if cfg.JWKS == nil {
-			return nil, fmt.Errorf("middleware.NewOIDC: KMAIL_ENV=%q requires a JWKS issuer (set KCHAT_OIDC_ISSUER)", cfg.Env)
+			// Both env var forms work — the Helm chart's ConfigMap
+			// ships the `KMAIL_`-prefixed form (the convention the
+			// chart enforces across every KMail-owned var), while
+			// docker-compose and shell-script invocations have
+			// historically used the bare form. `getenvKMail` in
+			// `internal/config/config.go` resolves both, so an
+			// operator who reads the error and grep's their values
+			// finds the right env var either way.
+			return nil, fmt.Errorf("middleware.NewOIDC: KMAIL_ENV=%q requires a JWKS issuer (set KMAIL_KCHAT_OIDC_ISSUER or KCHAT_OIDC_ISSUER)", cfg.Env)
 		}
 		if cfg.DevBypassToken != "" {
 			return nil, fmt.Errorf("middleware.NewOIDC: KMAIL_ENV=%q forbids KMAIL_DEV_BYPASS_TOKEN; unset it", cfg.Env)
@@ -286,7 +294,11 @@ func (o *OIDC) authenticate(r *http.Request) (*Claims, error) {
 	// the BFF from ever serving a request whose identity was not
 	// cryptographically verified.
 	if !o.cfg.isDevEnv() {
-		return nil, errors.New("no JWKS issuer configured (set KCHAT_OIDC_ISSUER)")
+		// Mirror the wording of the boot-time NewOIDC error so an
+		// operator reading the runtime log lands on the same set
+		// of env-var names (the Helm-shipped KMAIL_-prefixed form
+		// and the bare form both work — see `getenvKMail`).
+		return nil, errors.New("no JWKS issuer configured (set KMAIL_KCHAT_OIDC_ISSUER or KCHAT_OIDC_ISSUER)")
 	}
 	claims, err := decodeJWTClaims(token)
 	if err != nil {
