@@ -1,76 +1,48 @@
 // Ambient typings for the `window.kmail` bridge exposed by
 // `electron/preload.ts`.
 //
-// These types must be kept in lockstep with the bridge surface
-// in the preload script AND the napi-rs-generated `index.d.ts`
-// at `sdk/kmail-napi/index.d.ts`. We re-declare the napi JS
-// shapes here rather than importing them from `@kmail/sdk-native`
-// because the renderer is forbidden from importing the addon
-// (see `vite.config.ts` alias to `sdk-native.block.ts`).
+// The napi-rs `index.d.ts` at `sdk/kmail-napi/index.d.ts` is the
+// single source of truth for the JS-side shape of every record
+// the addon exports. We re-export the relevant interfaces here
+// via `import type`, which:
 //
-// The field naming convention mirrors napi-rs's default
-// camelCase output for `#[napi(object)]` records: Rust's
-// `bff_url` becomes JS's `bffUrl`. Method names also follow
-// camelCase. Any divergence here breaks at compile time via the
-// `tsc -p tsconfig.electron.json` step that links these types
-// against `electron/preload.ts`.
+//   * Is stripped by esbuild BEFORE Vite's resolver runs, so the
+//     `@kmail/sdk-native -> sdk-native.block.ts` alias in
+//     `vite.config.ts` / `vitest.config.ts` never fires for these
+//     references. The block continues to catch any *runtime*
+//     import attempt from the renderer.
+//   * Is honoured by `tsc -p tsconfig.json` via Node-style module
+//     resolution (the renderer tsconfig has no `paths` entry, so
+//     TypeScript reads `package.json` -> `types: "index.d.ts"`
+//     directly from the linked `@kmail/sdk-native` package). A
+//     field rename in the Rust `#[napi(object)]` struct now
+//     ripples to the renderer typecheck instead of silently
+//     diverging from the manual re-declaration that used to live
+//     here.
+//
+// `KMailBridge` is declared locally (not in the napi package)
+// because it describes the *IPC* surface the preload script
+// exposes, not the SDK surface itself. Every method here MUST
+// match an `ipcMain.handle(...)` registration in `electron/
+// main.ts` AND a `bridge.<method>` entry in `electron/
+// preload.ts`. The interface is what binds the three layers
+// together at compile time.
 
-export interface JsClientConfig {
-  bffUrl: string;
-  bearerToken: string;
-  databasePath: string;
-  attachmentCacheBytes?: bigint;
-  requestTimeoutSecs?: number;
-  retryBudgetSecs?: number;
-  initialSyncEmailWindow?: number;
-  accountId?: string;
-  bootstrapMailboxRole?: string;
-}
+import type {
+  JsClientConfig,
+  JsEmailAddress,
+  JsEmailSummary,
+  JsMailbox,
+  JsSyncSummary,
+} from '@kmail/sdk-native';
 
-export interface JsMailbox {
-  id: string;
-  name: string;
-  role?: string;
-  parentId?: string;
-  sortOrder: number;
-  totalEmails: bigint;
-  unreadEmails: bigint;
-  isVault: boolean;
-}
-
-export interface JsEmailAddress {
-  name: string;
-  email: string;
-}
-
-export interface JsEmailSummary {
-  id: string;
-  threadId: string;
-  blobId: string;
-  mailboxIds: string[];
-  keywordFlags: string[];
-  size: bigint;
-  receivedAtUnix: number;
-  sentAtUnix?: number;
-  fromAddresses: JsEmailAddress[];
-  toAddresses: JsEmailAddress[];
-  ccAddresses: JsEmailAddress[];
-  bccAddresses: JsEmailAddress[];
-  subject: string;
-  preview: string;
-  hasAttachment: boolean;
-}
-
-export interface JsSyncSummary {
-  mailboxesUpserted: bigint;
-  mailboxesDestroyed: bigint;
-  emailsCreated: bigint;
-  emailsUpdated: bigint;
-  emailsDestroyed: bigint;
-  pendingActionsApplied: bigint;
-  pendingActionsFailed: bigint;
-  pendingActionsDeferred: bigint;
-}
+export type {
+  JsClientConfig,
+  JsEmailAddress,
+  JsEmailSummary,
+  JsMailbox,
+  JsSyncSummary,
+};
 
 export interface KMailBridge {
   open(config: JsClientConfig): Promise<void>;
