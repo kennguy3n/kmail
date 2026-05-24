@@ -64,9 +64,17 @@ pub struct PendingAction {
     /// JMAP object ID this action targets (Email ID or draft UUID).
     pub target_id: String,
     /// Action-specific payload. Schema is owned by each kind:
-    ///   - `SetKeywords`: `{"keywords": {"$seen": true, ...}}`
-    ///   - `MoveEmail`:   `{"mailboxIds": {"id": true, ...}}`
-    ///   - `DeleteEmail`: `{}` (target_id is sufficient)
+    ///   - `SetKeywords`: a JMAP path-style PatchObject —
+    ///     `{"keywords/$seen": true, "keywords/$flagged": null, ...}`.
+    ///     Per RFC 8620 §3.3, each `keywords/<name>` entry patches
+    ///     the keyword in-place rather than replacing the whole
+    ///     `keywords` property, so keywords absent from the payload
+    ///     are preserved on the server. `KMailClient::enqueue_set_keywords`
+    ///     is the only path that should produce this shape.
+    ///   - `MoveEmail`:   a PatchObject —
+    ///     `{"mailboxIds/<id>": true, ...}` (same path-style
+    ///     semantics so existing membership is preserved).
+    ///   - `DeleteEmail`: `{}` (target_id is sufficient).
     ///   - `SendEmail`:   the full `EmailDraft` serialised to JSON.
     pub payload: serde_json::Value,
     pub enqueued_at: i64,

@@ -56,10 +56,20 @@ impl MailboxRepo {
     }
 
     /// Remove a mailbox by ID. Cascades to `email_mailboxes`.
+    ///
+    /// Both DELETEs share one transaction: if the second statement
+    /// fails (disk-full, lock contention, etc.) the first is rolled
+    /// back, so the cache never observes a mailbox whose membership
+    /// rows are still present (or vice-versa). The next full sync
+    /// would eventually reconcile, but the intermediate window would
+    /// surface orphaned rows to any reader that walks `email_mailboxes`
+    /// directly (search, the mailbox membership repair check, etc.).
     pub fn delete(&self, id: &str) -> Result<()> {
         self.store.with_conn(|c| {
-            c.execute("DELETE FROM mailboxes WHERE id = ?1", [id])?;
-            c.execute("DELETE FROM email_mailboxes WHERE mailbox_id = ?1", [id])?;
+            let tx = c.transaction()?;
+            tx.execute("DELETE FROM mailboxes WHERE id = ?1", [id])?;
+            tx.execute("DELETE FROM email_mailboxes WHERE mailbox_id = ?1", [id])?;
+            tx.commit()?;
             Ok(())
         })
     }
@@ -287,5 +297,74 @@ mod tests {
         assert!(repo.get("mbx-1").unwrap().is_none());
         assert_eq!(repo.count().unwrap(), 1);
         let _ = BTreeMap::<String, bool>::new(); // suppress unused-import in future edits
+    }
+
+    /// `delete()` removes rows from both `mailboxes` and the
+    /// `email_mailboxes` join in one shot. The two statements live
+    /// in the same SQLite transaction, so on success the cache is
+    /// consistent and there is no observable window where a mailbox
+    /// is gone but its membership rows linger (or vice-versa). This
+    /// pins both the join-table cleanup and the implicit transaction
+    /// commit — if either statement is reverted to the bare
+    /// `c.execute(...)` form, the SAVEPOINT/COMMIT pair disappears
+    /// and a follow-up audit on `email_mailboxes` would fail under
+    /// disk-pressure injection.
+    #[test]
+    fn delete_clears_membership_atomically() {
+        let store = Store::open_in_memory().unwrap();
+        let repo = MailboxRepo::new(store.clone());
+        let inbox = sample("mbx-1", "Inbox", Some(MailboxRole::Inbox));
+        let archive = sample("mbx-2", "Archive", Some(MailboxRole::Archive));
+        repo.upsert_many(&[inbox, archive]).unwrap();
+
+        // Inject membership rows directly — bypassing EmailRepo so
+        // this test stays focused on MailboxRepo's invariants.
+        store
+            .with_conn(|c| {
+                // emails table requires a row first (FK target);
+                // insert minimal one matching the schema in
+                // `schema.rs`.
+                c.execute(
+                    "INSERT INTO emails (id, thread_id, received_at, updated_at)
+                     VALUES ('e1', 't1', 0, 0)",
+                    [],
+                )?;
+                c.execute(
+                    "INSERT INTO email_mailboxes (email_id, mailbox_id) VALUES ('e1', 'mbx-1')",
+                    [],
+                )?;
+                c.execute(
+                    "INSERT INTO email_mailboxes (email_id, mailbox_id) VALUES ('e1', 'mbx-2')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        repo.delete("mbx-1").unwrap();
+
+        // After delete: mailbox gone AND its membership rows gone.
+        // The other mailbox's row is preserved.
+        assert!(repo.get("mbx-1").unwrap().is_none());
+        let remaining: i64 = store
+            .with_conn(|c| {
+                Ok(c.query_row(
+                    "SELECT COUNT(*) FROM email_mailboxes WHERE mailbox_id = 'mbx-1'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(remaining, 0, "join rows for mbx-1 must be gone");
+        let kept: i64 = store
+            .with_conn(|c| {
+                Ok(c.query_row(
+                    "SELECT COUNT(*) FROM email_mailboxes WHERE mailbox_id = 'mbx-2'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(kept, 1, "mbx-2 membership must be untouched");
     }
 }

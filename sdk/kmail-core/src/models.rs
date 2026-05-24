@@ -53,7 +53,18 @@ pub struct JmapSession {
     /// Capabilities the BFF advertises (see docs/JMAP-CONTRACT.md
     /// §2). Stored as `Vec<String>` rather than a typed enum so
     /// a new capability lands as data, not as a code change.
-    #[serde(default, deserialize_with = "deserialize_capabilities")]
+    ///
+    /// On the wire JMAP encodes capabilities as a `{urn: {...}}`
+    /// object (RFC 8620 §2). We deserialise both that shape *and*
+    /// a `[urn, urn]` array for legacy fixtures, and serialise back
+    /// out to the canonical `{urn: {}}` map so a round-trip
+    /// (e.g. the CLI's `run_session` pretty-printer) matches the
+    /// raw BFF response byte-for-byte modulo whitespace.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_capabilities",
+        serialize_with = "serialize_capabilities"
+    )]
     pub capabilities: Vec<String>,
 
     /// Username the BFF associates with this session. Surfaced to
@@ -391,6 +402,23 @@ where
     deserializer.deserialize_any(CapVisitor)
 }
 
+/// Serialise the SDK's internal `Vec<String>` capability list back
+/// out as the canonical JMAP `{urn: {}}` map shape. Each URN maps to
+/// an empty object — the per-capability arguments object — because
+/// the SDK doesn't model capability args today; downstream consumers
+/// that care about args parse the raw response themselves.
+fn serialize_capabilities<S>(caps: &[String], ser: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    use serde::ser::SerializeMap;
+    let mut m = ser.serialize_map(Some(caps.len()))?;
+    for cap in caps {
+        m.serialize_entry(cap, &serde_json::Map::<String, serde_json::Value>::new())?;
+    }
+    m.end()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -421,6 +449,42 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(from_arr.capabilities.len(), 2);
+    }
+
+    /// `JmapSession` MUST re-serialise `capabilities` as the
+    /// canonical RFC 8620 `{urn: {}}` map shape rather than the
+    /// lossy `[urn]` array shape that comes from the underlying
+    /// `Vec<String>`. This pins the round-trip property that the
+    /// CLI's `run_session` pretty-printer relies on for engineers
+    /// comparing SDK output against raw BFF responses.
+    #[test]
+    fn capabilities_serializes_as_rfc8620_map() {
+        let s: JmapSession = serde_json::from_value(serde_json::json!({
+            "apiUrl": "/jmap/api",
+            "capabilities": {
+                "urn:ietf:params:jmap:core": {},
+                "urn:ietf:params:jmap:mail": {}
+            }
+        }))
+        .unwrap();
+        let back = serde_json::to_value(&s).unwrap();
+        let caps = back
+            .get("capabilities")
+            .expect("capabilities field present");
+        assert!(
+            caps.is_object(),
+            "capabilities must serialise as a map, got: {caps}"
+        );
+        let map = caps.as_object().unwrap();
+        assert_eq!(map.len(), 2);
+        for urn in ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"] {
+            assert!(map.contains_key(urn), "missing urn {urn}");
+            assert!(
+                map.get(urn).unwrap().is_object(),
+                "urn {urn} must map to an object, not {:?}",
+                map.get(urn)
+            );
+        }
     }
 
     /// `MailboxRole::Vault` is a KMail extension. It must round-trip

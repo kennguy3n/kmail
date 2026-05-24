@@ -205,7 +205,27 @@ impl KMailClientJs {
             PathBuf::from(config.database_path),
         );
         if let Some(b) = config.attachment_cache_bytes {
-            core_cfg.attachment_cache_bytes = b.get_u64().1;
+            // napi-rs `BigInt::get_u64()` returns `(signed, value,
+            // lossless)`. Silently coercing a negative BigInt into a
+            // u64 absolute value (the prior `.1`-only behaviour) lets
+            // a JS caller passing `-1n` set the attachment cache to
+            // `1`-byte instead of seeing a thrown exception — a
+            // genuinely confusing failure mode. Reject anything that
+            // doesn't fit `u64` losslessly.
+            let (signed, value, lossless) = b.get_u64();
+            if signed {
+                return Err(Error::new(
+                    Status::InvalidArg,
+                    "attachment_cache_bytes must be a non-negative BigInt",
+                ));
+            }
+            if !lossless {
+                return Err(Error::new(
+                    Status::InvalidArg,
+                    "attachment_cache_bytes overflows u64",
+                ));
+            }
+            core_cfg.attachment_cache_bytes = value;
         }
         if let Some(t) = config.request_timeout_secs {
             core_cfg.request_timeout = Duration::from_secs(u64::from(t));

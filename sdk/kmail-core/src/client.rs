@@ -298,11 +298,14 @@ impl KMailClient {
 
         // 1. Mailboxes — full pull each cycle. Cheap (typically a
         //    few dozen rows) and avoids tracking mailbox/changes
-        //    state separately.
+        //    state separately. The whole batch is committed inside
+        //    one SQLite transaction via `upsert_many`, so either every
+        //    row is persisted alongside the JMAP state we're about to
+        //    save, or none of them are — never a partial snapshot.
+        //    See `MailboxRepo::upsert_many` for the atomicity
+        //    contract.
         let mailboxes = self.jmap.list_mailboxes(&session, &account_id).await?;
-        for m in &mailboxes.mailboxes {
-            self.mailbox_repo.upsert(m)?;
-        }
+        self.mailbox_repo.upsert_many(&mailboxes.mailboxes)?;
         summary.mailboxes_upserted = mailboxes.mailboxes.len() as u64;
         self.state_repo
             .put(SyncTypeName::Mailbox, &mailboxes.state)?;
@@ -519,14 +522,56 @@ impl KMailClient {
             .ok_or_else(|| Error::NotFound(format!("email {id} not found")))
     }
 
-    /// Queue an offline action. The next `sync()` will drain the
-    /// queue against the BFF.
+    /// Queue an offline keyword toggle. `keywords` is a JSON object
+    /// of `{keyword_name: bool | null}` pairs:
+    ///   * `true`  — set the keyword (e.g. mark `$seen`).
+    ///   * `false` — clear the keyword (rarely useful — most callers
+    ///     should send `null` for "remove").
+    ///   * `null`  — remove the keyword entirely.
+    ///
+    /// Per JMAP / RFC 8620 §3.3 PatchObject semantics, each entry is
+    /// serialised as a `keywords/<name>` path patch so the server
+    /// merges it into the existing keyword set instead of replacing
+    /// the whole property. A whole-property `{"keywords": {...}}`
+    /// update would silently drop any keyword not present in
+    /// `keywords` (e.g. `$flagged`, `$forwarded`, custom labels) —
+    /// see `RFC 8620 §3.3` and `RFC 8621 §4.1.2`.
+    ///
+    /// The next `sync()` drains the queue against the BFF.
     pub fn enqueue_set_keywords(&self, email_id: &str, keywords: &serde_json::Value) -> Result<()> {
+        let map = keywords.as_object().ok_or_else(|| {
+            Error::InvalidArgument(
+                "keywords must be a JSON object of {keyword: bool|null} pairs".into(),
+            )
+        })?;
+        if map.is_empty() {
+            return Err(Error::InvalidArgument(
+                "keywords map is empty; nothing to patch".into(),
+            ));
+        }
+        let mut patch = serde_json::Map::with_capacity(map.len());
+        for (k, v) in map {
+            // JMAP path components separate on `/` and escape `~`
+            // (RFC 8620 §3.1.2). Reject keyword names that would
+            // collide with the path grammar instead of silently
+            // producing a malformed PatchObject the BFF would reject.
+            if k.is_empty() || k.contains('/') || k.contains('~') {
+                return Err(Error::InvalidArgument(format!(
+                    "keyword name {k:?} contains a reserved JMAP path character"
+                )));
+            }
+            if !v.is_boolean() && !v.is_null() {
+                return Err(Error::InvalidArgument(format!(
+                    "keyword {k:?} value must be true (set), false (clear), or null (remove); got {v}"
+                )));
+            }
+            patch.insert(format!("keywords/{k}"), v.clone());
+        }
         self.actions_repo
             .enqueue(
                 PendingActionKind::SetKeywords,
                 email_id,
-                &serde_json::json!({"keywords": keywords}),
+                &serde_json::Value::Object(patch),
             )
             .map(|_| ())
     }
@@ -698,7 +743,36 @@ impl KMailClient {
                     }),
                 );
                 let resp = self.jmap.dispatch(session, &req).await?;
-                let _r: serde_json::Value = resp.parse(&id)?;
+                let r: serde_json::Value = resp.parse(&id)?;
+                // RFC 8620 §5.3: `Email/set` returns `notDestroyed`
+                // with a SetError per failed ID. If we don't surface
+                // it the queued action gets `complete()`d (see
+                // `flush_pending_actions`), so on the next `sync()`
+                // `Email/changes` won't list the email as destroyed
+                // (because it wasn't) and the locally-deleted email
+                // pops back into the cache — a user-visible "I
+                // deleted it and it came back" bug. Treat the same
+                // way as `SetKeywords/MoveEmail` does for
+                // `notUpdated`.
+                if let Some(not_destroyed) = r
+                    .get("notDestroyed")
+                    .and_then(|v| v.as_object())
+                    .and_then(|o| o.get(&action.target_id))
+                {
+                    let code = not_destroyed
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("urn:ietf:params:jmap:error:serverFail")
+                        .to_string();
+                    return Err(Error::JmapMethod {
+                        code,
+                        description: not_destroyed
+                            .get("description")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                    });
+                }
                 Ok(())
             }
             PendingActionKind::SendEmail => {
@@ -1411,5 +1485,152 @@ mod tests {
             .register_push_token(PushTransport::Apns, "apns-device-token", None)
             .await
             .expect("push registration should succeed with the live token");
+    }
+
+    /// `enqueue_set_keywords` MUST shape its payload as a JMAP
+    /// path-style PatchObject so the server merges the update
+    /// instead of replacing the whole `keywords` property. The
+    /// stored payload is what `apply_pending_action` later embeds
+    /// verbatim under `update[<emailId>]` in `Email/set`, so the
+    /// shape of the row in the queue is exactly the shape of the
+    /// wire patch. Pin both the path format and the value
+    /// validation.
+    #[test]
+    fn enqueue_set_keywords_emits_path_style_patch() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("kmail-kw.db");
+        let cfg = ClientConfig::new("https://bff.test", "tok", db);
+        let client = KMailClient::open(cfg).unwrap();
+
+        client
+            .enqueue_set_keywords(
+                "e-1",
+                &serde_json::json!({"$seen": true, "$flagged": serde_json::Value::Null}),
+            )
+            .unwrap();
+
+        let batch = client.actions_repo.next_batch(10).unwrap();
+        assert_eq!(batch.len(), 1);
+        let stored = &batch[0].payload;
+        let obj = stored
+            .as_object()
+            .expect("stored payload must be an object");
+        // Path-style: every key MUST be prefixed with `keywords/`,
+        // there is NO bare `keywords` entry (which would whole-
+        // property-replace and silently drop other keywords).
+        assert!(
+            obj.contains_key("keywords/$seen"),
+            "missing path-style key: {obj:?}"
+        );
+        assert!(
+            obj.contains_key("keywords/$flagged"),
+            "missing path-style key: {obj:?}"
+        );
+        assert!(
+            !obj.contains_key("keywords"),
+            "bare `keywords` key would whole-property-replace: {obj:?}"
+        );
+        assert_eq!(obj.get("keywords/$seen").unwrap(), &serde_json::json!(true));
+        assert!(obj.get("keywords/$flagged").unwrap().is_null());
+
+        // Invalid shapes are rejected up front, not at apply time.
+        let bad = client.enqueue_set_keywords("e-1", &serde_json::json!("not-an-object"));
+        assert!(matches!(bad, Err(Error::InvalidArgument(_))));
+
+        let bad = client.enqueue_set_keywords("e-1", &serde_json::json!({}));
+        assert!(matches!(bad, Err(Error::InvalidArgument(_))));
+
+        let bad = client.enqueue_set_keywords("e-1", &serde_json::json!({"$seen": "yes-please"}));
+        assert!(matches!(bad, Err(Error::InvalidArgument(_))));
+
+        let bad = client.enqueue_set_keywords("e-1", &serde_json::json!({"keywords/$seen": true}));
+        assert!(
+            matches!(bad, Err(Error::InvalidArgument(_))),
+            "keyword names containing `/` MUST be rejected so callers can't smuggle paths"
+        );
+    }
+
+    /// `apply_pending_action(DeleteEmail)` MUST treat a `notDestroyed`
+    /// entry in the `Email/set` response as a terminal `JmapMethod`
+    /// error. Before the fix the response was parsed into a
+    /// `serde_json::Value` and immediately discarded (`let _r = ...`),
+    /// so server-side refusals (read-only mailbox, permissions,
+    /// concurrent conflict, …) were silently treated as success.
+    /// The queued action was then `complete()`d, the local row was
+    /// already gone, and the next `Email/changes` re-introduced the
+    /// email because it still existed on the server — a user-visible
+    /// "I deleted it and it came back" bug.
+    #[tokio::test]
+    async fn delete_email_surfaces_not_destroyed_as_terminal_jmap_error() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("kmail-del.db");
+
+        mount_session(&server).await;
+
+        // BFF responds with notDestroyed for our target ID.
+        use wiremock::matchers::body_string_contains;
+        Mock::given(method("POST"))
+            .and(path("/jmap/api"))
+            .and(body_string_contains("\"destroy\""))
+            .and(body_string_contains("\"e-target\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "sessionState": "s-1",
+                "methodResponses": [
+                    ["Email/set", {
+                        "accountId": "acct-1",
+                        "destroyed": [],
+                        "notDestroyed": {
+                            "e-target": {
+                                "type": "forbidden",
+                                "description": "mailbox is read-only"
+                            }
+                        }
+                    }, "c0"]
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let cfg = ClientConfig::new(server.uri(), "test-token", db);
+        let client = KMailClient::open(cfg).unwrap();
+
+        // Enqueue the action manually rather than via a public API
+        // (there is no `enqueue_delete_email` today — the BFF triggers
+        // deletes through other paths). Drive the dispatch with the
+        // private `apply_pending_action` directly so this test
+        // exercises exactly the parse path under review.
+        let id = client
+            .actions_repo
+            .enqueue(
+                PendingActionKind::DeleteEmail,
+                "e-target",
+                &serde_json::json!({}),
+            )
+            .unwrap();
+        let session = client.discover_session().await.unwrap();
+        let batch = client.actions_repo.next_batch(1).unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].id, id);
+
+        let result = client
+            .apply_pending_action(&session, "acct-1", &batch[0])
+            .await;
+
+        match result {
+            Err(Error::JmapMethod { code, description }) => {
+                assert_eq!(code, "forbidden");
+                assert_eq!(description, "mailbox is read-only");
+            }
+            other => panic!("expected JmapMethod error, got {other:?}"),
+        }
+        // And that error is NOT retryable — the queue drainer
+        // would terminally fail the action, not silently complete it.
+        assert!(!Error::JmapMethod {
+            code: "forbidden".into(),
+            description: String::new(),
+        }
+        .is_retryable());
     }
 }
