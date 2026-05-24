@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	mathrand "math/rand/v2"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -137,6 +138,31 @@ type CutoverStore interface {
 	// used by Claim/MarkCompleted/MarkFailed governs this path too,
 	// keeping integration tests deterministic.
 	ReconcileCompleted(ctx context.Context, targetBackend string, before, now time.Time) (int64, error)
+	// ReconcileStale demotes `in_progress` rows BACK to `failed`
+	// when the tenant is still on `sourceBackend` (i.e., SetBackend
+	// has NOT been called yet) AND the row hasn't been updated
+	// since `before`. This is the complementary safety net to
+	// ReconcileCompleted: it handles a pod that crashed AFTER
+	// Claim but BEFORE either SetBackend or MarkFailed
+	// (OOM-kill / SIGKILL / node failure during ReindexTo).
+	// Without this, those rows would sit in `in_progress` forever:
+	//
+	//   - ListCandidates excludes `in_progress` rows (`cutover_state
+	//     <> 'in_progress'`), so the next tick can't pick them up.
+	//   - ReconcileCompleted only handles tenants ALREADY on
+	//     OpenSearch, but here the tenant is still on Meilisearch.
+	//
+	// Demotion to `failed` (with an incremented `failure_count` and
+	// a synthetic reason) lets the normal retry pathway re-promote
+	// the row through ListCandidates on the next tick, governed by
+	// the same `MaxFailures` / `MaxRetryGap` back-off as ordinary
+	// failures so a wedged tenant doesn't pin a worker forever.
+	// Idempotent: rows already in another state are left alone.
+	// Returns the count of rows demoted so the worker can log it.
+	// `now` is written to `updated_at` / `failed_at`; the worker
+	// passes `cfg.Now()` so all four reconciliation/claim/mark
+	// methods share one clock source.
+	ReconcileStale(ctx context.Context, sourceBackend string, before, now time.Time) (int64, error)
 }
 
 // CutoverConfig parameterises the auto-cutover worker.
@@ -178,6 +204,13 @@ type CutoverConfig struct {
 	// goroutine on a genuinely-broken store; the periodic
 	// reconciliation pass picks up anything the retry can't.
 	MarkCompletedRetries int
+	// StartupJitter caps the random delay applied before the first
+	// Tick when `Run` is invoked. Spreads the deploy-time burst of
+	// ListCandidates / TenantMailboxSize calls across pods so a
+	// rolling restart of N replicas doesn't hammer the database +
+	// Stalwart admin API in a single instant. Defaults to 30s; set
+	// to 0 for deterministic test runs that drive `Run` directly.
+	StartupJitter time.Duration
 	// Now is the wall-clock source; defaults to time.Now. Tests
 	// inject a fixed clock so retry-backoff is deterministic.
 	Now func() time.Time
@@ -186,6 +219,20 @@ type CutoverConfig struct {
 	// post-SetBackend MarkCompleted retry path, so the latency
 	// hit (a few hundred ms) is acceptable.
 	Sleep func(time.Duration)
+
+	// disableStartupJitter is set internally by the test entry
+	// point so the default-applied jitter doesn't slow the unit
+	// suite. Not exported — production should always go through
+	// the explicit `StartupJitter` knob or accept the default.
+	disableStartupJitter bool
+}
+
+// DisableStartupJitter is the explicit opt-out used by tests that
+// drive `Run` directly. Production callers should set
+// `CutoverConfig.StartupJitter` to a positive value (or leave it
+// zero to accept the default) instead.
+func DisableStartupJitter(cfg *CutoverConfig) {
+	cfg.disableStartupJitter = true
 }
 
 // CutoverWorker auto-promotes tenants from Meilisearch to
@@ -204,6 +251,7 @@ const (
 	defaultCutoverMaxRetryGap        = time.Hour
 	defaultCutoverReconcileAfter     = 30 * time.Minute
 	defaultCutoverMarkCompletedTries = 3
+	defaultCutoverStartupJitter      = 30 * time.Second
 	cutoverMarkCompletedBaseBackoff  = 250 * time.Millisecond
 )
 
@@ -246,6 +294,13 @@ func NewCutoverWorker(cfg CutoverConfig) (*CutoverWorker, error) {
 	if cfg.MarkCompletedRetries <= 0 {
 		cfg.MarkCompletedRetries = defaultCutoverMarkCompletedTries
 	}
+	if cfg.StartupJitter < 0 {
+		// Negative is operator-error; treat as zero (no jitter)
+		// rather than panicking inside mathrand.Int64N.
+		cfg.StartupJitter = 0
+	} else if cfg.StartupJitter == 0 && !cfg.disableStartupJitter {
+		cfg.StartupJitter = defaultCutoverStartupJitter
+	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
@@ -258,7 +313,24 @@ func NewCutoverWorker(cfg CutoverConfig) (*CutoverWorker, error) {
 // Run drives the worker in a loop until ctx is cancelled. Each
 // tick is independent — a failing tick logs and waits out the
 // interval rather than terminating the goroutine.
+//
+// A small randomised delay (0..cfg.StartupJitter) precedes the
+// initial tick so a rolling deployment with N replicas doesn't
+// fire N simultaneous ListCandidates + N×M TenantMailboxSize
+// calls within the same millisecond. The jitter is bounded so the
+// "don't wait a full interval after restart" guarantee still
+// holds. Tests that exercise `Run` can set StartupJitter to 0 to
+// keep behavior deterministic; tests that drive the state machine
+// directly via `Tick` are unaffected.
 func (w *CutoverWorker) Run(ctx context.Context) {
+	if w.cfg.StartupJitter > 0 {
+		jitter := time.Duration(mathrand.Int64N(int64(w.cfg.StartupJitter)))
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(jitter):
+		}
+	}
 	t := time.NewTicker(w.cfg.Interval)
 	defer t.Stop()
 	// One immediate tick so a pod restart doesn't add up to a
@@ -282,15 +354,34 @@ func (w *CutoverWorker) Run(ctx context.Context) {
 // stop the rest of the fleet from migrating).
 func (w *CutoverWorker) Tick(ctx context.Context) {
 	now := w.cfg.Now()
-	// Reconcile FIRST so any stale `in_progress` row from a
-	// previous tick (post-SetBackend, pre-MarkCompleted crash) is
-	// promoted to `completed` before we scan for new candidates.
-	// Reconciliation failure is logged and ignored — the main
-	// cutover loop is independent of it.
-	if n, err := w.cfg.Store.ReconcileCompleted(ctx, BackendOpenSearch, now.Add(-w.cfg.ReconcileAfter), now); err != nil {
-		w.cfg.Logger.Printf("search.cutover: reconcile: %v", err)
+	staleBefore := now.Add(-w.cfg.ReconcileAfter)
+	// Reconcile FIRST so any stale `in_progress` row is cleared
+	// before we scan for new candidates. Two complementary cases:
+	//
+	//   (a) ReconcileCompleted: tenant ALREADY on OpenSearch
+	//       (SetBackend committed, MarkCompleted didn't). Promote
+	//       the row to `completed`.
+	//   (b) ReconcileStale:     tenant STILL on Meilisearch
+	//       (pod crashed during ReindexTo or before SetBackend).
+	//       Demote the row to `failed` so the normal back-off /
+	//       retry path picks it up on a subsequent tick. Without
+	//       this, the row sits in `in_progress` forever — neither
+	//       ListCandidates (excludes `in_progress`) nor
+	//       ReconcileCompleted (gates on `search_backend =
+	//       opensearch`) recovers it.
+	//
+	// Reconciliation failures are logged and ignored — the main
+	// cutover loop is independent of them, and a transient store
+	// blip shouldn't bring the worker down.
+	if n, err := w.cfg.Store.ReconcileCompleted(ctx, BackendOpenSearch, staleBefore, now); err != nil {
+		w.cfg.Logger.Printf("search.cutover: reconcile completed: %v", err)
 	} else if n > 0 {
-		w.cfg.Logger.Printf("search.cutover: reconcile: promoted %d stale in_progress rows to completed", n)
+		w.cfg.Logger.Printf("search.cutover: reconcile completed: promoted %d stale in_progress rows to completed", n)
+	}
+	if n, err := w.cfg.Store.ReconcileStale(ctx, BackendMeilisearch, staleBefore, now); err != nil {
+		w.cfg.Logger.Printf("search.cutover: reconcile stale: %v", err)
+	} else if n > 0 {
+		w.cfg.Logger.Printf("search.cutover: reconcile stale: demoted %d crashed in_progress rows to failed", n)
 	}
 	ids, err := w.cfg.Store.ListCandidates(ctx, CandidateFilter{
 		SourceBackend:    BackendMeilisearch,
@@ -526,6 +617,37 @@ func (s *PostgresCutoverStore) ReconcileCompleted(ctx context.Context, targetBac
 		   AND j.updated_at     < $2
 		   AND t.search_backend = $1
 	`, targetBackend, before, now.UTC())
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
+// ReconcileStale implements CutoverStore. Mirror of
+// ReconcileCompleted for the opposite outcome: when a pod crashes
+// between Claim and SetBackend, the row sits in `in_progress` with
+// the tenant still on `sourceBackend`. The UPDATE demotes those
+// rows back to `failed` (incrementing `failure_count` and stamping
+// a synthetic reason) so the normal retry pathway can pick them up
+// on the next tick. The `updated_at < $2` predicate gates by the
+// reconciliation horizon so an in-flight migration on another
+// worker isn't incorrectly demoted. The `tenants.search_backend =
+// $1` join guarantees we only touch tenants still on the source
+// backend — a tenant on `targetBackend` would be handled by
+// ReconcileCompleted instead.
+func (s *PostgresCutoverStore) ReconcileStale(ctx context.Context, sourceBackend string, before, now time.Time) (int64, error) {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE search_cutover_jobs j
+		   SET cutover_state = 'failed',
+		       failure_count = j.failure_count + 1,
+		       last_error    = 'stale in_progress: assumed crash recovery',
+		       updated_at    = $3
+		  FROM tenants t
+		 WHERE j.tenant_id      = t.id
+		   AND j.cutover_state  = 'in_progress'
+		   AND j.updated_at     < $2
+		   AND t.search_backend = $1
+	`, sourceBackend, before, now.UTC())
 	if err != nil {
 		return 0, err
 	}

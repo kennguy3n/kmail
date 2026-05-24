@@ -311,19 +311,23 @@ func Load() (*Config, error) {
 			ReadHeaderTimeout: getenvDuration("KMAIL_API_READ_HEADER_TIMEOUT", 10*time.Second),
 			ShutdownTimeout:   getenvDuration("KMAIL_API_SHUTDOWN_TIMEOUT", 30*time.Second),
 		},
-		DatabaseURL:     getenv("DATABASE_URL", "postgresql://kmail:kmail@localhost:5432/kmail?sslmode=disable"),
+		DatabaseURL: getenvKMail("DATABASE_URL", "postgresql://kmail:kmail@localhost:5432/kmail?sslmode=disable"),
 		// Stalwart's container port 8080 is published to host 18080
 		// in `docker-compose.yml` precisely so a host-run BFF
 		// (`go run ./cmd/kmail-api`) can reach it without colliding
 		// with the BFF's own :8080 listener. Inside compose, override
-		// this with `STALWART_URL=http://stalwart:8080`.
-		StalwartURL:     getenv("STALWART_URL", "http://localhost:18080"),
-		ValkeyURL:       getenv("VALKEY_URL", "valkey:6379"),
-		KChatOIDCIssuer:   getenv("KCHAT_OIDC_ISSUER", ""),
-		KChatOIDCAudience: getenv("KCHAT_OIDC_AUDIENCE", ""),
+		// this with `STALWART_URL=http://stalwart:8080`. Routed through
+		// `getenvKMail` so the Helm chart's `KMAIL_STALWART_URL`
+		// override (set by the mTLS template) actually reaches the
+		// binary — without the prefix lookup the chart would silently
+		// fall back to plain HTTP.
+		StalwartURL:       getenvKMail("STALWART_URL", "http://localhost:18080"),
+		ValkeyURL:         getenvKMail("VALKEY_URL", "valkey:6379"),
+		KChatOIDCIssuer:   getenvKMail("KCHAT_OIDC_ISSUER", ""),
+		KChatOIDCAudience: getenvKMail("KCHAT_OIDC_AUDIENCE", ""),
 		DevBypassToken:    getenv("KMAIL_DEV_BYPASS_TOKEN", ""),
 		RateLimit: RateLimitConfig{
-			Enabled:   getenvBool("KMAIL_RATELIMIT_ENABLED", false),
+			Enabled:   GetenvBool("KMAIL_RATELIMIT_ENABLED", false),
 			TenantRPM: GetenvInt("KMAIL_RATELIMIT_TENANT_RPM", 1000),
 			UserRPM:   GetenvInt("KMAIL_RATELIMIT_USER_RPM", 200),
 			Window:    getenvDuration("KMAIL_RATELIMIT_WINDOW", 60*time.Second),
@@ -334,10 +338,10 @@ func Load() (*Config, error) {
 			// (console) to avoid collision with the BFF on :8080.
 			// Inside compose, override with
 			// `ZK_FABRIC_S3_URL=http://zk-fabric:8080`.
-			S3URL:      getenv("ZK_FABRIC_S3_URL", "http://localhost:9080"),
-			ConsoleURL: getenv("ZK_FABRIC_CONSOLE_URL", "http://localhost:9081"),
-			AccessKey:  getenv("ZK_FABRIC_ACCESS_KEY", "kmail-access-key"),
-			SecretKey:  getenv("ZK_FABRIC_SECRET_KEY", "kmail-secret-key"),
+			S3URL:      getenvKMail("ZK_FABRIC_S3_URL", "http://localhost:9080"),
+			ConsoleURL: getenvKMail("ZK_FABRIC_CONSOLE_URL", "http://localhost:9081"),
+			AccessKey:  getenvKMail("ZK_FABRIC_ACCESS_KEY", "kmail-access-key"),
+			SecretKey:  getenvKMail("ZK_FABRIC_SECRET_KEY", "kmail-secret-key"),
 		},
 		DNS: DNSConfig{
 			Addr:             getenv("KMAIL_DNS_ADDR", ":8090"),
@@ -350,9 +354,9 @@ func Load() (*Config, error) {
 			BIMILogoURL:      getenv("KMAIL_DNS_BIMI_LOGO_URL", ""),
 			BIMIVMCURL:       getenv("KMAIL_DNS_BIMI_VMC_URL", ""),
 		},
-		KChatAPIURL:      getenv("KCHAT_API_URL", ""),
-		KChatAPIToken:    getenv("KCHAT_API_TOKEN", ""),
-		KChatMLSEndpoint: getenv("KCHAT_MLS_ENDPOINT", ""),
+		KChatAPIURL:      getenvKMail("KCHAT_API_URL", ""),
+		KChatAPIToken:    getenvKMail("KCHAT_API_TOKEN", ""),
+		KChatMLSEndpoint: getenvKMail("KCHAT_MLS_ENDPOINT", ""),
 		ChatBridge: ChatBridgeConfig{
 			Addr: getenv("KMAIL_CHAT_BRIDGE_ADDR", ":8091"),
 		},
@@ -367,7 +371,7 @@ func Load() (*Config, error) {
 			ProPerSeatBytes:     GetenvInt64("KMAIL_BILLING_PRO_PERSEAT_BYTES", 15*1024*1024*1024),
 			PrivacyPerSeatBytes: GetenvInt64("KMAIL_BILLING_PRIVACY_PERSEAT_BYTES", 50*1024*1024*1024),
 			QuotaWorkerInterval: getenvDuration("KMAIL_QUOTA_WORKER_INTERVAL", 5*time.Minute),
-			QuotaWorkerEnabled:  getenvBool("KMAIL_QUOTA_WORKER_ENABLED", false),
+			QuotaWorkerEnabled:  GetenvBool("KMAIL_QUOTA_WORKER_ENABLED", false),
 		},
 		Deliverability: DeliverabilityConfig{
 			CoreDailyLimit:            GetenvInt("KMAIL_SEND_CORE_DAILY", 500),
@@ -378,8 +382,8 @@ func Load() (*Config, error) {
 			BounceSoftWindow:          getenvDuration("KMAIL_BOUNCE_SOFT_WINDOW", 72*time.Hour),
 		},
 		Observability: ObservabilityConfig{
-			MetricsEnabled: getenvBool("KMAIL_METRICS_ENABLED", true),
-			TracingEnabled: getenvBool("KMAIL_TRACING_ENABLED", false),
+			MetricsEnabled: GetenvBool("KMAIL_METRICS_ENABLED", true),
+			TracingEnabled: GetenvBool("KMAIL_TRACING_ENABLED", false),
 			OTLPEndpoint:   getenv("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
 			LogFormat:      getenv("KMAIL_LOG_FORMAT", "text"),
 		},
@@ -394,6 +398,28 @@ func Load() (*Config, error) {
 // getenv returns the value of the named environment variable or the
 // provided default if it is unset.
 func getenv(key, fallback string) string {
+	if v, ok := os.LookupEnv(key); ok && v != "" {
+		return v
+	}
+	return fallback
+}
+
+// getenvKMail resolves a KMail-owned environment variable. It
+// checks the `KMAIL_`-prefixed name first (the convention used by
+// the Helm chart's ConfigMap / Secret, and the only name the chart
+// guarantees to set), then falls back to the bare name for
+// compose / dev / scripts compatibility, then to the supplied
+// default. The two-step lookup is what makes overrides emitted by
+// the Helm template at `deploy/helm/kmail/templates/
+// deployment-api.yaml` (which sets KMAIL_-prefixed names) actually
+// take effect — without this layer the binary would read the bare
+// name, miss the override, and silently fall back to its dev
+// default (e.g. `valkey:6379` for VALKEY_URL, making the shared
+// circuit breaker silently operate on the wrong host).
+func getenvKMail(key, fallback string) string {
+	if v, ok := os.LookupEnv("KMAIL_" + key); ok && v != "" {
+		return v
+	}
 	if v, ok := os.LookupEnv(key); ok && v != "" {
 		return v
 	}
@@ -415,11 +441,12 @@ func getenvDuration(key string, fallback time.Duration) time.Duration {
 	return d
 }
 
-// getenvBool parses the named environment variable as a boolean.
+// GetenvBool parses the named environment variable as a boolean.
 // Accepted truthy values: 1, t, true, y, yes (case-insensitive);
 // everything else (including unset) falls back to the provided
-// default.
-func getenvBool(key string, fallback bool) bool {
+// default. Exported for use by sibling packages (e.g. cmd/kmail-api
+// for `KMAIL_BREAKER_SHARED_FORCE`).
+func GetenvBool(key string, fallback bool) bool {
 	v, ok := os.LookupEnv(key)
 	if !ok || v == "" {
 		return fallback

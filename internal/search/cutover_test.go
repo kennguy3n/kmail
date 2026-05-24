@@ -163,6 +163,34 @@ func (s *inMemoryCutoverStore) ReconcileCompleted(_ context.Context, targetBacke
 	return n, nil
 }
 
+// ReconcileStale is the mirror of ReconcileCompleted: it demotes
+// stale `in_progress` rows whose tenant is still on `sourceBackend`
+// back to `failed`. Increments `failureCount` and stamps a
+// synthetic `lastError` so the test can assert the recovery hook
+// fired exactly the same way the Postgres impl does.
+func (s *inMemoryCutoverStore) ReconcileStale(_ context.Context, sourceBackend string, before, now time.Time) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var n int64
+	for tenantID, r := range s.rows {
+		if r.state != CutoverInProgress {
+			continue
+		}
+		if !r.updatedAt.Before(before) {
+			continue
+		}
+		if s.tenantBackends[tenantID] != sourceBackend {
+			continue
+		}
+		r.state = CutoverFailed
+		r.failureCount++
+		r.lastError = "stale in_progress: assumed crash recovery"
+		r.updatedAt = now
+		n++
+	}
+	return n, nil
+}
+
 // fakeFlipper records ReindexTo / SetBackend invocations so tests
 // can assert what the worker drove and inject per-tenant failures.
 // SetBackend writes back to the linked inMemoryCutoverStore so the
@@ -661,6 +689,98 @@ func TestCutoverWorker_MarkCompletedPersistentFailureReconcilesNextTick(t *testi
 	w.Tick(context.Background())
 	if r := store.rows["tenant-a"]; r == nil || r.state != CutoverCompleted {
 		t.Fatalf("after reconcile tick, row = %+v, want completed", r)
+	}
+}
+
+// TestCutoverWorker_CrashDuringReindexRecoversViaReconcileStale
+// pins the recovery path for the unlucky case where a pod is
+// SIGKILLed (OOM, node failure, preemption) AFTER Claim but BEFORE
+// either SetBackend or MarkFailed has a chance to run. Without
+// ReconcileStale the row sits in `in_progress` forever — neither
+// ListCandidates (which excludes `in_progress`) nor
+// ReconcileCompleted (which only fires when the tenant is already
+// on the target backend) recovers it.
+//
+// The test simulates the crash by claiming the row manually
+// (bypassing the worker) and then advancing the clock past the
+// reconciliation horizon. The next Tick must demote the row to
+// `failed` so the normal `ListCandidates` retry path can pick it
+// up. A follow-up Tick (with a clear MailboxSizer / Source) then
+// completes the cutover normally — proving the recovery actually
+// reopens the retry path.
+func TestCutoverWorker_CrashDuringReindexRecoversViaReconcileStale(t *testing.T) {
+	store := newInMemoryStore([]string{"tenant-a"})
+	flipper := newFakeFlipper(store)
+	clock := &fakeNow{now: time.Unix(1_700_000_000, 0)}
+	sizer := MailboxSizerFunc(func(context.Context, string) (int64, error) { return 200_000, nil })
+	source := MessageSourceFunc(func(context.Context, string) ([]Message, error) {
+		return []Message{{TenantID: "tenant-a"}}, nil
+	})
+	w, err := NewCutoverWorker(CutoverConfig{
+		Store:                store,
+		Service:              flipper,
+		Sizer:                sizer,
+		Source:               source,
+		Logger:               silentLogger(),
+		Threshold:            100_000,
+		Interval:             time.Hour,
+		MaxFailures:          5,
+		MaxRetryGap:          time.Minute, // small so retry is eligible after the advance
+		ReconcileAfter:       30 * time.Minute,
+		MarkCompletedRetries: 3,
+		Now:                  clock.Now,
+		Sleep:                func(time.Duration) {},
+	})
+	if err != nil {
+		t.Fatalf("NewCutoverWorker: %v", err)
+	}
+
+	// Simulate the crash: claim the row but don't let the
+	// worker run. The row is now `in_progress`, tenant still on
+	// `meilisearch`, no follow-up MarkFailed/MarkCompleted.
+	if _, err := store.Claim(context.Background(), "tenant-a", 200_000, 100_000, clock.Now()); err != nil {
+		t.Fatalf("manual Claim: %v", err)
+	}
+	if r := store.rows["tenant-a"]; r == nil || r.state != CutoverInProgress {
+		t.Fatalf("after simulated crash, row = %+v, want in_progress", r)
+	}
+	if store.tenantBackends["tenant-a"] != BackendMeilisearch {
+		t.Fatalf("tenant backend = %q, want meilisearch (no SetBackend yet)", store.tenantBackends["tenant-a"])
+	}
+
+	// Before the reconciliation horizon, Tick must NOT demote
+	// the row — it could be a legitimate in-flight migration
+	// on another worker.
+	w.Tick(context.Background())
+	if r := store.rows["tenant-a"]; r == nil || r.state != CutoverInProgress {
+		t.Fatalf("pre-horizon Tick wrongly mutated row: %+v, want still in_progress", r)
+	}
+
+	// Cross the horizon; ReconcileStale must demote the row to
+	// `failed` so the normal retry path can pick it up.
+	clock.Advance(time.Hour)
+	w.Tick(context.Background())
+	r := store.rows["tenant-a"]
+	if r == nil || r.state != CutoverFailed {
+		t.Fatalf("post-horizon Tick row = %+v, want failed (demoted by ReconcileStale)", r)
+	}
+	if r.failureCount != 1 {
+		t.Fatalf("post-horizon failure_count = %d, want 1 (incremented by ReconcileStale)", r.failureCount)
+	}
+	if r.lastError != "stale in_progress: assumed crash recovery" {
+		t.Fatalf("post-horizon last_error = %q, want synthetic crash-recovery reason", r.lastError)
+	}
+
+	// Advance past MaxRetryGap so ListCandidates re-considers
+	// the failed row; the next Tick should complete the cutover.
+	clock.Advance(2 * time.Minute)
+	w.Tick(context.Background())
+	r = store.rows["tenant-a"]
+	if r == nil || r.state != CutoverCompleted {
+		t.Fatalf("recovery Tick row = %+v, want completed", r)
+	}
+	if store.tenantBackends["tenant-a"] != BackendOpenSearch {
+		t.Fatalf("recovery Tick tenant backend = %q, want opensearch", store.tenantBackends["tenant-a"])
 	}
 }
 

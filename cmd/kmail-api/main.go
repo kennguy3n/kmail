@@ -169,20 +169,62 @@ func main() {
 		}()
 	}
 
+	// Choose the breaker impl based on whether Valkey is actually
+	// reachable. cfg.ValkeyURL has a non-empty default ("valkey:6379")
+	// so `valkeyClient != nil` is always true in practice — that's
+	// fine because the rest of the program's Valkey consumers
+	// (deliverability, push, calendar reminder, SLO tracker, ...)
+	// already tolerate per-call errors and will recover when Valkey
+	// comes back. The JMAP shard breaker, however, is on the request
+	// hot path: if every Open() round-trips to an unreachable Valkey
+	// and we just log+allow, a 5xx storm against a shard never trips
+	// the breaker AND every request eats the round-trip latency.
+	//
+	// Strategy: ping Valkey with a short bounded timeout. If it
+	// answers, wire the shared (Valkey-backed) breaker so trip state
+	// is fleet-wide. If it doesn't, leave the *redis.Client live
+	// (consumers that tolerate failures may still benefit when
+	// Valkey recovers) but fall the proxy back to the in-process
+	// breaker so trip decisions happen locally, fast, and with no
+	// blocked-network surface area. The fallback is opt-out via
+	// `KMAIL_BREAKER_SHARED_FORCE` for the edge case of an operator
+	// who doesn't want the fallback (e.g., they prefer "fail loud").
 	var jmapBreaker jmap.CircuitBreaker
 	if valkeyClient != nil {
-		shared, breakerErr := jmap.NewRedisCircuitBreaker(jmap.RedisCircuitBreakerConfig{
-			Client:    valkeyClient,
-			Logger:    logger,
-			Threshold: breakerThreshold,
-			Cooldown:  breakerCooldown,
-			Window:    breakerWindow,
-		})
-		if breakerErr != nil {
-			logger.Fatalf("jmap.NewRedisCircuitBreaker: %v", breakerErr)
+		pingCtx, pingCancel := context.WithTimeout(ctx, 2*time.Second)
+		pingErr := valkeyClient.Ping(pingCtx).Err()
+		pingCancel()
+		forceShared := config.GetenvBool("KMAIL_BREAKER_SHARED_FORCE", false)
+		switch {
+		case pingErr == nil:
+			shared, breakerErr := jmap.NewRedisCircuitBreaker(jmap.RedisCircuitBreakerConfig{
+				Client:    valkeyClient,
+				Logger:    logger,
+				Threshold: breakerThreshold,
+				Cooldown:  breakerCooldown,
+				Window:    breakerWindow,
+			})
+			if breakerErr != nil {
+				logger.Fatalf("jmap.NewRedisCircuitBreaker: %v", breakerErr)
+			}
+			jmapBreaker = shared
+			logger.Printf("jmap: shared circuit breaker enabled against %s", cfg.ValkeyURL)
+		case forceShared:
+			shared, breakerErr := jmap.NewRedisCircuitBreaker(jmap.RedisCircuitBreakerConfig{
+				Client:    valkeyClient,
+				Logger:    logger,
+				Threshold: breakerThreshold,
+				Cooldown:  breakerCooldown,
+				Window:    breakerWindow,
+			})
+			if breakerErr != nil {
+				logger.Fatalf("jmap.NewRedisCircuitBreaker: %v", breakerErr)
+			}
+			jmapBreaker = shared
+			logger.Printf("jmap: shared circuit breaker forced (KMAIL_BREAKER_SHARED_FORCE=1) against unreachable %s: ping=%v", cfg.ValkeyURL, pingErr)
+		default:
+			logger.Printf("jmap: shared circuit breaker disabled — Valkey %s unreachable (%v); falling back to per-pod in-process breaker", cfg.ValkeyURL, pingErr)
 		}
-		jmapBreaker = shared
-		logger.Printf("jmap: shared circuit breaker enabled against %s", cfg.ValkeyURL)
 	} else {
 		logger.Printf("jmap: shared circuit breaker disabled (KMAIL_VALKEY_URL unset); falling back to per-pod breaker")
 	}
