@@ -291,6 +291,33 @@ func (s *Service) DeleteWebhookForClient(ctx context.Context, tenantID, oauthCli
 // delivery for a webhook the calling OAuth2 client owns. The
 // existence check is layered on top of webhooks.Service.TestFire
 // so we can return ErrWebhookNotFound for cross-client targets.
+//
+// The ownership pre-check folds `active = true` into the
+// existence predicate (mirroring webhooks.Service.TestFire's
+// own active-guard at internal/webhooks/service.go:293). Three
+// reasons for the fold:
+//
+//  1. webhooks.Service.TestFire returns a plain `errors.New`
+//     for the "endpoint not found or inactive" case that does
+//     NOT match ErrWebhookNotFound. Without the fold, an
+//     inactive-but-owned webhook would pass the ownership
+//     check (exists=true), then fail inside TestFire with an
+//     unmatched error, and the handler would surface it as
+//     500 server_error — wrong status code for a known
+//     resource state. The fold makes the 404 path catch it.
+//  2. The integration framework doesn't expose any
+//     reactivation API, so a 409 "webhook inactive" response
+//     would give the integration no actionable signal it
+//     can't already get from GET /webhooks (which lists the
+//     active flag). Better to treat "can't test what you
+//     can't deliver to" as a clean 404.
+//  3. From the caller's perspective an inactive webhook is
+//     indistinguishable from a soft-deleted one: the BFF
+//     doesn't deliver to it, so test-firing against it would
+//     mislead the integration about wire health. Refusing to
+//     test-fire inactive endpoints preserves the "if test
+//     succeeds, real deliveries will too" invariant the
+//     endpoint is designed around.
 func (s *Service) TestFireForClient(ctx context.Context, tenantID, oauthClientID, webhookID string) (int, error) {
 	if strings.TrimSpace(tenantID) == "" || strings.TrimSpace(oauthClientID) == "" || strings.TrimSpace(webhookID) == "" {
 		return 0, errors.New("integrations: tenantID + oauthClientID + webhookID required")
@@ -298,7 +325,9 @@ func (s *Service) TestFireForClient(ctx context.Context, tenantID, oauthClientID
 	// Verify ownership BEFORE delegating, so the underlying
 	// "endpoint not found" error from webhooks.Service.TestFire
 	// (which doesn't know about OAuth2 clients) does not leak
-	// the existence of an admin-owned endpoint.
+	// the existence of an admin-owned endpoint. `active = true`
+	// is folded in to keep status semantics aligned with the
+	// downstream call (see the function-level comment block).
 	var exists bool
 	err := pgx.BeginFunc(ctx, s.cfg.Pool, func(tx pgx.Tx) error {
 		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
@@ -306,7 +335,8 @@ func (s *Service) TestFireForClient(ctx context.Context, tenantID, oauthClientID
 		}
 		return tx.QueryRow(ctx, `
 			SELECT EXISTS(SELECT 1 FROM webhook_endpoints
-				WHERE id = $1::uuid AND tenant_id = $2::uuid AND oauth_client_id = $3::uuid)
+				WHERE id = $1::uuid AND tenant_id = $2::uuid
+				  AND oauth_client_id = $3::uuid AND active = true)
 		`, webhookID, tenantID, oauthClientID).Scan(&exists)
 	})
 	if err != nil {
@@ -378,36 +408,53 @@ func (s *Service) dispatchAdminOwned(ctx context.Context, tenantID, eventType st
 		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
 			return err
 		}
-		rows, err := tx.Query(ctx, `
-			SELECT id::text FROM webhook_endpoints
-			WHERE tenant_id = $1::uuid AND active = true
-			  AND oauth_client_id IS NULL
-			  AND (jsonb_array_length(events) = 0 OR events ? $2)
-		`, tenantID, eventType)
+		// Buffer IDs in-memory before the INSERT loop so the
+		// rows.Close() can run inside the same logical scope as
+		// the Query (via defer) without holding the result set
+		// open across N tx.Exec calls. pgx v5's pgx.Rows.Next()
+		// auto-closes on natural-end-of-iteration, but a Scan
+		// error or context cancellation between Query and the
+		// loop terminator would otherwise leave the rows open
+		// until the GC finalizer fires — fragile against future
+		// edits that add code paths between Query and Close.
+		// `defer rows.Close()` is idempotent (pgx.Rows.Close
+		// guards a closed flag internally) and handles every
+		// exit path uniformly.
+		ids, err := func() ([]string, error) {
+			rows, err := tx.Query(ctx, `
+				SELECT id::text FROM webhook_endpoints
+				WHERE tenant_id = $1::uuid AND active = true
+				  AND oauth_client_id IS NULL
+				  AND (jsonb_array_length(events) = 0 OR events ? $2)
+			`, tenantID, eventType)
+			if err != nil {
+				return nil, err
+			}
+			defer rows.Close()
+			var collected []string
+			for rows.Next() {
+				var id string
+				if err := rows.Scan(&id); err != nil {
+					return nil, err
+				}
+				collected = append(collected, id)
+			}
+			// pgx surfaces driver-level iteration errors
+			// (network reset, partial result) on rows.Err()
+			// after the loop terminates. Without this check
+			// a transport-level failure mid-scan would
+			// silently truncate the subscriber list and the
+			// dispatcher would under-deliver — a silent
+			// at-least-once violation. Treat as fatal: the
+			// outer BeginFunc retries the whole dispatch.
+			if err := rows.Err(); err != nil {
+				return nil, fmt.Errorf("integrations: scan admin-owned subscribers: %w", err)
+			}
+			return collected, nil
+		}()
 		if err != nil {
 			return err
 		}
-		var ids []string
-		for rows.Next() {
-			var id string
-			if err := rows.Scan(&id); err != nil {
-				rows.Close()
-				return err
-			}
-			ids = append(ids, id)
-		}
-		// pgx surfaces driver-level iteration errors (network
-		// reset, partial result) on rows.Err() AFTER Close().
-		// Without this check a transport-level failure mid-scan
-		// silently truncates the subscriber list and the
-		// dispatcher under-delivers — a silent at-least-once
-		// violation. Treat the iteration error as fatal: the
-		// caller retries the whole dispatch.
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			return fmt.Errorf("integrations: scan admin-owned subscribers: %w", err)
-		}
-		rows.Close()
 		for _, id := range ids {
 			if _, err := tx.Exec(ctx, `
 				INSERT INTO webhook_deliveries (tenant_id, endpoint_id, event_type, payload)

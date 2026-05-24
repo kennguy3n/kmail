@@ -5,7 +5,9 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
+	"sync"
 
 	"github.com/kennguy3n/kmail/internal/oauth"
 	"github.com/kennguy3n/kmail/internal/webhooks"
@@ -96,7 +98,23 @@ func hasAnyIntegrationScope(tokenCtx *oauth.AccessTokenContext) bool {
 // rather than hard-coded so a new event type whose scope is
 // already in the table doesn't require a change here, and a
 // new scope automatically widens the boundary check.
+//
+// EventRequiredScope is a package-level map that never changes
+// after init, so the derivation is computed exactly once via
+// sync.OnceValue and cached. The returned slice is shared across
+// all callers — they MUST NOT mutate it. All call sites
+// (requireAnyIntegrationScope, hasAnyIntegrationScope, the
+// FilterEventsForClient unit tests) only iterate.
+//
+// The cache is keyed on no state, so a test that swaps
+// EventRequiredScope at init must do so BEFORE the first call.
+// In practice EventRequiredScope is a package-level `var` set
+// at compile time; no test mutates it.
 func integrationEligibleScopes() []string {
+	return integrationEligibleScopesOnce()
+}
+
+var integrationEligibleScopesOnce = sync.OnceValue(func() []string {
 	seen := make(map[string]struct{}, len(EventRequiredScope))
 	out := make([]string, 0, len(EventRequiredScope))
 	for _, sc := range EventRequiredScope {
@@ -109,8 +127,13 @@ func integrationEligibleScopes() []string {
 		seen[sc] = struct{}{}
 		out = append(out, sc)
 	}
+	// Deterministic order so the human-readable list in the
+	// 403 "insufficient_scope" response is stable across boots
+	// (map iteration order is randomised in Go) — easier for
+	// integration developers to grep error logs.
+	sort.Strings(out)
 	return out
-}
+})
 
 // registerRequest is the body of POST /api/v1/integ/webhooks.
 type registerRequest struct {
