@@ -84,11 +84,22 @@ impl EmailRepo {
     ) -> Result<u64> {
         self.store.with_conn(|c| {
             let tx = c.transaction()?;
-            // Wipe the join table first so the FK from
-            // `email_mailboxes -> emails` doesn't reject the DELETE.
-            // Both DELETEs being inside this transaction means an
-            // intermediate observer can't see one without the other.
-            tx.execute("DELETE FROM email_mailboxes", [])?;
+            // The `email_mailboxes -> emails` foreign key has
+            // `ON DELETE CASCADE` (see schema.rs) and the
+            // connection runs with `PRAGMA foreign_keys = ON`,
+            // so deleting from `emails` automatically clears the
+            // matching `email_mailboxes` rows. We deliberately
+            // do NOT pre-wipe the join table here — that would
+            // be redundant work AND would mask a real bug if the
+            // FK were ever inadvertently dropped (because a
+            // future regression dropping the CASCADE would still
+            // be papered over by the explicit DELETE). Letting
+            // SQLite enforce the cascade is the canonical signal
+            // that the schema's referential-integrity contract
+            // is intact. Both side-effects (emails wipe + join-
+            // table cascade) commit atomically with the
+            // rehydrate + state-token bump because every
+            // statement runs inside this transaction.
             let destroyed: i64 = {
                 let count: i64 = tx.query_row("SELECT COUNT(*) FROM emails", [], |r| r.get(0))?;
                 tx.execute("DELETE FROM emails", [])?;

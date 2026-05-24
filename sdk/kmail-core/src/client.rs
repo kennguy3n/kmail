@@ -50,6 +50,43 @@ use tokio::sync::RwLock;
 /// forever.
 const MAX_EMAIL_CHANGES_BATCHES_PER_SYNC: u32 = 64;
 
+/// Upper bound on the number of `Mailbox/changes` batches we will
+/// drain in a single `sync()` call.
+///
+/// Mirrors `MAX_EMAIL_CHANGES_BATCHES_PER_SYNC` in spirit: per
+/// RFC 8620 §5.2 the server can paginate `Foo/changes` arbitrarily,
+/// so we need a hard ceiling against a pathological server that
+/// always returns `hasMoreChanges: true`. Mailbox sets are O(dozens)
+/// in steady state, but the *transient* fan-out during a bulk
+/// folder import or a label migration can spike well beyond that.
+/// The ceiling has to be high enough that a legitimate bulk-import
+/// catch-up converges in one `sync()` call rather than dripping
+/// through over many user-visible round-trips — 32 batches at the
+/// typical Stalwart page size of 128 buys us ~4k mailbox mutations
+/// per sync, which is generous for any realistic deployment.
+const MAX_MAILBOX_CHANGES_BATCHES_PER_SYNC: u32 = 32;
+
+/// Cap on how many times an individual offline action will be
+/// retried before the queue treats it as terminally stuck.
+///
+/// Each retryable failure bumps `pending_actions.attempts`. With a
+/// typical reconnect cadence (every `sync()` call once the user
+/// foregrounds the app, plus push-driven syncs on incoming mail),
+/// 10 attempts is roughly an hour of wall-clock retries before
+/// the queue gives up. The action is then completed off the queue
+/// and counted under `SyncSummary::pending_actions_failed` so the
+/// shell can surface a banner ("we couldn't send 3 messages")
+/// rather than letting the queue accumulate forever.
+///
+/// 10 was chosen pragmatically: high enough that a multi-hour
+/// network partition or a routine BFF restart doesn't drop user
+/// writes, low enough that a permanently misconfigured account
+/// (expired credentials, malformed payload that the server
+/// somehow returns 5xx for) does not pin the queue. Configurable
+/// per-deployment is a follow-up — the value lives in the SDK so
+/// it ships with sensible defaults.
+const MAX_PENDING_ACTION_ATTEMPTS: i64 = 10;
+
 /// SDK configuration.
 ///
 /// `Debug` is implemented by hand so that `bearer_token` is
@@ -500,73 +537,77 @@ impl KMailClient {
         account_id: &str,
         summary: &mut SyncSummary,
     ) -> Result<()> {
-        let saved_state = self.state_repo.get(SyncTypeName::Mailbox)?;
-        if let Some(since) = saved_state {
-            match self.jmap.mailbox_changes(session, account_id, &since).await {
-                Ok(changes) => {
-                    let mut ids_to_fetch =
-                        Vec::with_capacity(changes.created.len() + changes.updated.len());
-                    ids_to_fetch.extend(changes.created.iter().cloned());
-                    ids_to_fetch.extend(changes.updated.iter().cloned());
-                    let mailboxes = if ids_to_fetch.is_empty() {
-                        Vec::new()
-                    } else {
-                        self.jmap
-                            .get_mailboxes(session, account_id, &ids_to_fetch)
-                            .await?
-                            .mailboxes
-                    };
-                    self.mailbox_repo.upsert_many_with_state(
-                        &mailboxes,
-                        &changes.destroyed,
-                        &changes.new_state,
-                    )?;
-                    summary.mailboxes_upserted += mailboxes.len() as u64;
-                    summary.mailboxes_destroyed += changes.destroyed.len() as u64;
-                    if changes.has_more_changes {
-                        // Single follow-up batch is enough for any
-                        // realistic mailbox count; mailbox sets are
-                        // O(dozens) so a paginated `Mailbox/changes`
-                        // converges almost immediately. We don't need
-                        // the `MAX_*_BATCHES_PER_SYNC` style hard cap
-                        // here because the worst-case mailbox count
-                        // is bounded by JMAP's `Mailbox/set` quota,
-                        // not by user mailbox volume.
-                        let cont = self
-                            .jmap
-                            .mailbox_changes(session, account_id, &changes.new_state)
-                            .await?;
-                        let mut more_fetch =
-                            Vec::with_capacity(cont.created.len() + cont.updated.len());
-                        more_fetch.extend(cont.created.iter().cloned());
-                        more_fetch.extend(cont.updated.iter().cloned());
-                        let more_mailboxes = if more_fetch.is_empty() {
-                            Vec::new()
-                        } else {
-                            self.jmap
-                                .get_mailboxes(session, account_id, &more_fetch)
-                                .await?
-                                .mailboxes
-                        };
-                        self.mailbox_repo.upsert_many_with_state(
-                            &more_mailboxes,
-                            &cont.destroyed,
-                            &cont.new_state,
-                        )?;
-                        summary.mailboxes_upserted += more_mailboxes.len() as u64;
-                        summary.mailboxes_destroyed += cont.destroyed.len() as u64;
-                    }
-                    return Ok(());
+        if let Some(since) = self.state_repo.get(SyncTypeName::Mailbox)? {
+            // Delta loop — drain `Mailbox/changes` until
+            // `has_more_changes == false`. Mirrors the
+            // `Email/changes` loop shape: bounded so a buggy
+            // server can't spin us forever, and a
+            // `SyncStateDiverged` raised at ANY iteration
+            // (initial batch or continuation) falls through to
+            // the full-pull below. Earlier revisions of this
+            // function only issued one follow-up call, which
+            // meant a server that paginated `Mailbox/changes`
+            // across three or more batches would converge over
+            // multiple user-visible `sync()` invocations; that
+            // is no longer the case. They also propagated
+            // `SyncStateDiverged` raised during the continuation
+            // call, even though the same error on the *first*
+            // call was handled by full-pull recovery — that
+            // asymmetry would have left the local cache wedged
+            // against a stale cursor whenever the server's
+            // change-log eviction landed mid-pagination.
+            let mut current = since;
+            let mut iterations = 0u32;
+            let diverged = loop {
+                iterations += 1;
+                if iterations > MAX_MAILBOX_CHANGES_BATCHES_PER_SYNC {
+                    return Err(Error::Protocol(format!(
+                        "Mailbox/changes did not converge after {MAX_MAILBOX_CHANGES_BATCHES_PER_SYNC} batches"
+                    )));
                 }
-                Err(Error::SyncStateDiverged) => {
-                    // Fall through to the full-pull path below.
-                    // The stale state token is replaced when we
-                    // co-commit the fresh one with the full set,
-                    // so there's no separate `forget` call
-                    // required.
+
+                let changes = match self
+                    .jmap
+                    .mailbox_changes(session, account_id, &current)
+                    .await
+                {
+                    Ok(c) => c,
+                    Err(Error::SyncStateDiverged) => break true,
+                    Err(other) => return Err(other),
+                };
+
+                let mut ids_to_fetch =
+                    Vec::with_capacity(changes.created.len() + changes.updated.len());
+                ids_to_fetch.extend(changes.created.iter().cloned());
+                ids_to_fetch.extend(changes.updated.iter().cloned());
+                let mailboxes = if ids_to_fetch.is_empty() {
+                    Vec::new()
+                } else {
+                    self.jmap
+                        .get_mailboxes(session, account_id, &ids_to_fetch)
+                        .await?
+                        .mailboxes
+                };
+                self.mailbox_repo.upsert_many_with_state(
+                    &mailboxes,
+                    &changes.destroyed,
+                    &changes.new_state,
+                )?;
+                summary.mailboxes_upserted += mailboxes.len() as u64;
+                summary.mailboxes_destroyed += changes.destroyed.len() as u64;
+
+                if !changes.has_more_changes {
+                    break false;
                 }
-                Err(other) => return Err(other),
+                current = changes.new_state;
+            };
+            if !diverged {
+                return Ok(());
             }
+            // Fall through to full-pull. The stale state token
+            // is replaced when we co-commit the fresh one with
+            // the full set, so there is no separate `forget`
+            // call required.
         }
 
         // Full pull: first sync, or recovery from
@@ -855,6 +896,38 @@ impl KMailClient {
         let mut processed = 0u64;
         for action in batch {
             processed += 1;
+
+            // Circuit breaker: every retryable failure bumps
+            // `attempts`, so if a 5xx (or any other retryable
+            // error) keeps coming back we eventually treat the
+            // action as terminally stuck and drop it from the
+            // queue. Without this guard a permanently
+            // misconfigured BFF (or a single malformed payload
+            // the server somehow returns 503 for) would let the
+            // queue accumulate the same action forever, and the
+            // `attempts` column would just keep counting.
+            //
+            // The decision is taken BEFORE the network call so
+            // we don't burn another retry just to discover the
+            // same failure. The action is then `complete()`d
+            // with a synthesised `last_error` describing why
+            // the queue gave up, and counted under `failed` so
+            // the platform shell can surface a "we couldn't
+            // send N messages" banner.
+            if action.attempts >= MAX_PENDING_ACTION_ATTEMPTS {
+                self.actions_repo.record_failure(
+                    action.id,
+                    &format!(
+                        "exceeded {MAX_PENDING_ACTION_ATTEMPTS} retry attempts; \
+                         last error was: {}",
+                        action.last_error.as_deref().unwrap_or("<none>")
+                    ),
+                )?;
+                self.actions_repo.complete(action.id)?;
+                outcome.failed += 1;
+                continue;
+            }
+
             match self
                 .apply_pending_action(session, account_id, &action)
                 .await
@@ -871,6 +944,21 @@ impl KMailClient {
                     // retry on the next sync. Account for everything
                     // not yet processed as deferred so callers see
                     // an accurate queue-state snapshot.
+                    //
+                    // `processed - 1` is the count of items the
+                    // loop already settled (applied OR failed
+                    // terminally) BEFORE this action — those are
+                    // off the queue and must not be counted as
+                    // deferred. Everything else, including the
+                    // current action that just bailed, stays
+                    // queued for retry; that's exactly
+                    // `total - (processed - 1)`. The
+                    // `saturating_sub` is defensive only; the
+                    // arithmetic is guaranteed non-negative
+                    // because `processed >= 1` here (we bumped
+                    // it at the top of the loop iteration) and
+                    // `processed <= total` (we only iterate the
+                    // batch once).
                     outcome.deferred = total.saturating_sub(processed - 1);
                     return Ok(outcome);
                 }
@@ -2331,6 +2419,388 @@ mod tests {
         assert_eq!(
             state.get(SyncTypeName::Mailbox).unwrap().as_deref(),
             Some("mbx-state-2")
+        );
+    }
+
+    /// Regression: a `cannotCalculateChanges` raised by the
+    /// *continuation* call to `Mailbox/changes` (i.e. on the
+    /// second batch when `hasMoreChanges: true` on the first)
+    /// must fall through to a full pull, exactly like the same
+    /// error on the first batch already does. Previous shape of
+    /// `sync_mailboxes` only handled divergence on the initial
+    /// call and propagated it from continuations — which left the
+    /// local cache wedged against a stale cursor whenever the
+    /// server's change-log eviction landed mid-pagination.
+    #[tokio::test]
+    async fn mailbox_changes_continuation_divergence_falls_back_to_full_pull() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+        use wiremock::matchers::body_string_contains;
+
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("kmail.db");
+        mount_session(&server).await;
+
+        let mailbox_get_calls = Arc::new(AtomicU32::new(0));
+        let mailbox_changes_calls = Arc::new(AtomicU32::new(0));
+
+        struct GetResponder {
+            counter: Arc<AtomicU32>,
+        }
+        impl wiremock::Respond for GetResponder {
+            fn respond(&self, _req: &wiremock::Request) -> ResponseTemplate {
+                let n = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
+                // First call: state = "mbx-1" so the next sync
+                // takes the changes path. Second call (the
+                // full-pull recovery): state advances to
+                // "mbx-recovered" so we can assert it landed.
+                let state = if n == 1 { "mbx-1" } else { "mbx-recovered" };
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "sessionState": "s-1",
+                    "methodResponses": [
+                        ["Mailbox/get", {
+                            "accountId": "acct-1",
+                            "state": state,
+                            "list": [
+                                {"id": "mbx-inbox", "name": "Inbox", "role": "inbox"},
+                                {"id": "mbx-arch", "name": "Archive", "role": "archive"}
+                            ],
+                            "notFound": []
+                        }, "c0"]
+                    ]
+                }))
+            }
+        }
+
+        // Mailbox/changes responder:
+        //   1st call (since=mbx-1):     hasMoreChanges=true,
+        //                               new_state=mbx-2.
+        //   2nd call (since=mbx-2):     methodErrors with
+        //                               cannotCalculateChanges →
+        //                               must NOT propagate;
+        //                               must trigger full pull.
+        struct ChangesResponder {
+            counter: Arc<AtomicU32>,
+        }
+        impl wiremock::Respond for ChangesResponder {
+            fn respond(&self, _req: &wiremock::Request) -> ResponseTemplate {
+                let n = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
+                if n == 1 {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "sessionState": "s-1",
+                        "methodResponses": [
+                            ["Mailbox/changes", {
+                                "accountId": "acct-1",
+                                "oldState": "mbx-1",
+                                "newState": "mbx-2",
+                                "hasMoreChanges": true,
+                                "created": [],
+                                "updated": [],
+                                "destroyed": []
+                            }, "c0"]
+                        ]
+                    }))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "sessionState": "s-1",
+                        "methodResponses": [
+                            ["error", {
+                                "type": "cannotCalculateChanges",
+                                "description": "state too old"
+                            }, "c0"]
+                        ]
+                    }))
+                }
+            }
+        }
+
+        Mock::given(method("POST"))
+            .and(path("/jmap/api"))
+            .and(body_string_contains("\"Mailbox/get\""))
+            .respond_with(GetResponder {
+                counter: Arc::clone(&mailbox_get_calls),
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/jmap/api"))
+            .and(body_string_contains("\"Mailbox/changes\""))
+            .respond_with(ChangesResponder {
+                counter: Arc::clone(&mailbox_changes_calls),
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/jmap/api"))
+            .and(body_string_contains("\"Email/query\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(bootstrap_email_window_body()))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/jmap/api"))
+            .and(body_string_contains("\"Email/get\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(email_get_body()))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/jmap/api"))
+            .and(body_string_contains("\"Email/changes\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "sessionState": "s-1",
+                "methodResponses": [
+                    ["Email/changes", {
+                        "accountId": "acct-1",
+                        "oldState": "e-state-1",
+                        "newState": "e-state-1",
+                        "hasMoreChanges": false,
+                        "created": [],
+                        "updated": [],
+                        "destroyed": []
+                    }, "c0"]
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let cfg = ClientConfig::new(server.uri(), "test-token", db);
+        let client = KMailClient::open(cfg).unwrap();
+
+        // First sync: full pull. State token persisted as "mbx-1".
+        let _first = client.sync().await.unwrap();
+        assert_eq!(mailbox_get_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(mailbox_changes_calls.load(Ordering::SeqCst), 0);
+
+        // Second sync:
+        //   1) Mailbox/changes(mbx-1) -> ok, hasMore=true, newState=mbx-2
+        //   2) Mailbox/changes(mbx-2) -> cannotCalculateChanges
+        //   3) Fallback to full Mailbox/get → state=mbx-recovered.
+        let _second = client.sync().await.unwrap();
+        assert_eq!(
+            mailbox_changes_calls.load(Ordering::SeqCst),
+            2,
+            "both pagination batches must be issued before falling back"
+        );
+        assert_eq!(
+            mailbox_get_calls.load(Ordering::SeqCst),
+            2,
+            "the continuation divergence must trigger a recovery full pull"
+        );
+        assert_eq!(
+            client
+                .state_repo
+                .get(SyncTypeName::Mailbox)
+                .unwrap()
+                .as_deref(),
+            Some("mbx-recovered"),
+            "the recovery full-pull state token must replace the stale cursor"
+        );
+    }
+
+    /// Regression: `sync_mailboxes` must drain ALL pages when
+    /// the server reports `hasMoreChanges: true` across multiple
+    /// continuation batches. Previously the loop issued a single
+    /// follow-up call and dropped any additional pages on the
+    /// floor, forcing convergence over multiple user-visible
+    /// `sync()` invocations.
+    #[tokio::test]
+    async fn sync_mailboxes_drains_changes_until_has_more_is_false() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+        use wiremock::matchers::body_string_contains;
+
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("kmail.db");
+        mount_session(&server).await;
+
+        // Mailbox/get returns state="mbx-1" once on first sync.
+        Mock::given(method("POST"))
+            .and(path("/jmap/api"))
+            .and(body_string_contains("\"Mailbox/get\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(mailbox_get_body()))
+            .mount(&server)
+            .await;
+
+        // 3-step Mailbox/changes pagination:
+        //   step 1 (since=mbx-1)  -> hasMore=true, new_state=mbx-2
+        //   step 2 (since=mbx-2)  -> hasMore=true, new_state=mbx-3
+        //   step 3 (since=mbx-3)  -> hasMore=false, new_state=mbx-final
+        let changes_calls = Arc::new(AtomicU32::new(0));
+        struct PaginatingResponder {
+            counter: Arc<AtomicU32>,
+        }
+        impl wiremock::Respond for PaginatingResponder {
+            fn respond(&self, _req: &wiremock::Request) -> ResponseTemplate {
+                let n = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
+                let (new_state, more) = match n {
+                    1 => ("mbx-2", true),
+                    2 => ("mbx-3", true),
+                    _ => ("mbx-final", false),
+                };
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "sessionState": "s-1",
+                    "methodResponses": [
+                        ["Mailbox/changes", {
+                            "accountId": "acct-1",
+                            "oldState": format!("mbx-{n}"),
+                            "newState": new_state,
+                            "hasMoreChanges": more,
+                            "created": [],
+                            "updated": [],
+                            "destroyed": []
+                        }, "c0"]
+                    ]
+                }))
+            }
+        }
+        Mock::given(method("POST"))
+            .and(path("/jmap/api"))
+            .and(body_string_contains("\"Mailbox/changes\""))
+            .respond_with(PaginatingResponder {
+                counter: Arc::clone(&changes_calls),
+            })
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/jmap/api"))
+            .and(body_string_contains("\"Email/query\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(bootstrap_email_window_body()))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/jmap/api"))
+            .and(body_string_contains("\"Email/get\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(email_get_body()))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/jmap/api"))
+            .and(body_string_contains("\"Email/changes\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "sessionState": "s-1",
+                "methodResponses": [
+                    ["Email/changes", {
+                        "accountId": "acct-1",
+                        "oldState": "e-state-1",
+                        "newState": "e-state-1",
+                        "hasMoreChanges": false,
+                        "created": [],
+                        "updated": [],
+                        "destroyed": []
+                    }, "c0"]
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let cfg = ClientConfig::new(server.uri(), "test-token", db);
+        let client = KMailClient::open(cfg).unwrap();
+
+        let _first = client.sync().await.unwrap();
+        // Second sync drains all three Mailbox/changes pages in
+        // ONE invocation. The previous single-follow-up shape
+        // would have called `mailbox_changes` only twice and
+        // stalled at state=mbx-3 with one unconsumed page.
+        let _second = client.sync().await.unwrap();
+        assert_eq!(
+            changes_calls.load(Ordering::SeqCst),
+            3,
+            "every paginated batch must be drained in one sync"
+        );
+        assert_eq!(
+            client
+                .state_repo
+                .get(SyncTypeName::Mailbox)
+                .unwrap()
+                .as_deref(),
+            Some("mbx-final"),
+            "the final page's state token must be the persisted cursor"
+        );
+    }
+
+    /// Regression: an action that has already exceeded the
+    /// retry-attempt ceiling must be drained from the queue
+    /// (counted as `failed`) WITHOUT another network call —
+    /// previous behaviour would keep retrying forever and let
+    /// the queue accumulate.
+    #[tokio::test]
+    async fn flush_pending_actions_drops_actions_past_retry_ceiling() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+        use wiremock::matchers::body_string_contains;
+
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("kmail.db");
+        mount_session(&server).await;
+
+        // Asserts NO Email/set request is issued for the stuck
+        // action — if the circuit breaker were missing, the
+        // flush loop would call this responder.
+        let email_set_calls = Arc::new(AtomicU32::new(0));
+        struct AssertNoCall {
+            counter: Arc<AtomicU32>,
+        }
+        impl wiremock::Respond for AssertNoCall {
+            fn respond(&self, _req: &wiremock::Request) -> ResponseTemplate {
+                self.counter.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(500)
+            }
+        }
+        Mock::given(method("POST"))
+            .and(path("/jmap/api"))
+            .and(body_string_contains("\"Email/set\""))
+            .respond_with(AssertNoCall {
+                counter: Arc::clone(&email_set_calls),
+            })
+            .mount(&server)
+            .await;
+
+        let mut cfg = ClientConfig::new(server.uri(), "test-token", db);
+        cfg.account_id = Some("acct-1".into());
+        let client = KMailClient::open(cfg).unwrap();
+
+        // Enqueue an action and manually bump its `attempts` to
+        // the ceiling so the circuit breaker fires on the next
+        // flush.
+        let id = client
+            .actions_repo
+            .enqueue(
+                PendingActionKind::SetKeywords,
+                "stuck-1",
+                &serde_json::json!({"keywords/$seen": true}),
+            )
+            .unwrap();
+        for _ in 0..MAX_PENDING_ACTION_ATTEMPTS {
+            client
+                .actions_repo
+                .record_failure(id, "503 from BFF")
+                .unwrap();
+        }
+
+        let session = client.discover_session().await.unwrap();
+        let outcome = client
+            .flush_pending_actions(&session, "acct-1", 10)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            email_set_calls.load(Ordering::SeqCst),
+            0,
+            "the circuit breaker must drop the action without another network call"
+        );
+        assert_eq!(outcome.applied, 0);
+        assert_eq!(
+            outcome.failed, 1,
+            "an exhausted-retry action must be counted under `failed`"
+        );
+        assert_eq!(outcome.deferred, 0);
+        assert_eq!(
+            client.actions_repo.count().unwrap(),
+            0,
+            "the stuck action must be removed from the queue"
         );
     }
 }
