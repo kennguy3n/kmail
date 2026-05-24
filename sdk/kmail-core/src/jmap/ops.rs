@@ -17,12 +17,12 @@
 
 use crate::error::{Error, Result};
 use crate::jmap::request::{
-    EmailChangesArgs, EmailGetArgs, EmailQueryArgs, JmapRequest, MailboxGetArgs, CAP_CORE,
-    CAP_MAIL, CAP_SUBMISSION,
+    EmailChangesArgs, EmailGetArgs, EmailQueryArgs, JmapRequest, MailboxChangesArgs,
+    MailboxGetArgs, CAP_CORE, CAP_MAIL, CAP_SUBMISSION,
 };
 use crate::jmap::response::{
     EmailChangesResponse, EmailGetResponse, EmailQueryResponse, EmailSubmissionSetResponse,
-    JmapResponse, MailboxGetResponse,
+    JmapResponse, MailboxChangesResponse, MailboxGetResponse,
 };
 use crate::jmap::transport::{JmapTransport, TransportConfig};
 use crate::models::{Email, EmailDraft, JmapSession, Mailbox};
@@ -289,6 +289,70 @@ impl JmapClient {
             }) if code.ends_with("cannotCalculateChanges") => Err(Error::SyncStateDiverged),
             Err(other) => Err(other),
         }
+    }
+
+    /// Incremental sync for mailboxes (RFC 8621 §2.4). Same
+    /// `cannotCalculateChanges` → `Error::SyncStateDiverged`
+    /// mapping as `email_changes`, so the orchestrator in
+    /// `client.rs` can use one error-recovery path for both types.
+    pub async fn mailbox_changes(
+        &self,
+        session: &JmapSession,
+        account_id: &str,
+        since_state: &str,
+    ) -> Result<MailboxChangesResponse> {
+        let mut req = JmapRequest::new(vec![CAP_CORE.into(), CAP_MAIL.into()]);
+        let id = req.call(
+            "Mailbox/changes",
+            serde_json::to_value(MailboxChangesArgs {
+                account_id: account_id.to_string(),
+                since_state: since_state.to_string(),
+                max_changes: Some(500),
+            })?,
+        );
+        let resp = self.dispatch(session, &req).await?;
+        let parsed: Result<MailboxChangesResponse> = resp.parse(&id);
+        match parsed {
+            Ok(v) => Ok(v),
+            Err(Error::JmapMethod {
+                code,
+                description: _,
+            }) if code.ends_with("cannotCalculateChanges") => Err(Error::SyncStateDiverged),
+            Err(other) => Err(other),
+        }
+    }
+
+    /// Fetch a specific set of mailboxes by ID. Used by the
+    /// incremental sync path to hydrate the `created` + `updated`
+    /// IDs returned by `Mailbox/changes` without re-pulling the
+    /// entire mailbox set.
+    pub async fn get_mailboxes(
+        &self,
+        session: &JmapSession,
+        account_id: &str,
+        ids: &[String],
+    ) -> Result<MailboxesResult> {
+        if ids.is_empty() {
+            return Ok(MailboxesResult {
+                state: String::new(),
+                mailboxes: Vec::new(),
+            });
+        }
+        let mut req = JmapRequest::new(vec![CAP_CORE.into(), CAP_MAIL.into()]);
+        let id = req.call(
+            "Mailbox/get",
+            serde_json::to_value(MailboxGetArgs {
+                account_id: account_id.to_string(),
+                ids: Some(ids.to_vec()),
+                properties: None,
+            })?,
+        );
+        let resp = self.dispatch(session, &req).await?;
+        let r: MailboxGetResponse = resp.parse(&id)?;
+        Ok(MailboxesResult {
+            state: r.state,
+            mailboxes: r.list,
+        })
     }
 
     /// Persist a draft + submit it via `EmailSubmission/set`.
@@ -574,6 +638,100 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::SyncStateDiverged));
+    }
+
+    /// `Mailbox/changes` happy path: server reports a typical
+    /// delta with `created`/`updated`/`destroyed` plus an
+    /// `updatedProperties` hint and the SDK preserves it through
+    /// the parse layer.
+    #[tokio::test]
+    async fn mailbox_changes_parses_full_envelope_including_updated_properties() {
+        let server = MockServer::start().await;
+        let api_url = format!("{}/jmap/api", server.uri());
+        Mock::given(method("POST"))
+            .and(path("/jmap/api"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "sessionState": "s-1",
+                "methodResponses": [
+                    ["Mailbox/changes", {
+                        "accountId": "acct-1",
+                        "oldState": "mbx-1",
+                        "newState": "mbx-2",
+                        "hasMoreChanges": false,
+                        "created": ["mbx-new"],
+                        "updated": ["mbx-inbox"],
+                        "destroyed": ["mbx-archive"],
+                        "updatedProperties": ["totalEmails", "unreadEmails"]
+                    }, "c0"]
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = fresh_client(&server).await;
+        let sess = fake_session(&api_url);
+        let resp = client
+            .mailbox_changes(&sess, "acct-1", "mbx-1")
+            .await
+            .unwrap();
+        assert_eq!(resp.old_state, "mbx-1");
+        assert_eq!(resp.new_state, "mbx-2");
+        assert!(!resp.has_more_changes);
+        assert_eq!(resp.created, vec!["mbx-new".to_string()]);
+        assert_eq!(resp.updated, vec!["mbx-inbox".to_string()]);
+        assert_eq!(resp.destroyed, vec!["mbx-archive".to_string()]);
+        assert_eq!(
+            resp.updated_properties,
+            Some(vec!["totalEmails".into(), "unreadEmails".into()])
+        );
+    }
+
+    /// `Mailbox/changes` with `cannotCalculateChanges` must yield
+    /// `SyncStateDiverged` so the orchestrator can take the same
+    /// recovery path as `Email/changes`. Otherwise the mailbox set
+    /// would silently fall behind whenever the server evicts our
+    /// cursor.
+    #[tokio::test]
+    async fn mailbox_changes_cannot_calculate_maps_to_sync_state_diverged() {
+        let server = MockServer::start().await;
+        let api_url = format!("{}/jmap/api", server.uri());
+        Mock::given(method("POST"))
+            .and(path("/jmap/api"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "sessionState": "s-1",
+                "methodResponses": [
+                    ["error", {
+                        "type": "urn:ietf:params:jmap:error:cannotCalculateChanges",
+                        "description": "state too old"
+                    }, "c0"]
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = fresh_client(&server).await;
+        let sess = fake_session(&api_url);
+        let err = client
+            .mailbox_changes(&sess, "acct-1", "mbx-very-old")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::SyncStateDiverged));
+    }
+
+    /// `get_mailboxes` short-circuits empty `ids` (saves one
+    /// round-trip when `Mailbox/changes` reports a destroy-only
+    /// delta).
+    #[tokio::test]
+    async fn get_mailboxes_short_circuits_empty_ids() {
+        let server = MockServer::start().await;
+        let api_url = format!("{}/jmap/api", server.uri());
+        // No mock mounted — any request would 404, so a passing
+        // test proves we never hit the network.
+        let client = fresh_client(&server).await;
+        let sess = fake_session(&api_url);
+        let resp = client.get_mailboxes(&sess, "acct-1", &[]).await.unwrap();
+        assert!(resp.mailboxes.is_empty());
+        assert!(resp.state.is_empty());
     }
 
     /// 429 from the BFF must surface the `Retry-After` value in

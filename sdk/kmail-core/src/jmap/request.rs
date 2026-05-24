@@ -178,6 +178,22 @@ pub struct EmailChangesArgs {
     pub max_changes: Option<u32>,
 }
 
+/// `Mailbox/changes` arguments (RFC 8620 §5.2 + RFC 8621 §2.4).
+///
+/// Same wire shape as `Email/changes`; we keep the type distinct
+/// rather than aliasing because the response shape diverges
+/// (`Mailbox/changes` returns the `updatedProperties` hint that
+/// `Email/changes` does not) and conflating them would tempt
+/// future calls to take the wrong type.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MailboxChangesArgs {
+    pub account_id: String,
+    pub since_state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_changes: Option<u32>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

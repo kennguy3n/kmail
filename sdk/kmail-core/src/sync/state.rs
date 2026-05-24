@@ -8,6 +8,7 @@
 use crate::error::Result;
 use crate::sync::store::Store;
 use chrono::Utc;
+use rusqlite::Connection;
 
 /// Canonical JMAP type names we track state for. Spelled exactly
 /// as they appear on the wire so callers can pass JMAP-derived
@@ -45,13 +46,25 @@ impl StateRepo {
     /// Persist the latest known state token for `type_name`.
     /// Idempotent; overwrites the previous token.
     pub fn put(&self, type_name: SyncTypeName, token: &str) -> Result<()> {
+        self.store.with_conn(|c| put_in_conn(c, type_name, token))
+    }
+
+    /// Delete the persisted state token for `type_name`.
+    ///
+    /// Exposed primarily for "reset sync" UI affordances and for
+    /// debugging — the normal divergence-recovery path inside
+    /// `KMailClient::sync` does NOT call this. It instead uses the
+    /// transactional helpers (`MailboxRepo::upsert_many_with_state`,
+    /// `EmailRepo::replace_all_with_state`) that overwrite the
+    /// stale token in the same SQLite transaction as the
+    /// re-bootstrap row writes, which is the only way to avoid a
+    /// crash-window where the token is forgotten but the new rows
+    /// haven't been hydrated yet.
+    pub fn forget(&self, type_name: SyncTypeName) -> Result<()> {
         self.store.with_conn(|c| {
             c.execute(
-                "INSERT INTO sync_state (type_name, state_token, last_synced_at) VALUES (?1, ?2, ?3)
-                 ON CONFLICT(type_name) DO UPDATE SET
-                    state_token = excluded.state_token,
-                    last_synced_at = excluded.last_synced_at",
-                rusqlite::params![type_name.as_str(), token, Utc::now().timestamp()],
+                "DELETE FROM sync_state WHERE type_name = ?1",
+                [type_name.as_str()],
             )?;
             Ok(())
         })
@@ -93,6 +106,24 @@ impl StateRepo {
     }
 }
 
+/// Connection-level upsert. Reused by repos that want to commit a
+/// data write and the new JMAP state token in one transaction.
+///
+/// `rusqlite::Transaction` derefs to `Connection`, so the same
+/// signature serves both the standalone `put` path (above) and
+/// the in-transaction co-commit path (`MailboxRepo::upsert_many_with_state`,
+/// `EmailRepo::apply_with_state`).
+pub(crate) fn put_in_conn(c: &Connection, type_name: SyncTypeName, token: &str) -> Result<()> {
+    c.execute(
+        "INSERT INTO sync_state (type_name, state_token, last_synced_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(type_name) DO UPDATE SET
+            state_token = excluded.state_token,
+            last_synced_at = excluded.last_synced_at",
+        rusqlite::params![type_name.as_str(), token, Utc::now().timestamp()],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,6 +157,25 @@ mod tests {
             repo.get(SyncTypeName::Email).unwrap().as_deref(),
             Some("state-2")
         );
+    }
+
+    #[test]
+    fn forget_removes_token_for_type() {
+        let store = Store::open_in_memory().unwrap();
+        let repo = StateRepo::new(store);
+        repo.put(SyncTypeName::Email, "e-1").unwrap();
+        repo.put(SyncTypeName::Mailbox, "m-1").unwrap();
+
+        repo.forget(SyncTypeName::Email).unwrap();
+        assert!(repo.get(SyncTypeName::Email).unwrap().is_none());
+        // Sibling type unaffected.
+        assert_eq!(
+            repo.get(SyncTypeName::Mailbox).unwrap().as_deref(),
+            Some("m-1")
+        );
+
+        // Forgetting a non-existent token is a no-op (idempotent).
+        repo.forget(SyncTypeName::Email).unwrap();
     }
 
     #[test]

@@ -6,6 +6,7 @@
 
 use crate::error::Result;
 use crate::models::{EmailAddress, EmailSummary};
+use crate::sync::state::{put_in_conn as put_state_in_conn, SyncTypeName};
 use crate::sync::store::Store;
 use chrono::{DateTime, Utc};
 use rusqlite::OptionalExtension;
@@ -40,17 +41,63 @@ impl EmailRepo {
     pub fn apply(&self, mutations: &[EmailMutation]) -> Result<()> {
         self.store.with_conn(|c| {
             let tx = c.transaction()?;
-            for m in mutations {
-                match m {
-                    EmailMutation::Upsert(e) => upsert_in_tx(&tx, e.as_ref())?,
-                    EmailMutation::Delete(id) => {
-                        tx.execute("DELETE FROM emails WHERE id = ?1", [id])?;
-                        // `email_mailboxes` rows cascade via FK.
-                    }
-                }
-            }
+            apply_in_tx(&tx, mutations)?;
             tx.commit()?;
             Ok(())
+        })
+    }
+
+    /// Atomic counterpart to `apply` that co-commits the JMAP
+    /// `Email` state token. See
+    /// [`MailboxRepo::upsert_many_with_state`] for the same
+    /// argument: this is what the sync loop should use whenever a
+    /// new state token is being adopted, so the crash window
+    /// between "rows written" and "state advanced" cannot leak the
+    /// state cursor.
+    pub fn apply_with_state(&self, mutations: &[EmailMutation], state_token: &str) -> Result<()> {
+        self.store.with_conn(|c| {
+            let tx = c.transaction()?;
+            apply_in_tx(&tx, mutations)?;
+            put_state_in_conn(&tx, SyncTypeName::Email, state_token)?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    /// Atomically replace every email row with `mutations` and
+    /// adopt `state_token`.
+    ///
+    /// Called from the `SyncStateDiverged` recovery path: when the
+    /// server returns `cannotCalculateChanges`, our local state
+    /// cursor is gone from its change log and there is no way to
+    /// reconcile incrementally. The architecturally correct response
+    /// is to discard the local snapshot and re-bootstrap from the
+    /// fresh window, all under one transaction so the local cache
+    /// can never observe a half-purged state (where ghost emails
+    /// — server-side deletions during the gap — would coexist
+    /// with the newly hydrated rows). The bootstrap is by
+    /// definition the canonical state; partial overwrites are not.
+    pub fn replace_all_with_state(
+        &self,
+        mutations: &[EmailMutation],
+        state_token: &str,
+    ) -> Result<u64> {
+        self.store.with_conn(|c| {
+            let tx = c.transaction()?;
+            // Wipe the join table first so the FK from
+            // `email_mailboxes -> emails` doesn't reject the DELETE.
+            // Both DELETEs being inside this transaction means an
+            // intermediate observer can't see one without the other.
+            tx.execute("DELETE FROM email_mailboxes", [])?;
+            let destroyed: i64 = {
+                let count: i64 = tx.query_row("SELECT COUNT(*) FROM emails", [], |r| r.get(0))?;
+                tx.execute("DELETE FROM emails", [])?;
+                count
+            };
+            apply_in_tx(&tx, mutations)?;
+            put_state_in_conn(&tx, SyncTypeName::Email, state_token)?;
+            tx.commit()?;
+            Ok(destroyed.max(0) as u64)
         })
     }
 
@@ -114,6 +161,19 @@ impl EmailRepo {
             Ok(n.max(0) as u64)
         })
     }
+}
+
+fn apply_in_tx(tx: &rusqlite::Transaction<'_>, mutations: &[EmailMutation]) -> Result<()> {
+    for m in mutations {
+        match m {
+            EmailMutation::Upsert(e) => upsert_in_tx(tx, e.as_ref())?,
+            EmailMutation::Delete(id) => {
+                tx.execute("DELETE FROM emails WHERE id = ?1", [id])?;
+                // `email_mailboxes` rows cascade via FK.
+            }
+        }
+    }
+    Ok(())
 }
 
 fn upsert_in_tx(tx: &rusqlite::Transaction<'_>, e: &EmailSummary) -> Result<()> {

@@ -7,6 +7,7 @@
 
 use crate::error::{Error, Result};
 use crate::models::{Mailbox, MailboxRights, MailboxRole};
+use crate::sync::state::{put_in_conn as put_state_in_conn, SyncTypeName};
 use crate::sync::store::Store;
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension};
@@ -30,17 +31,15 @@ impl MailboxRepo {
     ///
     /// The whole batch is atomic: if any row fails, the entire write
     /// is rolled back and the local cache stays at the prior snapshot.
-    /// `Mailbox/get` responses are processed as a unit — a partially
-    /// applied batch would leave the SDK convinced it had observed the
-    /// JMAP state ID returned alongside (state tokens are committed
-    /// later in `sync()`) while some mailboxes were silently missing,
-    /// and the next `Mailbox/changes` against that state would not
-    /// re-deliver the missed rows. Rolling back is the only behaviour
-    /// consistent with the JMAP state-cursor contract.
-    ///
     /// Reusing one transaction also drops per-row fsyncs, which makes
     /// the bootstrap path roughly an order of magnitude faster on
     /// realistic mailbox counts.
+    ///
+    /// Prefer [`upsert_many_with_state`] in the sync loop: it
+    /// co-commits the JMAP state token in the same transaction so a
+    /// crash between "rows persisted" and "state advanced" can't
+    /// leave the cache convinced it observed a JMAP cursor it never
+    /// actually consumed.
     pub fn upsert_many(&self, mailboxes: &[Mailbox]) -> Result<()> {
         if mailboxes.is_empty() {
             return Ok(());
@@ -50,6 +49,46 @@ impl MailboxRepo {
             for m in mailboxes {
                 upsert_one(&tx, m)?;
             }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    /// Atomic counterpart to `upsert_many` that persists the JMAP
+    /// `Mailbox` state token in the same transaction.
+    ///
+    /// If `destroyed` is non-empty, those rows are deleted (with
+    /// their `email_mailboxes` membership cascading via FK) inside
+    /// the same transaction — mirroring the `Mailbox/changes` JMAP
+    /// semantics where created/updated/destroyed are reported as a
+    /// single coherent delta.
+    ///
+    /// The atomicity matters for incremental sync: if the process
+    /// crashes between `upsert_many` and `state_repo.put`, the next
+    /// sync would advance from a state cursor it never actually
+    /// reached in storage, silently skipping the rows the server
+    /// already considered delivered. Wrapping both writes in one
+    /// SQLite transaction means either we observe the new state
+    /// *and* the rows that justify it, or we observe neither and
+    /// the next sync re-issues `Mailbox/changes` from the prior
+    /// cursor. There is no third "state advanced, rows missing"
+    /// outcome.
+    pub fn upsert_many_with_state(
+        &self,
+        mailboxes: &[Mailbox],
+        destroyed: &[String],
+        state_token: &str,
+    ) -> Result<()> {
+        self.store.with_conn(|c| {
+            let tx = c.transaction()?;
+            for m in mailboxes {
+                upsert_one(&tx, m)?;
+            }
+            for id in destroyed {
+                tx.execute("DELETE FROM mailboxes WHERE id = ?1", [id])?;
+                tx.execute("DELETE FROM email_mailboxes WHERE mailbox_id = ?1", [id])?;
+            }
+            put_state_in_conn(&tx, SyncTypeName::Mailbox, state_token)?;
             tx.commit()?;
             Ok(())
         })

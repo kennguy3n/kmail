@@ -183,19 +183,54 @@ impl AttachmentCache {
 mod tests {
     use super::*;
     use crate::sync::store::Store;
-    use tempfile::tempdir;
+    use tempfile::{tempdir, TempDir};
 
-    fn fresh_store() -> Store {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("kmail.db");
-        // Leak `dir` so the file outlives the test scope.
-        std::mem::forget(dir);
-        Store::open(&path).unwrap()
+    /// Test harness that keeps the `TempDir` alive for the
+    /// lifetime of the `Store`.
+    ///
+    /// Previous implementation used `std::mem::forget(dir)` to
+    /// stop the `TempDir` `Drop` from racing the `Store`'s
+    /// SQLite `Connection`, but that leaked every temporary
+    /// directory the test suite created. Holding the `TempDir`
+    /// in the struct produces the same lifetime guarantee
+    /// without the leak: when the field goes out of scope, the
+    /// store is dropped first (which closes the SQLite
+    /// connection), then the directory is unlinked.
+    struct StoreEnv {
+        // Field declaration order matters: Rust drops struct
+        // fields in declaration order, and we need the
+        // `Store` (which holds an open `rusqlite::Connection`
+        // to a file inside the TempDir) to be dropped BEFORE
+        // the `TempDir` unlinks the directory. Reversing the
+        // order would unlink the directory out from under a
+        // live connection.
+        store: Store,
+        // Held only to keep the directory alive — never read,
+        // hence the underscore-prefixed binding. The
+        // `#[allow(dead_code)]` is defensive against future
+        // clippy versions that don't recognise the prefix
+        // convention.
+        #[allow(dead_code)]
+        _dir: TempDir,
+    }
+
+    impl StoreEnv {
+        fn new() -> Self {
+            let _dir = tempdir().unwrap();
+            let path = _dir.path().join("kmail.db");
+            let store = Store::open(&path).unwrap();
+            Self { store, _dir }
+        }
+    }
+
+    fn fresh_env() -> StoreEnv {
+        StoreEnv::new()
     }
 
     #[test]
     fn put_get_roundtrip_updates_lru() {
-        let store = fresh_store();
+        let env = fresh_env();
+        let store = env.store.clone();
         let cache = AttachmentCache::new(store, 1024 * 1024);
         cache
             .put("blob-a", Some("text/plain"), b"hello world")
@@ -212,7 +247,8 @@ mod tests {
     /// entry — never the just-inserted one.
     #[test]
     fn eviction_respects_lru_order() {
-        let store = fresh_store();
+        let env = fresh_env();
+        let store = env.store.clone();
         let cache = AttachmentCache::new(store, 20); // hold ~2 small blobs
 
         cache.put("a", None, &[1u8; 8]).unwrap();
@@ -235,7 +271,8 @@ mod tests {
 
     #[test]
     fn purge_clears_cache() {
-        let store = fresh_store();
+        let env = fresh_env();
+        let store = env.store.clone();
         let cache = AttachmentCache::new(store, 1024);
         cache.put("a", None, &[0u8; 8]).unwrap();
         cache.put("b", None, &[0u8; 8]).unwrap();
@@ -248,7 +285,8 @@ mod tests {
     /// error.
     #[test]
     fn empty_blob_id_rejected() {
-        let store = fresh_store();
+        let env = fresh_env();
+        let store = env.store.clone();
         let cache = AttachmentCache::new(store, 1024);
         let err = cache.put("", None, b"x").unwrap_err();
         assert!(matches!(err, Error::InvalidArgument(_)));
@@ -260,7 +298,8 @@ mod tests {
     /// `Ok(())` from `put` followed by `None` from `get`).
     #[test]
     fn oversized_payload_rejected() {
-        let store = fresh_store();
+        let env = fresh_env();
+        let store = env.store.clone();
         let cache = AttachmentCache::new(store, 16);
         let err = cache.put("too-big", None, &[0u8; 64]).unwrap_err();
         assert!(matches!(err, Error::InvalidArgument(_)));
@@ -274,7 +313,8 @@ mod tests {
     /// just wrote).
     #[test]
     fn just_inserted_blob_survives_eviction_at_boundary() {
-        let store = fresh_store();
+        let env = fresh_env();
+        let store = env.store.clone();
         // Capacity holds exactly two 8-byte entries.
         let cache = AttachmentCache::new(store, 16);
 

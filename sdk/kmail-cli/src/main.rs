@@ -162,10 +162,13 @@ async fn run_sync(args: SyncArgs) -> Result<()> {
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
             "mailboxesUpserted": summary.mailboxes_upserted,
+            "mailboxesDestroyed": summary.mailboxes_destroyed,
             "emailsCreated": summary.emails_created,
             "emailsUpdated": summary.emails_updated,
             "emailsDestroyed": summary.emails_destroyed,
-            "pendingActionsFlushed": summary.pending_actions_flushed,
+            "pendingActionsApplied": summary.pending_actions_applied,
+            "pendingActionsFailed": summary.pending_actions_failed,
+            "pendingActionsDeferred": summary.pending_actions_deferred,
         }))?
     );
     Ok(())

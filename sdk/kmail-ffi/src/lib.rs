@@ -179,10 +179,13 @@ pub struct FfiEmailSummary {
 #[derive(uniffi::Record)]
 pub struct FfiSyncSummary {
     pub mailboxes_upserted: u64,
+    pub mailboxes_destroyed: u64,
     pub emails_created: u64,
     pub emails_updated: u64,
     pub emails_destroyed: u64,
-    pub pending_actions_flushed: u64,
+    pub pending_actions_applied: u64,
+    pub pending_actions_failed: u64,
+    pub pending_actions_deferred: u64,
 }
 
 // ---------------------------------------------------------------
@@ -247,10 +250,13 @@ impl From<kmail_core::SyncSummary> for FfiSyncSummary {
     fn from(s: kmail_core::SyncSummary) -> Self {
         FfiSyncSummary {
             mailboxes_upserted: s.mailboxes_upserted,
+            mailboxes_destroyed: s.mailboxes_destroyed,
             emails_created: s.emails_created,
             emails_updated: s.emails_updated,
             emails_destroyed: s.emails_destroyed,
-            pending_actions_flushed: s.pending_actions_flushed,
+            pending_actions_applied: s.pending_actions_applied,
+            pending_actions_failed: s.pending_actions_failed,
+            pending_actions_deferred: s.pending_actions_deferred,
         }
     }
 }

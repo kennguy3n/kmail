@@ -115,10 +115,13 @@ pub struct JsEmailSummary {
 #[napi(object)]
 pub struct JsSyncSummary {
     pub mailboxes_upserted: BigInt,
+    pub mailboxes_destroyed: BigInt,
     pub emails_created: BigInt,
     pub emails_updated: BigInt,
     pub emails_destroyed: BigInt,
-    pub pending_actions_flushed: BigInt,
+    pub pending_actions_applied: BigInt,
+    pub pending_actions_failed: BigInt,
+    pub pending_actions_deferred: BigInt,
 }
 
 // ---------------------------------------------------------------
@@ -180,10 +183,13 @@ fn summary_to_js(s: kmail_core::EmailSummary) -> JsEmailSummary {
 fn sync_summary_to_js(s: kmail_core::SyncSummary) -> JsSyncSummary {
     JsSyncSummary {
         mailboxes_upserted: bigint_u64(s.mailboxes_upserted),
+        mailboxes_destroyed: bigint_u64(s.mailboxes_destroyed),
         emails_created: bigint_u64(s.emails_created),
         emails_updated: bigint_u64(s.emails_updated),
         emails_destroyed: bigint_u64(s.emails_destroyed),
-        pending_actions_flushed: bigint_u64(s.pending_actions_flushed),
+        pending_actions_applied: bigint_u64(s.pending_actions_applied),
+        pending_actions_failed: bigint_u64(s.pending_actions_failed),
+        pending_actions_deferred: bigint_u64(s.pending_actions_deferred),
     }
 }
 

@@ -165,6 +165,34 @@ pub struct EmailChangesResponse {
     pub destroyed: Vec<String>,
 }
 
+/// `Mailbox/changes` response payload (RFC 8621 §2.4).
+///
+/// `updated_properties`, when present and non-null, is the
+/// server's hint that ONLY the listed mailbox properties changed
+/// for the IDs in `updated`. The SDK ignores the hint today and
+/// always re-fetches the full `Mailbox` object, which keeps the
+/// hydration path uniform with `created` and is cheap because
+/// `Mailbox/get` returns the entire mailbox set per call (mailbox
+/// counts are typically O(dozens)). We parse the field for
+/// completeness and so a future optimisation can consume it
+/// without a wire-format change.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MailboxChangesResponse {
+    pub account_id: String,
+    pub old_state: String,
+    pub new_state: String,
+    pub has_more_changes: bool,
+    #[serde(default)]
+    pub created: Vec<String>,
+    #[serde(default)]
+    pub updated: Vec<String>,
+    #[serde(default)]
+    pub destroyed: Vec<String>,
+    #[serde(default)]
+    pub updated_properties: Option<Vec<String>>,
+}
+
 /// `EmailSubmission/set` response payload (subset).
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]

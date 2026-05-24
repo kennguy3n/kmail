@@ -21,7 +21,10 @@ pub mod transport;
 
 pub use ops::JmapClient;
 pub use request::{
-    EmailChangesArgs, EmailGetArgs, EmailQueryArgs, JmapInvocation, JmapRequest, MailboxGetArgs,
+    EmailChangesArgs, EmailGetArgs, EmailQueryArgs, JmapInvocation, JmapRequest,
+    MailboxChangesArgs, MailboxGetArgs,
 };
-pub use response::{JmapInvocationResponse, JmapResponse, MethodErrorPayload};
+pub use response::{
+    JmapInvocationResponse, JmapResponse, MailboxChangesResponse, MethodErrorPayload,
+};
 pub use transport::{JmapTransport, TransportConfig};
