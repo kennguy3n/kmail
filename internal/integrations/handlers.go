@@ -166,6 +166,24 @@ func (h *Handlers) register(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "invalid_request", "url required")
 		return
 	}
+	// An empty events list would pass FilterEventsForClient's
+	// "len(requested) > 0" guard at service.go:198, bypassing the
+	// insufficient-scope short-circuit, and the row would be
+	// stored with `events = []` — which the existing webhooks
+	// package interprets as a wildcard ("deliver every event").
+	// Defense-in-depth: the dispatch-time EventAllowedForClient
+	// check (service.go:493) still gates on the client's
+	// granted scopes, so an empty-events webhook only receives
+	// events the integration was actually consented for — there
+	// is no privilege escalation. But the row is broader than
+	// the client's actual scope, which is a confusing API
+	// contract. Reject the request at the boundary so an
+	// integration MUST enumerate what it wants to subscribe to.
+	if len(req.Events) == 0 {
+		writeJSONError(w, http.StatusBadRequest, "invalid_request",
+			"events required: declare at least one event type to subscribe to")
+		return
+	}
 
 	result, err := h.svc.RegisterWebhookForClient(
 		r.Context(),

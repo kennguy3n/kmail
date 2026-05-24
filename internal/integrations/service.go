@@ -489,6 +489,10 @@ func (s *Service) dispatchIntegrationOwned(ctx context.Context, tenantID, eventT
 		return 0, err
 	}
 	enqueued := 0
+	var (
+		insertFailed int
+		lastInsertErr error
+	)
 	for _, sub := range subs {
 		if !EventAllowedForClient(sub.GrantedScopes, eventType) {
 			// Subscribed at some past point with broader
@@ -508,11 +512,28 @@ func (s *Service) dispatchIntegrationOwned(ctx context.Context, tenantID, eventT
 		allowed, nextRetryAt := s.checkQuota(ctx, sub.OAuthClientID, quota)
 		if err := s.insertIntegrationDelivery(ctx, tenantID, sub.EndpointID, eventType, body, allowed, nextRetryAt); err != nil {
 			// One subscriber's failure must not block other
-			// subscribers — log and continue.
+			// subscribers (head-of-line blocking would be
+			// strictly worse for at-least-once than the per-
+			// subscriber drop), so we log + continue. BUT we
+			// also remember the failure and surface it as a
+			// non-nil return error after the loop so the
+			// caller (the outbox-style upstream that fired
+			// this event) knows to schedule a redrive. Without
+			// the surfaced error the dispatcher silently
+			// degrades to at-MOST-once on transient INSERT
+			// failure, violating the at-least-once default
+			// promised by the comment block at the top of
+			// this file (line 38-41) and in doc.go.
 			s.cfg.Logger.Printf("integrations: insert delivery failed for endpoint=%s client=%s: %v", sub.EndpointID, sub.OAuthClientID, err)
+			insertFailed++
+			lastInsertErr = err
 			continue
 		}
 		enqueued++
+	}
+	if insertFailed > 0 {
+		return enqueued, fmt.Errorf("integrations: %d of %d integration-owned subscribers failed to enqueue (last error: %w)",
+			insertFailed, len(subs), lastInsertErr)
 	}
 	return enqueued, nil
 }

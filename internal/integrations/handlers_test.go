@@ -152,6 +152,35 @@ func TestRegister_RejectsEmptyURL(t *testing.T) {
 	}
 }
 
+// TestRegister_RejectsEmptyEvents pins the events-required
+// validation. A registration with an empty events array would
+// previously bypass the FilterEventsForClient insufficient-
+// scope guard and store a wildcard subscription (`events = []`)
+// that the underlying webhooks package interprets as "deliver
+// every event". Defense-in-depth: dispatch-time
+// EventAllowedForClient still gates on the client's actual
+// scopes, so no privilege escalation, but the row is broader
+// than the client's intent — reject at the boundary so the
+// integration MUST enumerate its subscriptions.
+func TestRegister_RejectsEmptyEvents(t *testing.T) {
+	h := newHandlersForTest(t)
+	bodyJSON := `{"url": "https://example.com/hook", "events": []}`
+	req := httptest.NewRequest("POST", "/api/v1/integ/webhooks", strings.NewReader(bodyJSON))
+	req = req.WithContext(withTokenCtx(req.Context(), &oauth.AccessTokenContext{
+		TenantID: "tenant-1", ClientID: "client-1", Scopes: []string{oauth.ScopeReadMail},
+	}))
+	rec := httptest.NewRecorder()
+	h.register(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d; want %d", rec.Code, http.StatusBadRequest)
+	}
+	var body map[string]string
+	_ = json.Unmarshal(rec.Body.Bytes(), &body)
+	if body["error"] != "invalid_request" {
+		t.Errorf("error code = %q; want invalid_request", body["error"])
+	}
+}
+
 // TestRegister_RejectsMissingTokenContext pins that each
 // handler defensively rechecks the token context, even though
 // the middleware ought to guarantee it. This keeps the handler
