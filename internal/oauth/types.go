@@ -130,7 +130,20 @@ type AccessTokenContext struct {
 // future scope-hierarchy change (e.g. `write:mail` implies
 // `read:mail`) lands in one place.
 func (a *AccessTokenContext) HasScope(want string) bool {
-	for _, s := range a.Scopes {
+	return ScopesInclude(a.Scopes, want)
+}
+
+// ScopesInclude reports whether `granted` satisfies a `want`
+// scope requirement, accounting for the write:* → read:*
+// implication. This is the canonical scope-subset helper —
+// downstream packages (e.g. internal/integrations) that need to
+// re-check scopes outside the request-context flow (e.g.
+// dispatch-time defence-in-depth on stored subscription rows)
+// MUST call this rather than open-coding a string slice walk,
+// so a future hierarchy change lands once. HasScope above
+// delegates here.
+func ScopesInclude(granted []string, want string) bool {
+	for _, s := range granted {
 		if s == want {
 			return true
 		}

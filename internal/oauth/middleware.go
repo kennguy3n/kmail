@@ -25,6 +25,22 @@ func FromContext(ctx context.Context) (*AccessTokenContext, bool) {
 	return v, ok
 }
 
+// WithAccessTokenContext returns a context that carries the
+// given AccessTokenContext under the package's unexported key.
+// Production code does not use this directly — AuthMiddleware
+// performs the attachment as part of validating the bearer
+// token. Exposed for downstream packages' tests (e.g.
+// internal/integrations) that need to simulate a request
+// authenticated by AuthMiddleware without actually running it.
+//
+// Keeping the key unexported and the setter exported is the
+// least-coupled API: callers that want the attach behaviour
+// MUST go through this function (which is auditable), but the
+// key itself remains unforgeable from outside the package.
+func WithAccessTokenContext(ctx context.Context, tc *AccessTokenContext) context.Context {
+	return context.WithValue(ctx, accessTokenCtxKey, tc)
+}
+
 // AuthMiddleware verifies the Authorization: Bearer header
 // against the oauth_access_tokens table and attaches the
 // resolved AccessTokenContext to the request context.

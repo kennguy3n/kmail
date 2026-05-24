@@ -38,6 +38,21 @@ func (f *fakeLimiterStore) IncrWithTTL(_ context.Context, key string, _ time.Dur
 	return f.counts[key], nil
 }
 
+// Allow is required to satisfy the middleware.RateLimiterStore
+// interface but never exercised by the integrations tests
+// (those drive checkQuota via IncrWithTTL only). Return values
+// are a benign "admitted" pair so a hypothetical accidental
+// caller fails open rather than rejecting traffic.
+func (f *fakeLimiterStore) Allow(
+	_ context.Context,
+	_, _ string,
+	_ time.Duration,
+	_, _ int,
+	_ time.Time,
+) (bool, bool, error) {
+	return true, true, nil
+}
+
 // newServiceForUnitTests assembles a Service with the
 // dependencies we can construct without a Postgres. Methods
 // that hit Pool / OAuth / Webhooks panic in these tests by
