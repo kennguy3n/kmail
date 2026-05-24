@@ -135,9 +135,35 @@ impl From<reqwest::header::InvalidHeaderValue> for Error {
 
 impl Error {
     /// Returns `true` if the caller should attempt the operation
-    /// again after waiting. Used by the sync engine to decide
-    /// whether to leave an action on the `pending_actions` queue
-    /// versus surfacing it to the UI as terminal.
+    /// again after waiting. Two call-sites consult this method and
+    /// they apply **different semantics**:
+    ///
+    /// 1. The HTTP transport retry loop in `jmap::transport::with_retries`
+    ///    treats "retryable" as *re-issue the HTTP request immediately
+    ///    (after exponential backoff)*. Only error types the transport
+    ///    itself produces are relevant here.
+    /// 2. The pending-actions queue drainer in `client::flush_pending_actions`
+    ///    treats "retryable" as *leave the action on the queue for the
+    ///    next sync attempt* \u2014 a much weaker statement than "retry now".
+    ///
+    /// `Error::Cancelled` is classified as retryable because cancellation
+    /// is observed only from the queue drainer side (it surfaces when a
+    /// `tokio::task` is dropped, e.g. the FFI host process backgrounds the
+    /// app mid-sync). A cancelled write must stay on the queue so the next
+    /// sync replays it; dropping it would silently lose user actions. The
+    /// `MAX_PENDING_ACTION_ATTEMPTS` ceiling (10) prevents an infinite
+    /// retry loop if the cancellation is structurally persistent.
+    ///
+    /// The transport-loop semantic remains safe **only as long as
+    /// `Cancelled` is never produced inside the transport layer**.
+    /// `From<reqwest::Error>` maps to `Transport(_)`, not `Cancelled`, so
+    /// the loop currently never observes a `Cancelled` to retry. Future
+    /// contributors adding a cancellation-token path to the transport
+    /// MUST either route it to a non-retryable variant (e.g. a new
+    /// `Aborted` variant) or special-case `Cancelled` inside the loop \u2014
+    /// otherwise an aborted request will retry until the `with_retries`
+    /// attempt budget is exhausted, defeating the entire point of the
+    /// cancellation signal.
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         matches!(
