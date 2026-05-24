@@ -5,9 +5,15 @@ metadata:
   name: {{ include "kmail.fullname" . }}-api
   labels:
     {{- include "kmail.labels" . | nindent 4 }}
-  {{- with .Values.kmailApi.ingress.annotations }}
+  {{- $mrAnnotations := include "kmail.multiregionIngressAnnotations" . }}
+  {{- if or .Values.kmailApi.ingress.annotations (trim $mrAnnotations) }}
   annotations:
+    {{- with .Values.kmailApi.ingress.annotations }}
     {{- toYaml . | nindent 4 }}
+    {{- end }}
+    {{- with trim $mrAnnotations }}
+    {{- nindent 4 . }}
+    {{- end }}
   {{- end }}
 spec:
   {{- with .Values.kmailApi.ingress.className }}

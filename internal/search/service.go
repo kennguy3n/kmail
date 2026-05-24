@@ -88,7 +88,18 @@ type SearchBackend interface {
 	// tenant index. Used by `Service.Reindex` when switching
 	// backends.
 	MigrateIndex(ctx context.Context, tenantID string, msgs []Message) error
+	// ExportMessages returns every document currently in the
+	// tenant index. Used by `Service.Export` during the auto-
+	// cutover (Phase 5) so the worker can read messages out of
+	// the old backend and push them into the new one. Backends
+	// that don't support bulk export return ErrNotSupported.
+	ExportMessages(ctx context.Context, tenantID string) ([]Message, error)
 }
+
+// ErrNotSupported is returned by SearchBackend implementations
+// that can't honour an optional method (e.g. an upstream that has
+// no bulk-export API).
+var ErrNotSupported = errors.New("backend does not support operation")
 
 // Service manages per-tenant backend selection and reindex jobs.
 type Service struct {
@@ -182,6 +193,22 @@ func (s *Service) SetBackend(ctx context.Context, tenantID, backend string) erro
 	})
 }
 
+// Export returns every indexed message for `tenantID` from the
+// tenant's CURRENT backend. Used by the Phase 5 auto-cutover
+// worker as its MessageSource: read from Meilisearch, flip the
+// backend column, push into OpenSearch.
+func (s *Service) Export(ctx context.Context, tenantID string) ([]Message, error) {
+	name, err := s.GetBackend(ctx, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	b, ok := s.backends[name]
+	if !ok {
+		return nil, fmt.Errorf("%w: backend %q not configured", ErrNotFound, name)
+	}
+	return b.ExportMessages(ctx, tenantID)
+}
+
 // Reindex re-imports every message in `msgs` into whatever backend
 // the tenant is currently configured for. Phase 7 calls this
 // after a SetBackend that flipped the column; in production the
@@ -191,9 +218,37 @@ func (s *Service) Reindex(ctx context.Context, tenantID string, msgs []Message) 
 	if err != nil {
 		return err
 	}
-	b, ok := s.backends[name]
+	return s.reindexInto(ctx, tenantID, name, msgs)
+}
+
+// ReindexTo bulk-imports `msgs` into a SPECIFIC named backend,
+// ignoring the tenant's currently-configured `search_backend`
+// column. Used by the Phase 5 auto-cutover worker so it can warm
+// the destination index BEFORE flipping the column — if the
+// reindex fails, the tenant stays readable on the old backend and
+// the worker simply retries on the next tick. Validates `backend`
+// against the registered backend names so a typo can't write to
+// a non-existent destination.
+func (s *Service) ReindexTo(ctx context.Context, tenantID, backend string, msgs []Message) error {
+	if tenantID == "" || backend == "" {
+		return fmt.Errorf("%w: tenantID and backend required", ErrInvalidInput)
+	}
+	switch backend {
+	case BackendMeilisearch, BackendOpenSearch:
+	default:
+		return fmt.Errorf("%w: backend must be %q or %q", ErrInvalidInput, BackendMeilisearch, BackendOpenSearch)
+	}
+	return s.reindexInto(ctx, tenantID, backend, msgs)
+}
+
+// reindexInto is the shared body for Reindex and ReindexTo. It
+// always wipes the destination index first so a retry after a
+// half-written run produces a consistent index (no orphan
+// documents from the previous attempt).
+func (s *Service) reindexInto(ctx context.Context, tenantID, backendName string, msgs []Message) error {
+	b, ok := s.backends[backendName]
 	if !ok {
-		return fmt.Errorf("%w: backend %q not configured", ErrNotFound, name)
+		return fmt.Errorf("%w: backend %q not configured", ErrNotFound, backendName)
 	}
 	if err := b.DeleteIndex(ctx, tenantID); err != nil {
 		return fmt.Errorf("reindex: delete: %w", err)
