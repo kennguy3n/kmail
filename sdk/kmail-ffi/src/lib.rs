@@ -294,6 +294,21 @@ impl KMailClientHandle {
         self.inner.set_bearer_token(token).map_err(Into::into)
     }
 
+    /// Drop the cached JMAP session. The next `sync()` call will
+    /// re-fetch `/jmap/session`. Use when the shell observes a
+    /// reauth-required 401 or a tenant-rebalanced push.
+    pub async fn invalidate_session(&self) {
+        let inner = self.inner.clone();
+        // Spawn through our owned runtime so the session lock lives
+        // there — matches the pattern used by `sync()` above and
+        // avoids deadlocks if the foreign caller's runtime context is
+        // ambiguous.
+        runtime()
+            .spawn(async move { inner.invalidate_session().await })
+            .await
+            .expect("invalidate_session task panicked");
+    }
+
     pub fn cached_mailboxes(&self) -> Result<Vec<FfiMailbox>, KMailError> {
         Ok(self
             .inner

@@ -17,6 +17,24 @@ use crate::error::{Error, Result};
 use crate::sync::store::Store;
 use chrono::Utc;
 
+/// Wall-clock used to stamp `last_accessed_at` in the cache.
+///
+/// Returns milliseconds since the Unix epoch. We deliberately
+/// pick millisecond precision (not whole seconds) so that two
+/// `put`s issued back-to-back from the same thread within the
+/// same wall-clock second still produce strictly increasing
+/// timestamps. Whole-second precision would let two entries
+/// share a `last_accessed_at`, and the `ORDER BY last_accessed_at
+/// ASC` candidate-selection query in `put`'s eviction sweep
+/// would then fall back to SQLite's implementation-defined row
+/// order — effectively non-deterministic LRU.
+///
+/// `i64` is fine for the foreseeable future: milliseconds since
+/// epoch fits in 63 bits until year 292,277,026.
+fn now_ms() -> i64 {
+    Utc::now().timestamp_millis()
+}
+
 /// Attachment cache wrapping the shared `Store`.
 pub struct AttachmentCache {
     store: Store,
@@ -55,7 +73,7 @@ impl AttachmentCache {
                 self.max_bytes,
             )));
         }
-        let now = Utc::now().timestamp();
+        let now = now_ms();
         let max_bytes = self.max_bytes;
         self.store.with_conn(|conn| {
             let tx = conn.transaction()?;
@@ -133,7 +151,7 @@ impl AttachmentCache {
             if payload.is_some() {
                 tx.execute(
                     "UPDATE blob_cache SET last_accessed_at = ?1 WHERE blob_id = ?2",
-                    rusqlite::params![Utc::now().timestamp(), blob_id],
+                    rusqlite::params![now_ms(), blob_id],
                 )?;
             }
             tx.commit()?;
@@ -199,10 +217,12 @@ mod tests {
 
         cache.put("a", None, &[1u8; 8]).unwrap();
         // Sleep so `last_accessed_at` strictly orders the entries.
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        // Millisecond precision means a handful of ms is enough; we
+        // pick 10ms to absorb scheduler jitter on slow CI runners.
+        std::thread::sleep(std::time::Duration::from_millis(10));
         cache.put("b", None, &[2u8; 8]).unwrap();
         // Now `a` is older. Inserting `c` should evict `a`.
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        std::thread::sleep(std::time::Duration::from_millis(10));
         cache.put("c", None, &[3u8; 8]).unwrap();
 
         assert!(
@@ -259,9 +279,9 @@ mod tests {
         let cache = AttachmentCache::new(store, 16);
 
         cache.put("old-1", None, &[0u8; 8]).unwrap();
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        std::thread::sleep(std::time::Duration::from_millis(10));
         cache.put("old-2", None, &[0u8; 8]).unwrap();
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        std::thread::sleep(std::time::Duration::from_millis(10));
         // Inserting a third 8-byte blob would push total to 24, so
         // the cache must evict the oldest (`old-1`) — and must NOT
         // evict `new` itself.

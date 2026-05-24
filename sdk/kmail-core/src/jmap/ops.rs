@@ -72,6 +72,24 @@ impl JmapClient {
         self.transport.get_json(&self.session_path).await
     }
 
+    /// Pass-through POST that reuses the live transport (and therefore
+    /// the live bearer token from `Arc<RwLock<String>>`).
+    ///
+    /// Intended for SDK calls that hit non-JMAP HTTP endpoints on the
+    /// same BFF — e.g. `POST /api/v1/push/subscribe`. Routing those
+    /// through `self.transport` instead of building a fresh
+    /// `JmapTransport` from a static config is the difference between
+    /// observing OIDC token refresh and ossifying the original token at
+    /// `KMailClient::open` time. The latter manifests as a 401 from the
+    /// BFF five-to-sixty minutes into any session.
+    pub async fn post_json<B: serde::Serialize, T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T> {
+        self.transport.post_json(path, body).await
+    }
+
     /// Dispatch a pre-built batch request against the session's
     /// `apiUrl`. The session is fetched if not supplied — pass
     /// one in when chaining several batches to avoid the extra

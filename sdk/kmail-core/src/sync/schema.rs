@@ -103,6 +103,12 @@ pub(crate) const MIGRATIONS: &[(u32, &str)] = &[(
         CREATE INDEX IF NOT EXISTS idx_pending_actions_enqueued
             ON pending_actions(enqueued_at);
 
+        -- `fetched_at` and `last_accessed_at` are milliseconds since
+        -- the Unix epoch (i.e. `chrono::Utc::now().timestamp_millis()`,
+        -- via `cache::now_ms()`). Whole-second precision would let
+        -- two back-to-back `put`s share a `last_accessed_at`, making
+        -- the LRU eviction order in `cache::AttachmentCache::put`
+        -- depend on SQLite's implementation-defined row order on ties.
         CREATE TABLE IF NOT EXISTS blob_cache (
             blob_id TEXT NOT NULL PRIMARY KEY,
             content_type TEXT,

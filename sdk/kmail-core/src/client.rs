@@ -35,7 +35,7 @@ use crate::sync::{
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::OnceCell;
+use tokio::sync::RwLock;
 
 /// Upper bound on the number of `Email/changes` batches we will
 /// drain in a single `sync()` call.
@@ -140,9 +140,26 @@ pub struct KMailClient {
     actions_repo: Arc<ActionsRepo>,
     cache: Arc<AttachmentCache>,
     /// Cached session resource — fetched on first `sync()` or
-    /// `discover_session()` call. Wrapped in `tokio::sync::OnceCell`
-    /// for async-aware idempotent initialisation.
-    session: Arc<OnceCell<JmapSession>>,
+    /// `discover_session()` call.
+    ///
+    /// Held behind `Arc<RwLock<Option<_>>>` (rather than the simpler
+    /// `OnceCell`) so [`invalidate_session`] can drop it. JMAP sessions
+    /// are usually stable for the lifetime of an authenticated client,
+    /// but they can change in three scenarios the SDK must be able to
+    /// recover from without forcing the platform shell to close + reopen
+    /// the client (which would re-run SQLite migrations and dump the
+    /// attachment cache):
+    ///   1. The user's tenant gets resharded — `apiUrl` rotates.
+    ///   2. The user upgrades their plan — `accounts` / `capabilities`
+    ///      grow new entries (Confidential Send, Vault).
+    ///   3. The BFF returns a `Reauth-Required` 401 with a fresh
+    ///      session document attached (future protocol extension).
+    ///
+    /// `set_bearer_token` deliberately does NOT auto-invalidate the
+    /// session because OIDC refresh by itself never rotates `apiUrl` or
+    /// account mapping. Platform shells call [`invalidate_session`]
+    /// explicitly when they observe one of the above signals.
+    session: Arc<RwLock<Option<JmapSession>>>,
     /// Memoised account ID. Resolved from config, or from the
     /// session's `primaryAccounts[urn:...:mail]` on first use.
     account_id: Arc<Mutex<Option<String>>>,
@@ -183,7 +200,7 @@ impl KMailClient {
             state_repo,
             actions_repo,
             cache,
-            session: Arc::new(OnceCell::new()),
+            session: Arc::new(RwLock::new(None)),
             account_id: Arc::new(Mutex::new(None)),
         })
     }
@@ -204,12 +221,39 @@ impl KMailClient {
     }
 
     /// Fetch (or return the cached) JMAP session resource.
+    ///
+    /// Concurrency: we do a cheap read-lock probe first, then upgrade
+    /// to a write lock and re-check before paying the HTTP cost so
+    /// concurrent callers can't double-fetch the session. The HTTP
+    /// request itself runs while we hold the write lock; that's fine
+    /// here because (a) the session endpoint is small and fast, and (b)
+    /// without holding the write lock through the HTTP call, two
+    /// callers that both observe `None` would each fire their own GET,
+    /// defeating the cache's purpose on the cold path.
     pub async fn discover_session(&self) -> Result<JmapSession> {
-        let s = self
-            .session
-            .get_or_try_init(|| async { self.jmap.session().await })
-            .await?;
-        Ok(s.clone())
+        if let Some(cached) = self.session.read().await.as_ref() {
+            return Ok(cached.clone());
+        }
+        let mut guard = self.session.write().await;
+        if let Some(cached) = guard.as_ref() {
+            return Ok(cached.clone());
+        }
+        let fresh = self.jmap.session().await?;
+        *guard = Some(fresh.clone());
+        Ok(fresh)
+    }
+
+    /// Drop the cached JMAP session so the next `discover_session()`
+    /// / `sync()` re-fetches it from `/jmap/session`.
+    ///
+    /// Platform shells should call this when they have a signal that
+    /// the server-side session document has changed — e.g. after a
+    /// 401 with `WWW-Authenticate: Reauth-Required`, after a plan
+    /// upgrade webhook, or after a shard-migration push. Calling it on
+    /// a never-fetched session is a no-op.
+    pub async fn invalidate_session(&self) {
+        let mut guard = self.session.write().await;
+        *guard = None;
     }
 
     /// Account ID resolution policy:
@@ -497,6 +541,14 @@ impl KMailClient {
 
     /// Register a push token with the BFF. The transport-specific
     /// payload shape mirrors `cmd/kmail-api/main.go` lines 698-748.
+    ///
+    /// Routes through the live `JmapClient::post_json`, which reuses
+    /// the same `Arc<RwLock<String>>`-backed bearer token as every
+    /// other JMAP request. That means a `set_bearer_token` refresh is
+    /// observed here too — building a fresh `JmapTransport` from
+    /// `self.config.bearer_token` would have ossified the original
+    /// token captured at `open()` time and produced a 401 the moment
+    /// the OIDC access token rotated (typically every 5–60 minutes).
     pub async fn register_push_token(
         &self,
         transport: PushTransport,
@@ -509,11 +561,7 @@ impl KMailClient {
             web_push_keys,
             types: Vec::new(),
         };
-        let resp: serde_json::Value = crate::jmap::transport::JmapTransport::new(
-            TransportConfig::new(&self.config.bff_url, &self.config.bearer_token),
-        )?
-        .post_json("/api/v1/push/subscribe", &req)
-        .await?;
+        let resp: serde_json::Value = self.jmap.post_json("/api/v1/push/subscribe", &req).await?;
         // BFF returns `{"id": "...", "transport": "..."}` on success;
         // we don't surface the subscription ID today — the SDK
         // re-registers on every reauth, so storing the ID is the
@@ -1272,5 +1320,96 @@ mod tests {
         let live_via_clone = cloned.jmap.current_bearer_token_for_test().unwrap();
         assert_eq!(live_via_origin, "v1-token");
         assert_eq!(live_via_clone, "v1-token");
+    }
+
+    /// Regression: `invalidate_session()` must drop the cached
+    /// session so the next `discover_session()` re-fetches from
+    /// `/jmap/session`. Use case: tenant resharding / plan upgrade
+    /// where the server's session document has changed but the SDK
+    /// has cached the stale copy.
+    #[tokio::test]
+    async fn invalidate_session_forces_refetch() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("kmail-invalidate.db");
+        // The mock expects exactly 2 GETs to /jmap/session — one
+        // before invalidation, one after. If invalidation didn't
+        // drop the cache, the second discover_session() would be
+        // served from memory and the mock would observe only 1
+        // request, failing the .expect(2) assertion.
+        Mock::given(method("GET"))
+            .and(path("/jmap/session"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiUrl": format!("{}/jmap/api", server.uri()),
+                "capabilities": {CAP_CORE: {}, CAP_MAIL: {}},
+                "username": "alice@example.com",
+                "accounts": {
+                    "acct-1": {
+                        "name": "Alice",
+                        "isPersonal": true,
+                        "isReadOnly": false,
+                        "accountCapabilities": {}
+                    }
+                },
+                "primaryAccounts": {CAP_MAIL: "acct-1"}
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let cfg = ClientConfig::new(server.uri(), "test-token", db);
+        let client = KMailClient::open(cfg).unwrap();
+
+        // First call: cold fetch.
+        let s1 = client.discover_session().await.unwrap();
+        // Second call without invalidation: served from cache, no
+        // new HTTP request.
+        let s2 = client.discover_session().await.unwrap();
+        assert_eq!(s1.username, s2.username);
+
+        // Now invalidate and re-discover: a second HTTP request
+        // must hit the mock for `.expect(2)` to be satisfied on
+        // drop.
+        client.invalidate_session().await;
+        let s3 = client.discover_session().await.unwrap();
+        assert_eq!(s3.username, "alice@example.com");
+    }
+
+    /// Regression for the cross-shell push-token bug: building a
+    /// fresh `JmapTransport` from `ClientConfig::bearer_token` in
+    /// `register_push_token` would ignore any subsequent
+    /// `set_bearer_token` refresh and 401 every push registration
+    /// after the first OIDC refresh. The fix routes push through
+    /// the live `JmapClient::post_json`. Verify the BFF call is
+    /// authenticated with the *current* live token.
+    #[tokio::test]
+    async fn register_push_token_uses_live_bearer_token() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("kmail-push.db");
+
+        // Accept the push subscribe POST only when it carries the
+        // refreshed token. If `register_push_token` used the stale
+        // ClientConfig snapshot, this stub would never match and
+        // the call would 404 (wiremock default for unmatched).
+        Mock::given(method("POST"))
+            .and(path("/api/v1/push/subscribe"))
+            .and(header("authorization", "Bearer refreshed-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "sub-1",
+                "transport": "apns"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let cfg = ClientConfig::new(server.uri(), "original-token", db);
+        let client = KMailClient::open(cfg).unwrap();
+        client.set_bearer_token("refreshed-token").unwrap();
+
+        client
+            .register_push_token(PushTransport::Apns, "apns-device-token", None)
+            .await
+            .expect("push registration should succeed with the live token");
     }
 }

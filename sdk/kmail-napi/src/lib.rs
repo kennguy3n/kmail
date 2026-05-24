@@ -240,6 +240,15 @@ impl KMailClientJs {
         self.inner.set_bearer_token(token).map_err(napi_err)
     }
 
+    /// Drop the cached JMAP session so the next sync re-fetches
+    /// `/jmap/session`. Call after a reauth-required 401, tenant
+    /// resharding webhook, or plan-upgrade event.
+    #[napi]
+    pub async fn invalidate_session(&self) {
+        let inner = (*self.inner).clone();
+        inner.invalidate_session().await
+    }
+
     #[napi]
     pub fn cached_mailboxes(&self) -> Result<Vec<JsMailbox>> {
         let v = self.inner.cached_mailboxes().map_err(napi_err)?;

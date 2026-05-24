@@ -9,7 +9,7 @@ use crate::error::{Error, Result};
 use crate::models::{Mailbox, MailboxRights, MailboxRole};
 use crate::sync::store::Store;
 use chrono::Utc;
-use rusqlite::OptionalExtension;
+use rusqlite::{Connection, OptionalExtension};
 
 #[derive(Clone)]
 pub struct MailboxRepo {
@@ -23,57 +23,36 @@ impl MailboxRepo {
 
     /// Insert or update a single mailbox.
     pub fn upsert(&self, mbx: &Mailbox) -> Result<()> {
-        let role_str = mbx.role.map(role_to_str);
-        let rights_json = match mbx.my_rights {
-            Some(ref r) => Some(serde_json::to_string(r)?),
-            None => None,
-        };
-        self.store.with_conn(|c| {
-            c.execute(
-                "INSERT INTO mailboxes (
-                    id, name, role, parent_id, sort_order,
-                    total_emails, unread_emails, total_threads, unread_threads,
-                    is_vault, rights_json, updated_at
-                 ) VALUES (
-                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12
-                 )
-                 ON CONFLICT(id) DO UPDATE SET
-                    name = excluded.name,
-                    role = excluded.role,
-                    parent_id = excluded.parent_id,
-                    sort_order = excluded.sort_order,
-                    total_emails = excluded.total_emails,
-                    unread_emails = excluded.unread_emails,
-                    total_threads = excluded.total_threads,
-                    unread_threads = excluded.unread_threads,
-                    is_vault = excluded.is_vault,
-                    rights_json = excluded.rights_json,
-                    updated_at = excluded.updated_at",
-                rusqlite::params![
-                    mbx.id,
-                    mbx.name,
-                    role_str,
-                    mbx.parent_id,
-                    mbx.sort_order as i64,
-                    mbx.total_emails as i64,
-                    mbx.unread_emails as i64,
-                    mbx.total_threads as i64,
-                    mbx.unread_threads as i64,
-                    if mbx.is_vault { 1i64 } else { 0i64 },
-                    rights_json,
-                    Utc::now().timestamp(),
-                ],
-            )?;
-            Ok(())
-        })
+        self.store.with_conn(|c| upsert_one(c, mbx))
     }
 
-    /// Bulk insert. Used by the initial bootstrap path.
+    /// Bulk insert wrapped in a single transaction.
+    ///
+    /// The whole batch is atomic: if any row fails, the entire write
+    /// is rolled back and the local cache stays at the prior snapshot.
+    /// `Mailbox/get` responses are processed as a unit — a partially
+    /// applied batch would leave the SDK convinced it had observed the
+    /// JMAP state ID returned alongside (state tokens are committed
+    /// later in `sync()`) while some mailboxes were silently missing,
+    /// and the next `Mailbox/changes` against that state would not
+    /// re-deliver the missed rows. Rolling back is the only behaviour
+    /// consistent with the JMAP state-cursor contract.
+    ///
+    /// Reusing one transaction also drops per-row fsyncs, which makes
+    /// the bootstrap path roughly an order of magnitude faster on
+    /// realistic mailbox counts.
     pub fn upsert_many(&self, mailboxes: &[Mailbox]) -> Result<()> {
-        for m in mailboxes {
-            self.upsert(m)?;
+        if mailboxes.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        self.store.with_conn(|c| {
+            let tx = c.transaction()?;
+            for m in mailboxes {
+                upsert_one(&tx, m)?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
     }
 
     /// Remove a mailbox by ID. Cascades to `email_mailboxes`.
@@ -125,6 +104,55 @@ impl MailboxRepo {
             Ok(n.max(0) as u64)
         })
     }
+}
+
+/// Row-level upsert against either a `Connection` or a `Transaction`.
+///
+/// `rusqlite::Connection::execute` is also available on `Transaction`
+/// via the `Deref<Target = Connection>` impl, so a single signature
+/// taking `&Connection` covers both call sites.
+fn upsert_one(c: &Connection, mbx: &Mailbox) -> Result<()> {
+    let role_str = mbx.role.map(role_to_str);
+    let rights_json = match mbx.my_rights {
+        Some(ref r) => Some(serde_json::to_string(r)?),
+        None => None,
+    };
+    c.execute(
+        "INSERT INTO mailboxes (
+            id, name, role, parent_id, sort_order,
+            total_emails, unread_emails, total_threads, unread_threads,
+            is_vault, rights_json, updated_at
+         ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12
+         )
+         ON CONFLICT(id) DO UPDATE SET
+            name = excluded.name,
+            role = excluded.role,
+            parent_id = excluded.parent_id,
+            sort_order = excluded.sort_order,
+            total_emails = excluded.total_emails,
+            unread_emails = excluded.unread_emails,
+            total_threads = excluded.total_threads,
+            unread_threads = excluded.unread_threads,
+            is_vault = excluded.is_vault,
+            rights_json = excluded.rights_json,
+            updated_at = excluded.updated_at",
+        rusqlite::params![
+            mbx.id,
+            mbx.name,
+            role_str,
+            mbx.parent_id,
+            mbx.sort_order as i64,
+            mbx.total_emails as i64,
+            mbx.unread_emails as i64,
+            mbx.total_threads as i64,
+            mbx.unread_threads as i64,
+            if mbx.is_vault { 1i64 } else { 0i64 },
+            rights_json,
+            Utc::now().timestamp(),
+        ],
+    )?;
+    Ok(())
 }
 
 fn role_to_str(r: MailboxRole) -> &'static str {
