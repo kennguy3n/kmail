@@ -2,7 +2,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 
 import { jmapClient } from "../../api/jmap";
+import { snoozeEmail } from "../../api/snooze";
+import SnoozePicker from "./SnoozePicker";
 import type { Email, Mailbox } from "../../types";
+
+/** Display name for the lazily-provisioned per-user Snoozed mailbox. */
+const SNOOZED_MAILBOX_NAME = "Snoozed";
 
 /**
  * Inbox is the primary Mail list view.
@@ -244,6 +249,27 @@ export default function Inbox() {
     [mailboxes],
   );
 
+  // Resolve the Snoozed mailbox lazily. We don't auto-create it
+  // up-front because most users never snooze; we provision it on
+  // first use inside `handleSnooze` instead. The lookup matches
+  // either the (uncommon) `"snoozed"` JMAP role or the
+  // conventional mailbox name we create.
+  const snoozedMailboxId = useMemo(() => {
+    const list = mailboxes ?? [];
+    const byRole = list.find((m) => m.role === "snoozed");
+    if (byRole) return byRole.id;
+    const byName = list.find(
+      (m) => m.name.toLowerCase() === SNOOZED_MAILBOX_NAME.toLowerCase(),
+    );
+    return byName?.id ?? null;
+  }, [mailboxes]);
+
+  // Open snooze picker state — one at a time, keyed by email id.
+  // Closing == setting to null. The actual handler lives below
+  // bumpAfterWrite (state shape here, behaviour after writes).
+  const [snoozeOpenFor, setSnoozeOpenFor] = useState<string | null>(null);
+  const [snoozeBusy, setSnoozeBusy] = useState(false);
+
   // Single source of truth for "this row behaves as if it lives in
   // trash". Used both for the row label (Trash vs Delete) and the
   // handler's delete-vs-move branch so they can't drift. In search
@@ -291,6 +317,45 @@ export default function Inbox() {
     setReloadNonce((n) => n + 1);
     setSearchReloadNonce((n) => n + 1);
   }, []);
+
+  const handleSnooze = useCallback(
+    async (email: Email, until: Date) => {
+      if (snoozeBusy) return;
+      setSnoozeBusy(true);
+      try {
+        // Lazily create the Snoozed mailbox on first use. If a
+        // pre-existing mailbox is present (either by role or by
+        // name) we reuse it.
+        let snoozedId = snoozedMailboxId;
+        if (!snoozedId) {
+          snoozedId = await jmapClient.createMailbox(SNOOZED_MAILBOX_NAME);
+        }
+        // The user might already have toggled the email into the
+        // snoozed mailbox manually; refuse the no-op case so the
+        // BFF doesn't reject `snoozed_mailbox_id ∈ originals`.
+        const originals = { ...email.mailboxIds } as Record<string, boolean>;
+        if (originals[snoozedId]) {
+          throw new Error(
+            "Email is already in the Snoozed mailbox — wake it first.",
+          );
+        }
+        await snoozeEmail({
+          email_id: email.id,
+          original_mailbox_ids: originals,
+          snoozed_mailbox_id: snoozedId,
+          snooze_until: until.toISOString(),
+          mark_unread_on_wake: true,
+        });
+        setSnoozeOpenFor(null);
+        bumpAfterWrite();
+      } catch (err: unknown) {
+        setError(errorMessage(err));
+      } finally {
+        setSnoozeBusy(false);
+      }
+    },
+    [bumpAfterWrite, snoozeBusy, snoozedMailboxId],
+  );
 
   const handleToggleRead = useCallback(
     async (email: Email) => {
@@ -549,10 +614,15 @@ export default function Inbox() {
                     inTrashView={rowInTrash}
                     inJunkView={rowInJunk}
                     hasJunkMailbox={junkMailboxId !== null}
+                    snoozeOpen={snoozeOpenFor === email.id}
+                    snoozeBusy={snoozeBusy && snoozeOpenFor === email.id}
                     onOpen={() => handleOpenEmail(email.id)}
                     onToggleRead={() => handleToggleRead(email)}
                     onMoveToTrash={() => handleMoveToTrash(email)}
                     onToggleSpam={() => handleToggleSpam(email)}
+                    onOpenSnooze={() => setSnoozeOpenFor(email.id)}
+                    onCancelSnooze={() => setSnoozeOpenFor(null)}
+                    onPickSnooze={(until) => handleSnooze(email, until)}
                   />
                 );
               })}
@@ -569,10 +639,15 @@ interface EmailRowProps {
   inTrashView: boolean;
   inJunkView: boolean;
   hasJunkMailbox: boolean;
+  snoozeOpen: boolean;
+  snoozeBusy: boolean;
   onOpen: () => void;
   onToggleRead: () => void;
   onMoveToTrash: () => void;
   onToggleSpam: () => void;
+  onOpenSnooze: () => void;
+  onCancelSnooze: () => void;
+  onPickSnooze: (until: Date) => void;
 }
 
 function EmailRow({
@@ -580,10 +655,15 @@ function EmailRow({
   inTrashView,
   inJunkView,
   hasJunkMailbox,
+  snoozeOpen,
+  snoozeBusy,
   onOpen,
   onToggleRead,
   onMoveToTrash,
   onToggleSpam,
+  onOpenSnooze,
+  onCancelSnooze,
+  onPickSnooze,
 }: EmailRowProps) {
   const isUnread = !email.keywords.$seen;
   const from = email.from?.[0];
@@ -657,6 +737,28 @@ function EmailRow({
           >
             {inTrashView ? "Delete" : "Trash"}
           </button>
+          <div style={layoutStyles.snoozeWrap}>
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                onOpenSnooze();
+              }}
+              disabled={snoozeBusy}
+              style={layoutStyles.actionButton}
+              title="Snooze this email until later"
+              aria-haspopup="dialog"
+              aria-expanded={snoozeOpen}
+            >
+              {snoozeBusy ? "Snoozing…" : "Snooze"}
+            </button>
+            {snoozeOpen && (
+              <SnoozePicker
+                onPick={(until) => onPickSnooze(until)}
+                onCancel={onCancelSnooze}
+              />
+            )}
+          </div>
         </div>
       </div>
     </li>
@@ -753,6 +855,10 @@ const layoutStyles: Record<string, React.CSSProperties> = {
   },
   main: {
     padding: "1rem",
+  },
+  snoozeWrap: {
+    position: "relative",
+    display: "inline-block",
   },
   searchBar: {
     display: "flex",

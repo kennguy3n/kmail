@@ -49,6 +49,7 @@ import (
 	"github.com/kennguy3n/kmail/internal/search"
 	"github.com/kennguy3n/kmail/internal/sharedinbox"
 	"github.com/kennguy3n/kmail/internal/sieve"
+	"github.com/kennguy3n/kmail/internal/snooze"
 	syncsvc "github.com/kennguy3n/kmail/internal/sync"
 	"github.com/kennguy3n/kmail/internal/tenant"
 	"github.com/kennguy3n/kmail/internal/undosend"
@@ -649,6 +650,34 @@ func main() {
 	}
 	go scheduledWorker.Run(ctx)
 	logger.Printf("scheduledsend: worker wired (interval=%s)", scheduledInterval)
+
+	// Email Snooze (WS5). Hides an already-delivered email in a
+	// per-user "Snoozed" mailbox until snooze_until, then patches
+	// mailboxIds back to the originals via the JMAP InternalClient.
+	// Symmetric with scheduledsend: durable Postgres queue, worker
+	// with SKIP LOCKED, exponential backoff, dead-letter via
+	// status='failed'. Wiring is always on (the DB pool is
+	// required) — there is no env gate.
+	snoozeSvc, err := snooze.NewService(snooze.Config{
+		Pool:   pool,
+		Logger: logger,
+	})
+	if err != nil {
+		logger.Fatalf("snooze.NewService: %v", err)
+	}
+	snooze.NewHandlers(snoozeSvc, internalJmap).Register(mux, authMW)
+	snoozeInterval := getenvDuration("KMAIL_SNOOZE_INTERVAL", 30*time.Second)
+	snoozeWorker, err := snooze.NewDispatchWorker(snooze.WorkerConfig{
+		Service:  snoozeSvc,
+		Internal: internalJmap,
+		Logger:   logger,
+		Interval: snoozeInterval,
+	})
+	if err != nil {
+		logger.Fatalf("snooze.NewDispatchWorker: %v", err)
+	}
+	go snoozeWorker.Run(ctx)
+	logger.Printf("snooze: worker wired (interval=%s)", snoozeInterval)
 
 	if chained := jmap.ChainSendInterceptors(sendInterceptors...); chained != nil {
 		proxy.SetSendInterceptor(chained)

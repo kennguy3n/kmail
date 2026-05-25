@@ -1,0 +1,406 @@
+package snooze
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/kennguy3n/kmail/internal/jmap"
+	"github.com/kennguy3n/kmail/internal/middleware"
+)
+
+// fakeManager implements the handlers' manager interface.
+type fakeManager struct {
+	mu        sync.Mutex
+	rows      []Snooze
+	snoozeResult *Snooze
+	snoozeErr error
+	getResult *Snooze
+	getErr    error
+	listErr   error
+	cancelErr error
+	created   []SnoozeInput
+	cancels   []string
+}
+
+func (f *fakeManager) Snooze(_ context.Context, in SnoozeInput) (*Snooze, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.created = append(f.created, in)
+	if f.snoozeErr != nil {
+		return nil, f.snoozeErr
+	}
+	if f.snoozeResult != nil {
+		return f.snoozeResult, nil
+	}
+	now := time.Now().UTC()
+	return &Snooze{
+		ID:                 "s-1",
+		TenantID:           in.TenantID,
+		KChatUserID:        in.KChatUserID,
+		StalwartAccountID:  in.StalwartAccountID,
+		EmailID:            in.EmailID,
+		OriginalMailboxIDs: in.OriginalMailboxIDs,
+		SnoozedMailboxID:   in.SnoozedMailboxID,
+		SnoozeUntil:        in.SnoozeUntil,
+		MarkUnreadOnWake:   in.MarkUnreadOnWake,
+		Status:             StatusSnoozed,
+		CreatedAt:          now,
+		UpdatedAt:          now,
+		NextRetryAt:        in.SnoozeUntil,
+	}, nil
+}
+
+func (f *fakeManager) Get(_ context.Context, _, _ string) (*Snooze, error) {
+	if f.getErr != nil {
+		return nil, f.getErr
+	}
+	return f.getResult, nil
+}
+
+func (f *fakeManager) ListByUser(_ context.Context, _, _ string) ([]Snooze, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	return f.rows, nil
+}
+
+func (f *fakeManager) Cancel(_ context.Context, _, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.cancels = append(f.cancels, id)
+	return f.cancelErr
+}
+
+// fakeDispatcher implements the handlers' dispatcher interface.
+type fakeDispatcher struct {
+	mu       sync.Mutex
+	calls    int
+	requests []jmap.JmapRequest
+	resp     *jmap.JmapResponse
+	err      error
+	resolveErr error
+}
+
+func (f *fakeDispatcher) ResolveAccountID(_ context.Context, _, _ string) (string, error) {
+	if f.resolveErr != nil {
+		return "", f.resolveErr
+	}
+	return "acct-a", nil
+}
+
+func (f *fakeDispatcher) Dispatch(_ context.Context, _, _ string, req jmap.JmapRequest) (*jmap.JmapResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	f.requests = append(f.requests, req)
+	if f.err != nil {
+		return nil, f.err
+	}
+	if f.resp != nil {
+		return f.resp, nil
+	}
+	return okHandlerResp(), nil
+}
+
+func okHandlerResp() *jmap.JmapResponse {
+	return &jmap.JmapResponse{
+		MethodResponses: [][]any{
+			{"Email/set", map[string]any{"accountId": "acct-a", "updated": map[string]any{"email-1": nil}}, "snz"},
+		},
+	}
+}
+
+func handlerRequest(method, target, body string) *http.Request {
+	var r *http.Request
+	if body == "" {
+		r = httptest.NewRequest(method, target, nil)
+	} else {
+		r = httptest.NewRequest(method, target, strings.NewReader(body))
+	}
+	ctx := middleware.WithTenantID(r.Context(), "tenant-a")
+	ctx = middleware.WithKChatUserID(ctx, "kchat-a")
+	return r.WithContext(ctx)
+}
+
+func newRouterForTest(m manager, d dispatcher) *http.ServeMux {
+	mux := http.NewServeMux()
+	h := newHandlersWith(m, d, func() time.Time { return time.Unix(1_700_000_000, 0) })
+	mux.HandleFunc("POST /api/v1/snooze", h.create)
+	mux.HandleFunc("GET /api/v1/snoozed", h.list)
+	mux.HandleFunc("GET /api/v1/snoozed/{id}", h.get)
+	mux.HandleFunc("DELETE /api/v1/snoozed/{id}", h.wakeNow)
+	return mux
+}
+
+func makeCreateBody() string {
+	until := time.Now().Add(2 * time.Hour).UTC().Format(time.RFC3339)
+	body := map[string]any{
+		"email_id":             "email-1",
+		"original_mailbox_ids": map[string]bool{"mb-inbox": true},
+		"snoozed_mailbox_id":   "mb-snoozed",
+		"snooze_until":         until,
+	}
+	b, _ := json.Marshal(body)
+	return string(b)
+}
+
+func TestCreate_HappyPathMovesAndPersists(t *testing.T) {
+	fm := &fakeManager{}
+	fd := &fakeDispatcher{}
+	router := newRouterForTest(fm, fd)
+	w := httptest.NewRecorder()
+	r := handlerRequest("POST", "/api/v1/snooze", makeCreateBody())
+	router.ServeHTTP(w, r)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d body=%s, want 201", w.Code, w.Body.String())
+	}
+	if fd.calls != 1 {
+		t.Fatalf("expected exactly 1 dispatch (move-to-snoozed), got %d", fd.calls)
+	}
+	if len(fm.created) != 1 {
+		t.Fatalf("expected exactly 1 service.Snooze call, got %d", len(fm.created))
+	}
+	in := fm.created[0]
+	if in.SnoozedMailboxID != "mb-snoozed" {
+		t.Errorf("SnoozedMailboxID = %q, want mb-snoozed", in.SnoozedMailboxID)
+	}
+	if !in.MarkUnreadOnWake {
+		t.Errorf("MarkUnreadOnWake should default true")
+	}
+	// Verify the patch shape on dispatch: snoozed mailbox added,
+	// inbox dropped, $seen untouched.
+	args, _ := fd.requests[0].MethodCalls[0][1].(map[string]any)
+	update, _ := args["update"].(map[string]any)
+	patch, _ := update["email-1"].(map[string]any)
+	if patch["mailboxIds/mb-snoozed"] != any(true) {
+		t.Errorf("expected mb-snoozed added on move-in, got %v", patch["mailboxIds/mb-snoozed"])
+	}
+	if patch["mailboxIds/mb-inbox"] != any(nil) {
+		t.Errorf("expected mb-inbox dropped on move-in, got %v", patch["mailboxIds/mb-inbox"])
+	}
+	if _, has := patch["keywords/$seen"]; has {
+		t.Errorf("move-in patch must not touch $seen, got %v", patch["keywords/$seen"])
+	}
+}
+
+func TestCreate_RejectsSnoozedMailboxInOriginals(t *testing.T) {
+	fm := &fakeManager{}
+	fd := &fakeDispatcher{}
+	router := newRouterForTest(fm, fd)
+
+	bodyMap := map[string]any{
+		"email_id":             "email-1",
+		"original_mailbox_ids": map[string]bool{"mb-snoozed": true, "mb-inbox": true},
+		"snoozed_mailbox_id":   "mb-snoozed",
+		"snooze_until":         time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+	}
+	b, _ := json.Marshal(bodyMap)
+
+	w := httptest.NewRecorder()
+	r := handlerRequest("POST", "/api/v1/snooze", string(b))
+	router.ServeHTTP(w, r)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 when snoozed mailbox is in originals", w.Code)
+	}
+	if fd.calls != 0 {
+		t.Fatalf("expected no dispatch when validation rejects, got %d", fd.calls)
+	}
+}
+
+func TestCreate_StalwartRefusalReturns502(t *testing.T) {
+	fm := &fakeManager{}
+	fd := &fakeDispatcher{err: errors.New("502 from stalwart")}
+	router := newRouterForTest(fm, fd)
+
+	w := httptest.NewRecorder()
+	r := handlerRequest("POST", "/api/v1/snooze", makeCreateBody())
+	router.ServeHTTP(w, r)
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502 when stalwart move fails", w.Code)
+	}
+	if len(fm.created) != 0 {
+		t.Fatalf("must NOT persist row when JMAP move fails: %d rows created", len(fm.created))
+	}
+}
+
+func TestCreate_DuplicateSnoozeReturns409(t *testing.T) {
+	fm := &fakeManager{snoozeErr: ErrAlreadySnoozed}
+	fd := &fakeDispatcher{}
+	router := newRouterForTest(fm, fd)
+
+	w := httptest.NewRecorder()
+	r := handlerRequest("POST", "/api/v1/snooze", makeCreateBody())
+	router.ServeHTTP(w, r)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 for duplicate active snooze", w.Code)
+	}
+}
+
+func TestCreate_InvalidJSONReturns400(t *testing.T) {
+	fm := &fakeManager{}
+	fd := &fakeDispatcher{}
+	router := newRouterForTest(fm, fd)
+
+	w := httptest.NewRecorder()
+	r := handlerRequest("POST", "/api/v1/snooze", "{not valid json")
+	router.ServeHTTP(w, r)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for invalid json", w.Code)
+	}
+}
+
+func TestList_HappyPath(t *testing.T) {
+	fm := &fakeManager{
+		rows: []Snooze{
+			{ID: "s-1", TenantID: "tenant-a", Status: StatusSnoozed, EmailID: "email-1", SnoozedMailboxID: "mb-snoozed", SnoozeUntil: time.Now().Add(time.Hour), CreatedAt: time.Now()},
+			{ID: "s-2", TenantID: "tenant-a", Status: StatusUnsnoozed, EmailID: "email-2", SnoozedMailboxID: "mb-snoozed", SnoozeUntil: time.Now().Add(-time.Hour), CreatedAt: time.Now()},
+		},
+	}
+	router := newRouterForTest(fm, &fakeDispatcher{})
+
+	w := httptest.NewRecorder()
+	r := handlerRequest("GET", "/api/v1/snoozed", "")
+	router.ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	var body struct {
+		Snoozes []responsePayload `json:"snoozes"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(body.Snoozes) != 2 {
+		t.Fatalf("got %d rows, want 2", len(body.Snoozes))
+	}
+}
+
+func TestGet_NotFoundReturns404(t *testing.T) {
+	fm := &fakeManager{getErr: ErrNotFound}
+	router := newRouterForTest(fm, &fakeDispatcher{})
+	w := httptest.NewRecorder()
+	r := handlerRequest("GET", "/api/v1/snoozed/missing", "")
+	router.ServeHTTP(w, r)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", w.Code)
+	}
+}
+
+func TestWakeNow_HappyPath(t *testing.T) {
+	fm := &fakeManager{
+		getResult: &Snooze{
+			ID:                 "s-1",
+			TenantID:           "tenant-a",
+			KChatUserID:        "kchat-a",
+			StalwartAccountID:  "acct-a",
+			EmailID:            "email-1",
+			OriginalMailboxIDs: json.RawMessage(`{"mb-inbox":true}`),
+			SnoozedMailboxID:   "mb-snoozed",
+			Status:             StatusSnoozed,
+		},
+	}
+	fd := &fakeDispatcher{}
+	router := newRouterForTest(fm, fd)
+
+	w := httptest.NewRecorder()
+	r := handlerRequest("DELETE", "/api/v1/snoozed/s-1", "")
+	router.ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s, want 200", w.Code, w.Body.String())
+	}
+	if fd.calls != 1 {
+		t.Fatalf("expected 1 dispatch (move-back), got %d", fd.calls)
+	}
+	if len(fm.cancels) != 1 || fm.cancels[0] != "s-1" {
+		t.Fatalf("expected service.Cancel(s-1), got %v", fm.cancels)
+	}
+	// Verify the patch shape: originals restored, snoozed dropped,
+	// $seen cleared because MarkUnreadOnWake defaulted true on the
+	// fixture row's zero value... wait actually MarkUnreadOnWake
+	// is FALSE on the zero value. The wake patch from the handler
+	// honours the row's flag; let's verify mailbox parts only.
+	args, _ := fd.requests[0].MethodCalls[0][1].(map[string]any)
+	update, _ := args["update"].(map[string]any)
+	patch, _ := update["email-1"].(map[string]any)
+	if patch["mailboxIds/mb-inbox"] != any(true) {
+		t.Errorf("expected mb-inbox restored on wake, got %v", patch["mailboxIds/mb-inbox"])
+	}
+	if patch["mailboxIds/mb-snoozed"] != any(nil) {
+		t.Errorf("expected mb-snoozed dropped on wake, got %v", patch["mailboxIds/mb-snoozed"])
+	}
+}
+
+func TestWakeNow_AlreadyTerminalIsIdempotent(t *testing.T) {
+	fm := &fakeManager{
+		getResult: &Snooze{
+			ID:                 "s-1",
+			TenantID:           "tenant-a",
+			KChatUserID:        "kchat-a",
+			StalwartAccountID:  "acct-a",
+			EmailID:            "email-1",
+			OriginalMailboxIDs: json.RawMessage(`{"mb-inbox":true}`),
+			SnoozedMailboxID:   "mb-snoozed",
+			Status:             StatusUnsnoozed,
+		},
+	}
+	fd := &fakeDispatcher{}
+	router := newRouterForTest(fm, fd)
+
+	w := httptest.NewRecorder()
+	r := handlerRequest("DELETE", "/api/v1/snoozed/s-1", "")
+	router.ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 idempotent", w.Code)
+	}
+	if fd.calls != 0 {
+		t.Fatalf("expected NO dispatch when already terminal, got %d", fd.calls)
+	}
+}
+
+func TestWakeNow_NotFoundReturns404(t *testing.T) {
+	fm := &fakeManager{getErr: ErrNotFound}
+	fd := &fakeDispatcher{}
+	router := newRouterForTest(fm, fd)
+	w := httptest.NewRecorder()
+	r := handlerRequest("DELETE", "/api/v1/snoozed/missing", "")
+	router.ServeHTTP(w, r)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", w.Code)
+	}
+}
+
+func TestWakeNow_StalwartRefusalReturns502(t *testing.T) {
+	fm := &fakeManager{
+		getResult: &Snooze{
+			ID:                 "s-1",
+			TenantID:           "tenant-a",
+			KChatUserID:        "kchat-a",
+			StalwartAccountID:  "acct-a",
+			EmailID:            "email-1",
+			OriginalMailboxIDs: json.RawMessage(`{"mb-inbox":true}`),
+			SnoozedMailboxID:   "mb-snoozed",
+			Status:             StatusSnoozed,
+		},
+	}
+	fd := &fakeDispatcher{err: errors.New("connect refused")}
+	router := newRouterForTest(fm, fd)
+	w := httptest.NewRecorder()
+	r := handlerRequest("DELETE", "/api/v1/snoozed/s-1", "")
+	router.ServeHTTP(w, r)
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", w.Code)
+	}
+	if len(fm.cancels) != 0 {
+		t.Fatalf("must NOT cancel row when JMAP wake failed: %v", fm.cancels)
+	}
+}

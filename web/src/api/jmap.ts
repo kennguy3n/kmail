@@ -826,6 +826,50 @@ export class JMAPClient {
     }
   }
 
+  /**
+   * Create a top-level mailbox with the given name. Returns the
+   * server-assigned id. Used by the Snooze feature to lazily
+   * provision a per-user "Snoozed" mailbox when the user snoozes
+   * their first email.
+   */
+  async createMailbox(name: string): Promise<string> {
+    const accountId = await this.getAccountId();
+    const response = await this.request([
+      [
+        "Mailbox/set",
+        {
+          accountId,
+          create: {
+            mb: {
+              name,
+              parentId: null,
+            },
+          },
+        },
+        "0",
+      ],
+    ]);
+    const result = expectResult(response, "Mailbox/set", "0");
+    const notCreated = result.notCreated as
+      | Record<string, { type?: string; description?: string }>
+      | undefined;
+    if (notCreated && notCreated.mb) {
+      const entry = notCreated.mb;
+      throw new Error(
+        `kmail-web: failed to create mailbox ${name}: ${entry.type ?? "unknown"}${entry.description ? `: ${entry.description}` : ""}`,
+      );
+    }
+    const created = result.created as
+      | Record<string, { id: string }>
+      | undefined;
+    if (!created || !created.mb) {
+      throw new Error(
+        `kmail-web: createMailbox(${name}) did not return an id`,
+      );
+    }
+    return created.mb.id;
+  }
+
   // ----------------------------------------------------------------
   // Calendars (draft `urn:ietf:params:jmap:calendars`).
   //
