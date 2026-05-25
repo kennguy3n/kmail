@@ -287,15 +287,24 @@ func TestAliasStalwartSyncWorker_TickLoop_ContextCancelDuringDelay(t *testing.T)
 	// delay window. We use a 1-hour delay so any return inside
 	// the test's deadline is conclusive evidence the select
 	// woke on ctx.Done().
+	//
+	// `calls` is an atomic so both the success path (Load after
+	// <-done, with a happens-before via close(done)) AND the
+	// timeout path (Fatalf's read while the goroutine may still
+	// be blocked in the select) are race-free under `go test
+	// -race`. The Load in the timeout branch is the diagnostic
+	// the test prints — making it atomic avoids relying on
+	// "the goroutine isn't actually writing right now" for
+	// memory-model correctness.
 	w := newTestAliasWorker().WithBatchCap(10).WithInterCallDelay(time.Hour)
 	ctx, cancel := context.WithCancel(context.Background())
-	var calls int
+	var calls atomic.Int64
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		w.tickLoop(ctx, func(_ context.Context) (bool, error) {
-			calls++
-			if calls == 1 {
+			n := calls.Add(1)
+			if n == 1 {
 				// Cancel right after the first call. The loop
 				// will then sleep for the inter-call delay and
 				// must wake on ctx.Done() instead of waiting
@@ -308,9 +317,9 @@ func TestAliasStalwartSyncWorker_TickLoop_ContextCancelDuringDelay(t *testing.T)
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
-		t.Fatalf("tickLoop did not return promptly on context cancel; calls=%d", calls)
+		t.Fatalf("tickLoop did not return promptly on context cancel; calls=%d", calls.Load())
 	}
-	if calls != 1 {
-		t.Errorf("processNext invoked %d times, want 1 (canceled during delay)", calls)
+	if got := calls.Load(); got != 1 {
+		t.Errorf("processNext invoked %d times, want 1 (canceled during delay)", got)
 	}
 }
