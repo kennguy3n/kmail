@@ -135,12 +135,44 @@ func (w *AliasStalwartSyncWorker) tick(ctx context.Context) {
 // context-cancel responsiveness, error short-circuit) can be
 // exercised by tests without standing up a pgx pool.
 func (w *AliasStalwartSyncWorker) tickLoop(ctx context.Context, process func(context.Context) (bool, error)) {
+	// Allocate the inter-call delay timer once and reset it per
+	// iteration. `time.After` would allocate a fresh timer each
+	// loop body — fine for GC pressure at the default 50-row
+	// cap, but more importantly leaves the underlying Timer
+	// orphaned until its deadline fires when ctx.Done wins the
+	// select. With operator-tuned long delays (seconds or
+	// minutes) and a frequently-cancelled context that's a real
+	// goroutine + timer-heap leak. NewTimer + Stop on the
+	// cancel path makes the lifecycle explicit and bounded.
+	var delayTimer *time.Timer
+	defer func() {
+		if delayTimer != nil {
+			delayTimer.Stop()
+		}
+	}()
 	for i := 0; w.batchCap <= 0 || i < w.batchCap; i++ {
 		if i > 0 && w.interCallDelay > 0 {
+			if delayTimer == nil {
+				delayTimer = time.NewTimer(w.interCallDelay)
+			} else {
+				delayTimer.Reset(w.interCallDelay)
+			}
 			select {
 			case <-ctx.Done():
+				// Stop and drain so the next call to Reset
+				// (next iteration, if reached) sees a quiesced
+				// timer. The drain only runs if Stop returned
+				// false (timer already fired but channel not
+				// consumed) — otherwise we'd block forever
+				// waiting on an empty channel.
+				if !delayTimer.Stop() {
+					select {
+					case <-delayTimer.C:
+					default:
+					}
+				}
 				return
-			case <-time.After(w.interCallDelay):
+			case <-delayTimer.C:
 			}
 		}
 		ok, err := process(ctx)
