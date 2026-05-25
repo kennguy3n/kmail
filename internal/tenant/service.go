@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -34,11 +35,22 @@ type SeatAccounter interface {
 // the HTTP handlers in this package.
 type Service struct {
 	pool          *pgxpool.Pool
+	logger        *log.Logger
 	seats         SeatAccounter
 	provisioner   StorageProvisioner
 	billing       BillingLifecycleHook
 	sharedInboxFn SharedInboxMembershipHook
 	aliasSync     StalwartAliasSync
+}
+
+// WithLogger returns a copy of the Service wired to the provided
+// logger. Used by the alias Stalwart-sync inline attempt to record
+// when sync deferred to the background worker. Falls back to the
+// standard logger when not set.
+func (s *Service) WithLogger(logger *log.Logger) *Service {
+	cp := *s
+	cp.logger = logger
+	return &cp
 }
 
 // SharedInboxMembershipHook is invoked after a successful

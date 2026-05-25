@@ -45,11 +45,16 @@ type StalwartShardResolver interface {
 // dev-compose (`admin:kmail-dev`) is fine for local testing;
 // production wires a long-lived management account via
 // `KMAIL_STALWART_ADMIN_USER` / `KMAIL_STALWART_ADMIN_PASS`.
+//
+// Fields are unexported so the constructor invariants (non-nil
+// resolver, non-empty admin user, fixed-timeout HTTP client) can't
+// be violated post-construction by a caller that imports the
+// package.
 type StalwartAliasHTTPSync struct {
-	Resolver   StalwartShardResolver
-	AdminUser  string
-	AdminPass  string
-	HTTPClient *http.Client
+	resolver   StalwartShardResolver
+	adminUser  string
+	adminPass  string
+	httpClient *http.Client
 }
 
 // NewStalwartAliasHTTPSync constructs a sync wired to the given
@@ -64,15 +69,27 @@ func NewStalwartAliasHTTPSync(resolver StalwartShardResolver, adminUser, adminPa
 		return nil, errors.New("stalwart alias sync: admin user is required")
 	}
 	return &StalwartAliasHTTPSync{
-		Resolver:  resolver,
-		AdminUser: adminUser,
-		AdminPass: adminPass,
+		resolver:  resolver,
+		adminUser: adminUser,
+		adminPass: adminPass,
 		// 10s matches the JMAP proxy's default Stalwart timeout
 		// for non-streaming admin calls. A Stalwart blip should
 		// fail fast and let the operator retry, rather than
 		// hanging the create-alias HTTP request.
-		HTTPClient: &http.Client{Timeout: 10 * time.Second},
+		httpClient: &http.Client{Timeout: 10 * time.Second},
 	}, nil
+}
+
+// WithHTTPClient returns a copy of the sync wired to a custom
+// HTTP client. Used by tests to point the sync at an httptest
+// server with a tighter timeout than the production default.
+func (s *StalwartAliasHTTPSync) WithHTTPClient(c *http.Client) *StalwartAliasHTTPSync {
+	if c == nil {
+		return s
+	}
+	cp := *s
+	cp.httpClient = c
+	return &cp
 }
 
 // AddAlias appends the alias address to the principal's `emails`
@@ -102,7 +119,7 @@ func (s *StalwartAliasHTTPSync) patchPrincipal(ctx context.Context, tenantID, st
 	if strings.TrimSpace(value) == "" {
 		return errors.New("stalwart alias sync: alias email is required")
 	}
-	shardURL, err := s.Resolver.GetTenantShard(ctx, tenantID)
+	shardURL, err := s.resolver.GetTenantShard(ctx, tenantID)
 	if err != nil {
 		return fmt.Errorf("resolve tenant shard: %w", err)
 	}
@@ -120,8 +137,8 @@ func (s *StalwartAliasHTTPSync) patchPrincipal(ctx context.Context, tenantID, st
 		return fmt.Errorf("build principal request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.SetBasicAuth(s.AdminUser, s.AdminPass)
-	resp, err := s.HTTPClient.Do(req)
+	req.SetBasicAuth(s.adminUser, s.adminPass)
+	resp, err := s.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("call stalwart admin api: %w", err)
 	}

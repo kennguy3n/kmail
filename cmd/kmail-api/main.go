@@ -418,7 +418,15 @@ func main() {
 		if err != nil {
 			logger.Printf("stalwart alias sync disabled: %v", err)
 		} else {
-			tenantSvc = tenantSvc.WithStalwartAliasSync(aliasSync)
+			tenantSvc = tenantSvc.WithStalwartAliasSync(aliasSync).WithLogger(logger)
+			// Drain `alias_stalwart_sync_queue` (migration 049)
+			// in the background. The Tenant Service enqueues
+			// sync intents atomically with each alias write and
+			// then attempts Stalwart sync inline; this worker
+			// retries the ones that fail inline so a Stalwart
+			// outage eventually converges without operator
+			// intervention.
+			go tenant.NewAliasStalwartSyncWorker(pool, aliasSync, logger).Run(ctx)
 		}
 	} else {
 		logger.Printf("stalwart alias sync disabled: KMAIL_STALWART_ADMIN_USER not set")

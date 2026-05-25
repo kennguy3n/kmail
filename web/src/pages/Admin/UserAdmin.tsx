@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 
 import {
   AdminApiError,
@@ -339,8 +339,13 @@ export default function UserAdmin() {
                       </td>
                     </tr>
                   ) : (
-                    <>
-                      <tr key={u.id}>
+                    // `Fragment` (not the `<>` shorthand) is required
+                    // here because the .map() callback returns two
+                    // sibling <tr> rows per user; React needs the key
+                    // on the outermost element it reconciles, and the
+                    // shorthand syntax cannot accept one.
+                    <Fragment key={u.id}>
+                      <tr>
                         <td>{u.email}</td>
                         <td>{u.display_name}</td>
                         <td>{u.role}</td>
@@ -393,7 +398,7 @@ export default function UserAdmin() {
                         </td>
                       </tr>
                       {aliasOpen[u.id] && selectedTenantId && (
-                        <tr key={u.id + ":aliases"} className="kmail-admin-subrow">
+                        <tr className="kmail-admin-subrow">
                           <td colSpan={6}>
                             <AliasManager
                               tenantId={selectedTenantId}
@@ -402,7 +407,7 @@ export default function UserAdmin() {
                           </td>
                         </tr>
                       )}
-                    </>
+                    </Fragment>
                   ),
                 )}
               </tbody>
