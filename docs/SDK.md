@@ -222,6 +222,23 @@ build. The job is gated on a `sdk` paths-filter so unrelated PRs
 do not pay the Rust compile cost, but is rolled into the
 aggregate `CI Status` check that branch protection requires.
 
+A nightly workflow at `.github/workflows/sdk-nightly.yml`
+(`SDK Nightly`, cron `0 3 * * *` UTC) closes the gap that the
+PR-level `sdk` job leaves: the in-process tests there replay
+recorded JMAP responses against wiremock, so a wire-format drift
+on the live BFF↔SDK boundary would not flag until staging. The
+nightly job spins up the full `docker-compose.yml` stack
+(Postgres + Stalwart + zk-fabric + Valkey + Meilisearch +
+kmail-api) and runs `scripts/test-e2e-sdk.sh` — a sister of the
+existing `scripts/test-e2e.sh` BFF smoke that drives the live
+backend through the real `kmail_core::KMailClient` via the
+`kmail-cli` release binary. Four probes: JMAP session
+discovery, delta-pull sync, local SQLite mailbox read, and the
+SDK doctor's schema + sqlite-version self-check. Triggers are
+the cron and `workflow_dispatch` (so a wire-format change can be
+opted into pre-merge from a feature branch); it does NOT run on
+every PR.
+
 ## Encryption
 
 The SDK implements the contract documented in `ARCHITECTURE.md`
