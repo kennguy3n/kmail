@@ -164,6 +164,23 @@ export class JMAPClient {
     methodCalls: JmapInvocation[],
     using: string[] = [JMAP_MAIL_CAPABILITY, JMAP_SUBMISSION_CAPABILITY],
   ): Promise<JmapResponse> {
+    const { body } = await this.requestWithHeaders(methodCalls, using);
+    return body;
+  }
+
+  /**
+   * Lower-level variant of `request` that returns both the parsed
+   * JMAP response envelope AND the underlying HTTP response
+   * headers. The Undo-Send proxy hook stamps
+   * `X-KMail-Pending-Send-Id` / `X-KMail-Undo-Deadline` on the
+   * EmailSubmission/set response; this method is the seam Compose
+   * reads those values through.
+   */
+  async requestWithHeaders(
+    methodCalls: JmapInvocation[],
+    using: string[] = [JMAP_MAIL_CAPABILITY, JMAP_SUBMISSION_CAPABILITY],
+    extraHeaders: Record<string, string> = {},
+  ): Promise<{ body: JmapResponse; headers: Headers }> {
     const session = await this.getSession();
     const res = await fetch(session.apiUrl, {
       method: "POST",
@@ -171,6 +188,7 @@ export class JMAPClient {
       headers: authHeaders({
         "Content-Type": "application/json",
         Accept: "application/json",
+        ...extraHeaders,
       }),
       body: JSON.stringify({
         using,
@@ -182,7 +200,8 @@ export class JMAPClient {
         `kmail-web: JMAP request failed: ${res.status} ${res.statusText}`,
       );
     }
-    return (await res.json()) as JmapResponse;
+    const body = (await res.json()) as JmapResponse;
+    return { body, headers: res.headers };
   }
 
   /** Fetch every mailbox for the current account. */
@@ -467,7 +486,8 @@ export class JMAPClient {
   async sendEmail(
     draft: EmailDraft,
     existingDraftId: string | null = null,
-  ): Promise<string> {
+    options: SendEmailOptions = {},
+  ): Promise<SendEmailResult> {
     const accountId = await this.getAccountId();
     const identityId = await this.resolveIdentityId(draft);
     const create = buildEmailCreate(draft);
@@ -485,23 +505,36 @@ export class JMAPClient {
     if (existingDraftId) {
       emailSetArgs.destroy = [existingDraftId];
     }
-    const response = await this.request([
-      ["Email/set", emailSetArgs, "0"],
-      [
-        "EmailSubmission/set",
-        {
-          accountId,
-          create: {
-            submission: {
-              emailId: "#draft",
-              identityId,
+    const extraHeaders: Record<string, string> = {};
+    if (options.undoSend) {
+      // Opt in to the BFF Undo-Send hold queue (internal/undosend).
+      // The proxy will forward only the Email/set portion of this
+      // batch to Stalwart, hold the EmailSubmission/set payload in
+      // Valkey, and respond with X-KMail-Pending-Send-Id headers.
+      extraHeaders["X-KMail-Undo-Send"] = "true";
+    }
+    const { body: response, headers: responseHeaders } =
+      await this.requestWithHeaders(
+        [
+          ["Email/set", emailSetArgs, "0"],
+          [
+            "EmailSubmission/set",
+            {
+              accountId,
+              create: {
+                submission: {
+                  emailId: "#draft",
+                  identityId,
+                },
+              },
+              onSuccessDestroyEmail: ["#submission"],
             },
-          },
-          onSuccessDestroyEmail: ["#submission"],
-        },
-        "1",
-      ],
-    ]);
+            "1",
+          ],
+        ],
+        undefined,
+        extraHeaders,
+      );
     const emailResult = expectResult(response, "Email/set", "0");
     const created = emailResult.created as
       | Record<string, { id: string }>
@@ -540,7 +573,21 @@ export class JMAPClient {
         "kmail-web: sendEmail did not create an EmailSubmission",
       );
     }
-    return created.draft.id;
+    // Undo-Send: when the BFF held the submission, the response
+    // carries the pending-send id + deadline. Surface them on the
+    // result so Compose can render the cancel banner.
+    const pendingSendId =
+      responseHeaders.get("X-KMail-Pending-Send-Id") ?? null;
+    const deadlineHeader =
+      responseHeaders.get("X-KMail-Undo-Deadline") ?? null;
+    const undoDeadline = deadlineHeader
+      ? parseDeadlineHeader(deadlineHeader)
+      : null;
+    return {
+      emailId: created.draft.id,
+      pendingSendId,
+      undoDeadline,
+    };
   }
 
   /**
@@ -1141,6 +1188,52 @@ function buildEventCreate(
     create.recurrenceRules = draft.recurrenceRules;
   }
   return create;
+}
+
+// ---------------------------------------------------------------
+// Undo Send (Phase 9 / WS3)
+// ---------------------------------------------------------------
+
+/** Caller-side options for `sendEmail`. */
+export interface SendEmailOptions {
+  /**
+   * When true, the JMAP request carries the `X-KMail-Undo-Send`
+   * opt-in header. The BFF proxy hook then holds the
+   * `EmailSubmission/set` portion in Valkey for the configured
+   * delay (default 10s) instead of forwarding immediately. The
+   * response carries the pending-send id + deadline so Compose
+   * can render the cancel banner.
+   */
+  undoSend?: boolean;
+}
+
+/**
+ * Result of a `sendEmail` call.
+ *
+ * `pendingSendId` and `undoDeadline` are populated only when the
+ * Undo-Send hook intercepted the request. For non-undo sends both
+ * fields are `null` and the result behaves like the previous
+ * `Promise<string>` shape.
+ */
+export interface SendEmailResult {
+  /** The minted Email id (the draft Stalwart created). */
+  emailId: string;
+  /** Proxy-issued pending-send id, or null when not held. */
+  pendingSendId: string | null;
+  /** Absolute deadline (Date) past which Cancel is no longer possible. */
+  undoDeadline: Date | null;
+}
+
+/**
+ * Parse the `X-KMail-Undo-Deadline` header (unix-seconds-int) into
+ * a `Date`. Returns null for any malformed value rather than
+ * throwing — the Compose page still needs to fall back to "Message
+ * sent" even when the deadline header is missing/garbage.
+ */
+function parseDeadlineHeader(raw: string): Date | null {
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return new Date(n * 1000);
 }
 
 // ---------------------------------------------------------------
