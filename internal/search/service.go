@@ -44,10 +44,35 @@ var ErrNotFound = errors.New("not found")
 
 // Backend names recognised by the service. Stored verbatim in
 // `tenants.search_backend`.
+//
+// The three `shared_*` and `dedicated_*` values were added in
+// migration 050 (shared indexes). Older values (`meilisearch`,
+// `opensearch`) remain valid for backward compatibility — pre-
+// existing tenants stay on whatever they were promoted to under
+// the per-tenant-index model until an operator migrates them.
 const (
-	BackendMeilisearch = "meilisearch"
-	BackendOpenSearch  = "opensearch"
+	BackendMeilisearch         = "meilisearch"
+	BackendOpenSearch          = "opensearch"
+	BackendSharedMeilisearch   = "shared_meilisearch"
+	BackendSharedOpenSearch    = "shared_opensearch"
+	BackendDedicatedOpenSearch = "dedicated_opensearch"
 )
+
+// IsValidBackend reports whether `name` is one of the recognised
+// `tenants.search_backend` values. Used by `SetBackend` and by
+// the cutover worker before it writes the column so a typo can't
+// strand a tenant in an unreachable state.
+func IsValidBackend(name string) bool {
+	switch name {
+	case BackendMeilisearch,
+		BackendOpenSearch,
+		BackendSharedMeilisearch,
+		BackendSharedOpenSearch,
+		BackendDedicatedOpenSearch:
+		return true
+	}
+	return false
+}
 
 // Message is the per-message indexable shape passed to
 // `SearchBackend.IndexMessage`. Stalwart owns the canonical
@@ -134,14 +159,16 @@ func NewService(cfg Config) *Service {
 }
 
 // GetBackend returns the configured backend name for a tenant. If
-// the column is NULL or empty we default to BackendMeilisearch so
-// existing tenants keep working without a migration backfill.
+// the column is NULL or empty we default to BackendSharedMeilisearch
+// — that matches the migration-049 column default for newly-
+// provisioned tenants and is the cheapest backend to land on if a
+// row is somehow missing its setting.
 func (s *Service) GetBackend(ctx context.Context, tenantID string) (string, error) {
 	if tenantID == "" {
 		return "", fmt.Errorf("%w: tenantID required", ErrInvalidInput)
 	}
 	if s.pool == nil {
-		return BackendMeilisearch, nil
+		return BackendSharedMeilisearch, nil
 	}
 	var backend string
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
@@ -158,22 +185,20 @@ func (s *Service) GetBackend(ctx context.Context, tenantID string) (string, erro
 		return "", fmt.Errorf("get backend: %w", err)
 	}
 	if backend == "" {
-		backend = BackendMeilisearch
+		backend = BackendSharedMeilisearch
 	}
 	return backend, nil
 }
 
 // SetBackend updates the tenant's search backend. Validates the
-// name against the registered backends so a typo can't put a
+// name against the recognised values so a typo can't put a
 // tenant into an unreachable state.
 func (s *Service) SetBackend(ctx context.Context, tenantID, backend string) error {
 	if tenantID == "" || backend == "" {
 		return fmt.Errorf("%w: tenantID and backend required", ErrInvalidInput)
 	}
-	switch backend {
-	case BackendMeilisearch, BackendOpenSearch:
-	default:
-		return fmt.Errorf("%w: backend must be %q or %q", ErrInvalidInput, BackendMeilisearch, BackendOpenSearch)
+	if !IsValidBackend(backend) {
+		return fmt.Errorf("%w: backend %q is not a recognised value", ErrInvalidInput, backend)
 	}
 	if s.pool == nil {
 		return nil
@@ -233,10 +258,8 @@ func (s *Service) ReindexTo(ctx context.Context, tenantID, backend string, msgs 
 	if tenantID == "" || backend == "" {
 		return fmt.Errorf("%w: tenantID and backend required", ErrInvalidInput)
 	}
-	switch backend {
-	case BackendMeilisearch, BackendOpenSearch:
-	default:
-		return fmt.Errorf("%w: backend must be %q or %q", ErrInvalidInput, BackendMeilisearch, BackendOpenSearch)
+	if !IsValidBackend(backend) {
+		return fmt.Errorf("%w: backend %q is not a recognised value", ErrInvalidInput, backend)
 	}
 	return s.reindexInto(ctx, tenantID, backend, msgs)
 }
@@ -328,12 +351,45 @@ func httpJSON(ctx context.Context, client *http.Client, method, endpoint string,
 	return nil
 }
 
-// indexNameFor returns the per-tenant index identifier. Both
-// backends use the same shape so a tenant migrating between them
-// can keep their existing index identifier.
+// indexNameFor returns the per-tenant index identifier. The
+// dedicated (per-tenant) backends use this directly; the shared
+// backends derive their index from the tenant's Stalwart shard
+// instead (see `sharedIndexNameFor`).
 func indexNameFor(tenantID string) string {
 	clean := strings.ReplaceAll(tenantID, "-", "")
 	return "kmail_" + clean
+}
+
+// sharedIndexNameFor returns the shared-index identifier for a
+// given Stalwart shard. Every tenant assigned to that shard
+// shares this one index; tenant isolation is enforced at query
+// time via a `tenant_id` filter (see `SharedMeilisearchBackend`
+// and `SharedOpenSearchBackend`).
+//
+// Shard IDs are UUIDs in production; we strip the hyphens to
+// keep the index name compatible with the strictest of
+// Meilisearch's identifier rules (alphanumerics, `-`, `_`).
+func sharedIndexNameFor(shardID string) string {
+	clean := strings.ReplaceAll(shardID, "-", "")
+	return "kmail_shared_" + clean
+}
+
+// ShardResolver resolves the Stalwart shard ID a tenant is
+// assigned to. The shared backends use this to derive their
+// index name. Production wires this against
+// `tenant.ShardService.GetTenantShardID`; tests inject a fake
+// that returns a fixed ID without touching the database.
+type ShardResolver interface {
+	ShardForTenant(ctx context.Context, tenantID string) (string, error)
+}
+
+// ShardResolverFunc adapts a closure into the ShardResolver
+// interface for inline wiring in main.go and tests.
+type ShardResolverFunc func(ctx context.Context, tenantID string) (string, error)
+
+// ShardForTenant implements ShardResolver.
+func (f ShardResolverFunc) ShardForTenant(ctx context.Context, tenantID string) (string, error) {
+	return f(ctx, tenantID)
 }
 
 // pathEscape is `url.PathEscape` exposed through the package so

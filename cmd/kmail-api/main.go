@@ -569,15 +569,35 @@ func main() {
 	}
 	dns.NewDKIMHandlers(dkimSvc, logger).Register(mux, authMW)
 
-	// Search backend abstraction (Phase 7). Meilisearch is the
-	// default; OpenSearch is opt-in per-tenant via the admin
-	// surface. The backend registry only contains the backends
-	// configured via env so dev compose stays lean.
+	// Search backend abstraction (Phase 7 + Phase 8). Meilisearch
+	// is the default; OpenSearch is opt-in per-tenant via the
+	// admin surface. The backend registry only contains the
+	// backends configured via env so dev compose stays lean.
+	//
+	// Phase 8 adds the shared-index variants (one index per
+	// Stalwart shard, tenant_id filter at query time). The
+	// shared backends are wired off the same env vars as the
+	// per-tenant ones and share the Stalwart shard resolver
+	// (`shardSvc.GetTenantShardID`) for index-name derivation —
+	// that keeps the index a tenant lands on aligned with the
+	// shard their JMAP traffic already routes to.
+	shardResolver := search.ShardResolverFunc(func(ctx context.Context, tenantID string) (string, error) {
+		return shardSvc.GetTenantShardID(ctx, tenantID)
+	})
 	var searchBackends []search.SearchBackend
+	var sharedInitBackends []search.SharedIndexEnsurer
 	if url := os.Getenv("KMAIL_MEILISEARCH_URL"); url != "" {
 		searchBackends = append(searchBackends, search.NewMeilisearchBackend(
 			url, os.Getenv("KMAIL_MEILISEARCH_API_KEY"),
 		))
+		shared, err := search.NewSharedMeilisearchBackend(
+			url, os.Getenv("KMAIL_MEILISEARCH_API_KEY"), shardResolver,
+		)
+		if err != nil {
+			logger.Fatalf("search.NewSharedMeilisearchBackend: %v", err)
+		}
+		searchBackends = append(searchBackends, shared)
+		sharedInitBackends = append(sharedInitBackends, shared)
 	}
 	if url := os.Getenv("KMAIL_OPENSEARCH_URL"); url != "" {
 		searchBackends = append(searchBackends, search.NewOpenSearchBackend(
@@ -585,6 +605,17 @@ func main() {
 			os.Getenv("KMAIL_OPENSEARCH_USER"),
 			os.Getenv("KMAIL_OPENSEARCH_PASS"),
 		))
+		shared, err := search.NewSharedOpenSearchBackend(
+			url,
+			os.Getenv("KMAIL_OPENSEARCH_USER"),
+			os.Getenv("KMAIL_OPENSEARCH_PASS"),
+			shardResolver,
+		)
+		if err != nil {
+			logger.Fatalf("search.NewSharedOpenSearchBackend: %v", err)
+		}
+		searchBackends = append(searchBackends, shared)
+		sharedInitBackends = append(sharedInitBackends, shared)
 	}
 	searchSvc := search.NewService(search.Config{
 		Pool:     pool,
@@ -593,11 +624,27 @@ func main() {
 	})
 	search.NewHandlers(searchSvc, logger).Register(mux, authMW)
 
-	// Phase 5: auto-cutover from Meilisearch to OpenSearch.
-	// Disabled when either backend is missing (we'd have nowhere
-	// to read from or write to). The worker polls hourly and
-	// promotes any tenant whose mailbox is past the configured
-	// byte threshold — see `internal/search/cutover.go`.
+	// Ensure every shared index exists with the correct
+	// settings before the first per-tenant write lands. We do
+	// this synchronously at startup so the admin / search
+	// surface can return early errors rather than discovering a
+	// missing index on the first SearchMessages call.
+	// Failures inside `EnsureSharedIndexes` are per-(backend,
+	// shard) and logged; only a fatal lister error aborts here,
+	// in which case the BFF can still start (the call returns
+	// the lister error and we log it, but we do not block the
+	// rest of startup).
+	if err := search.EnsureSharedIndexes(ctx, logger, shardSvc, sharedInitBackends); err != nil {
+		logger.Printf("search.EnsureSharedIndexes: %v (continuing — shared indexes will be created lazily)", err)
+	}
+
+	// Phase 5 / Phase 8: auto-cutover. Disabled when either
+	// backend is missing (we'd have nowhere to read from or
+	// write to). The worker now walks every configured
+	// transition pair (meili->opensearch AND
+	// shared_meili->shared_opensearch by default), so the
+	// fleet's hot tenants move forward regardless of which
+	// model they were provisioned under.
 	hasMeili, hasOpen := false, false
 	for _, b := range searchBackends {
 		switch b.Name() {

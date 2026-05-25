@@ -165,6 +165,38 @@ type CutoverStore interface {
 	ReconcileStale(ctx context.Context, sourceBackend string, before, now time.Time) (int64, error)
 }
 
+// CutoverTransition pairs a `source` backend with the `target`
+// backend a tenant on `source` should be promoted to. The worker
+// runs one full scan per configured transition each tick. Two
+// transitions ship by default:
+//
+//   - {meilisearch -> opensearch}: the legacy per-tenant index
+//     path that existed before the shared-index work landed.
+//   - {shared_meilisearch -> shared_opensearch}: the modern
+//     shared-index path for tenants on the migration-050 default.
+//
+// Operators who need a custom pair (e.g. forcing a shared tenant
+// onto a dedicated index) inject their own slice via
+// `CutoverConfig.Transitions`.
+type CutoverTransition struct {
+	// Source is the `tenants.search_backend` value that makes a
+	// tenant eligible. The worker filters ListCandidates on it.
+	Source string
+	// Target is the backend the worker reindexes INTO and then
+	// SetBackend flips the column to. The worker only marks a
+	// row `completed` after Target is fully populated.
+	Target string
+}
+
+// DefaultCutoverTransitions is what the worker uses when no
+// Transitions are explicitly configured. Listed in execution
+// order — the legacy pair runs first because that's the path
+// that has historically been in production.
+var DefaultCutoverTransitions = []CutoverTransition{
+	{Source: BackendMeilisearch, Target: BackendOpenSearch},
+	{Source: BackendSharedMeilisearch, Target: BackendSharedOpenSearch},
+}
+
 // CutoverConfig parameterises the auto-cutover worker.
 //
 //	Threshold:        mailbox-size (bytes) at or above which a tenant
@@ -198,6 +230,12 @@ type CutoverConfig struct {
 	MaxFailures    int
 	MaxRetryGap    time.Duration
 	ReconcileAfter time.Duration
+	// Transitions enumerates the (source, target) backend pairs
+	// the worker considers each tick. Defaults to
+	// `DefaultCutoverTransitions` (legacy meili->opensearch plus
+	// modern shared_meili->shared_opensearch). Operators can
+	// override to bias only one path or to add a custom pair.
+	Transitions []CutoverTransition
 	// MarkCompletedRetries bounds the retry loop around the
 	// post-SetBackend MarkCompleted call. Defaults to 3. A bounded
 	// retry covers a Postgres connection blip without spinning the
@@ -291,6 +329,9 @@ func NewCutoverWorker(cfg CutoverConfig) (*CutoverWorker, error) {
 	if cfg.ReconcileAfter <= 0 {
 		cfg.ReconcileAfter = defaultCutoverReconcileAfter
 	}
+	if len(cfg.Transitions) == 0 {
+		cfg.Transitions = DefaultCutoverTransitions
+	}
 	if cfg.MarkCompletedRetries <= 0 {
 		cfg.MarkCompletedRetries = defaultCutoverMarkCompletedTries
 	}
@@ -352,57 +393,83 @@ func (w *CutoverWorker) Run(ctx context.Context) {
 // without spinning the time.Ticker. Errors per tenant are logged
 // and counted; they do NOT abort the tick (one bad tenant must not
 // stop the rest of the fleet from migrating).
+//
+// The tick walks every configured transition pair in order. For
+// each pair it:
+//
+//  1. Runs the reconcile passes scoped to that pair's source /
+//     target so a stale `in_progress` row left by a previous
+//     transition's worker is cleaned up before new candidates
+//     are scanned.
+//  2. Lists candidates whose `search_backend` matches the
+//     pair's source.
+//  3. Migrates each candidate from source -> target.
+//
+// The reconcile passes are pair-scoped because the
+// `search_cutover_jobs` table doesn't itself carry a target
+// backend — the (source, target) interpretation lives in the
+// worker. A row promoted to `completed` is one whose tenant has
+// moved off the *source* the worker last claimed it from. If
+// two pairs share a row by mistake the worst case is one extra
+// reindex of a tenant already on the target, which is
+// idempotent.
 func (w *CutoverWorker) Tick(ctx context.Context) {
+	for _, tr := range w.cfg.Transitions {
+		w.tickTransition(ctx, tr)
+	}
+}
+
+// tickTransition runs one (source, target) pair of the cutover
+// pipeline. Two complementary reconcile passes prefix the scan:
+//
+//   (a) ReconcileCompleted: tenant ALREADY on `target`
+//       (SetBackend committed, MarkCompleted didn't). Promote
+//       the row to `completed`.
+//   (b) ReconcileStale:     tenant STILL on `source`
+//       (pod crashed during ReindexTo or before SetBackend).
+//       Demote the row to `failed` so the normal back-off /
+//       retry path picks it up on a subsequent tick. Without
+//       this, the row sits in `in_progress` forever — neither
+//       ListCandidates (excludes `in_progress`) nor
+//       ReconcileCompleted (gates on `search_backend = target`)
+//       recovers it.
+//
+// Reconciliation failures are logged and ignored — the main
+// cutover loop is independent of them, and a transient store
+// blip shouldn't bring the worker down.
+func (w *CutoverWorker) tickTransition(ctx context.Context, tr CutoverTransition) {
 	now := w.cfg.Now()
 	staleBefore := now.Add(-w.cfg.ReconcileAfter)
-	// Reconcile FIRST so any stale `in_progress` row is cleared
-	// before we scan for new candidates. Two complementary cases:
-	//
-	//   (a) ReconcileCompleted: tenant ALREADY on OpenSearch
-	//       (SetBackend committed, MarkCompleted didn't). Promote
-	//       the row to `completed`.
-	//   (b) ReconcileStale:     tenant STILL on Meilisearch
-	//       (pod crashed during ReindexTo or before SetBackend).
-	//       Demote the row to `failed` so the normal back-off /
-	//       retry path picks it up on a subsequent tick. Without
-	//       this, the row sits in `in_progress` forever — neither
-	//       ListCandidates (excludes `in_progress`) nor
-	//       ReconcileCompleted (gates on `search_backend =
-	//       opensearch`) recovers it.
-	//
-	// Reconciliation failures are logged and ignored — the main
-	// cutover loop is independent of them, and a transient store
-	// blip shouldn't bring the worker down.
-	if n, err := w.cfg.Store.ReconcileCompleted(ctx, BackendOpenSearch, staleBefore, now); err != nil {
-		w.cfg.Logger.Printf("search.cutover: reconcile completed: %v", err)
+	if n, err := w.cfg.Store.ReconcileCompleted(ctx, tr.Target, staleBefore, now); err != nil {
+		w.cfg.Logger.Printf("search.cutover[%s->%s]: reconcile completed: %v", tr.Source, tr.Target, err)
 	} else if n > 0 {
-		w.cfg.Logger.Printf("search.cutover: reconcile completed: promoted %d stale in_progress rows to completed", n)
+		w.cfg.Logger.Printf("search.cutover[%s->%s]: reconcile completed: promoted %d stale in_progress rows to completed", tr.Source, tr.Target, n)
 	}
-	if n, err := w.cfg.Store.ReconcileStale(ctx, BackendMeilisearch, staleBefore, now); err != nil {
-		w.cfg.Logger.Printf("search.cutover: reconcile stale: %v", err)
+	if n, err := w.cfg.Store.ReconcileStale(ctx, tr.Source, staleBefore, now); err != nil {
+		w.cfg.Logger.Printf("search.cutover[%s->%s]: reconcile stale: %v", tr.Source, tr.Target, err)
 	} else if n > 0 {
-		w.cfg.Logger.Printf("search.cutover: reconcile stale: demoted %d crashed in_progress rows to failed", n)
+		w.cfg.Logger.Printf("search.cutover[%s->%s]: reconcile stale: demoted %d crashed in_progress rows to failed", tr.Source, tr.Target, n)
 	}
 	ids, err := w.cfg.Store.ListCandidates(ctx, CandidateFilter{
-		SourceBackend:    BackendMeilisearch,
+		SourceBackend:    tr.Source,
 		MaxFailures:      w.cfg.MaxFailures,
 		RetryAfterBefore: now.Add(-w.cfg.MaxRetryGap),
 	})
 	if err != nil {
-		w.cfg.Logger.Printf("search.cutover: list candidates: %v", err)
+		w.cfg.Logger.Printf("search.cutover[%s->%s]: list candidates: %v", tr.Source, tr.Target, err)
 		return
 	}
 	for _, tenantID := range ids {
 		size, err := w.cfg.Sizer.TenantMailboxSize(ctx, tenantID)
 		if err != nil {
-			w.cfg.Logger.Printf("search.cutover: sizer tenant=%s: %v", tenantID, err)
+			w.cfg.Logger.Printf("search.cutover[%s->%s]: sizer tenant=%s: %v", tr.Source, tr.Target, tenantID, err)
 			continue
 		}
 		if size < w.cfg.Threshold {
 			continue
 		}
-		if err := w.cutoverOne(ctx, tenantID, size); err != nil {
-			w.cfg.Logger.Printf("search.cutover: tenant %s: %v", tenantID, err)
+		if err := w.cutoverOne(ctx, tenantID, size, tr); err != nil {
+			w.cfg.Logger.Printf("search.cutover[%s->%s]: tenant %s: %v", tr.Source, tr.Target, tenantID, err)
 		}
 	}
 }
@@ -412,7 +479,11 @@ func (w *CutoverWorker) Tick(ctx context.Context) {
 // is a separate store write so a crash mid-flight resumes from the
 // last persisted state. Concurrent workers race the `Claim` call;
 // the loser short-circuits and lets the winner finish.
-func (w *CutoverWorker) cutoverOne(ctx context.Context, tenantID string, size int64) error {
+//
+// The `tr` parameter scopes which (source, target) backend pair
+// the migration is for — the same worker handles every
+// configured pair in turn, so the destination is not implicit.
+func (w *CutoverWorker) cutoverOne(ctx context.Context, tenantID string, size int64, tr CutoverTransition) error {
 	now := w.cfg.Now()
 	claimed, err := w.cfg.Store.Claim(ctx, tenantID, size, w.cfg.Threshold, now)
 	if err != nil {
@@ -438,18 +509,17 @@ func (w *CutoverWorker) cutoverOne(ctx context.Context, tenantID string, size in
 	// `ListCandidates` for the next retry. ReindexTo deletes the
 	// destination index first so a half-written previous attempt
 	// doesn't leave orphan documents.
-	if err := w.cfg.Service.ReindexTo(ctx, tenantID, BackendOpenSearch, msgs); err != nil {
+	if err := w.cfg.Service.ReindexTo(ctx, tenantID, tr.Target, msgs); err != nil {
 		_ = w.cfg.Store.MarkFailed(ctx, tenantID, fmt.Sprintf("reindex: %v", err), w.cfg.Now())
 		return fmt.Errorf("reindex: %w", err)
 	}
-	// OpenSearch is now warm; atomically flip reads over. A
-	// SetBackend failure here is the unfortunate-but-recoverable
-	// case: the OpenSearch index is fully populated but reads
-	// still go to Meilisearch. The next tick re-discovers the
-	// tenant (still on `meilisearch`), the ReindexTo wipes & re-
-	// fills OpenSearch (idempotent), and the SetBackend is
-	// retried.
-	if err := w.cfg.Service.SetBackend(ctx, tenantID, BackendOpenSearch); err != nil {
+	// Target is now warm; atomically flip reads over. A SetBackend
+	// failure here is the unfortunate-but-recoverable case: the
+	// target index is fully populated but reads still go to the
+	// source. The next tick re-discovers the tenant (still on the
+	// source), the ReindexTo wipes & re-fills the target
+	// (idempotent), and the SetBackend is retried.
+	if err := w.cfg.Service.SetBackend(ctx, tenantID, tr.Target); err != nil {
 		_ = w.cfg.Store.MarkFailed(ctx, tenantID, fmt.Sprintf("set backend: %v", err), w.cfg.Now())
 		return fmt.Errorf("set backend: %w", err)
 	}
@@ -461,10 +531,10 @@ func (w *CutoverWorker) cutoverOne(ctx context.Context, tenantID string, size in
 	// ReconcileCompleted pass will promote the row (the tenant
 	// is already on OpenSearch, so the reconcile guard fires).
 	if err := w.markCompletedWithRetry(ctx, tenantID); err != nil {
-		w.cfg.Logger.Printf("search.cutover: tenant=%s SetBackend OK but MarkCompleted persistently failed; will be reconciled on next tick: %v", tenantID, err)
+		w.cfg.Logger.Printf("search.cutover[%s->%s]: tenant=%s SetBackend OK but MarkCompleted persistently failed; will be reconciled on next tick: %v", tr.Source, tr.Target, tenantID, err)
 		return fmt.Errorf("mark completed: %w", err)
 	}
-	w.cfg.Logger.Printf("search.cutover: tenant=%s migrated %d messages to OpenSearch", tenantID, len(msgs))
+	w.cfg.Logger.Printf("search.cutover[%s->%s]: tenant=%s migrated %d messages", tr.Source, tr.Target, tenantID, len(msgs))
 	return nil
 }
 

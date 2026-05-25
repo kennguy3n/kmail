@@ -819,3 +819,102 @@ func (f *fakeNow) Advance(d time.Duration) {
 	f.now = f.now.Add(d)
 	f.mu.Unlock()
 }
+
+// TestCutoverWorker_MultiTransitionRunsAllConfiguredPairs is the
+// architectural pin that the worker handles ≥2 (source, target)
+// pairs in a single Tick. Without this guard the worker silently
+// drops back to a single pair (legacy meilisearch->opensearch)
+// and tenants on the shared variant stagnate forever.
+//
+// Setup:
+//   - tenant-legacy is on `meilisearch` with a 200k mailbox.
+//   - tenant-shared is on `shared_meilisearch` with a 200k mailbox.
+//
+// One Tick using DefaultCutoverTransitions must promote both:
+// the first transition flips tenant-legacy to `opensearch`, the
+// second flips tenant-shared to `shared_opensearch`.
+func TestCutoverWorker_MultiTransitionRunsAllConfiguredPairs(t *testing.T) {
+	store := newInMemoryStore([]string{"tenant-legacy", "tenant-shared"})
+	store.flipBackend("tenant-shared", BackendSharedMeilisearch)
+	flipper := newFakeFlipper(store)
+	now := time.Unix(1_700_000_000, 0)
+	sizer := MailboxSizerFunc(func(context.Context, string) (int64, error) {
+		return 200_000, nil
+	})
+	source := MessageSourceFunc(func(_ context.Context, tenantID string) ([]Message, error) {
+		return []Message{{TenantID: tenantID, MessageID: tenantID + "-m1"}}, nil
+	})
+	w := buildWorker(t, store, flipper, sizer, source, 100_000, func() time.Time { return now })
+	w.Tick(context.Background())
+
+	// tenant-legacy: meilisearch -> opensearch (transition 1).
+	if got := store.tenantBackends["tenant-legacy"]; got != BackendOpenSearch {
+		t.Errorf("tenant-legacy backend = %q, want %q", got, BackendOpenSearch)
+	}
+	if rec := flipper.reindexCall["tenant-legacy"]; rec.backend != BackendOpenSearch {
+		t.Errorf("tenant-legacy reindex target = %q, want %q", rec.backend, BackendOpenSearch)
+	}
+	if r := store.rows["tenant-legacy"]; r == nil || r.state != CutoverCompleted {
+		t.Errorf("tenant-legacy row state = %+v, want CutoverCompleted", r)
+	}
+
+	// tenant-shared: shared_meilisearch -> shared_opensearch
+	// (transition 2). The worker must NOT promote it to plain
+	// `opensearch` — that would silently strip tenant isolation.
+	if got := store.tenantBackends["tenant-shared"]; got != BackendSharedOpenSearch {
+		t.Errorf("tenant-shared backend = %q, want %q", got, BackendSharedOpenSearch)
+	}
+	if rec := flipper.reindexCall["tenant-shared"]; rec.backend != BackendSharedOpenSearch {
+		t.Errorf("tenant-shared reindex target = %q, want %q", rec.backend, BackendSharedOpenSearch)
+	}
+	if r := store.rows["tenant-shared"]; r == nil || r.state != CutoverCompleted {
+		t.Errorf("tenant-shared row state = %+v, want CutoverCompleted", r)
+	}
+}
+
+// TestCutoverWorker_CustomTransitionsOverride pins that the
+// operator-supplied `CutoverConfig.Transitions` actually replaces
+// the default — a misconfigured worker that fell back to the
+// defaults would silently broaden the set of tenants it touches
+// (e.g., a runbook intending to migrate ONLY shared tenants would
+// also flip every legacy tenant past the threshold).
+func TestCutoverWorker_CustomTransitionsOverride(t *testing.T) {
+	store := newInMemoryStore([]string{"tenant-legacy", "tenant-shared"})
+	store.flipBackend("tenant-shared", BackendSharedMeilisearch)
+	flipper := newFakeFlipper(store)
+	now := time.Unix(1_700_000_000, 0)
+	sizer := MailboxSizerFunc(func(context.Context, string) (int64, error) {
+		return 200_000, nil
+	})
+	source := MessageSourceFunc(func(_ context.Context, tenantID string) ([]Message, error) {
+		return []Message{{TenantID: tenantID, MessageID: "m1"}}, nil
+	})
+	w, err := NewCutoverWorker(CutoverConfig{
+		Store:       store,
+		Service:     flipper,
+		Sizer:       sizer,
+		Source:      source,
+		Logger:      silentLogger(),
+		Threshold:   100_000,
+		Interval:    time.Hour,
+		MaxFailures: 5,
+		MaxRetryGap: time.Hour,
+		Now:         func() time.Time { return now },
+		Sleep:       func(time.Duration) {},
+		Transitions: []CutoverTransition{
+			{Source: BackendSharedMeilisearch, Target: BackendSharedOpenSearch},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewCutoverWorker: %v", err)
+	}
+	w.Tick(context.Background())
+
+	// Custom transitions: shared moves, legacy must not.
+	if got := store.tenantBackends["tenant-shared"]; got != BackendSharedOpenSearch {
+		t.Errorf("tenant-shared backend = %q, want %q", got, BackendSharedOpenSearch)
+	}
+	if got := store.tenantBackends["tenant-legacy"]; got != BackendMeilisearch {
+		t.Errorf("tenant-legacy backend = %q, want %q (untouched)", got, BackendMeilisearch)
+	}
+}

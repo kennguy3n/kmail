@@ -116,6 +116,39 @@ func (s *ShardService) RegisterShard(ctx context.Context, shard Shard) (*Shard, 
 	return &out, nil
 }
 
+// ListShardIDs returns the UUID of every registered Stalwart
+// shard, including `draining` shards. Used by the search
+// package's shared-index initialiser at startup so a shared
+// index is created for every shard the BFF knows about (a
+// draining shard still has tenants assigned to it, so its
+// index must exist for searches to land somewhere).
+//
+// Kept narrow on purpose — callers that need the full row
+// continue using `ListShards`. Returning only the ID keeps the
+// initialiser independent of the rest of the shard struct
+// shape.
+func (s *ShardService) ListShardIDs(ctx context.Context) ([]string, error) {
+	if s.Pool == nil {
+		return nil, nil
+	}
+	rows, err := s.Pool.Query(ctx, `
+		SELECT id::text FROM stalwart_shards ORDER BY id
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list shard ids: %w", err)
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
 // ListShards returns every shard row.
 func (s *ShardService) ListShards(ctx context.Context) ([]Shard, error) {
 	if s.Pool == nil {
@@ -292,6 +325,36 @@ func (s *ShardService) AssignTenantToShard(ctx context.Context, tenantID string)
 	}
 	s.invalidate(tenantID)
 	return &assignment, nil
+}
+
+// GetTenantShardID returns the Stalwart shard UUID a tenant is
+// assigned to, hitting the database every time so the result is
+// fresh. Callers that need only the URL (the JMAP proxy, the
+// admin probe) should use GetTenantShard — that path is cached
+// against the URL because it's hot. The shared search backends
+// call this once at startup per index init and once per indexed
+// message; an in-process cache against the shard id is a future
+// optimisation if it shows up in profiles.
+func (s *ShardService) GetTenantShardID(ctx context.Context, tenantID string) (string, error) {
+	if tenantID == "" {
+		return "", fmt.Errorf("tenantID required")
+	}
+	if s.Pool == nil {
+		return "", ErrNoCapacity
+	}
+	var shardID string
+	err := s.Pool.QueryRow(ctx, `
+		SELECT shard_id::text
+		FROM tenant_shard_assignments
+		WHERE tenant_id = $1::uuid
+	`, tenantID).Scan(&shardID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrNoCapacity
+	}
+	if err != nil {
+		return "", fmt.Errorf("get tenant shard id: %w", err)
+	}
+	return shardID, nil
 }
 
 // GetTenantShard returns the Stalwart URL for the tenant, using

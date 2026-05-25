@@ -1924,8 +1924,29 @@ export async function revokeAdminProxySession(
 
 // ─── Phase 7 Production hardening ─────────────────────────────────
 
+/**
+ * The set of search backends the BFF will accept on
+ * `PUT /api/v1/tenants/:id/search/backend`. Must stay in sync
+ * with `internal/search/service.go::IsValidBackend` and with the
+ * migration-050 CHECK constraint on `tenants.search_backend`.
+ *
+ *   meilisearch         — legacy per-tenant Meilisearch index
+ *   opensearch          — legacy per-tenant OpenSearch index
+ *   shared_meilisearch  — Phase 8 default; one index per shard
+ *   shared_opensearch   — Phase 8 cutover target for shared tenants
+ *   dedicated_opensearch — enterprise: per-tenant OpenSearch index
+ */
+export const SEARCH_BACKENDS = [
+  "meilisearch",
+  "opensearch",
+  "shared_meilisearch",
+  "shared_opensearch",
+  "dedicated_opensearch",
+] as const;
+export type SearchBackendName = (typeof SEARCH_BACKENDS)[number];
+
 export interface SearchBackendConfig {
-  backend: "meilisearch" | "opensearch";
+  backend: SearchBackendName;
 }
 
 export async function getSearchBackend(tenantId: string): Promise<SearchBackendConfig> {
