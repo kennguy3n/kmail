@@ -25,9 +25,13 @@ import {
   ADMIN_API_BASE,
   AdminApiError,
   adminAuthHeaders,
+  createAlias,
+  deleteAlias,
   exportAuditLog,
   getAuditLog,
+  listAliases,
   listTenants,
+  listUserAliases,
   listUsers,
   requestJSON,
   verifyAuditChain,
@@ -227,6 +231,80 @@ describe("exportAuditLog", () => {
     const csv = await exportAuditLog("tenant-1", "csv");
 
     expect(csv).toContain("tenant.create");
+  });
+});
+
+describe("alias CRUD", () => {
+  const sampleAlias = {
+    id: "a-1",
+    tenant_id: "tenant-1",
+    user_id: "u-1",
+    alias_email: "alias@example.com",
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  };
+
+  it("listAliases hits the tenant scope and carries the dev tenant header", async () => {
+    const fetchMock = mockFetch(jsonResponse([sampleAlias]));
+
+    const aliases = await listAliases("tenant-1");
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe(`${ADMIN_API_BASE}/tenants/tenant-1/aliases`);
+    expect(init.method).toBe("GET");
+    expect(new Headers(init.headers).get("X-KMail-Dev-Tenant-Id")).toBe(
+      "tenant-1",
+    );
+    expect(aliases).toHaveLength(1);
+    expect(aliases[0].alias_email).toBe("alias@example.com");
+  });
+
+  it("listUserAliases scopes by user id and url-encodes both segments", async () => {
+    const fetchMock = mockFetch(jsonResponse([]));
+
+    await listUserAliases("tenant/1", "user/1");
+
+    const [url] = fetchMock.mock.calls[0] as [string];
+    expect(url).toBe(
+      `${ADMIN_API_BASE}/tenants/tenant%2F1/users/user%2F1/aliases`,
+    );
+  });
+
+  it("createAlias POSTs the typed body to the tenant-scoped endpoint", async () => {
+    const fetchMock = mockFetch(jsonResponse(sampleAlias, 201));
+
+    const created = await createAlias("tenant-1", {
+      user_id: "u-1",
+      alias_email: "alias@example.com",
+    });
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe(`${ADMIN_API_BASE}/tenants/tenant-1/aliases`);
+    expect(init.method).toBe("POST");
+    const body = JSON.parse(String(init.body)) as Record<string, string>;
+    expect(body.user_id).toBe("u-1");
+    expect(body.alias_email).toBe("alias@example.com");
+    expect(created.id).toBe("a-1");
+  });
+
+  it("deleteAlias issues DELETE and treats 204 as success", async () => {
+    const fetchMock = mockFetch(new Response(null, { status: 204 }));
+
+    await deleteAlias("tenant-1", "a-1");
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe(`${ADMIN_API_BASE}/tenants/tenant-1/aliases/a-1`);
+    expect(init.method).toBe("DELETE");
+  });
+
+  it("createAlias surfaces a 409 conflict as AdminApiError", async () => {
+    mockFetch(jsonResponse({ error: "alias email already in use" }, 409));
+    await expect(
+      createAlias("tenant-1", {
+        user_id: "u-1",
+        alias_email: "alias@example.com",
+      }),
+    ).rejects.toBeInstanceOf(AdminApiError);
   });
 });
 

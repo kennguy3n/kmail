@@ -54,6 +54,10 @@ func (h *Handlers) Register(mux *http.ServeMux, authMW *middleware.OIDC) {
 	mux.Handle("DELETE /api/v1/tenants/{id}/users/{userId}", authMW.Wrap(http.HandlerFunc(h.deleteUser)))
 	mux.Handle("POST /api/v1/tenants/{id}/domains", authMW.Wrap(http.HandlerFunc(h.createDomain)))
 	mux.Handle("GET /api/v1/tenants/{id}/domains", authMW.Wrap(http.HandlerFunc(h.listDomains)))
+	mux.Handle("POST /api/v1/tenants/{id}/aliases", authMW.Wrap(http.HandlerFunc(h.createAlias)))
+	mux.Handle("GET /api/v1/tenants/{id}/aliases", authMW.Wrap(http.HandlerFunc(h.listAliases)))
+	mux.Handle("GET /api/v1/tenants/{id}/users/{userId}/aliases", authMW.Wrap(http.HandlerFunc(h.listUserAliases)))
+	mux.Handle("DELETE /api/v1/tenants/{id}/aliases/{aliasId}", authMW.Wrap(http.HandlerFunc(h.deleteAlias)))
 	mux.Handle("POST /api/v1/tenants/{id}/shared-inboxes", authMW.Wrap(http.HandlerFunc(h.createSharedInbox)))
 	mux.Handle("GET /api/v1/tenants/{id}/shared-inboxes", authMW.Wrap(http.HandlerFunc(h.listSharedInboxes)))
 	mux.Handle("POST /api/v1/tenants/{id}/shared-inboxes/{inboxId}/members", authMW.Wrap(http.HandlerFunc(h.addSharedInboxMember)))
@@ -257,6 +261,78 @@ func (h *Handlers) listDomains(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, domains)
 }
 
+func (h *Handlers) createAlias(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.PathValue("id")
+	if err := checkTenantScope(r, tenantID); err != nil {
+		writeError(w, http.StatusForbidden, err)
+		return
+	}
+	var in CreateAliasInput
+	if err := decodeJSON(r, &in); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	a, err := h.svc.CreateAlias(r.Context(), tenantID, in)
+	if err != nil {
+		h.logger.Printf("createAlias: %v", err)
+		writeError(w, statusForServiceError(err), err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, a)
+}
+
+func (h *Handlers) listAliases(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.PathValue("id")
+	if err := checkTenantScope(r, tenantID); err != nil {
+		writeError(w, http.StatusForbidden, err)
+		return
+	}
+	aliases, err := h.svc.ListAliases(r.Context(), tenantID)
+	if err != nil {
+		h.logger.Printf("listAliases: %v", err)
+		writeError(w, statusForServiceError(err), err)
+		return
+	}
+	if aliases == nil {
+		aliases = []Alias{}
+	}
+	writeJSON(w, http.StatusOK, aliases)
+}
+
+func (h *Handlers) listUserAliases(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.PathValue("id")
+	userID := r.PathValue("userId")
+	if err := checkTenantScope(r, tenantID); err != nil {
+		writeError(w, http.StatusForbidden, err)
+		return
+	}
+	aliases, err := h.svc.ListUserAliases(r.Context(), tenantID, userID)
+	if err != nil {
+		h.logger.Printf("listUserAliases: %v", err)
+		writeError(w, statusForServiceError(err), err)
+		return
+	}
+	if aliases == nil {
+		aliases = []Alias{}
+	}
+	writeJSON(w, http.StatusOK, aliases)
+}
+
+func (h *Handlers) deleteAlias(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.PathValue("id")
+	aliasID := r.PathValue("aliasId")
+	if err := checkTenantScope(r, tenantID); err != nil {
+		writeError(w, http.StatusForbidden, err)
+		return
+	}
+	if err := h.svc.DeleteAlias(r.Context(), tenantID, aliasID); err != nil {
+		h.logger.Printf("deleteAlias: %v", err)
+		writeError(w, statusForServiceError(err), err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (h *Handlers) createSharedInbox(w http.ResponseWriter, r *http.Request) {
 	tenantID := r.PathValue("id")
 	if err := checkTenantScope(r, tenantID); err != nil {
@@ -379,6 +455,8 @@ func statusForServiceError(err error) int {
 		return http.StatusBadRequest
 	case errors.Is(err, ErrNotFound):
 		return http.StatusNotFound
+	case errors.Is(err, ErrAliasInUse):
+		return http.StatusConflict
 	default:
 		return http.StatusInternalServerError
 	}

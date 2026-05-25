@@ -266,6 +266,80 @@ export async function deleteUser(
   );
 }
 
+/** Mirrors `internal/tenant/service.go#Alias`. */
+export interface Alias {
+  id: string;
+  tenant_id: string;
+  user_id: string;
+  alias_email: string;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Mirrors `internal/tenant/service.go#CreateAliasInput`. */
+export interface CreateAliasInput {
+  user_id: string;
+  alias_email: string;
+}
+
+/** List every alias for a tenant. */
+export async function listAliases(tenantId: string): Promise<Alias[]> {
+  return requestJSON<Alias[]>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/aliases`,
+    {
+      method: "GET",
+      headers: adminAuthHeaders(tenantId, { Accept: "application/json" }),
+    },
+  );
+}
+
+/** List aliases owned by a specific user inside a tenant. */
+export async function listUserAliases(
+  tenantId: string,
+  userId: string,
+): Promise<Alias[]> {
+  return requestJSON<Alias[]>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/users/${encodeURIComponent(userId)}/aliases`,
+    {
+      method: "GET",
+      headers: adminAuthHeaders(tenantId, { Accept: "application/json" }),
+    },
+  );
+}
+
+/** Create a new alias for a user. */
+export async function createAlias(
+  tenantId: string,
+  input: CreateAliasInput,
+): Promise<Alias> {
+  return requestJSON<Alias>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/aliases`,
+    {
+      method: "POST",
+      headers: adminAuthHeaders(tenantId, {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      }),
+      body: JSON.stringify(input),
+    },
+  );
+}
+
+/** Delete an alias. Returns on 204 No Content. */
+export async function deleteAlias(
+  tenantId: string,
+  aliasId: string,
+): Promise<void> {
+  await requestJSON<void>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/aliases/${encodeURIComponent(aliasId)}`,
+    {
+      method: "DELETE",
+      headers: adminAuthHeaders(tenantId),
+    },
+    { expectJson: false },
+  );
+}
+
 /**
  * Mirrors `internal/audit/audit.go#Entry`. Each row carries a
  * hash-chain link (`prev_hash`, `entry_hash`) so `VerifyChain`

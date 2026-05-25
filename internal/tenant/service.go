@@ -38,6 +38,7 @@ type Service struct {
 	provisioner   StorageProvisioner
 	billing       BillingLifecycleHook
 	sharedInboxFn SharedInboxMembershipHook
+	aliasSync     StalwartAliasSync
 }
 
 // SharedInboxMembershipHook is invoked after a successful

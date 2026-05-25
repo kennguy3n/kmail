@@ -406,6 +406,23 @@ func main() {
 		WithSharedInboxMembershipHook(func(ctx context.Context, _ /*tenantID*/, inboxID string, members []string, reason string) {
 			sharedInboxWorkflowEarly.HandleMembershipChange(ctx, inboxID, members, reason)
 		})
+	// Phase 9 — alias CRUD optionally mirrors writes to Stalwart's
+	// principal database so inbound SMTP routes the alias address
+	// to the user's account. The BFF row is authoritative for the
+	// admin console even when Stalwart is unreachable, so a missing
+	// admin user is logged but does not fail startup.
+	if adminUser := os.Getenv("KMAIL_STALWART_ADMIN_USER"); adminUser != "" {
+		aliasSync, err := tenant.NewStalwartAliasHTTPSync(
+			shardSvc, adminUser, os.Getenv("KMAIL_STALWART_ADMIN_PASS"),
+		)
+		if err != nil {
+			logger.Printf("stalwart alias sync disabled: %v", err)
+		} else {
+			tenantSvc = tenantSvc.WithStalwartAliasSync(aliasSync)
+		}
+	} else {
+		logger.Printf("stalwart alias sync disabled: KMAIL_STALWART_ADMIN_USER not set")
+	}
 	dnsSvc := dns.NewService(dns.Config{
 		Pool:                pool,
 		MailHost:            cfg.DNS.MailHost,

@@ -2,9 +2,13 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
   AdminApiError,
+  createAlias,
+  deleteAlias,
   deleteUser,
+  listUserAliases,
   listUsers,
   updateUser,
+  type Alias,
   type TenantUser,
   type UpdateUserInput,
 } from "../../api/admin";
@@ -23,10 +27,17 @@ import { useTenantSelection } from "./useTenantSelection";
  *   PATCH  /api/v1/tenants/:id/users/:userId
  *   DELETE /api/v1/tenants/:id/users/:userId
  *
- * Shared-inbox membership, alias management, and MLS-epoch
- * plumbing for shared-group membership changes are out of scope
- * for this iteration — they land alongside the KChat-group side
- * of that workflow (docs/SCHEMA.md §5.6).
+ * The per-user **Aliases** toggle expands into an inline manager
+ * that lists and mutates the `aliases` table for that user via:
+ *
+ *   GET    /api/v1/tenants/:id/users/:userId/aliases
+ *   POST   /api/v1/tenants/:id/aliases
+ *   DELETE /api/v1/tenants/:id/aliases/:aliasId
+ *
+ * Shared-inbox membership and MLS-epoch plumbing for shared-group
+ * membership changes are out of scope for this iteration — they
+ * land alongside the KChat-group side of that workflow
+ * (docs/SCHEMA.md §5.6).
  */
 export default function UserAdmin() {
   const {
@@ -61,6 +72,10 @@ export default function UserAdmin() {
   // per-row confirm. The user clicks Delete once to arm, then
   // Confirm delete to actually fire the DELETE.
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
+  // Track which user rows have the alias manager expanded. We key
+  // by user id so multiple managers can be open at once — admins
+  // typically want to compare aliases across two users at a time.
+  const [aliasOpen, setAliasOpen] = useState<Record<string, boolean>>({});
 
   const loadUsers = useCallback((tenantId: string) => {
     let cancelled = false;
@@ -324,46 +339,70 @@ export default function UserAdmin() {
                       </td>
                     </tr>
                   ) : (
-                    <tr key={u.id}>
-                      <td>{u.email}</td>
-                      <td>{u.display_name}</td>
-                      <td>{u.role}</td>
-                      <td>{u.status}</td>
-                      <td>{u.quota_bytes.toLocaleString()}</td>
-                      <td>
-                        <button type="button" onClick={() => startEdit(u)}>
-                          Edit
-                        </button>{" "}
-                        {pendingDelete === u.id ? (
-                          <>
+                    <>
+                      <tr key={u.id}>
+                        <td>{u.email}</td>
+                        <td>{u.display_name}</td>
+                        <td>{u.role}</td>
+                        <td>{u.status}</td>
+                        <td>{u.quota_bytes.toLocaleString()}</td>
+                        <td>
+                          <button type="button" onClick={() => startEdit(u)}>
+                            Edit
+                          </button>{" "}
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setAliasOpen((prev) => ({
+                                ...prev,
+                                [u.id]: !prev[u.id],
+                              }))
+                            }
+                            aria-expanded={Boolean(aliasOpen[u.id])}
+                          >
+                            {aliasOpen[u.id] ? "Hide aliases" : "Aliases"}
+                          </button>{" "}
+                          {pendingDelete === u.id ? (
+                            <>
+                              <button
+                                type="button"
+                                onClick={() => onDelete(u)}
+                                className="kmail-admin-danger"
+                              >
+                                Confirm delete
+                              </button>{" "}
+                              <button
+                                type="button"
+                                onClick={() => setPendingDelete(null)}
+                              >
+                                Cancel
+                              </button>
+                            </>
+                          ) : (
                             <button
                               type="button"
                               onClick={() => onDelete(u)}
                               className="kmail-admin-danger"
                             >
-                              Confirm delete
-                            </button>{" "}
-                            <button
-                              type="button"
-                              onClick={() => setPendingDelete(null)}
-                            >
-                              Cancel
+                              Delete
                             </button>
-                          </>
-                        ) : (
-                          <button
-                            type="button"
-                            onClick={() => onDelete(u)}
-                            className="kmail-admin-danger"
-                          >
-                            Delete
-                          </button>
-                        )}
-                        {rowError[u.id] && (
-                          <div className="kmail-admin-error">{rowError[u.id]}</div>
-                        )}
-                      </td>
-                    </tr>
+                          )}
+                          {rowError[u.id] && (
+                            <div className="kmail-admin-error">{rowError[u.id]}</div>
+                          )}
+                        </td>
+                      </tr>
+                      {aliasOpen[u.id] && selectedTenantId && (
+                        <tr key={u.id + ":aliases"} className="kmail-admin-subrow">
+                          <td colSpan={6}>
+                            <AliasManager
+                              tenantId={selectedTenantId}
+                              userId={u.id}
+                            />
+                          </td>
+                        </tr>
+                      )}
+                    </>
                   ),
                 )}
               </tbody>
@@ -379,4 +418,133 @@ function errorMessage(e: unknown): string {
   if (e instanceof AdminApiError) return e.message;
   if (e instanceof Error) return e.message;
   return String(e);
+}
+
+/**
+ * Inline alias manager rendered as an expanded sub-row underneath
+ * a user. Lists the user's existing aliases and exposes an "Add
+ * alias" form that POSTs to the tenant alias endpoint. Pulls /
+ * pushes via `listUserAliases` / `createAlias` / `deleteAlias` so
+ * each manager owns its own optimistic state.
+ */
+function AliasManager(props: { tenantId: string; userId: string }): JSX.Element {
+  const { tenantId, userId } = props;
+  const [aliases, setAliases] = useState<Alias[] | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [draft, setDraft] = useState("");
+  const [adding, setAdding] = useState(false);
+  const [pendingDelete, setPendingDelete] = useState<string | null>(null);
+
+  // Re-load when either id flips (e.g. the admin collapses one
+  // user's manager and expands another without unmounting).
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    listUserAliases(tenantId, userId)
+      .then((list) => {
+        if (!cancelled) setAliases(list);
+      })
+      .catch((e: unknown) => {
+        if (!cancelled) setError(errorMessage(e));
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [tenantId, userId]);
+
+  const handleAdd = (e: React.FormEvent<HTMLFormElement>): void => {
+    e.preventDefault();
+    const trimmed = draft.trim();
+    if (!trimmed) return;
+    setAdding(true);
+    setError(null);
+    createAlias(tenantId, { user_id: userId, alias_email: trimmed })
+      .then((created) => {
+        setAliases((prev) => (prev ? [...prev, created] : [created]));
+        setDraft("");
+      })
+      .catch((err: unknown) => setError(errorMessage(err)))
+      .finally(() => setAdding(false));
+  };
+
+  const handleDelete = (alias: Alias): void => {
+    if (pendingDelete !== alias.id) {
+      setPendingDelete(alias.id);
+      return;
+    }
+    setError(null);
+    deleteAlias(tenantId, alias.id)
+      .then(() => {
+        setAliases((prev) =>
+          prev ? prev.filter((a) => a.id !== alias.id) : prev,
+        );
+        setPendingDelete(null);
+      })
+      .catch((err: unknown) => setError(errorMessage(err)));
+  };
+
+  return (
+    <div className="kmail-admin-aliases">
+      <h3>Aliases</h3>
+      {loading && <p>Loading aliases…</p>}
+      {error && <p className="kmail-admin-error">{error}</p>}
+      {aliases && aliases.length === 0 && !loading && (
+        <p>No aliases for this user.</p>
+      )}
+      {aliases && aliases.length > 0 && (
+        <ul className="kmail-admin-alias-list">
+          {aliases.map((a) => (
+            <li key={a.id}>
+              <code>{a.alias_email}</code>{" "}
+              {pendingDelete === a.id ? (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => handleDelete(a)}
+                    className="kmail-admin-danger"
+                  >
+                    Confirm delete
+                  </button>{" "}
+                  <button
+                    type="button"
+                    onClick={() => setPendingDelete(null)}
+                  >
+                    Cancel
+                  </button>
+                </>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => handleDelete(a)}
+                  className="kmail-admin-danger"
+                >
+                  Delete
+                </button>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+      <form onSubmit={handleAdd} className="kmail-admin-alias-form">
+        <label htmlFor={`alias-input-${userId}`}>Add alias:</label>{" "}
+        <input
+          id={`alias-input-${userId}`}
+          type="email"
+          value={draft}
+          placeholder="alias@example.com"
+          onChange={(e) => setDraft(e.target.value)}
+          disabled={adding}
+          required
+        />{" "}
+        <button type="submit" disabled={adding || !draft.trim()}>
+          {adding ? "Adding…" : "Add"}
+        </button>
+      </form>
+    </div>
+  );
 }
