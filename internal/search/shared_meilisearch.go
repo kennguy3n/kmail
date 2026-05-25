@@ -149,14 +149,19 @@ func (m *SharedMeilisearchBackend) DeleteIndex(ctx context.Context, tenantID str
 	return nil
 }
 
-// MigrateIndex deletes the tenant's documents from the shared
-// index and then bulk-imports `msgs`. Mirrors the legacy
-// per-tenant backend: every reindex starts from a clean slate so
-// a partial previous attempt doesn't leave orphan documents.
+// MigrateIndex bulk-imports `msgs` into the shared index for
+// `tenantID`. It does NOT clear the tenant's documents first —
+// `Service.reindexInto` (the only production caller) always calls
+// `DeleteIndex` immediately before `MigrateIndex`, so doing the
+// clear here too caused a redundant `_delete_by_query` round-trip
+// per cutover. Mirroring the per-tenant `MeilisearchBackend.
+// MigrateIndex` semantics keeps the shared and per-tenant backends
+// interchangeable behind the `Backend` interface and means a
+// future caller can opt out of the clear if it wants append-only
+// behaviour. The empty-msgs branch is preserved so the caller can
+// fan out a "make sure the index exists + settings are applied"
+// pass without a write payload.
 func (m *SharedMeilisearchBackend) MigrateIndex(ctx context.Context, tenantID string, msgs []Message) error {
-	if err := m.DeleteIndex(ctx, tenantID); err != nil {
-		return fmt.Errorf("migrate: clear tenant: %w", err)
-	}
 	if len(msgs) == 0 {
 		return nil
 	}

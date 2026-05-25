@@ -161,14 +161,19 @@ func (o *SharedOpenSearchBackend) DeleteIndex(ctx context.Context, tenantID stri
 	return nil
 }
 
-// MigrateIndex deletes the tenant's documents and then bulk-
-// imports `msgs` via `_bulk`. The bulk header uses the per-
-// tenant doc id so re-indexing is idempotent on the (tenant,
-// message) pair.
+// MigrateIndex bulk-imports `msgs` via `_bulk` into the shared
+// index for `tenantID`. The bulk header uses the per-tenant doc id
+// so re-indexing is idempotent on the (tenant, message) pair.
+//
+// MigrateIndex does NOT clear the tenant's documents first —
+// `Service.reindexInto` (the only production caller) always calls
+// `DeleteIndex` immediately before `MigrateIndex`, so doing the
+// clear here too caused a redundant `_delete_by_query` round-trip
+// per cutover. Mirroring `OpenSearchBackend.MigrateIndex` keeps
+// the per-tenant and shared backends interchangeable behind the
+// `Backend` interface so a future caller can opt out of the clear
+// if it wants append-only behaviour.
 func (o *SharedOpenSearchBackend) MigrateIndex(ctx context.Context, tenantID string, msgs []Message) error {
-	if err := o.DeleteIndex(ctx, tenantID); err != nil {
-		return fmt.Errorf("migrate: clear tenant: %w", err)
-	}
 	if len(msgs) == 0 {
 		return nil
 	}

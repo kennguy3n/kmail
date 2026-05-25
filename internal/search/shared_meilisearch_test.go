@@ -264,11 +264,12 @@ func TestSharedMeilisearch_DeleteIndex404IsSuccess(t *testing.T) {
 	}
 }
 
-// TestSharedMeilisearch_MigrateIndexClearsThenBulkInserts
-// verifies the migration deletes the tenant's documents first
-// (so a previous partial reindex doesn't leave orphans) and
-// then POSTs the new documents in a single batch.
-func TestSharedMeilisearch_MigrateIndexClearsThenBulkInserts(t *testing.T) {
+// TestSharedMeilisearch_MigrateIndexBulkInsertsOnly verifies the
+// migration POSTs the new documents in a single batch and does
+// NOT re-delete the tenant's documents — `Service.reindexInto`
+// already issues `DeleteIndex` immediately before this call, so
+// double-deleting wastes a network round-trip per cutover.
+func TestSharedMeilisearch_MigrateIndexBulkInsertsOnly(t *testing.T) {
 	var (
 		mu          sync.Mutex
 		ops         []string
@@ -302,18 +303,27 @@ func TestSharedMeilisearch_MigrateIndexClearsThenBulkInserts(t *testing.T) {
 	if err := b.MigrateIndex(context.Background(), "t1", msgs); err != nil {
 		t.Fatalf("MigrateIndex: %v", err)
 	}
-	if len(ops) < 2 || ops[0] != "delete" {
-		t.Fatalf("op order = %v, want delete then insert", ops)
+	for _, op := range ops {
+		if op == "delete" {
+			t.Fatalf("MigrateIndex issued a delete op (ops=%v) — must not double-delete", ops)
+		}
+	}
+	if len(ops) != 1 || ops[0] != "insert" {
+		t.Fatalf("op sequence = %v, want exactly one insert", ops)
 	}
 	if len(insertedIDs) != 3 {
 		t.Errorf("inserted = %v, want 3", insertedIDs)
 	}
 }
 
-// TestSharedMeilisearch_MigrateIndexEmptyJustClears verifies a
-// migration with zero messages still does a delete pass so the
-// destination is clean.
-func TestSharedMeilisearch_MigrateIndexEmptyJustClears(t *testing.T) {
+// TestSharedMeilisearch_MigrateIndexEmptyIsNoop verifies a
+// migration with zero messages issues NO HTTP calls at all.
+// `Service.reindexInto` is responsible for clearing the
+// destination before MigrateIndex, so the empty-msgs branch
+// must stay a pure no-op — issuing a redundant
+// `/documents/delete` here would re-delete on every empty
+// cutover.
+func TestSharedMeilisearch_MigrateIndexEmptyIsNoop(t *testing.T) {
 	var deletes atomic.Int32
 	b, _ := newSharedMeili(t, "shard-1", func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/documents/delete") {
@@ -324,8 +334,8 @@ func TestSharedMeilisearch_MigrateIndexEmptyJustClears(t *testing.T) {
 	if err := b.MigrateIndex(context.Background(), "t1", nil); err != nil {
 		t.Fatalf("MigrateIndex(nil): %v", err)
 	}
-	if deletes.Load() != 1 {
-		t.Errorf("deletes = %d, want 1 (must still wipe an empty migration)", deletes.Load())
+	if deletes.Load() != 0 {
+		t.Errorf("deletes = %d, want 0 (MigrateIndex must not double-delete)", deletes.Load())
 	}
 }
 

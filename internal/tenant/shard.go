@@ -72,6 +72,19 @@ type ShardService struct {
 	// it does its own locking, so callers don't need a separate
 	// RWMutex around `Get` / `Add` / `Remove`.
 	cache *lru.LRU[string, string]
+
+	// idCache maps tenantID -> shard UUID. Mirrors `cache` for the
+	// shared search backends: those derive their index name from
+	// the shard id and call `GetTenantShardID` once per indexed
+	// message AND once per search request, so a DB round-trip on
+	// every search would dominate latency. The cache shares the
+	// same bounds and TTL as `cache` so a rebalance lands on the
+	// next request after the TTL on every pod with no explicit
+	// invalidation. Writes that move a tenant between shards
+	// (AssignTenantToShard, RebalanceShard) call `invalidate`,
+	// which clears BOTH caches atomically against the same
+	// tenantID.
+	idCache *lru.LRU[string, string]
 }
 
 // NewShardService builds a ShardService with sensible defaults.
@@ -84,6 +97,7 @@ func NewShardService(pool *pgxpool.Pool, logger *log.Logger) *ShardService {
 		HTTPClient: &http.Client{Timeout: 5 * time.Second},
 		Logger:     logger,
 		cache:      lru.NewLRU[string, string](shardCacheMaxEntries, nil, shardCacheTTL),
+		idCache:    lru.NewLRU[string, string](shardCacheMaxEntries, nil, shardCacheTTL),
 	}
 }
 
@@ -328,16 +342,22 @@ func (s *ShardService) AssignTenantToShard(ctx context.Context, tenantID string)
 }
 
 // GetTenantShardID returns the Stalwart shard UUID a tenant is
-// assigned to, hitting the database every time so the result is
-// fresh. Callers that need only the URL (the JMAP proxy, the
-// admin probe) should use GetTenantShard — that path is cached
-// against the URL because it's hot. The shared search backends
-// call this once at startup per index init and once per indexed
-// message; an in-process cache against the shard id is a future
-// optimisation if it shows up in profiles.
+// assigned to, backed by the same in-process LRU+TTL cache as
+// GetTenantShard so the shared search backends (which derive
+// their index name from the shard id and call this on every
+// indexed message AND every search) don't issue a Postgres
+// round-trip per request. The cache is invalidated on every
+// AssignTenantToShard / RebalanceShard write, and entries
+// expire after shardCacheTTL (5 minutes) so an operator-side
+// rebalance lands without explicit cross-pod invalidation.
 func (s *ShardService) GetTenantShardID(ctx context.Context, tenantID string) (string, error) {
 	if tenantID == "" {
 		return "", fmt.Errorf("tenantID required")
+	}
+	if s.idCache != nil {
+		if shardID, ok := s.idCache.Get(tenantID); ok {
+			return shardID, nil
+		}
 	}
 	if s.Pool == nil {
 		return "", ErrNoCapacity
@@ -353,6 +373,9 @@ func (s *ShardService) GetTenantShardID(ctx context.Context, tenantID string) (s
 	}
 	if err != nil {
 		return "", fmt.Errorf("get tenant shard id: %w", err)
+	}
+	if s.idCache != nil {
+		s.idCache.Add(tenantID, shardID)
 	}
 	return shardID, nil
 }
@@ -453,9 +476,18 @@ func (s *ShardService) ListTenantsOnShard(ctx context.Context, shardID string) (
 	return out, rows.Err()
 }
 
+// invalidate purges every per-tenant cache entry the service
+// keeps. Currently both `cache` (URL) and `idCache` (shard UUID)
+// are keyed by tenantID, so a single helper keeps the cache
+// state from drifting between the two when an assignment moves.
+// Callers: AssignTenantToShard, RebalanceShard, UpdateShard's
+// per-tenant fan-out.
 func (s *ShardService) invalidate(tenantID string) {
 	if s.cache != nil {
 		s.cache.Remove(tenantID)
+	}
+	if s.idCache != nil {
+		s.idCache.Remove(tenantID)
 	}
 }
 

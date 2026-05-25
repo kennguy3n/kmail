@@ -204,7 +204,10 @@ func TestSharedOpenSearch_DeleteIndex404IsSuccess(t *testing.T) {
 // migration path issues a bulk request and namespaces every doc
 // id with the tenant prefix so the shared index keeps tenant
 // isolation even when two tenants share the same per-account
-// message id.
+// message id. MigrateIndex itself MUST NOT issue a
+// `_delete_by_query` — `Service.reindexInto` already calls
+// `DeleteIndex` before this, and double-deleting wastes a network
+// round-trip on every cutover.
 func TestSharedOpenSearch_MigrateIndexUsesBulk(t *testing.T) {
 	const tenantID = "tenant-bulk"
 	var (
@@ -235,8 +238,8 @@ func TestSharedOpenSearch_MigrateIndexUsesBulk(t *testing.T) {
 	if err := b.MigrateIndex(context.Background(), tenantID, msgs); err != nil {
 		t.Fatalf("MigrateIndex: %v", err)
 	}
-	if deleteCalls != 1 {
-		t.Errorf("deleteCalls = %d, want 1 (wipe before bulk)", deleteCalls)
+	if deleteCalls != 0 {
+		t.Errorf("deleteCalls = %d, want 0 (MigrateIndex must not double-delete)", deleteCalls)
 	}
 	if bulkCalls != 1 {
 		t.Fatalf("bulkCalls = %d, want 1", bulkCalls)
@@ -276,11 +279,13 @@ func TestSharedOpenSearch_MigrateIndexUsesBulk(t *testing.T) {
 	}
 }
 
-// TestSharedOpenSearch_MigrateIndexEmptyJustClears verifies a
-// migration with zero messages still does a delete-by-query so
-// the destination is clean. The bulk request is skipped because
-// OpenSearch's `_bulk` rejects an empty body.
-func TestSharedOpenSearch_MigrateIndexEmptyJustClears(t *testing.T) {
+// TestSharedOpenSearch_MigrateIndexEmptyIsNoop verifies a
+// migration with zero messages issues NO HTTP calls at all.
+// `Service.reindexInto` is responsible for clearing the
+// destination before MigrateIndex, so the empty-msgs branch must
+// stay a pure no-op — issuing a redundant `_delete_by_query` here
+// would re-delete on every empty cutover.
+func TestSharedOpenSearch_MigrateIndexEmptyIsNoop(t *testing.T) {
 	var (
 		deletes atomic.Int32
 		bulks   atomic.Int32
@@ -297,8 +302,8 @@ func TestSharedOpenSearch_MigrateIndexEmptyJustClears(t *testing.T) {
 	if err := b.MigrateIndex(context.Background(), "tenant-empty", nil); err != nil {
 		t.Fatalf("MigrateIndex(nil): %v", err)
 	}
-	if deletes.Load() != 1 {
-		t.Errorf("deletes = %d, want 1", deletes.Load())
+	if deletes.Load() != 0 {
+		t.Errorf("deletes = %d, want 0 (MigrateIndex must not double-delete)", deletes.Load())
 	}
 	if bulks.Load() != 0 {
 		t.Errorf("bulks = %d, want 0 on empty migration", bulks.Load())
