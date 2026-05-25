@@ -142,13 +142,29 @@ func (s *StalwartAliasHTTPSync) patchPrincipal(ctx context.Context, tenantID, st
 	if err != nil {
 		return fmt.Errorf("call stalwart admin api: %w", err)
 	}
-	defer resp.Body.Close()
+	// Drain the body before Close so the underlying HTTP/1.1
+	// connection is returned to the keep-alive pool. Without
+	// the explicit Copy-then-Close, a non-empty 200 response
+	// (Stalwart 0.16 returns a small JSON status envelope on
+	// principal updates) leaves bytes unread and forces the
+	// transport to close the connection, defeating connection
+	// reuse across the worker's batched retries. A bounded
+	// LimitReader caps the worst case so an admin endpoint that
+	// regresses into returning a multi-MB body cannot pin the
+	// goroutine.
+	defer func() {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+		_ = resp.Body.Close()
+	}()
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		return nil
 	}
 	// Drain a bounded slice of the error body so the audit log
 	// captures the Stalwart error code without spamming on a
-	// large HTML 500 page from a misrouted call.
+	// large HTML 500 page from a misrouted call. The deferred
+	// LimitReader above still runs after we read here, so any
+	// residual bytes past the 1KB prefix are still discarded
+	// and the connection is returned to the pool.
 	body, _ = io.ReadAll(io.LimitReader(resp.Body, 1024))
 	return fmt.Errorf("stalwart admin api returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 }

@@ -146,12 +146,22 @@ func (w *AliasStalwartSyncWorker) processNext(ctx context.Context) (bool, error)
 	if syncErr == nil {
 		return true, markAliasSyncSynced(ctx, w.pool, id)
 	}
+	// `attempts` is the DB column value BEFORE this worker call.
+	// `nextAttempt` is the 1-indexed number of the attempt the
+	// worker just executed (e.g. attempts=1 means the inline
+	// attempt failed already, so this is attempt #2). After this
+	// attempt fails, the schedule entry at index `nextAttempt`
+	// gives the delay before the *next* try — see the contract
+	// on `nextAliasSyncBackoff`. The previous implementation
+	// passed `nextAttempt+1` here, which skipped the 2-minute
+	// tier of the schedule entirely (30s → 10m → 30m → 1h
+	// instead of the documented 30s → 2m → 10m → 30m).
 	nextAttempt := attempts + 1
 	if nextAttempt >= AliasSyncMaxAttempts {
 		w.logger.Printf("alias_sync.worker: giving up after %d attempts for tenant=%s alias=%s op=%s: %v", nextAttempt, tenantID, aliasEmail, op, syncErr)
 		return true, markAliasSyncFailed(ctx, w.pool, id, syncErr.Error())
 	}
-	if err := recordAliasSyncFailure(ctx, w.pool, id, syncErr.Error(), nextAliasSyncBackoff(nextAttempt+1)); err != nil {
+	if err := recordAliasSyncFailure(ctx, w.pool, id, syncErr.Error(), nextAliasSyncBackoff(nextAttempt)); err != nil {
 		return true, err
 	}
 	w.logger.Printf("alias_sync.worker: attempt %d failed for tenant=%s alias=%s op=%s: %v (will retry)", nextAttempt, tenantID, aliasEmail, op, syncErr)

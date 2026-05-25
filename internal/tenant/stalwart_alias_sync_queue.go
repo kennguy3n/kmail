@@ -40,11 +40,18 @@ const (
 // retry policy across the BFF.
 const AliasSyncMaxAttempts = 5
 
-// nextAliasSyncBackoff returns the delay before the next retry
-// attempt given the upcoming attempt number (1-indexed). Mirrors
-// the webhooks worker schedule: 30s, 2m, 10m, 30m, 1h.
-func nextAliasSyncBackoff(nextAttempt int) time.Duration {
-	switch nextAttempt {
+// nextAliasSyncBackoff returns the delay between an attempt that
+// just failed and the next retry. `attempt` is the 1-indexed
+// number of the attempt that *just failed* — so the first call
+// after the inline-from-the-handler attempt fails passes
+// `attempt=1`, the next worker call after the first
+// worker-driven retry fails passes `attempt=2`, and so on. The
+// schedule mirrors the webhooks worker tiers: 30s, 2m, 10m,
+// 30m, 1h. Values past the explicit schedule fall through to
+// the 1h default — the worker's `AliasSyncMaxAttempts` guard
+// gives up before that tier ever runs.
+func nextAliasSyncBackoff(attempt int) time.Duration {
+	switch attempt {
 	case 1:
 		return 30 * time.Second
 	case 2:

@@ -16,9 +16,16 @@ import (
 // ---------------------------------------------------------------
 
 func TestNextAliasSyncBackoff_Schedule(t *testing.T) {
+	// `attempt` is the 1-indexed number of the attempt that *just
+	// failed*, per the contract on `nextAliasSyncBackoff`. The
+	// schedule under test is the documented webhook-mirrored
+	// 30s -> 2m -> 10m -> 30m -> 1h. The fall-through case
+	// (attempt past the schedule) returns 1h — the worker's
+	// `AliasSyncMaxAttempts` guard gives up before that tier
+	// would otherwise produce a too-large delay.
 	tests := []struct {
-		nextAttempt int
-		want        time.Duration
+		attempt int
+		want    time.Duration
 	}{
 		{1, 30 * time.Second},
 		{2, 2 * time.Minute},
@@ -29,8 +36,8 @@ func TestNextAliasSyncBackoff_Schedule(t *testing.T) {
 		{100, time.Hour},
 	}
 	for _, tc := range tests {
-		if got := nextAliasSyncBackoff(tc.nextAttempt); got != tc.want {
-			t.Errorf("nextAliasSyncBackoff(%d) = %v, want %v", tc.nextAttempt, got, tc.want)
+		if got := nextAliasSyncBackoff(tc.attempt); got != tc.want {
+			t.Errorf("nextAliasSyncBackoff(%d) = %v, want %v", tc.attempt, got, tc.want)
 		}
 	}
 }
