@@ -161,11 +161,51 @@ if [ -n "${TENANT_ID}" ]; then
 fi
 
 # ---------------------------------------------------------------
+# 11. Alias CRUD
+# ---------------------------------------------------------------
+step '11. Alias CRUD (create → list → delete)'
+if [ -n "${TENANT_ID}" ]; then
+  USER_ID=$(curl_json "${API}/api/v1/tenants/${TENANT_ID}/users" \
+              -H "X-KMail-Dev-Tenant-Id: ${TENANT_ID}" |
+              jq -r '.[0].id // empty')
+  if [ -z "${USER_ID}" ]; then
+    fail "no users in tenant; create one before exercising aliases"
+  else
+    # Unique alias per run so a re-run does not collide on the
+    # global UNIQUE constraint without a cleanup pass.
+    ALIAS_EMAIL="e2e-$(date +%s)-$$@e2e.kmail.local"
+    CREATE_BODY=$(jq -n --arg uid "${USER_ID}" --arg ae "${ALIAS_EMAIL}" \
+                    '{user_id:$uid, alias_email:$ae}')
+    CREATE_RES=$(curl --fail --silent -X POST \
+      -H "Authorization: Bearer ${TOK}" \
+      -H "X-KMail-Dev-Tenant-Id: ${TENANT_ID}" \
+      -H 'Content-Type: application/json' \
+      -d "${CREATE_BODY}" \
+      "${API}/api/v1/tenants/${TENANT_ID}/aliases" || echo '{}')
+    ALIAS_ID=$(printf '%s' "${CREATE_RES}" | jq -r '.id // empty')
+    if [ -z "${ALIAS_ID}" ]; then
+      fail "create alias returned no id"
+    else
+      ok
+      if curl_json "${API}/api/v1/tenants/${TENANT_ID}/aliases" \
+           -H "X-KMail-Dev-Tenant-Id: ${TENANT_ID}" |
+           jq -e --arg id "${ALIAS_ID}" '.[] | select(.id == $id)' >/dev/null; then ok
+      else fail "list aliases did not include the new row"; fi
+      if curl --fail --silent -X DELETE \
+           -H "Authorization: Bearer ${TOK}" \
+           -H "X-KMail-Dev-Tenant-Id: ${TENANT_ID}" \
+           "${API}/api/v1/tenants/${TENANT_ID}/aliases/${ALIAS_ID}" >/dev/null; then ok
+      else fail "delete alias failed"; fi
+    fi
+  fi
+fi
+
+# ---------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------
 printf '\n'
 if [ "${FAIL}" -eq 0 ]; then
-  printf 'kmail-e2e: all 10 stages passed\n'
+  printf 'kmail-e2e: all 11 stages passed\n'
   exit 0
 fi
 printf 'kmail-e2e: %d stage(s) failed\n' "${FAIL}" 1>&2
