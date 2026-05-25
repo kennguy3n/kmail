@@ -280,3 +280,42 @@ in platform-native bridges in their respective follow-up PRs
 The Rust side never touches platform secure storage directly;
 it only ever sees opaque `KeyMaterial` byte slices via the
 `MlsKeyProvider` and `KeyStore` boundaries.
+
+## First-launch bootstrap
+
+A cold-start `sync()` requires four round-trips: JMAP session
+discovery → `Mailbox/get` → `Email/query` → `Email/get`. The
+SDK ships `KMailClient::bootstrap_sync(mailbox_role, limit)` as
+a one-shot replacement that fires a single
+`POST /api/v1/sync/bootstrap` against the BFF
+(`internal/sync/sync.go`). The BFF composes the three JMAP
+calls server-side as one batch, returns a flat envelope, and the
+SDK persists the response atomically:
+
+- `mailboxes` → `MailboxRepo::upsert_many_with_state` (commits
+  the upsert *and* the JMAP `Mailbox/state` cursor in one
+  SQLite transaction).
+- `emails` → `EmailRepo::replace_all_with_state` (wipes the
+  prior window, inserts the new canonical window, and commits
+  the `Email/state` cursor in one SQLite transaction so
+  observers never see a half-purged cache).
+- `account_id` → cached eagerly so subsequent calls skip the
+  JMAP session-discovery round-trip.
+
+See `docs/JMAP-CONTRACT.md` §6.4 for the wire contract.
+
+## Push payload extension
+
+Real-time push notifications carry an inline metadata bundle
+(`EmailDeliveryHint`) so the SDK can update its local snapshot
+without a full `Email/get` round-trip. The transport-level
+`Notification.Data` field is a flat `map[string]string` keyed
+by the canonical wire keys pinned in both
+`internal/push/email_delivery.go::EmailDeliveryKey*` (Go) and
+`sdk/kmail-core/src/push.rs::EmailDeliveryHint` (Rust).
+
+The SDK parses the bundle via
+`EmailDeliveryHint::from_data(&map)` (returns `None` when
+`email_id` is missing — without it the hint is unusable and the
+caller should fall back to a full `sync()`). Wire-format key
+reference: `docs/JMAP-CONTRACT.md` §5.5.

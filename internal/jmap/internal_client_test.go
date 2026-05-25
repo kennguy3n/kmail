@@ -1,0 +1,246 @@
+package jmap
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
+	"testing"
+)
+
+func TestInternalClient_Dispatch_HappyPath(t *testing.T) {
+	t.Parallel()
+
+	var capturedHeaders http.Header
+	var capturedBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/jmap/api" {
+			t.Errorf("unexpected path %q", r.URL.Path)
+		}
+		capturedHeaders = r.Header.Clone()
+		b, _ := io.ReadAll(r.Body)
+		capturedBody = b
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{
+			"methodResponses": [
+				["Mailbox/get", {"list": [{"id": "mbx-1"}], "state": "ms-1"}, "c0"]
+			],
+			"sessionState": "session-1"
+		}`))
+	}))
+	defer srv.Close()
+
+	p := newTestProxy(t)
+	// Point the proxy at our httptest server. Tests construct
+	// the URL directly via `joinPath` so we don't need the proxy
+	// reverse-proxy machinery here.
+	pTarget := p.target
+	pTarget.Scheme = "http"
+	pTarget.Host = srv.Listener.Addr().String()
+	p.target = pTarget
+
+	p.PrimeAccountCache("t1", "u1", "acc-1")
+
+	c, err := NewInternalClient(p)
+	if err != nil {
+		t.Fatalf("NewInternalClient: %v", err)
+	}
+
+	resp, err := c.Dispatch(context.Background(), "t1", "u1", JmapRequest{
+		Using: []string{"urn:ietf:params:jmap:core"},
+		MethodCalls: [][]any{
+			{"Mailbox/get", map[string]any{"accountId": "acc-1"}, "c0"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Dispatch: %v", err)
+	}
+
+	if capturedHeaders.Get("X-KMail-Tenant-Id") != "t1" {
+		t.Errorf("tenant header = %q", capturedHeaders.Get("X-KMail-Tenant-Id"))
+	}
+	if capturedHeaders.Get("X-KMail-Stalwart-Account-Id") != "acc-1" {
+		t.Errorf("account header = %q", capturedHeaders.Get("X-KMail-Stalwart-Account-Id"))
+	}
+
+	var sent map[string]any
+	if err := json.Unmarshal(capturedBody, &sent); err != nil {
+		t.Fatalf("unmarshal body: %v", err)
+	}
+	if _, ok := sent["methodCalls"]; !ok {
+		t.Errorf("body missing methodCalls: %s", capturedBody)
+	}
+
+	name, args, ok := resp.CallByID("c0")
+	if !ok {
+		t.Fatalf("response missing c0")
+	}
+	if name != "Mailbox/get" {
+		t.Errorf("name = %q", name)
+	}
+	list, _ := args["list"].([]any)
+	if len(list) != 1 {
+		t.Errorf("list len = %d", len(list))
+	}
+	if state, _ := args["state"].(string); state != "ms-1" {
+		t.Errorf("state = %q", state)
+	}
+}
+
+func TestInternalClient_Dispatch_MethodLevelError(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{
+			"methodResponses": [
+				["error", {"type": "accountNotFound", "description": "no such acc"}, "c0"]
+			]
+		}`))
+	}))
+	defer srv.Close()
+
+	p := newTestProxy(t)
+	p.target.Host = srv.Listener.Addr().String()
+	p.target.Scheme = "http"
+	p.PrimeAccountCache("t1", "u1", "acc-1")
+
+	c, _ := NewInternalClient(p)
+	_, err := c.Dispatch(context.Background(), "t1", "u1", JmapRequest{
+		MethodCalls: [][]any{{"Mailbox/get", map[string]any{}, "c0"}},
+	})
+	if err == nil {
+		t.Fatal("expected method-level error to surface")
+	}
+	if !strings.Contains(err.Error(), "accountNotFound") {
+		t.Errorf("err = %v want accountNotFound", err)
+	}
+}
+
+func TestInternalClient_Dispatch_5xxFailsOver(t *testing.T) {
+	t.Parallel()
+
+	var primaryHits, secondaryHits int32
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&primaryHits, 1)
+		http.Error(w, "down", http.StatusBadGateway)
+	}))
+	defer primary.Close()
+
+	secondary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&secondaryHits, 1)
+		_, _ = w.Write([]byte(`{"methodResponses":[]}`))
+	}))
+	defer secondary.Close()
+
+	p := newTestProxy(t)
+	p.target.Scheme = "http"
+	p.target.Host = primary.Listener.Addr().String()
+	// Inject a static shard resolver returning both URLs.
+	p.cfg.Shards = staticShardResolver{
+		"t1": {"http://" + primary.Listener.Addr().String(), "http://" + secondary.Listener.Addr().String()},
+	}
+	p.PrimeAccountCache("t1", "u1", "acc-1")
+
+	c, _ := NewInternalClient(p)
+	resp, err := c.Dispatch(context.Background(), "t1", "u1", JmapRequest{
+		MethodCalls: [][]any{{"Mailbox/get", map[string]any{}, "c0"}},
+	})
+	if err != nil {
+		t.Fatalf("Dispatch: %v", err)
+	}
+	if resp == nil {
+		t.Fatal("nil response")
+	}
+	if atomic.LoadInt32(&primaryHits) != 1 {
+		t.Errorf("primary hits = %d want 1", primaryHits)
+	}
+	if atomic.LoadInt32(&secondaryHits) != 1 {
+		t.Errorf("secondary hits = %d want 1", secondaryHits)
+	}
+}
+
+func TestInternalClient_Dispatch_4xxDoesNotFailOver(t *testing.T) {
+	t.Parallel()
+
+	var primaryHits, secondaryHits int32
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&primaryHits, 1)
+		http.Error(w, "bad req", http.StatusBadRequest)
+	}))
+	defer primary.Close()
+	secondary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&secondaryHits, 1)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer secondary.Close()
+
+	p := newTestProxy(t)
+	p.cfg.Shards = staticShardResolver{
+		"t1": {"http://" + primary.Listener.Addr().String(), "http://" + secondary.Listener.Addr().String()},
+	}
+	p.PrimeAccountCache("t1", "u1", "acc-1")
+
+	c, _ := NewInternalClient(p)
+	_, err := c.Dispatch(context.Background(), "t1", "u1", JmapRequest{
+		MethodCalls: [][]any{{"Mailbox/get", map[string]any{}, "c0"}},
+	})
+	if err == nil {
+		t.Fatal("expected 4xx to surface immediately")
+	}
+	if atomic.LoadInt32(&secondaryHits) != 0 {
+		t.Errorf("4xx must not fail over; secondary hits = %d", secondaryHits)
+	}
+	if atomic.LoadInt32(&primaryHits) != 1 {
+		t.Errorf("primary hits = %d want 1", primaryHits)
+	}
+}
+
+func TestInternalClient_RequiresProxy(t *testing.T) {
+	t.Parallel()
+	if _, err := NewInternalClient(nil); err == nil {
+		t.Fatal("expected error for nil proxy")
+	}
+}
+
+func TestJoinPath_NoDoubleSlash(t *testing.T) {
+	t.Parallel()
+	cases := []struct{ base, rel, want string }{
+		{"http://a.b", "/jmap/api", "http://a.b/jmap/api"},
+		{"http://a.b/", "/jmap/api", "http://a.b/jmap/api"},
+		{"http://a.b/prefix", "/jmap/api", "http://a.b/prefix/jmap/api"},
+		{"http://a.b/prefix/", "/jmap/api", "http://a.b/prefix/jmap/api"},
+		{"http://a.b", "jmap/api", "http://a.b/jmap/api"},
+	}
+	for _, tc := range cases {
+		got, err := joinPath(tc.base, tc.rel)
+		if err != nil {
+			t.Errorf("joinPath(%q, %q): %v", tc.base, tc.rel, err)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("joinPath(%q, %q) = %q want %q", tc.base, tc.rel, got, tc.want)
+		}
+	}
+}
+
+// staticShardResolver — minimal ShardResolver for tests. The
+// underlying map's first entry is the primary; subsequent
+// entries are secondaries (in slice order).
+type staticShardResolver map[string][]string
+
+func (s staticShardResolver) GetTenantShard(ctx context.Context, tenantID string) (string, error) {
+	if v, ok := s[tenantID]; ok && len(v) > 0 {
+		return v[0], nil
+	}
+	return "", nil
+}
+
+func (s staticShardResolver) GetSecondaryShards(ctx context.Context, tenantID string) ([]string, error) {
+	if v, ok := s[tenantID]; ok && len(v) > 1 {
+		return v[1:], nil
+	}
+	return nil, nil
+}

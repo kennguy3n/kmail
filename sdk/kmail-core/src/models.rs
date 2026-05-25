@@ -587,6 +587,67 @@ where
     m.end()
 }
 
+/// Request body for `POST /api/v1/sync/bootstrap`.
+///
+/// Matches the BFF's `internal/sync/sync.go::BootstrapRequest`
+/// struct byte-for-byte. Both fields are optional — sending an
+/// empty body causes the BFF to use its defaults (account-wide
+/// window, `DefaultBootstrapLimit` emails).
+///
+/// `limit == 0` is treated as "use BFF default"; non-zero values
+/// are clamped by the BFF to `MaxBootstrapLimit`. `mailbox_role`
+/// is the lowercase canonical JMAP role string (matching
+/// [`MailboxRole::canonical_name`]); unknown roles are rejected
+/// with HTTP 400.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct BootstrapRequest {
+    /// Maximum number of emails in the returned window. `0`
+    /// (the serde default) means "use BFF default".
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub limit: u32,
+    /// Optional mailbox role to restrict the window to. Empty
+    /// string ("" — the serde default) means "no filter".
+    #[serde(
+        default,
+        rename = "mailbox_role",
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub mailbox_role: String,
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+
+/// Response body for `POST /api/v1/sync/bootstrap`.
+///
+/// Matches the BFF's `internal/sync/sync.go::BootstrapResponse`
+/// struct. `mailboxes` and `emails` carry the JMAP wire shapes
+/// verbatim (as `serde_json::Value` so the SDK can route them
+/// through the same `Mailbox` / `EmailSummary` deserialisers used
+/// by `JmapClient::list_mailboxes` / `bootstrap_email_window`,
+/// without re-implementing the JMAP envelope parser).
+///
+/// The `*_state` fields are the canonical JMAP state tokens
+/// returned by `Mailbox/get` / `Email/get` inside the BFF's
+/// composed request — RFC 8620 §3.4 guarantees they reflect a
+/// single coherent snapshot, so persisting them as the next
+/// `*_changes` cursor is safe.
+#[derive(Clone, Debug, Deserialize)]
+pub struct BootstrapResponse {
+    pub account_id: String,
+    #[serde(default)]
+    pub mailboxes: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub mailbox_state: String,
+    #[serde(default)]
+    pub emails: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub email_state: String,
+    #[serde(default)]
+    pub bootstrapped_at: Option<DateTime<Utc>>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

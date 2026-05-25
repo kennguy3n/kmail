@@ -309,6 +309,48 @@ On a mailbox change event from Stalwart the BFF:
 - No push event is allowed to block the BFF's main JMAP data-plane
   request loop.
 
+### 5.5 Email-delivery payload extension
+
+When the change that triggers the push is a *new email delivery*
+(`Email/state` advanced; the BFF observed a freshly-created
+`Email` JMAP object in the affected mailbox), the BFF augments the
+transport-layer notification with a flat, typed metadata bundle so
+the SDK can update its local SQLite snapshot without forcing a
+full `Email/get` round-trip.
+
+The metadata is encoded as `Notification.Data` (a flat
+`map[string]string`) under the canonical keys pinned in both Go
+(`internal/push/email_delivery.go::EmailDeliveryKey*`) and Rust
+(`sdk/kmail-core/src/push.rs::EmailDeliveryHint::from_data`):
+
+| Wire key            | Type                | Source / semantics                                                                |
+| ------------------- | ------------------- | --------------------------------------------------------------------------------- |
+| `email_id`          | string (required)   | Stalwart-assigned JMAP `Email.id`. Hint is dropped if this key is missing.        |
+| `account_id`        | string              | Resolved Stalwart account ID for the recipient.                                   |
+| `mailbox_id`        | string              | Target mailbox (typically `inbox`).                                               |
+| `thread_id`         | string              | JMAP `Email.threadId`.                                                            |
+| `keywords`          | string              | Comma-separated, deduplicated, embedded commas stripped (e.g. `$seen,$important`).|
+| `subject`           | string (≤256 runes) | Truncated at rune boundary; valid UTF-8 is preserved.                             |
+| `snippet`           | string (≤200 runes) | Server-rendered preview line, rune-truncated.                                     |
+| `from`              | string              | RFC 5322-style sender address as displayed in the UI.                             |
+| `received_at_unix`  | int (Unix seconds)  | UTC. Omitted if the source timestamp is zero.                                     |
+| `has_attachment`    | `"true"`/`"false"`  | Omitted if unknown.                                                               |
+| `email_state`       | string              | JMAP `Email/state` after the delivery — lets the SDK skip `Email/changes`.        |
+| `mailbox_state`     | string              | JMAP `Mailbox/state` after the delivery.                                          |
+
+The `Notification.Kind` field is the canonical string
+`"new_email"` (`NotificationKindNewEmail` constant on both
+sides). The transport router (`cmd/kmail-api/main.go`) renders
+this payload to APNs / FCM / Web Push without further
+modification; all three transports carry the
+`map[string]string` at the payload level.
+
+Vault mailboxes are an explicit exception: `subject` and
+`snippet` are omitted because the BFF has no plaintext. The SDK
+still gets enough metadata (`email_id`, `mailbox_id`, state
+tokens) to update the local index pointer without requiring a
+post-decrypt round-trip.
+
 ---
 
 ## 6. Request Batching
@@ -338,6 +380,41 @@ the authenticated user's tenant returns
 - The BFF does not open-endedly hold sockets for Stalwart calls
   that exceed its tail-latency SLO; instead it returns a ticket
   and tracks the upstream call on a separate worker.
+
+### 6.4 SDK first-launch bootstrap
+
+The cold-start client path is `JMAP session discovery → Mailbox/get
+→ Email/query → Email/get` — four round-trips on a fresh device
+(session response, mailboxes, the inbox-window query, then the
+bulk hydration of the queried IDs).
+
+For native SDK clients (iOS / Android / Electron) the BFF exposes
+a one-shot `POST /api/v1/sync/bootstrap` endpoint
+(`internal/sync/sync.go`). The handler composes a *single* JMAP
+batch server-side via the BFF-internal JMAP client
+(`internal/jmap/internal_client.go`):
+
+| Call ID | Method        | Notes                                                                       |
+| ------- | ------------- | --------------------------------------------------------------------------- |
+| `c0`    | `Mailbox/get` | All mailboxes, no projection (the client needs the full role/parent tree). |
+| `c1`    | `Email/query` | Filtered by `mailbox_role` if requested, ordered by `receivedAt` DESC, capped at `limit` (default 50, max 500). |
+| `c2`    | `Email/get`   | Back-referenced from `c1` via `#filter`, projecting the SDK's canonical `EmailSummary` shape. |
+
+The handler returns a flat envelope (account ID, mailboxes,
+emails, both JMAP state tokens, bootstrap timestamp) the SDK
+persists atomically. The SDK calls
+`KMailClient::bootstrap_sync()` instead of `sync()` on first
+launch and saves three round-trips of cold-start latency.
+
+The endpoint shares the proxy's mTLS transport, account-resolution
+cache, and shard routing — there is no second account-resolution
+path. Operators that pre-warm the account cache from a sidecar
+process via `Proxy.PrimeAccountCache` reduce the cold-start
+Postgres load.
+
+Authentication is identical to the JMAP API URL: the OIDC
+middleware injects `(tenant_id, kchat_user_id)` from the verified
+access token; the handler 403s any request missing either claim.
 
 ---
 

@@ -160,6 +160,126 @@ impl PushPayload {
     }
 }
 
+/// Email-delivery hint extracted from the transport-level push
+/// payload (APNs `aps.alert.payload`, FCM `data` map, Web Push
+/// JSON body).
+///
+/// The BFF populates this via `internal/push::BuildEmailDelivery
+/// Notification` when it fans out a `new_email` event. The data
+/// map keys are the canonical lowercase strings defined in
+/// `internal/push/email_delivery.go::EmailDeliveryKey*`; the SDK
+/// reads them through this typed view so a key rename or new
+/// field surfaces as a compile error rather than a silent
+/// type-coerce-to-empty.
+///
+/// **Wire-format contract.** Every field is OPTIONAL on the wire
+/// — the BFF emits only the keys it has populated, and the SDK
+/// degrades gracefully. The two load-bearing fields are
+/// `email_id` and `email_state`: with both present, the SDK can
+/// short-circuit `Email/changes` and write the new row directly.
+/// Without `email_state`, the SDK still inserts the row but
+/// needs the next `sync()` to advance the state token via the
+/// usual delta path. Without `email_id` (a malformed payload),
+/// the SDK falls back to a full `sync()` rather than guess.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EmailDeliveryHint {
+    /// Stalwart account ID the email landed in.
+    pub account_id: Option<String>,
+    /// JMAP `Email/get` object ID.
+    pub email_id: Option<String>,
+    /// JMAP `mailboxIds` key — i.e. the mailbox the email landed
+    /// in. When Stalwart routed the email through a Sieve rule
+    /// this may be a non-inbox mailbox; the SDK persists the
+    /// value verbatim so the JMAP-state model stays correct.
+    pub mailbox_id: Option<String>,
+    /// JMAP `threadId`. Used to group with existing thread state.
+    pub thread_id: Option<String>,
+    /// JMAP `keywords` set, parsed back from the comma-separated
+    /// wire format. Order is preserved from the wire payload —
+    /// callers that need set semantics should hash into their own
+    /// collection.
+    pub keywords: Vec<String>,
+    /// Subject line, truncated to the wire-format cap on the BFF.
+    pub subject: Option<String>,
+    /// First ~200 runes of the email body, plain text.
+    pub snippet: Option<String>,
+    /// Human-readable sender display (`"Name <name@example.com>"`).
+    pub from: Option<String>,
+    /// Unix-epoch seconds — when Stalwart accepted delivery.
+    pub received_at_unix: Option<i64>,
+    /// JMAP `hasAttachment` boolean, when populated.
+    pub has_attachment: Option<bool>,
+    /// Canonical `Email/get` state token after this delivery.
+    /// Persisting this as the next `Email/changes` cursor lets
+    /// the SDK skip the round-trip.
+    pub email_state: Option<String>,
+    /// Canonical `Mailbox/get` state token after this delivery.
+    pub mailbox_state: Option<String>,
+}
+
+impl EmailDeliveryHint {
+    /// Parse the wire-format `data` map produced by
+    /// `internal/push::BuildEmailDeliveryNotification`. Returns
+    /// `Some` only when at least `email_id` is present — without
+    /// it the hint is unusable and the caller should fall back
+    /// to a full `sync()`.
+    pub fn from_data(data: &std::collections::BTreeMap<String, String>) -> Option<Self> {
+        let email_id = data.get("email_id").cloned()?;
+        let mut hint = Self {
+            email_id: Some(email_id),
+            ..Self::default()
+        };
+        if let Some(v) = data.get("account_id") {
+            hint.account_id = Some(v.clone());
+        }
+        if let Some(v) = data.get("mailbox_id") {
+            hint.mailbox_id = Some(v.clone());
+        }
+        if let Some(v) = data.get("thread_id") {
+            hint.thread_id = Some(v.clone());
+        }
+        if let Some(v) = data.get("subject") {
+            hint.subject = Some(v.clone());
+        }
+        if let Some(v) = data.get("snippet") {
+            hint.snippet = Some(v.clone());
+        }
+        if let Some(v) = data.get("from") {
+            hint.from = Some(v.clone());
+        }
+        if let Some(v) = data.get("received_at_unix") {
+            if let Ok(ts) = v.parse::<i64>() {
+                hint.received_at_unix = Some(ts);
+            }
+        }
+        if let Some(v) = data.get("has_attachment") {
+            hint.has_attachment = match v.as_str() {
+                "true" => Some(true),
+                "false" => Some(false),
+                _ => None,
+            };
+        }
+        if let Some(v) = data.get("email_state") {
+            hint.email_state = Some(v.clone());
+        }
+        if let Some(v) = data.get("mailbox_state") {
+            hint.mailbox_state = Some(v.clone());
+        }
+        if let Some(v) = data.get("keywords") {
+            // Comma-separated wire format. Empty strings between
+            // commas are dropped so an accidental trailing comma
+            // doesn't produce an empty keyword entry.
+            hint.keywords = v
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect();
+        }
+        Some(hint)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
