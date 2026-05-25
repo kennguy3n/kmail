@@ -97,10 +97,16 @@ shares the same versions:
 | Android arm64        | `cargo build -p kmail-ffi --target aarch64-linux-android --release` *(follow-up PR)*                     |
 | Android armv7        | `cargo build -p kmail-ffi --target armv7-linux-androideabi --release` *(follow-up PR)*                   |
 | Android x86_64       | `cargo build -p kmail-ffi --target x86_64-linux-android --release` *(follow-up PR)*                      |
-| Desktop (napi-rs)    | `cd sdk/kmail-napi && npx @napi-rs/cli build --release` *(follow-up PR for multi-target sweep)*          |
+| Desktop (napi-rs)    | `cd sdk/kmail-napi && npx @napi-rs/cli build --release --platform`                                       |
+| Desktop multi-target | Driven by `.github/workflows/sdk-build-napi.yml` — fan-out matrix builds + uploads `.node` per target.   |
+| Electron shell       | `cd apps/desktop && npm run build` (Vite for renderer + tsc for main); `npm run package` for installers. |
 
-Cross-compile sweeps for Android and napi targets land in
-follow-up PRs that wire the AAR and `.node` bundling into CI.
+The iOS XCFramework sweep is live (driven by
+`.github/workflows/sdk-build-ios.yml`, landed in PR #41). The
+napi multi-target sweep is live as of this PR
+(`.github/workflows/sdk-build-napi.yml`). The Android AAR sweep
+lands in a follow-up PR (`sdk-build-android.yml` is staged
+there).
 
 ## UniFFI binding generation
 

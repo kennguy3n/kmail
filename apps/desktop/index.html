@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0"
+    />
+    <!--
+      Content-Security-Policy mirrors the hardened Electron
+      defaults (contextIsolation, no nodeIntegration, sandbox on).
+      The renderer is forbidden from loading remote scripts and
+      from `eval`. `connect-src 'self'` is intentionally narrow:
+      every network call must round-trip through the napi-rs SDK
+      in the main process, which uses Rust's reqwest+rustls — the
+      renderer should never have a reason to issue its own fetch.
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none';"
+    />
+    <title>KMail</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
