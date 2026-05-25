@@ -152,6 +152,50 @@ describe("<UserAdmin /> alias manager", () => {
     });
   });
 
+  it("only fires one DELETE when 'Confirm delete' is double-clicked", async () => {
+    listUserAliases.mockResolvedValueOnce([alias]);
+    // Hold the DELETE promise open so we can fire a second click
+    // while the first is still in flight — that's the race the
+    // `deletingId` guard exists to prevent.
+    let resolveDelete: () => void = () => {
+      throw new Error("DELETE promise not initialised");
+    };
+    deleteAlias.mockReturnValueOnce(
+      new Promise<void>((resolve) => {
+        resolveDelete = () => resolve();
+      }),
+    );
+
+    await renderAndExpandAliases();
+
+    const aliasRow = (
+      await screen.findByText("alice.alt@acme.com")
+    ).closest("li") as HTMLElement;
+    const aliasScope = within(aliasRow);
+
+    // First click arms the confirm.
+    fireEvent.click(aliasScope.getByRole("button", { name: "Delete" }));
+    // Second click fires the actual DELETE.
+    fireEvent.click(
+      aliasScope.getByRole("button", { name: "Confirm delete" }),
+    );
+    // Third click (double-tap on Confirm) must be ignored —
+    // the button is disabled and the in-flight guard short-
+    // circuits handleDelete anyway.
+    const inflight = aliasScope.getByRole("button", { name: /Deleting/ });
+    expect(inflight).toBeDisabled();
+    fireEvent.click(inflight);
+
+    // Resolve the DELETE so the test finishes cleanly.
+    resolveDelete();
+    await waitFor(() => {
+      expect(deleteAlias).toHaveBeenCalledTimes(1);
+    });
+    await waitFor(() => {
+      expect(screen.queryByText("alice.alt@acme.com")).not.toBeInTheDocument();
+    });
+  });
+
   it("surfaces a 409 from createAlias in the manager error slot", async () => {
     listUserAliases.mockResolvedValueOnce([]);
     createAlias.mockRejectedValueOnce(new Error("alias email already in use"));

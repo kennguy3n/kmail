@@ -440,6 +440,16 @@ function AliasManager(props: { tenantId: string; userId: string }): JSX.Element 
   const [draft, setDraft] = useState("");
   const [adding, setAdding] = useState(false);
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
+  // `deletingId` is the alias the component is mid-DELETE on.
+  // It guards against the user double-clicking "Confirm delete"
+  // before the network round-trip resolves — without it the
+  // second click would also enter the `pendingDelete === alias.id`
+  // branch and fire a second DELETE that the server then 404s,
+  // surfacing a spurious error toast in the UI for an action the
+  // user already completed successfully. Mirrors the existing
+  // user-row delete flow so the optimistic-UX shape is consistent
+  // across this page.
+  const [deletingId, setDeletingId] = useState<string | null>(null);
 
   // Re-load when either id flips (e.g. the admin collapses one
   // user's manager and expands another without unmounting).
@@ -478,10 +488,18 @@ function AliasManager(props: { tenantId: string; userId: string }): JSX.Element 
   };
 
   const handleDelete = (alias: Alias): void => {
+    // Two-stage confirmation: first click arms the row, second
+    // click actually deletes. The `deletingId` guard below
+    // ensures a double-tap on "Confirm delete" only fires one
+    // network round-trip.
     if (pendingDelete !== alias.id) {
       setPendingDelete(alias.id);
       return;
     }
+    if (deletingId === alias.id) {
+      return;
+    }
+    setDeletingId(alias.id);
     setError(null);
     deleteAlias(tenantId, alias.id)
       .then(() => {
@@ -490,7 +508,8 @@ function AliasManager(props: { tenantId: string; userId: string }): JSX.Element 
         );
         setPendingDelete(null);
       })
-      .catch((err: unknown) => setError(errorMessage(err)));
+      .catch((err: unknown) => setError(errorMessage(err)))
+      .finally(() => setDeletingId((cur) => (cur === alias.id ? null : cur)));
   };
 
   return (
@@ -512,12 +531,14 @@ function AliasManager(props: { tenantId: string; userId: string }): JSX.Element 
                     type="button"
                     onClick={() => handleDelete(a)}
                     className="kmail-admin-danger"
+                    disabled={deletingId === a.id}
                   >
-                    Confirm delete
+                    {deletingId === a.id ? "Deleting…" : "Confirm delete"}
                   </button>{" "}
                   <button
                     type="button"
                     onClick={() => setPendingDelete(null)}
+                    disabled={deletingId === a.id}
                   >
                     Cancel
                   </button>
@@ -527,6 +548,7 @@ function AliasManager(props: { tenantId: string; userId: string }): JSX.Element 
                   type="button"
                   onClick={() => handleDelete(a)}
                   className="kmail-admin-danger"
+                  disabled={deletingId === a.id}
                 >
                   Delete
                 </button>

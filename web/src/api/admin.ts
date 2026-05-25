@@ -266,7 +266,7 @@ export async function deleteUser(
   );
 }
 
-/** Mirrors `internal/tenant/service.go#Alias`. */
+/** Mirrors `internal/tenant/aliases.go#Alias`. */
 export interface Alias {
   id: string;
   tenant_id: string;
@@ -276,7 +276,7 @@ export interface Alias {
   updated_at: string;
 }
 
-/** Mirrors `internal/tenant/service.go#CreateAliasInput`. */
+/** Mirrors `internal/tenant/aliases.go#CreateAliasInput`. */
 export interface CreateAliasInput {
   user_id: string;
   alias_email: string;
