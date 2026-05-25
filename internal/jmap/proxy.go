@@ -667,6 +667,16 @@ type Proxy struct {
 	target  *url.URL
 	stripPR string
 
+	// base is the underlying BFF→Stalwart transport (mTLS-aware
+	// when `cfg.TLS != nil`, the default transport otherwise).
+	// The reverse proxy wraps this in a `shardFailoverTransport`
+	// to drive the proxy retries; BFF-internal callers (see
+	// `InternalClient`) reuse the bare base via
+	// `Proxy.BaseTransport` so they get the same certificate
+	// material + dialer tuning without inheriting the proxy's
+	// per-request shard-list context plumbing.
+	base http.RoundTripper
+
 	// breaker is the active circuit-breaker implementation. It's
 	// either the per-process default (a thin wrapper over a
 	// counter map) or a `*RedisCircuitBreaker` wired by the
@@ -674,6 +684,75 @@ type Proxy struct {
 	// surface is consulted by `shardFailoverTransport.RoundTrip`
 	// on every retry decision.
 	breaker CircuitBreaker
+}
+
+// BaseTransport returns the underlying BFF→Stalwart RoundTripper
+// used by the proxy. The transport is mTLS-aware when the proxy
+// was built with a non-nil `ProxyConfig.TLS`, otherwise it is
+// `http.DefaultTransport`. `InternalClient` reuses it so
+// BFF-initiated JMAP requests (e.g. `/api/v1/sync/bootstrap`)
+// observe the same handshake / dialer tuning as proxied traffic.
+func (p *Proxy) BaseTransport() http.RoundTripper { return p.base }
+
+// Target returns the configured Stalwart base URL. Used as the
+// default upstream for `InternalClient` when no per-tenant shard
+// is configured.
+func (p *Proxy) Target() *url.URL { return p.target }
+
+// Logger returns the proxy's logger so colocated helpers can emit
+// to the same destination.
+func (p *Proxy) Logger() *log.Logger { return p.logger }
+
+// ResolveAccountID returns the Stalwart account ID for the given
+// `(tenant_id, kchat_user_id)` pair, hitting the in-process cache
+// and falling through to Postgres on a miss. Exposes the proxy's
+// internal `resolveAccount` to colocated helpers like
+// `InternalClient` so BFF-initiated JMAP requests share the same
+// `(tenant, user) → account_id` lookup path as proxied requests —
+// the cache stays consistent across both call sites and we don't
+// double the Postgres query rate on a cold pod.
+func (p *Proxy) ResolveAccountID(ctx context.Context, tenantID, kchatUserID string) (string, error) {
+	return p.resolveAccount(ctx, tenantID, kchatUserID)
+}
+
+// PrimeAccountCache seeds the in-process `(tenant_id, kchat_user_id)
+// → stalwart_account_id` cache.
+//
+// Two legitimate use cases:
+//
+//   - **Cold-start warm-up.** Operators that already know the
+//     account-ID set for an incoming traffic burst can pre-load
+//     the cache from a sidecar process so the first request
+//     doesn't pay a Postgres round-trip. The TTL still applies;
+//     entries seeded here are evicted on the same `cacheTTL`
+//     schedule as cache-miss writes.
+//
+//   - **Integration tests.** The proxy's account-resolution path
+//     normally falls back to Postgres on miss; tests that run
+//     against an httptest Stalwart but lack a real Postgres
+//     fixture seed the cache directly so the `(tenant, user) →
+//     account_id` resolution returns deterministic values.
+//
+// `tenantID` and `kchatUserID` must both be non-empty; calls
+// with empty strings are silent no-ops so a buggy seeder cannot
+// accidentally cache `("", "") → "acc-1"` and shadow legitimate
+// lookups.
+func (p *Proxy) PrimeAccountCache(tenantID, kchatUserID, accountID string) {
+	if tenantID == "" || kchatUserID == "" || accountID == "" {
+		return
+	}
+	p.cache.set(tenantID, kchatUserID, accountID)
+}
+
+// ResolveShardURLs returns the ordered list of Stalwart shard URLs
+// for the given tenant (primary first, then secondaries) when a
+// `ShardResolver` is wired; nil otherwise. Callers should treat
+// the slice as read-only and dispatch the request against the
+// head, failing over to subsequent entries on transport errors
+// or 5xx responses. Single-shard deployments (no `ShardResolver`)
+// fall back to `Target()`.
+func (p *Proxy) ResolveShardURLs(ctx context.Context, tenantID string) []string {
+	return p.resolveShardURLs(ctx, tenantID)
 }
 
 // shardCtxKey carries the resolved shard URL list (primary first)
@@ -777,6 +856,7 @@ func NewProxy(cfg ProxyConfig) (*Proxy, error) {
 	} else if target.Scheme == "https" {
 		logger.Printf("jmap proxy: WARNING StalwartURL=%s is HTTPS but no client TLS configured \u2014 falling back to default transport (no mutual auth)", cfg.StalwartURL)
 	}
+	p.base = base
 	p.rp = &httputil.ReverseProxy{
 		Rewrite:      p.rewrite,
 		ErrorHandler: p.errorHandler,

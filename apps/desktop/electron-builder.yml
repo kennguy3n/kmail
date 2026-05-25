@@ -1,0 +1,77 @@
+# electron-builder packaging config.
+#
+# Packages the desktop client into a per-OS installer that
+# bundles the napi `.node` addon for the matching arch. The
+# napi build runs as a prepack hook because electron-builder
+# can't cross-compile Rust on its own.
+#
+# Code signing / notarisation: macOS uses an Apple Developer
+# certificate stored in CI secrets (Apple Developer Program
+# membership required); Windows uses Authenticode signing via
+# a hardware HSM token. Both flows are wired through env vars
+# that CI populates from GitHub Actions Secrets — local
+# `npm run package` skips signing automatically because the
+# secrets are absent.
+
+appId: com.kmail.desktop
+productName: KMail
+copyright: Copyright © ${author}
+
+directories:
+  output: dist/installers
+  buildResources: build-resources
+
+files:
+  - dist/**/*
+  - package.json
+  - "!**/node_modules/*/{CHANGELOG.md,README.md,README,readme.md,readme}"
+  - "!**/node_modules/*/{test,__tests__,tests,powered-test,example,examples}"
+  - "!**/*.{ts,tsx,map}"
+
+# Extra resources packaged as-is. The napi addon's .node files
+# are arch-specific; electron-builder picks the correct one
+# based on the target platform via the @kmail/sdk-native
+# package's optionalDependencies metadata.
+asarUnpack:
+  - "**/*.node"
+
+mac:
+  category: public.app-category.business
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  entitlements: build-resources/entitlements.mac.plist
+  entitlementsInherit: build-resources/entitlements.mac.plist
+  target:
+    - target: dmg
+      arch:
+        - arm64
+        - x64
+    - target: zip
+      arch:
+        - arm64
+        - x64
+
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+  # Authenticode signing: signtool.exe must be on PATH and the
+  # cert thumbprint stored in CSC_LINK / CSC_KEY_PASSWORD env
+  # vars (matches electron-builder's default contract).
+  signAndEditExecutable: true
+
+linux:
+  category: Office
+  target:
+    - target: AppImage
+      arch:
+        - x64
+    - target: deb
+      arch:
+        - x64
+
+# Auto-update channel. Disabled in CI until we have a signed
+# release server stood up — flipping `publish` from `null` to
+# `github` (or another publishService) wires it on.
+publish: null

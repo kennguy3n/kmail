@@ -65,6 +65,7 @@ jobs:
       integration: ${{ steps.filter.outputs.integration }}
       helm: ${{ steps.filter.outputs.helm }}
       sdk: ${{ steps.filter.outputs.sdk }}
+      desktop: ${{ steps.filter.outputs.desktop }}
       ci_workflows: ${{ steps.filter.outputs.ci_workflows }}
     steps:
       - uses: actions/checkout@v4
@@ -135,10 +136,28 @@ jobs:
             # `Cargo.toml`/`Cargo.lock` and any napi / UniFFI
             # build scaffolding under those crate roots. We
             # deliberately do NOT include `apps/**` here because
-            # the platform shells live behind their own per-shell
-            # CI sweep (added in a follow-up workstream).
+            # each platform shell has its own per-shell CI workflow:
+            # `.github/workflows/sdk-build-ios.yml` builds the
+            # XCFramework on a macOS runner, and
+            # `.github/workflows/sdk-build-android.yml` builds the
+            # AAR + jniLibs on a Linux runner with the Android NDK.
+            # The sdk job stays ubuntu-only so a pure apps/ios or
+            # apps/android PR doesn't pay the per-shell cost twice.
             sdk:
               - 'sdk/**'
+              - '.github/workflows/ci.yml'
+            # Desktop (Electron + React) Shell.
+            #
+            # Scoped narrowly to `apps/desktop/**` so an SDK-only
+            # PR doesn't trigger the desktop renderer's vitest +
+            # vite build dance. The desktop job ALSO fires when
+            # `sdk/kmail-napi/**` changes because the renderer's
+            # IPC bridge surface is derived from the napi shape
+            # — a Rust-side rename to a `#[napi]` method must
+            # re-run desktop typecheck.
+            desktop:
+              - 'apps/desktop/**'
+              - 'sdk/kmail-napi/**'
               - '.github/workflows/ci.yml'
             # When the workflow itself changes we re-run
             # everything so we can validate the new YAML
@@ -230,10 +249,14 @@ jobs:
       # build (~3 min) down to ~30 seconds on subsequent runs.
       # Scoped to the `sdk/` workspace so it doesn't collide
       # with any future Rust workspaces elsewhere in the repo.
+      # `key: sdk-job` keeps this job's cache distinct from the
+      # `desktop` job (which also builds inside `sdk/`) so the
+      # two don't contend on the same save slot.
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: sdk -> target
+          key: sdk-job
 
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
@@ -255,6 +278,89 @@ jobs:
         # checks differ, dead-code elision differs, etc.). Cheap
         # in CI thanks to the cargo cache above.
         run: cargo build --workspace --release
+
+  desktop:
+    name: Desktop
+    needs: changes
+    # Run when any desktop or napi file changed, OR the workflow
+    # itself changed, OR it's a push to main. Same shape as the
+    # web/sdk/go gates above.
+    if: |
+      needs.changes.outputs.desktop == 'true' ||
+      needs.changes.outputs.ci_workflows == 'true' ||
+      github.event_name == 'push'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/desktop
+    steps:
+      - uses: actions/checkout@v4
+
+      # Node 20 LTS matches the @napi-rs/cli host requirement and
+      # the Electron 31 bundled Node ABI. The version is pinned
+      # so a future setup-node default bump can't silently break
+      # the @kmail/sdk-native build pipeline.
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Rust toolchain
+        # The desktop job builds @kmail/sdk-native from source
+        # because the `file:../../sdk/kmail-napi` workspace
+        # dependency resolves to a Cargo crate that has to
+        # compile before `npm install` finishes. clippy + rustfmt
+        # aren't needed here — the SDK job above covers those.
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + target (napi build)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sdk -> target
+          # Distinct from the `sdk` job's `sdk-job` key so the
+          # two jobs maintain independent caches even when they
+          # run in parallel on the same commit.
+          key: desktop-job
+
+      - name: Build napi-rs addon (@kmail/sdk-native)
+        # The renderer never imports the addon (see vite alias
+        # to sdk-native.block.ts), but the *typechecker* needs
+        # the napi-rs-generated `index.d.ts` to resolve the
+        # `JsClientConfig` / `KMailClientJs` types referenced
+        # in electron/preload.ts and electron/main.ts. Running
+        # `napi build` here also catches build-side regressions
+        # (e.g. a napi-derive macro mismatch) before the desktop
+        # job runs.
+        working-directory: sdk/kmail-napi
+        run: |
+          npm install --no-audit --no-fund
+          npx @napi-rs/cli build --release --platform
+
+      - name: npm install
+        run: npm install --no-audit --no-fund
+
+      - name: npm run typecheck
+        # Validates BOTH tsconfigs (renderer + electron). The
+        # electron config covers main.ts + preload.ts.
+        run: npm run typecheck
+
+      - name: npm run test
+        # Renderer-side vitest run. The tests cover wire-format
+        # parity with iOS/Android, error-tag parsing, and IPC
+        # dispatch via stub bridge.
+        run: npm run test
+
+      - name: npm run build:renderer
+        # `vite build` exercises the production Rollup bundle
+        # path. Catches CSS-imports / TSX-syntax / type-only
+        # import regressions that `tsc --noEmit` doesn't flag.
+        run: npm run build:renderer
+
+      - name: npm run build:main
+        # `tsc -p tsconfig.electron.json` emits CommonJS for
+        # the Electron main process. A regression here means
+        # the packaged app would fail to boot.
+        run: npm run build:main
 
   web:
     name: Web
@@ -579,7 +685,7 @@ jobs:
   ci-status:
     name: CI Status
     if: always()
-    needs: [changes, go, web, sdk, integration]
+    needs: [changes, go, web, sdk, desktop, integration]
     runs-on: ubuntu-latest
     steps:
       - name: Verify dependent job results
@@ -589,16 +695,18 @@ jobs:
           go_result='${{ needs.go.result }}'
           web_result='${{ needs.web.result }}'
           sdk_result='${{ needs.sdk.result }}'
+          desktop_result='${{ needs.desktop.result }}'
           integration_result='${{ needs.integration.result }}'
           go_changed='${{ needs.changes.outputs.go }}'
           web_changed='${{ needs.changes.outputs.web }}'
           sdk_changed='${{ needs.changes.outputs.sdk }}'
+          desktop_changed='${{ needs.changes.outputs.desktop }}'
           integration_changed='${{ needs.changes.outputs.integration }}'
           helm_changed='${{ needs.changes.outputs.helm }}'
           ci_workflows_changed='${{ needs.changes.outputs.ci_workflows }}'
           event='${{ github.event_name }}'
           ci_full_label='${{ contains(github.event.pull_request.labels.*.name, 'ci:full') }}'
-          echo "event=${event} changes=${changes_result} go=${go_result}/${go_changed} web=${web_result}/${web_changed} sdk=${sdk_result}/${sdk_changed} integration=${integration_result}/${integration_changed} helm=${helm_changed} ci_workflows=${ci_workflows_changed} ci_full_label=${ci_full_label}"
+          echo "event=${event} changes=${changes_result} go=${go_result}/${go_changed} web=${web_result}/${web_changed} sdk=${sdk_result}/${sdk_changed} desktop=${desktop_result}/${desktop_changed} integration=${integration_result}/${integration_changed} helm=${helm_changed} ci_workflows=${ci_workflows_changed} ci_full_label=${ci_full_label}"
 
           # If the changes-detection job itself didn't succeed,
           # every downstream job was skipped AND the filter
@@ -663,6 +771,7 @@ jobs:
           check_subsystem go "${go_result}" "${go_changed}" || fail=1
           check_subsystem web "${web_result}" "${web_changed}" || fail=1
           check_subsystem sdk "${sdk_result}" "${sdk_changed}" || fail=1
+          check_subsystem desktop "${desktop_result}" "${desktop_changed}" || fail=1
 
           # Integration has an additional legitimate skip path:
           # fork-origin PRs. We can't tell at this layer whether

@@ -1,0 +1,163 @@
+# Multi-target napi-rs build for `@kmail/sdk-native`.
+#
+# Produces a `.node` addon for every platform the desktop client
+# ships to:
+#
+#   - macOS arm64 (Apple Silicon) — Electron 31 ships universal2
+#     binaries but the napi addon must be arch-specific because
+#     the underlying Rust code links against arch-specific TLS
+#     intrinsics.
+#   - macOS x64 (Intel) — supported through electron-builder's
+#     `target.arch: [arm64, x64]` matrix.
+#   - Linux x64 — Ubuntu LTS the runner uses; matches the
+#     server-side Stalwart build for consistency.
+#   - Linux arm64 — built via cross-compile from the x64 runner
+#     using the `aarch64-linux-gnu-gcc` cross toolchain. We do
+#     NOT use `napi-rs/setup-action`'s built-in Docker-based
+#     cross because that pulls a 1.5GB image per run; the
+#     toolchain-package install is faster.
+#   - Windows x64 — Authenticode signing happens in the packaging
+#     workflow, not here.
+#
+# Each job uploads its `.node` artefact under a target-triple key
+# so a downstream publish workflow (added when the SDK reaches
+# release-candidate status) can assemble them into the
+# `@kmail/sdk-native` npm package's `optionalDependencies`.
+
+name: sdk-build-napi
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'sdk/kmail-napi/**'
+      - 'sdk/kmail-core/**'
+      - 'sdk/Cargo.toml'
+      - 'sdk/Cargo.lock'
+      - '.github/workflows/sdk-build-napi.yml'
+  pull_request:
+    paths:
+      - 'sdk/kmail-napi/**'
+      - 'sdk/kmail-core/**'
+      - 'sdk/Cargo.toml'
+      - 'sdk/Cargo.lock'
+      - '.github/workflows/sdk-build-napi.yml'
+  # Manual trigger lets us cut a release build without pushing a
+  # commit. `workflow_dispatch` requires the workflow to live on
+  # the default branch.
+  workflow_dispatch:
+
+# A new build for the same PR / branch invalidates earlier ones.
+# Saves runner minutes when a contributor force-pushes a series
+# of fix-up commits.
+concurrency:
+  group: sdk-build-napi-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      # Continue with the rest of the matrix if any single target
+      # fails so we can see ALL failures in one CI run rather than
+      # one-at-a-time after each fix.
+      fail-fast: false
+      matrix:
+        include:
+          - host: macos-14
+            target: aarch64-apple-darwin
+            cross: false
+            artifact_name: kmail-sdk-native-darwin-arm64
+          - host: macos-13
+            target: x86_64-apple-darwin
+            cross: false
+            artifact_name: kmail-sdk-native-darwin-x64
+          - host: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            cross: false
+            artifact_name: kmail-sdk-native-linux-x64-gnu
+          - host: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            cross: true
+            artifact_name: kmail-sdk-native-linux-arm64-gnu
+          - host: windows-latest
+            target: x86_64-pc-windows-msvc
+            cross: false
+            artifact_name: kmail-sdk-native-win32-x64-msvc
+
+    name: napi (${{ matrix.target }})
+    runs-on: ${{ matrix.host }}
+    defaults:
+      run:
+        working-directory: sdk/kmail-napi
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compile toolchain (Linux arm64)
+        if: matrix.cross && contains(matrix.target, 'linux')
+        # `gcc-aarch64-linux-gnu` provides the cross linker the
+        # napi `cdylib` build calls into. Without this the build
+        # fails at link time with "ld: cannot find -lgcc_s".
+        # `CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER` tells
+        # cargo to use the cross linker for the target slice;
+        # the host slice still uses the default x86_64 linker.
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            gcc-aarch64-linux-gnu \
+            libc6-dev-arm64-cross
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+          echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sdk -> target
+          # The cache key includes the matrix target so the arm64
+          # cross build doesn't clobber the x64 cache.
+          key: ${{ matrix.target }}
+
+      - name: npm install (@napi-rs/cli)
+        run: npm install --no-audit --no-fund
+
+      - name: napi build
+        # `--release` strips debug symbols and runs the full
+        # optimiser; `--platform` emits the platform-specific
+        # binary name (`kmail-sdk-native.darwin-arm64.node`) so
+        # multiple .node files can coexist in the same package.
+        # `--target` lets napi-rs orchestrate the cross-compile.
+        run: npx @napi-rs/cli build --release --platform --target ${{ matrix.target }}
+
+      - name: List build outputs
+        # Diagnostic step: prints the .node file (and its size)
+        # so a failed build shows up clearly in the GHA log.
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=( ./*.node )
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::no .node artefact produced"
+            exit 1
+          fi
+          for f in "${files[@]}"; do
+            ls -la "$f"
+          done
+
+      - name: Upload .node artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: sdk/kmail-napi/*.node
+          if-no-files-found: error
+          retention-days: 14

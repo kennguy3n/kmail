@@ -450,6 +450,22 @@ func WithStalwartAccountID(ctx context.Context, accountID string) context.Contex
 	return context.WithValue(ctx, ctxKeyStalwartAccountID, accountID)
 }
 
+// WithTenantID returns a copy of ctx with the provided tenant ID
+// stored. The OIDC middleware sets this from the verified
+// `tenant_id` claim; tests use it to drive the authenticated-user
+// path without standing up a full OIDC fixture.
+func WithTenantID(ctx context.Context, tenantID string) context.Context {
+	return context.WithValue(ctx, ctxKeyTenantID, tenantID)
+}
+
+// WithKChatUserID returns a copy of ctx with the provided KChat
+// user ID stored. The OIDC middleware sets this from the verified
+// `kchat_user_id` claim; tests use it to drive the authenticated-
+// user path without standing up a full OIDC fixture.
+func WithKChatUserID(ctx context.Context, kchatUserID string) context.Context {
+	return context.WithValue(ctx, ctxKeyKChatUserID, kchatUserID)
+}
+
 // SetTenantGUC sets the `app.tenant_id` Postgres session variable on
 // the provided transaction. Row-level security policies on every
 // tenant-scoped table read this GUC — see
