@@ -3,6 +3,8 @@ package tenant
 import (
 	"context"
 	"errors"
+	"io"
+	"log"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -175,5 +177,149 @@ func TestAttemptAliasSyncInline_StalwartFails_NilPool(t *testing.T) {
 	s.attemptAliasSyncInline(context.Background(), "tid", "qid", aliasSyncOpAdd, "acc", "a@b")
 	if rec.addCalls.Load() != 1 {
 		t.Errorf("AddAlias called %d times, want 1", rec.addCalls.Load())
+	}
+}
+
+// ---------------------------------------------------------------
+// Worker tick loop — per-tick batch cap and inter-call delay.
+//
+// `tickLoop` is the body of `tick()` with the per-row work
+// injected as a function. That lets us assert the loop semantics
+// (cap enforced, no cap when disabled, context cancellation
+// honored, error short-circuit) without spinning up a pgx pool
+// for `processNext`. The Stalwart-touching path is covered by
+// the integration suite.
+// ---------------------------------------------------------------
+
+func newTestAliasWorker() *AliasStalwartSyncWorker {
+	return &AliasStalwartSyncWorker{
+		logger:         log.New(io.Discard, "", 0),
+		interval:       30 * time.Second,
+		batchCap:       DefaultAliasSyncBatchCap,
+		interCallDelay: DefaultAliasSyncInterCallDelay,
+	}
+}
+
+func TestAliasStalwartSyncWorker_TickLoop_BatchCapEnforced(t *testing.T) {
+	w := newTestAliasWorker().WithBatchCap(3)
+	var calls int
+	w.tickLoop(context.Background(), func(_ context.Context) (bool, error) {
+		calls++
+		// Always more work available — the cap is the only thing
+		// that should stop the loop.
+		return true, nil
+	})
+	if calls != 3 {
+		t.Errorf("processNext invoked %d times, want 3 (batch cap)", calls)
+	}
+}
+
+func TestAliasStalwartSyncWorker_TickLoop_StopsOnEmptyQueue(t *testing.T) {
+	w := newTestAliasWorker().WithBatchCap(10)
+	var calls int
+	w.tickLoop(context.Background(), func(_ context.Context) (bool, error) {
+		calls++
+		// Three rows of work, then "queue empty".
+		return calls < 3, nil
+	})
+	if calls != 3 {
+		t.Errorf("processNext invoked %d times, want 3 (empty queue stop)", calls)
+	}
+}
+
+func TestAliasStalwartSyncWorker_TickLoop_StopsOnError(t *testing.T) {
+	w := newTestAliasWorker().WithBatchCap(10)
+	var calls int
+	boom := errors.New("boom")
+	w.tickLoop(context.Background(), func(_ context.Context) (bool, error) {
+		calls++
+		if calls == 2 {
+			return false, boom
+		}
+		return true, nil
+	})
+	if calls != 2 {
+		t.Errorf("processNext invoked %d times, want 2 (error stop)", calls)
+	}
+}
+
+func TestAliasStalwartSyncWorker_TickLoop_BatchCapDisabled(t *testing.T) {
+	// A non-positive batch cap disables the cap entirely; the
+	// loop runs until the work function reports an empty queue.
+	w := newTestAliasWorker().WithBatchCap(0)
+	var calls int
+	w.tickLoop(context.Background(), func(_ context.Context) (bool, error) {
+		calls++
+		return calls < 250, nil
+	})
+	if calls != 250 {
+		t.Errorf("processNext invoked %d times, want 250 (cap disabled)", calls)
+	}
+}
+
+func TestAliasStalwartSyncWorker_TickLoop_InterCallDelay(t *testing.T) {
+	// With a 10ms inter-call delay and a cap of 4, the loop
+	// inserts the delay 3 times (between calls 1↔2, 2↔3, 3↔4)
+	// so the total runtime is at least 30ms. We assert ≥ 20ms
+	// to keep the test resilient to coarse OS scheduler tick
+	// resolution while still confirming the delay is in fact
+	// applied between calls (and not before the first or after
+	// the last).
+	w := newTestAliasWorker().WithBatchCap(4).WithInterCallDelay(10 * time.Millisecond)
+	var calls int
+	start := time.Now()
+	w.tickLoop(context.Background(), func(_ context.Context) (bool, error) {
+		calls++
+		return true, nil
+	})
+	elapsed := time.Since(start)
+	if calls != 4 {
+		t.Errorf("processNext invoked %d times, want 4", calls)
+	}
+	if elapsed < 20*time.Millisecond {
+		t.Errorf("tickLoop ran in %v, want ≥ 20ms (inter-call delay applied)", elapsed)
+	}
+}
+
+func TestAliasStalwartSyncWorker_TickLoop_ContextCancelDuringDelay(t *testing.T) {
+	// Confirm that a context cancellation during the inter-call
+	// delay returns promptly instead of waiting out the full
+	// delay window. We use a 1-hour delay so any return inside
+	// the test's deadline is conclusive evidence the select
+	// woke on ctx.Done().
+	//
+	// `calls` is an atomic so both the success path (Load after
+	// <-done, with a happens-before via close(done)) AND the
+	// timeout path (Fatalf's read while the goroutine may still
+	// be blocked in the select) are race-free under `go test
+	// -race`. The Load in the timeout branch is the diagnostic
+	// the test prints — making it atomic avoids relying on
+	// "the goroutine isn't actually writing right now" for
+	// memory-model correctness.
+	w := newTestAliasWorker().WithBatchCap(10).WithInterCallDelay(time.Hour)
+	ctx, cancel := context.WithCancel(context.Background())
+	var calls atomic.Int64
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		w.tickLoop(ctx, func(_ context.Context) (bool, error) {
+			n := calls.Add(1)
+			if n == 1 {
+				// Cancel right after the first call. The loop
+				// will then sleep for the inter-call delay and
+				// must wake on ctx.Done() instead of waiting
+				// the full hour.
+				cancel()
+			}
+			return true, nil
+		})
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("tickLoop did not return promptly on context cancel; calls=%d", calls.Load())
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("processNext invoked %d times, want 1 (canceled during delay)", got)
 	}
 }

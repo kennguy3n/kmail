@@ -24,12 +24,37 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// DefaultAliasSyncBatchCap bounds the number of queue rows the
+// worker drains in a single tick. Without this cap, a backlog
+// spike (e.g. hundreds of rows becoming due simultaneously after a
+// Stalwart outage clears) would cause `tick()` to fire that many
+// admin-API requests back-to-back. Stalwart's /api/principal
+// endpoint is single-threaded per shard and an unbounded burst can
+// starve interactive operator traffic.
+//
+// 50 rows × the default 30s tick interval = 100 syncs/min sustained.
+// That comfortably exceeds any realistic alias-edit rate while
+// leaving headroom in the next tick to drain a remaining backlog.
+const DefaultAliasSyncBatchCap = 50
+
+// DefaultAliasSyncInterCallDelay is the gap inserted between
+// successive Stalwart calls inside a single tick. Disabled (0) by
+// default — operators can opt in via WithInterCallDelay when
+// Stalwart is co-located with a noisy neighbor and needs a softer
+// burst profile. A non-zero delay still lets the worker drain the
+// per-tick batch cap inside the next tick window; with the default
+// 30s interval and 50-row cap, even 250ms / call leaves 17.5s of
+// idle time per tick.
+const DefaultAliasSyncInterCallDelay = 0 * time.Millisecond
+
 // AliasStalwartSyncWorker drains the alias-Stalwart sync queue.
 type AliasStalwartSyncWorker struct {
-	pool     *pgxpool.Pool
-	sync     StalwartAliasSync
-	logger   *log.Logger
-	interval time.Duration
+	pool           *pgxpool.Pool
+	sync           StalwartAliasSync
+	logger         *log.Logger
+	interval       time.Duration
+	batchCap       int
+	interCallDelay time.Duration
 }
 
 // NewAliasStalwartSyncWorker constructs a worker. `sync` must be
@@ -40,10 +65,12 @@ func NewAliasStalwartSyncWorker(pool *pgxpool.Pool, sync StalwartAliasSync, logg
 		logger = log.Default()
 	}
 	return &AliasStalwartSyncWorker{
-		pool:     pool,
-		sync:     sync,
-		logger:   logger,
-		interval: 30 * time.Second,
+		pool:           pool,
+		sync:           sync,
+		logger:         logger,
+		interval:       30 * time.Second,
+		batchCap:       DefaultAliasSyncBatchCap,
+		interCallDelay: DefaultAliasSyncInterCallDelay,
 	}
 }
 
@@ -51,6 +78,25 @@ func NewAliasStalwartSyncWorker(pool *pgxpool.Pool, sync StalwartAliasSync, logg
 // the worker without waiting 30s between ticks.
 func (w *AliasStalwartSyncWorker) WithInterval(d time.Duration) *AliasStalwartSyncWorker {
 	w.interval = d
+	return w
+}
+
+// WithBatchCap overrides the per-tick batch cap. A non-positive
+// value disables the cap, which is appropriate for a high-volume
+// dedicated cluster where the backlog is expected to clear
+// quickly. Tests use this to assert the cap is enforced without
+// pre-loading more rows than necessary.
+func (w *AliasStalwartSyncWorker) WithBatchCap(n int) *AliasStalwartSyncWorker {
+	w.batchCap = n
+	return w
+}
+
+// WithInterCallDelay overrides the inter-call delay. A non-positive
+// value disables the delay. Operators tune this when Stalwart is
+// sharing capacity with interactive traffic and they want to
+// smooth out the worker's per-tick burst.
+func (w *AliasStalwartSyncWorker) WithInterCallDelay(d time.Duration) *AliasStalwartSyncWorker {
+	w.interCallDelay = d
 	return w
 }
 
@@ -73,12 +119,63 @@ func (w *AliasStalwartSyncWorker) Run(ctx context.Context) {
 	}
 }
 
-// tick drains all currently due rows. Calling tick() once per
-// poll interval keeps the worker latency-bounded even if the
-// backlog spikes briefly.
+// tick drains due rows up to the worker's batch cap. The cap
+// bounds the per-tick burst the worker can send to Stalwart so a
+// backlog spike (hundreds of rows becoming due at once after an
+// outage clears) cannot starve interactive operator traffic — any
+// remaining rows wait for the next tick. The optional inter-call
+// delay smooths the burst inside a tick when operators need an
+// even softer profile.
 func (w *AliasStalwartSyncWorker) tick(ctx context.Context) {
-	for {
-		ok, err := w.processNext(ctx)
+	w.tickLoop(ctx, w.processNext)
+}
+
+// tickLoop is the body of tick() with the per-row work injected as
+// a function so the loop semantics (batch cap, inter-call delay,
+// context-cancel responsiveness, error short-circuit) can be
+// exercised by tests without standing up a pgx pool.
+func (w *AliasStalwartSyncWorker) tickLoop(ctx context.Context, process func(context.Context) (bool, error)) {
+	// Allocate the inter-call delay timer once and reset it per
+	// iteration. `time.After` would allocate a fresh timer each
+	// loop body — fine for GC pressure at the default 50-row
+	// cap, but more importantly leaves the underlying Timer
+	// orphaned until its deadline fires when ctx.Done wins the
+	// select. With operator-tuned long delays (seconds or
+	// minutes) and a frequently-cancelled context that's a real
+	// goroutine + timer-heap leak. NewTimer + Stop on the
+	// cancel path makes the lifecycle explicit and bounded.
+	var delayTimer *time.Timer
+	defer func() {
+		if delayTimer != nil {
+			delayTimer.Stop()
+		}
+	}()
+	for i := 0; w.batchCap <= 0 || i < w.batchCap; i++ {
+		if i > 0 && w.interCallDelay > 0 {
+			if delayTimer == nil {
+				delayTimer = time.NewTimer(w.interCallDelay)
+			} else {
+				delayTimer.Reset(w.interCallDelay)
+			}
+			select {
+			case <-ctx.Done():
+				// Stop and drain so the next call to Reset
+				// (next iteration, if reached) sees a quiesced
+				// timer. The drain only runs if Stop returned
+				// false (timer already fired but channel not
+				// consumed) — otherwise we'd block forever
+				// waiting on an empty channel.
+				if !delayTimer.Stop() {
+					select {
+					case <-delayTimer.C:
+					default:
+					}
+				}
+				return
+			case <-delayTimer.C:
+			}
+		}
+		ok, err := process(ctx)
 		if err != nil {
 			w.logger.Printf("alias_sync.worker: %v", err)
 			return
