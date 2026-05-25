@@ -146,6 +146,51 @@ type SendInterceptor interface {
 	Intercept(ctx context.Context, w http.ResponseWriter, r *http.Request, body []byte) (intercepted bool, err error)
 }
 
+// ChainSendInterceptors composes multiple SendInterceptors into
+// a single one. Each member is offered the request in order. The
+// first member that returns `intercepted=true` (or any non-nil
+// error) wins; subsequent members are not invoked.
+//
+// The chain is the architecturally clean way to register N
+// independent send hooks (Undo Send + Scheduled Send today;
+// future features tomorrow) without coupling them to each other.
+// Each hook is header-gated and self-contained, so the order
+// inside the chain only matters when a single request could
+// match more than one — in which case the first-registered hook
+// wins by design.
+func ChainSendInterceptors(hooks ...SendInterceptor) SendInterceptor {
+	filtered := make([]SendInterceptor, 0, len(hooks))
+	for _, h := range hooks {
+		if h != nil {
+			filtered = append(filtered, h)
+		}
+	}
+	if len(filtered) == 0 {
+		return nil
+	}
+	if len(filtered) == 1 {
+		return filtered[0]
+	}
+	return &chainedSendInterceptor{hooks: filtered}
+}
+
+type chainedSendInterceptor struct {
+	hooks []SendInterceptor
+}
+
+func (c *chainedSendInterceptor) Intercept(ctx context.Context, w http.ResponseWriter, r *http.Request, body []byte) (bool, error) {
+	for _, h := range c.hooks {
+		intercepted, err := h.Intercept(ctx, w, r, body)
+		if err != nil {
+			return intercepted, err
+		}
+		if intercepted {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // ClientTLSConfig configures the BFF→Stalwart mTLS transport.
 //
 // The expected layout in production is that cert-manager issues a

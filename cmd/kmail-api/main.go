@@ -44,6 +44,7 @@ import (
 	"github.com/kennguy3n/kmail/internal/onboarding"
 	"github.com/kennguy3n/kmail/internal/push"
 	"github.com/kennguy3n/kmail/internal/retention"
+	"github.com/kennguy3n/kmail/internal/scheduledsend"
 	"github.com/kennguy3n/kmail/internal/scim"
 	"github.com/kennguy3n/kmail/internal/search"
 	"github.com/kennguy3n/kmail/internal/sharedinbox"
@@ -562,6 +563,14 @@ func main() {
 	}
 	syncsvc.NewHandlers(syncSvc, logger).Register(mux, authMW)
 
+	// Send-time interceptors (Undo Send / Scheduled Send). Each
+	// is independently header-gated and degrades to immediate
+	// submission when its backing store is unwired. They are
+	// chained behind a single `Proxy.SetSendInterceptor` call so
+	// future send-time features can register without touching
+	// the proxy.
+	var sendInterceptors []jmap.SendInterceptor
+
 	// Undo Send (WS3). Holds outgoing EmailSubmission/set traffic
 	// in Valkey for a configurable delay and dispatches to
 	// Stalwart only after the window elapses, giving the user a
@@ -587,7 +596,7 @@ func main() {
 		if err != nil {
 			logger.Fatalf("undosend.NewHook: %v", err)
 		}
-		proxy.SetSendInterceptor(undoHook)
+		sendInterceptors = append(sendInterceptors, undoHook)
 		undosend.NewHandlers(undoSvc).Register(mux, authMW)
 		undoWorker, err := undosend.NewDispatchWorker(undosend.WorkerConfig{
 			Service:  undoSvc,
@@ -601,6 +610,46 @@ func main() {
 		logger.Printf("undosend: hold queue wired (delay=%s)", undoDelay)
 	} else {
 		logger.Printf("undosend: disabled (KMAIL_VALKEY_URL unset)")
+	}
+
+	// Scheduled Send (WS4). Persists future EmailSubmission/set
+	// traffic in Postgres until `send_at` and dispatches via the
+	// JMAP InternalClient. The DB pool is already required for
+	// every other Service in this binary, so the feature is
+	// always on (no env gate). If the pool is later made
+	// optional the wiring degrades the same way undosend does.
+	scheduledSvc, err := scheduledsend.NewService(scheduledsend.Config{
+		Pool:   pool,
+		Logger: logger,
+	})
+	if err != nil {
+		logger.Fatalf("scheduledsend.NewService: %v", err)
+	}
+	scheduledHook, err := scheduledsend.NewHook(scheduledsend.HookConfig{
+		Service:         scheduledSvc,
+		Forwarder:       internalJmap,
+		AccountResolver: proxy.ResolveAccountID,
+	})
+	if err != nil {
+		logger.Fatalf("scheduledsend.NewHook: %v", err)
+	}
+	sendInterceptors = append(sendInterceptors, scheduledHook)
+	scheduledsend.NewHandlers(scheduledSvc).Register(mux, authMW)
+	scheduledInterval := getenvDuration("KMAIL_SCHEDULED_SEND_INTERVAL", 15*time.Second)
+	scheduledWorker, err := scheduledsend.NewDispatchWorker(scheduledsend.WorkerConfig{
+		Service:  scheduledSvc,
+		Internal: internalJmap,
+		Logger:   logger,
+		Interval: scheduledInterval,
+	})
+	if err != nil {
+		logger.Fatalf("scheduledsend.NewDispatchWorker: %v", err)
+	}
+	go scheduledWorker.Run(ctx)
+	logger.Printf("scheduledsend: worker wired (interval=%s)", scheduledInterval)
+
+	if chained := jmap.ChainSendInterceptors(sendInterceptors...); chained != nil {
+		proxy.SetSendInterceptor(chained)
 	}
 
 	// kmail-secrets envelope. KMAIL_SECRETS_KEY is the single

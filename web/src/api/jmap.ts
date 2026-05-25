@@ -506,7 +506,23 @@ export class JMAPClient {
       emailSetArgs.destroy = [existingDraftId];
     }
     const extraHeaders: Record<string, string> = {};
-    if (options.undoSend) {
+    if (options.scheduleAt) {
+      // Opt in to the BFF Scheduled Send hold queue
+      // (internal/scheduledsend). The proxy forwards only the
+      // Email/set portion of this batch to Stalwart, persists
+      // the EmailSubmission/set payload to Postgres with the
+      // target send time, and stamps the row id + send-at on
+      // the response headers. We send unix-seconds (smaller and
+      // unambiguous) — the BFF also accepts RFC3339 for
+      // cURL/Postman callers.
+      //
+      // When both `scheduleAt` and `undoSend` are set the
+      // schedule wins: there is no UX reason to layer a 10s
+      // undo banner on top of a "send tomorrow" hold.
+      extraHeaders["X-KMail-Schedule-At"] = String(
+        Math.floor(options.scheduleAt.getTime() / 1000),
+      );
+    } else if (options.undoSend) {
       // Opt in to the BFF Undo-Send hold queue (internal/undosend).
       // The proxy will forward only the Email/set portion of this
       // batch to Stalwart, hold the EmailSubmission/set payload in
@@ -583,10 +599,24 @@ export class JMAPClient {
     const undoDeadline = deadlineHeader
       ? parseDeadlineHeader(deadlineHeader)
       : null;
+    // Scheduled-Send: when the BFF held the submission until a
+    // future `send_at`, the response carries the row id and the
+    // resolved send-at. Surface both so Compose can show a
+    // "Scheduled for X" confirmation and the Scheduled Sends
+    // page can link back.
+    const scheduledSendId =
+      responseHeaders.get("X-KMail-Scheduled-Send-Id") ?? null;
+    const scheduleAtHeader =
+      responseHeaders.get("X-KMail-Scheduled-Send-At") ?? null;
+    const scheduledSendAt = scheduleAtHeader
+      ? parseDeadlineHeader(scheduleAtHeader)
+      : null;
     return {
       emailId: created.draft.id,
       pendingSendId,
       undoDeadline,
+      scheduledSendId,
+      scheduledSendAt,
     };
   }
 
@@ -1205,6 +1235,19 @@ export interface SendEmailOptions {
    * can render the cancel banner.
    */
   undoSend?: boolean;
+  /**
+   * When set, the JMAP request carries the
+   * `X-KMail-Schedule-At` header. The BFF proxy hook then
+   * persists the EmailSubmission/set payload to Postgres until
+   * the given timestamp and dispatches via the scheduled-send
+   * worker. The response carries the row id and the resolved
+   * send-at so Compose can confirm "Scheduled for X".
+   *
+   * When `scheduleAt` is set, `undoSend` is ignored — there is
+   * no UX value in stacking a 10s undo banner on top of a
+   * "send tomorrow" hold.
+   */
+  scheduleAt?: Date;
 }
 
 /**
@@ -1222,6 +1265,10 @@ export interface SendEmailResult {
   pendingSendId: string | null;
   /** Absolute deadline (Date) past which Cancel is no longer possible. */
   undoDeadline: Date | null;
+  /** Proxy-issued scheduled-send id, or null when not scheduled. */
+  scheduledSendId: string | null;
+  /** Absolute send-at (Date) for a scheduled send, or null. */
+  scheduledSendAt: Date | null;
 }
 
 /**

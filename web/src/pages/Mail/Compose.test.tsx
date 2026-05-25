@@ -21,7 +21,7 @@
  * (the path tested here) does not depend on it.
  */
 import { describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 
@@ -144,6 +144,8 @@ describe("<Compose />", () => {
       emailId: "e-sent-1",
       pendingSendId: null,
       undoDeadline: null,
+      scheduledSendId: null,
+      scheduledSendAt: null,
     });
 
     const user = userEvent.setup();
@@ -177,6 +179,8 @@ describe("<Compose />", () => {
       // 800 ms in the future — short enough to keep the test fast
       // but long enough that the banner is visible before tick 0.
       undoDeadline: new Date(Date.now() + 800),
+      scheduledSendId: null,
+      scheduledSendAt: null,
     });
 
     const user = userEvent.setup();
@@ -203,6 +207,8 @@ describe("<Compose />", () => {
       emailId: "e-sent-cancel",
       pendingSendId: "ps-2",
       undoDeadline: new Date(Date.now() + 60_000),
+      scheduledSendId: null,
+      scheduledSendAt: null,
     });
     cancelPendingSend.mockResolvedValueOnce({ cancelled: true });
 
@@ -220,6 +226,64 @@ describe("<Compose />", () => {
     );
     expect(
       await screen.findByText(/send cancelled\. edit the message/i),
+    ).toBeInTheDocument();
+  });
+
+  it("sends the X-KMail-Schedule-At opt-in when the user picks 'Schedule for later'", async () => {
+    getMailboxes.mockResolvedValueOnce(mailboxes);
+    getIdentities.mockResolvedValueOnce(identities);
+    const scheduledFor = new Date(Date.now() + 2 * 60 * 60 * 1000);
+    sendEmail.mockResolvedValueOnce({
+      emailId: "e-sent-sched",
+      pendingSendId: null,
+      undoDeadline: null,
+      scheduledSendId: "ss-1",
+      scheduledSendAt: scheduledFor,
+    });
+
+    const user = userEvent.setup();
+    renderCompose();
+
+    await screen.findByRole("button", { name: /^send$/i });
+    await user.type(screen.getByLabelText(/^to/i), "alice@example.com");
+    await user.selectOptions(screen.getByTestId("compose-send-mode"), "schedule");
+    // Default value is already 1h ahead — the picker uses the
+    // local-ISO format, so just submit and trust the helper.
+    await user.click(screen.getByTestId("compose-send"));
+
+    await waitFor(() => expect(sendEmail).toHaveBeenCalledTimes(1));
+    const [, , options] = sendEmail.mock.calls[0];
+    expect(options).toMatchObject({ undoSend: false });
+    expect(options.scheduleAt).toBeInstanceOf(Date);
+    // Confirmation banner appears with a link to the scheduled list.
+    expect(
+      await screen.findByTestId("scheduled-send-confirm"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /view scheduled sends/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("rejects a scheduled time that is in the past", async () => {
+    getMailboxes.mockResolvedValueOnce(mailboxes);
+    getIdentities.mockResolvedValueOnce(identities);
+
+    const user = userEvent.setup();
+    renderCompose();
+
+    await screen.findByRole("button", { name: /^send$/i });
+    await user.type(screen.getByLabelText(/^to/i), "alice@example.com");
+    await user.selectOptions(screen.getByTestId("compose-send-mode"), "schedule");
+    // Force an obviously-past value on the picker. userEvent.clear
+    // + type on a datetime-local input is brittle across timezones,
+    // so we set it via fireEvent on the underlying input.
+    const picker = screen.getByTestId("compose-schedule-at") as HTMLInputElement;
+    fireEvent.change(picker, { target: { value: "2000-01-01T00:00" } });
+
+    await user.click(screen.getByTestId("compose-send"));
+    expect(sendEmail).not.toHaveBeenCalled();
+    expect(
+      await screen.findByText(/at least 1 minute in the future/i),
     ).toBeInTheDocument();
   });
 });
