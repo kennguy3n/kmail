@@ -50,6 +50,7 @@ import (
 	"github.com/kennguy3n/kmail/internal/sieve"
 	syncsvc "github.com/kennguy3n/kmail/internal/sync"
 	"github.com/kennguy3n/kmail/internal/tenant"
+	"github.com/kennguy3n/kmail/internal/undosend"
 	"github.com/kennguy3n/kmail/internal/valkeyurl"
 	"github.com/kennguy3n/kmail/internal/vault"
 	"github.com/kennguy3n/kmail/internal/webhooks"
@@ -560,6 +561,47 @@ func main() {
 		logger.Fatalf("sync.NewService: %v", err)
 	}
 	syncsvc.NewHandlers(syncSvc, logger).Register(mux, authMW)
+
+	// Undo Send (WS3). Holds outgoing EmailSubmission/set traffic
+	// in Valkey for a configurable delay and dispatches to
+	// Stalwart only after the window elapses, giving the user a
+	// "Cancel" button on the Compose page. When Valkey is
+	// unreachable the proxy falls through to immediate
+	// submission (interceptor's Forwarder error path), so the
+	// feature degrades gracefully rather than blocking sends.
+	if valkeyClient != nil {
+		undoDelay := time.Duration(config.GetenvInt("KMAIL_UNDO_SEND_DELAY_SECONDS", undosend.DefaultDelaySeconds)) * time.Second
+		undoSvc, err := undosend.NewService(undosend.Config{
+			Client: valkeyClient,
+			Logger: logger,
+			Delay:  undoDelay,
+		})
+		if err != nil {
+			logger.Fatalf("undosend.NewService: %v", err)
+		}
+		undoHook, err := undosend.NewHook(undosend.HookConfig{
+			Service:         undoSvc,
+			Forwarder:       internalJmap,
+			AccountResolver: proxy.ResolveAccountID,
+		})
+		if err != nil {
+			logger.Fatalf("undosend.NewHook: %v", err)
+		}
+		proxy.SetSendInterceptor(undoHook)
+		undosend.NewHandlers(undoSvc).Register(mux, authMW)
+		undoWorker, err := undosend.NewDispatchWorker(undosend.WorkerConfig{
+			Service:  undoSvc,
+			Internal: internalJmap,
+			Logger:   logger,
+		})
+		if err != nil {
+			logger.Fatalf("undosend.NewDispatchWorker: %v", err)
+		}
+		go undoWorker.Run(ctx)
+		logger.Printf("undosend: hold queue wired (delay=%s)", undoDelay)
+	} else {
+		logger.Printf("undosend: disabled (KMAIL_VALKEY_URL unset)")
+	}
 
 	// kmail-secrets envelope. KMAIL_SECRETS_KEY is the single
 	// master key from which every BFF-side at-rest encryption key

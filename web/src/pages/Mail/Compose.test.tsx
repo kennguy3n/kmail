@@ -64,11 +64,15 @@ const saveDraft = vi.fn();
 
 vi.mock("../../api/jmap", () => ({
   ATTACHMENT_LINK_THRESHOLD_BYTES: 10 * 1024 * 1024,
+  DEV_BEARER_TOKEN: "kmail-dev",
   jmapClient: {
     getMailboxes: () => getMailboxes(),
     getIdentities: () => getIdentities(),
-    sendEmail: (draft: unknown, savedId?: string | null) =>
-      sendEmail(draft, savedId),
+    sendEmail: (
+      draft: unknown,
+      savedId?: string | null,
+      options?: unknown,
+    ) => sendEmail(draft, savedId, options),
     saveDraft: (draft: unknown, savedId?: string | null) =>
       saveDraft(draft, savedId),
   },
@@ -77,6 +81,11 @@ vi.mock("../../api/jmap", () => ({
 
 vi.mock("../../api/confidentialSend", () => ({
   createSecureMessage: vi.fn(),
+}));
+
+const cancelPendingSend = vi.fn();
+vi.mock("../../api/undoSend", () => ({
+  cancelPendingSend: (id: string) => cancelPendingSend(id),
 }));
 
 vi.mock("../Admin/useTenantSelection", () => ({
@@ -129,7 +138,13 @@ describe("<Compose />", () => {
   it("invokes jmapClient.sendEmail() with the typed recipient and subject", async () => {
     getMailboxes.mockResolvedValueOnce(mailboxes);
     getIdentities.mockResolvedValueOnce(identities);
-    sendEmail.mockResolvedValueOnce("e-sent-1");
+    // BFF without the Undo-Send hook returns no pending-send id
+    // — simulate the immediate-dispatch happy path.
+    sendEmail.mockResolvedValueOnce({
+      emailId: "e-sent-1",
+      pendingSendId: null,
+      undoDeadline: null,
+    });
 
     const user = userEvent.setup();
     renderCompose();
@@ -140,8 +155,9 @@ describe("<Compose />", () => {
     await user.click(screen.getByRole("button", { name: /^send$/i }));
 
     await waitFor(() => expect(sendEmail).toHaveBeenCalledTimes(1));
-    const [draft, savedId] = sendEmail.mock.calls[0];
+    const [draft, savedId, options] = sendEmail.mock.calls[0];
     expect(savedId).toBeNull();
+    expect(options).toMatchObject({ undoSend: true });
     expect(draft).toMatchObject({
       mailboxIds: { "mb-drafts": true },
       to: [{ name: null, email: "alice@example.com" }],
@@ -150,6 +166,61 @@ describe("<Compose />", () => {
       privacyMode: "standard",
       identityId: "id-1",
     });
+  });
+
+  it("renders the Undo banner and clears it after the deadline elapses", async () => {
+    getMailboxes.mockResolvedValueOnce(mailboxes);
+    getIdentities.mockResolvedValueOnce(identities);
+    sendEmail.mockResolvedValueOnce({
+      emailId: "e-sent-undo",
+      pendingSendId: "ps-1",
+      // 800 ms in the future — short enough to keep the test fast
+      // but long enough that the banner is visible before tick 0.
+      undoDeadline: new Date(Date.now() + 800),
+    });
+
+    const user = userEvent.setup();
+    renderCompose();
+    await screen.findByRole("button", { name: /^send$/i });
+    await user.type(screen.getByLabelText(/^to/i), "alice@example.com");
+    await user.click(screen.getByRole("button", { name: /^send$/i }));
+
+    const undoBtn = await screen.findByTestId("undo-send-cancel");
+    expect(undoBtn).toBeEnabled();
+    // Deadline expires within the timeout: banner disappears,
+    // success toast appears, and the route navigates to /mail.
+    await waitFor(
+      () => expect(screen.queryByTestId("undo-send-cancel")).toBeNull(),
+      { timeout: 3000 },
+    );
+    await screen.findByText(/back to mail/i);
+  });
+
+  it("cancels the pending send when the Undo button is clicked", async () => {
+    getMailboxes.mockResolvedValueOnce(mailboxes);
+    getIdentities.mockResolvedValueOnce(identities);
+    sendEmail.mockResolvedValueOnce({
+      emailId: "e-sent-cancel",
+      pendingSendId: "ps-2",
+      undoDeadline: new Date(Date.now() + 60_000),
+    });
+    cancelPendingSend.mockResolvedValueOnce({ cancelled: true });
+
+    const user = userEvent.setup();
+    renderCompose();
+    await screen.findByRole("button", { name: /^send$/i });
+    await user.type(screen.getByLabelText(/^to/i), "alice@example.com");
+    await user.click(screen.getByRole("button", { name: /^send$/i }));
+
+    const undoBtn = await screen.findByTestId("undo-send-cancel");
+    await user.click(undoBtn);
+
+    await waitFor(() =>
+      expect(cancelPendingSend).toHaveBeenCalledWith("ps-2"),
+    );
+    expect(
+      await screen.findByText(/send cancelled\. edit the message/i),
+    ).toBeInTheDocument();
   });
 });
 

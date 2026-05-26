@@ -63,6 +63,94 @@ func TestNewProxy_RequiresPool(t *testing.T) {
 	}
 }
 
+// stubInterceptor is a no-op SendInterceptor used to assert which
+// interceptor (if any) is wired and active at a given point.
+type stubInterceptor struct {
+	id string
+}
+
+func (s *stubInterceptor) Intercept(_ context.Context, _ http.ResponseWriter, _ *http.Request, _ []byte) (bool, error) {
+	return false, nil
+}
+
+// TestSendInterceptor_CfgWiredAtNewProxyIsLoaded pins the migration
+// guarantee that `ProxyConfig.SendInterceptor` is honored even
+// after NewProxy returns. Without the cfg→atomic migration in
+// NewProxy, the atomic.Pointer would be nil at construction and
+// `loadSendInterceptor` would have to walk back to cfg on every
+// request — by migrating once at construction we get a single
+// source of truth (the atomic) and the cfg field becomes write-only.
+func TestSendInterceptor_CfgWiredAtNewProxyIsLoaded(t *testing.T) {
+	stub := &stubInterceptor{id: "cfg"}
+	p, err := NewProxy(ProxyConfig{
+		StalwartURL:     "http://stalwart.test",
+		Pool:            newDummyPool(t),
+		Logger:          log.New(io.Discard, "", 0),
+		SendInterceptor: stub,
+	})
+	if err != nil {
+		t.Fatalf("NewProxy: %v", err)
+	}
+	got := p.loadSendInterceptor()
+	if got == nil {
+		t.Fatal("loadSendInterceptor returned nil; cfg.SendInterceptor was not migrated to the atomic at NewProxy time")
+	}
+	if got != stub {
+		t.Fatalf("loadSendInterceptor = %v, want the cfg-wired stub %v", got, stub)
+	}
+}
+
+// TestSendInterceptor_SetNilTrulyDisablesEvenWithCfgWiring pins
+// the contract documented on SetSendInterceptor: "Passing nil
+// disables interception entirely". Before the cfg→atomic
+// migration, loadSendInterceptor had a fallback that would
+// resurrect cfg.SendInterceptor after a SetSendInterceptor(nil)
+// call, making the doc comment a lie. The fix moved cfg into the
+// atomic at NewProxy time so Store(nil) genuinely wins.
+func TestSendInterceptor_SetNilTrulyDisablesEvenWithCfgWiring(t *testing.T) {
+	cfgStub := &stubInterceptor{id: "cfg"}
+	p, err := NewProxy(ProxyConfig{
+		StalwartURL:     "http://stalwart.test",
+		Pool:            newDummyPool(t),
+		Logger:          log.New(io.Discard, "", 0),
+		SendInterceptor: cfgStub,
+	})
+	if err != nil {
+		t.Fatalf("NewProxy: %v", err)
+	}
+	// Sanity: cfg-wired hook is live to start.
+	if p.loadSendInterceptor() == nil {
+		t.Fatal("precondition: cfg-wired interceptor must be live at construction")
+	}
+	p.SetSendInterceptor(nil)
+	if got := p.loadSendInterceptor(); got != nil {
+		t.Fatalf("loadSendInterceptor after SetSendInterceptor(nil) = %v, want nil. The doc comment promises Passing nil disables interception entirely.", got)
+	}
+}
+
+// TestSendInterceptor_RuntimeSetOverridesCfg confirms the layered
+// wiring model: cfg is a default seeded at NewProxy; a runtime
+// `SetSendInterceptor(new)` cleanly swaps the implementation
+// without leaking the cfg-era hook back. Tests the swap operation
+// in both directions (cfg→new, new→another).
+func TestSendInterceptor_RuntimeSetOverridesCfg(t *testing.T) {
+	cfgStub := &stubInterceptor{id: "cfg"}
+	newStub := &stubInterceptor{id: "runtime"}
+	p, err := NewProxy(ProxyConfig{
+		StalwartURL:     "http://stalwart.test",
+		Pool:            newDummyPool(t),
+		Logger:          log.New(io.Discard, "", 0),
+		SendInterceptor: cfgStub,
+	})
+	if err != nil {
+		t.Fatalf("NewProxy: %v", err)
+	}
+	p.SetSendInterceptor(newStub)
+	if got := p.loadSendInterceptor(); got != newStub {
+		t.Fatalf("loadSendInterceptor after runtime swap = %v, want runtime stub %v", got, newStub)
+	}
+}
+
 func TestAccountCache_SetGet(t *testing.T) {
 	c := newAccountCache(time.Minute)
 	if _, ok := c.get("t", "u"); ok {

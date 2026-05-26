@@ -26,6 +26,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	lru "github.com/hashicorp/golang-lru/v2/expirable"
@@ -117,6 +118,32 @@ type ProxyConfig struct {
 	// var. The hook only runs on writes (POST/PUT) — JMAP is a
 	// JSON-RPC-style protocol so the body is small and re-readable.
 	PreDeliverHook func(ctx context.Context, body []byte) error
+
+	// SendInterceptor (Phase 9 — Undo Send, WS3) is the optional
+	// hook that owns `EmailSubmission/set` create traffic when the
+	// client opts in via the `X-KMail-Undo-Send: true` header. The
+	// interceptor:
+	//
+	//   • Forwards the `Email/set` portion of the batch to Stalwart
+	//     so the underlying draft is still minted.
+	//   • Holds the `EmailSubmission/set` portion in Valkey with a
+	//     deadline.
+	//   • Writes a synthesised JMAP response (plus undo-send headers)
+	//     directly to the response writer.
+	//
+	// Returning `intercepted=true` means the interceptor has fully
+	// served the response and the proxy MUST NOT forward upstream.
+	// `intercepted=false` means "not my request, continue as usual"
+	// and the proxy forwards normally.
+	//
+	// Wired in `cmd/kmail-api/main.go` from `internal/undosend`.
+	SendInterceptor SendInterceptor
+}
+
+// SendInterceptor is the optional Undo-Send hook surface. See
+// the `ProxyConfig.SendInterceptor` doc for semantics.
+type SendInterceptor interface {
+	Intercept(ctx context.Context, w http.ResponseWriter, r *http.Request, body []byte) (intercepted bool, err error)
 }
 
 // ClientTLSConfig configures the BFF→Stalwart mTLS transport.
@@ -684,6 +711,50 @@ type Proxy struct {
 	// surface is consulted by `shardFailoverTransport.RoundTrip`
 	// on every retry decision.
 	breaker CircuitBreaker
+
+	// sendInterceptor is the optional Undo-Send hook. Loaded
+	// atomically because it is wired by `cmd/kmail-api/main.go`
+	// *after* `NewProxy` returns (the interceptor depends on
+	// `InternalClient` which depends on the proxy — see
+	// `SetSendInterceptor` for the wiring rationale).
+	sendInterceptor atomic.Pointer[sendInterceptorRef]
+}
+
+// sendInterceptorRef wraps the interface so atomic.Pointer’s
+// type-parameter constraint is satisfied (interface values cannot
+// be stored in atomic.Pointer directly).
+type sendInterceptorRef struct{ v SendInterceptor }
+
+// SetSendInterceptor swaps in (or clears) the Undo-Send hook at
+// runtime. Safe for concurrent use with `ServeHTTP`. Passing nil
+// disables interception entirely — the atomic.Pointer is the sole
+// source of truth for the interceptor, so a Store(nil) call wins
+// even if `ProxyConfig.SendInterceptor` was wired at NewProxy
+// time (the cfg value is migrated into the atomic on construction
+// so there is no orphaned fallback path that could resurrect a
+// disabled hook).
+//
+// Wiring callers should call this exactly once at startup, before
+// the HTTP listener starts accepting client traffic, so the
+// initial-request cohort observes the wired interceptor.
+func (p *Proxy) SetSendInterceptor(s SendInterceptor) {
+	if s == nil {
+		p.sendInterceptor.Store(nil)
+		return
+	}
+	p.sendInterceptor.Store(&sendInterceptorRef{v: s})
+}
+
+// loadSendInterceptor returns the currently-wired interceptor or
+// nil if none. The atomic.Pointer is the single source of truth;
+// `ProxyConfig.SendInterceptor` is migrated into the atomic at
+// NewProxy time so there is no separate cfg fallback for
+// `SetSendInterceptor(nil)` to leak past.
+func (p *Proxy) loadSendInterceptor() SendInterceptor {
+	if ref := p.sendInterceptor.Load(); ref != nil {
+		return ref.v
+	}
+	return nil
 }
 
 // BaseTransport returns the underlying BFF→Stalwart RoundTripper
@@ -815,6 +886,18 @@ func NewProxy(cfg ProxyConfig) (*Proxy, error) {
 		target:  target,
 		stripPR: "/jmap",
 		breaker: breaker,
+	}
+	// Migrate the static `ProxyConfig.SendInterceptor` (if any) into
+	// the atomic so `loadSendInterceptor` has a single source of
+	// truth. Without this, `SetSendInterceptor(nil)` would silently
+	// fall back to the cfg-wired interceptor at later requests and
+	// the "Passing nil disables interception" contract on
+	// SetSendInterceptor would be a lie. In production the cfg field
+	// is never set (main.go always wires via SetSendInterceptor) so
+	// this is also a no-op there; the migration exists so test code
+	// and any future cfg-wiring caller share the same semantics.
+	if cfg.SendInterceptor != nil {
+		p.sendInterceptor.Store(&sendInterceptorRef{v: cfg.SendInterceptor})
 	}
 	base := http.DefaultTransport
 	if cfg.TLS != nil {
@@ -1027,7 +1110,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	//     `Email/set` or `EmailSubmission/set` invocation, which
 	//     are the only methods that submit (or stage for
 	//     submission) a message.
-	if p.cfg.PreDeliverHook != nil && (r.Method == http.MethodPost || r.Method == http.MethodPut) && r.Body != nil && requestCarriesMessageContent(r) {
+	sendInterceptor := p.loadSendInterceptor()
+	if (p.cfg.PreDeliverHook != nil || sendInterceptor != nil) && (r.Method == http.MethodPost || r.Method == http.MethodPut) && r.Body != nil && requestCarriesMessageContent(r) {
 		// Buffer up to 33 MiB (32 MiB cap + 1 byte sentinel) into
 		// the scan buffer. We deliberately do NOT stream-pipe to
 		// ClamAV in parallel with the upstream: ClamAV INSTREAM can
@@ -1054,12 +1138,25 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if shouldScanBody(r, body) {
-			if err := p.cfg.PreDeliverHook(ctx, body); err != nil {
-				p.logger.Printf("jmap proxy: pre-deliver hook rejected tenant=%s err=%v", tenantID, err)
-				w.Header().Set("Content-Type", "application/problem+json")
-				w.WriteHeader(http.StatusUnprocessableEntity)
-				_, _ = w.Write([]byte(`{"type":"urn:ietf:params:jmap:error:rejectedByPolicy","title":"message rejected by malware scanner"}` + "\n"))
-				return
+			if p.cfg.PreDeliverHook != nil {
+				if err := p.cfg.PreDeliverHook(ctx, body); err != nil {
+					p.logger.Printf("jmap proxy: pre-deliver hook rejected tenant=%s err=%v", tenantID, err)
+					w.Header().Set("Content-Type", "application/problem+json")
+					w.WriteHeader(http.StatusUnprocessableEntity)
+					_, _ = w.Write([]byte(`{"type":"urn:ietf:params:jmap:error:rejectedByPolicy","title":"message rejected by malware scanner"}` + "\n"))
+					return
+				}
+			}
+			if sendInterceptor != nil {
+				intercepted, err := sendInterceptor.Intercept(ctx, w, r.WithContext(ctx), body)
+				if err != nil {
+					p.logger.Printf("jmap proxy: send interceptor error tenant=%s err=%v", tenantID, err)
+					// Don't 5xx here unless the interceptor truly couldn't decide; we still let
+					// the request fall through to Stalwart so a transient Valkey blip can't break
+					// the send path entirely.
+				} else if intercepted {
+					return
+				}
 			}
 		}
 		r.Body = io.NopCloser(bytes.NewReader(body))

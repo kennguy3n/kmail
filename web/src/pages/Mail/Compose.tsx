@@ -14,6 +14,7 @@ import {
   type AttachmentLinkResponse,
 } from "../../api/jmap";
 import { createSecureMessage } from "../../api/confidentialSend";
+import { cancelPendingSend } from "../../api/undoSend";
 import { useTenantSelection } from "../Admin/useTenantSelection";
 import type {
   EmailAddress,
@@ -102,6 +103,17 @@ export default function Compose() {
   // back to /mail.
   const navTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // Undo-Send banner state. Populated when the BFF proxy hook
+  // reports `X-KMail-Pending-Send-Id` on the EmailSubmission/set
+  // response. `remainingMs` ticks down at 250ms cadence so the
+  // banner renders a smooth second-by-second countdown; at zero
+  // the banner clears and Compose navigates the user to the
+  // inbox (Stalwart has accepted the submission at that point).
+  const [pendingSend, setPendingSend] =
+    useState<{ id: string; deadline: Date } | null>(null);
+  const [remainingMs, setRemainingMs] = useState(0);
+  const [isCancelling, setCancelling] = useState(false);
+
   useEffect(() => {
     return () => {
       if (navTimerRef.current) {
@@ -110,6 +122,57 @@ export default function Compose() {
       }
     };
   }, []);
+
+  useEffect(() => {
+    if (!pendingSend) {
+      setRemainingMs(0);
+      return;
+    }
+    const tick = () => {
+      const ms = pendingSend.deadline.getTime() - Date.now();
+      setRemainingMs(Math.max(0, ms));
+      if (ms <= 0) {
+        // Deadline passed — Stalwart will have accepted the
+        // submission. Clear state and route to /mail.
+        setPendingSend(null);
+        setSuccessMessage("Message sent.");
+        setSending(false);
+        navTimerRef.current = setTimeout(() => {
+          navTimerRef.current = null;
+          navigate("/mail");
+        }, 600);
+      }
+    };
+    tick();
+    const t = setInterval(tick, 250);
+    return () => clearInterval(t);
+  }, [pendingSend, navigate]);
+
+  const handleCancelUndoSend = async () => {
+    if (!pendingSend) return;
+    setCancelling(true);
+    try {
+      const result = await cancelPendingSend(pendingSend.id);
+      setPendingSend(null);
+      if (result.cancelled) {
+        setSuccessMessage("Send cancelled. Edit the message and send again.");
+      } else {
+        // Worker won the race; the message is already on its way.
+        setSuccessMessage(
+          "Too late — the message was dispatched before we could cancel.",
+        );
+        navTimerRef.current = setTimeout(() => {
+          navTimerRef.current = null;
+          navigate("/mail");
+        }, 1200);
+      }
+    } catch (err: unknown) {
+      setError(errorMessage(err));
+    } finally {
+      setCancelling(false);
+      setSending(false);
+    }
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -194,7 +257,16 @@ export default function Compose() {
       // destroy that stale draft in the same Email/set call as the
       // submission; otherwise Save-then-Send would leave an
       // orphaned draft in the Drafts mailbox.
-      const sentId = await jmapClient.sendEmail(draft, savedDraftId);
+      //
+      // Undo-Send (Phase 9 / WS3): opt in for non-confidential
+      // sends only. Confidential Send mints a portal link
+      // *after* the submission, so holding the submission would
+      // require deferring the portal link too — keep the simpler
+      // existing flow for now and revisit when Compose adds a
+      // schedule-time picker.
+      const sendResult = await jmapClient.sendEmail(draft, savedDraftId, {
+        undoSend: privacyMode !== "confidential-send",
+      });
       setSavedDraftId(null);
 
       if (privacyMode === "confidential-send") {
@@ -213,7 +285,7 @@ export default function Compose() {
         const link = await createSecureMessage({
           tenantId: selectedTenantId,
           senderId: identity?.email ?? "unknown",
-          encryptedBlobRef: sentId,
+          encryptedBlobRef: sendResult.emailId,
           password: confidential.passwordEnabled ? confidential.password : undefined,
           expiresInSeconds: confidential.expirySeconds,
           maxViews: confidential.maxViews <= 0 ? 0 : confidential.maxViews,
@@ -221,6 +293,18 @@ export default function Compose() {
         setSecureLink(`${window.location.origin}/secure/${link.link_token}`);
         setSuccessMessage("Confidential message sent. Share the secure link with the recipient.");
         setSending(false);
+        return;
+      }
+
+      if (sendResult.pendingSendId && sendResult.undoDeadline) {
+        // BFF intercepted the submission and is holding it in
+        // Valkey. Render the undo banner; the deadline-timer
+        // effect handles navigation after the hold elapses.
+        setPendingSend({
+          id: sendResult.pendingSendId,
+          deadline: sendResult.undoDeadline,
+        });
+        setSuccessMessage(null);
         return;
       }
 
@@ -304,6 +388,22 @@ export default function Compose() {
       {successMessage && (
         <div style={styles.success} role="status">
           {successMessage}
+        </div>
+      )}
+      {pendingSend && (
+        <div style={styles.undoBanner} role="status" aria-live="polite">
+          <span>
+            Sending in {Math.ceil(remainingMs / 1000)}s…
+          </span>
+          <button
+            type="button"
+            onClick={handleCancelUndoSend}
+            disabled={isCancelling}
+            style={styles.undoCancel}
+            data-testid="undo-send-cancel"
+          >
+            {isCancelling ? "Cancelling…" : "Undo"}
+          </button>
         </div>
       )}
       <form onSubmit={handleSend} style={styles.form}>
@@ -811,5 +911,25 @@ const styles: Record<string, React.CSSProperties> = {
     color: "#166534",
     borderRadius: "0.25rem",
     marginBottom: "0.5rem",
+  },
+  undoBanner: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: "0.75rem",
+    padding: "0.5rem 0.75rem",
+    background: "#1f2937",
+    color: "#f9fafb",
+    borderRadius: "0.25rem",
+    marginBottom: "0.5rem",
+  },
+  undoCancel: {
+    padding: "0.25rem 0.75rem",
+    border: "1px solid #f9fafb",
+    background: "transparent",
+    color: "#f9fafb",
+    borderRadius: "0.25rem",
+    cursor: "pointer",
+    fontWeight: 600,
   },
 };
