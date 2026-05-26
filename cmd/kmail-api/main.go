@@ -638,8 +638,22 @@ func main() {
 	// mapping on its first IndexMessage / MigrateIndex call —
 	// the BFF is degraded (latency on the first write) rather
 	// than broken (wrong mapping breaking the tenant filter).
+	//
+	// On partial failure we emit a HIGH-SIGNAL aggregate log
+	// line ("shared-indexes init partial-failure: N of M
+	// pairs failed") in addition to the per-shard lines the
+	// helper already wrote. This is the hook an operator wires
+	// to a startup-health metric / alert — they don't have to
+	// grep the per-shard noise to know if the fleet booted
+	// cleanly.
 	if err := search.EnsureSharedIndexes(ctx, logger, shardSvc, sharedInitBackends); err != nil {
-		logger.Printf("search.EnsureSharedIndexes: %v (continuing — shared indexes will be created lazily on first write)", err)
+		var agg *search.EnsureSharedIndexesError
+		if errors.As(err, &agg) {
+			logger.Printf("search.EnsureSharedIndexes: shared-indexes init partial-failure: %d of %d (backend, shard) pairs failed (continuing — lazy paths will repair on first write)",
+				len(agg.Failures), agg.Attempted)
+		} else {
+			logger.Printf("search.EnsureSharedIndexes: %v (continuing — shared indexes will be created lazily on first write)", err)
+		}
 	}
 
 	// Phase 5 / Phase 8: auto-cutover. Disabled when either

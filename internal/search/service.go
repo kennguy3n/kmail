@@ -172,9 +172,11 @@ func NewService(cfg Config) *Service {
 
 // GetBackend returns the configured backend name for a tenant. If
 // the column is NULL or empty we default to BackendSharedMeilisearch
-// — that matches the migration-049 column default for newly-
-// provisioned tenants and is the cheapest backend to land on if a
-// row is somehow missing its setting.
+// — that matches the migration-050 column default for newly-
+// provisioned tenants (`migrations/050_search_shared_indexes.sql`
+// `ALTER COLUMN ... SET DEFAULT 'shared_meilisearch'`) and is the
+// cheapest backend to land on if a row is somehow missing its
+// setting.
 func (s *Service) GetBackend(ctx context.Context, tenantID string) (string, error) {
 	if tenantID == "" {
 		return "", fmt.Errorf("%w: tenantID required", ErrInvalidInput)

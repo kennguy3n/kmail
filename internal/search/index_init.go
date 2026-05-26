@@ -23,6 +23,7 @@ package search
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 )
 
@@ -66,13 +67,16 @@ type ShardLister interface {
 // or hit `resource_already_exists_exception` on the lazy path.
 //
 // The function blocks until every (backend, shard) pair has
-// been attempted. Failures are surfaced only through the
-// provided logger; the return value is `nil` unless a setup
-// precondition fails (nil shard lister). The synchronous call
-// is bounded by `(backends × shards) × per-call timeout` and
-// in practice completes in a few seconds even for fleets with
-// dozens of shards because `EnsureIndex` is idempotent and
-// cheap on the steady-state path.
+// been attempted. Per-shard failures are logged AND aggregated
+// into the returned `EnsureSharedIndexesError` so the caller has
+// a single high-signal log line (`N of M pairs failed`) in
+// addition to the per-failure lines — operators don't have to
+// grep + count individual entries to know if the fleet is
+// healthy. The synchronous call is bounded by `(backends ×
+// shards) × per-call timeout` and in practice completes in a
+// few seconds even for fleets with dozens of shards because
+// `EnsureIndex` is idempotent and cheap on the steady-state
+// path.
 func EnsureSharedIndexes(ctx context.Context, logger *log.Logger, shards ShardLister, backends []SharedIndexEnsurer) error {
 	if logger == nil {
 		logger = log.Default()
@@ -95,16 +99,84 @@ func EnsureSharedIndexes(ctx context.Context, logger *log.Logger, shards ShardLi
 		logger.Printf("search.EnsureSharedIndexes: no shards registered, skipping initialisation")
 		return nil
 	}
+	var (
+		attempted int
+		failures  []EnsureSharedIndexFailure
+	)
 	for _, b := range backends {
 		if b == nil {
 			continue
 		}
 		for _, shardID := range ids {
+			attempted++
 			if err := b.EnsureIndex(ctx, shardID); err != nil {
+				// Keep the per-(backend, shard) log line: it's
+				// load-bearing for operator debugging because
+				// it carries the exact upstream error message.
 				logger.Printf("search.EnsureSharedIndexes: backend=%s shard=%s: %v", b.Name(), shardID, err)
+				failures = append(failures, EnsureSharedIndexFailure{
+					Backend: b.Name(),
+					ShardID: shardID,
+					Err:     err,
+				})
 				continue
 			}
 		}
 	}
-	return nil
+	if len(failures) == 0 {
+		return nil
+	}
+	// Aggregate so the caller has ONE high-signal log line
+	// (`shared indexes init: 3 of 24 (backend, shard) pairs
+	// failed`) on top of the per-shard lines. This is the
+	// hook operators wire to a startup-health metric / alert
+	// without forcing every alert backend to grep the per-shard
+	// log lines.
+	return &EnsureSharedIndexesError{Attempted: attempted, Failures: failures}
+}
+
+// EnsureSharedIndexFailure is one (backend, shard) pair whose
+// EnsureIndex call failed during EnsureSharedIndexes.
+type EnsureSharedIndexFailure struct {
+	Backend string
+	ShardID string
+	Err     error
+}
+
+// EnsureSharedIndexesError aggregates per-(backend, shard)
+// failures from a single EnsureSharedIndexes pass. The caller
+// uses it to emit ONE high-signal log line / metric reflecting
+// the whole pass without losing per-shard granularity (which is
+// preserved via the per-failure log lines and the Failures
+// slice).
+//
+// Wrapping `error` rather than e.g. returning a count keeps the
+// shape compatible with the existing `if err != nil` caller
+// pattern in `main.go` and makes `errors.As` / `errors.Is`
+// work naturally for any future caller that wants to act on a
+// specific upstream error (e.g. retry on `context.DeadlineExceeded`).
+type EnsureSharedIndexesError struct {
+	Attempted int
+	Failures  []EnsureSharedIndexFailure
+}
+
+// Error renders the aggregate summary. Individual failures are
+// not included to keep the line greppable; callers that need
+// the full list inspect `Failures` directly.
+func (e *EnsureSharedIndexesError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return fmt.Sprintf("search.EnsureSharedIndexes: %d of %d (backend, shard) pairs failed",
+		len(e.Failures), e.Attempted)
+}
+
+// Unwrap returns the first underlying failure so `errors.Is` /
+// `errors.As` can target a representative upstream error
+// without losing the aggregate count via `Error()`.
+func (e *EnsureSharedIndexesError) Unwrap() error {
+	if e == nil || len(e.Failures) == 0 {
+		return nil
+	}
+	return e.Failures[0].Err
 }

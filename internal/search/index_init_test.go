@@ -78,28 +78,97 @@ func TestEnsureSharedIndexes_NoBackendsIsNoOp(t *testing.T) {
 	}
 }
 
-// TestEnsureSharedIndexes_PerShardFailureIsLoggedNotFatal pins
-// the partial-failure contract: a single misbehaving shard
-// (e.g., one OpenSearch node in the fleet is down) must not
-// block the rest of the fleet from being initialised, and the
-// error MUST be logged so an operator can see it.
-func TestEnsureSharedIndexes_PerShardFailureIsLoggedNotFatal(t *testing.T) {
+// TestEnsureSharedIndexes_PerShardFailureIsLoggedAndAggregated
+// pins the partial-failure contract: a single misbehaving shard
+// (e.g., one OpenSearch node in the fleet is down) must NOT
+// block the rest of the fleet from being initialised. The error
+// MUST be logged per-shard AND the function must return an
+// aggregate `EnsureSharedIndexesError` so the caller has ONE
+// high-signal log line (`N of M pairs failed`) in addition to
+// the per-shard ones — operators don't have to grep + count.
+func TestEnsureSharedIndexes_PerShardFailureIsLoggedAndAggregated(t *testing.T) {
 	shards := &fakeShardLister{ids: []string{"shard-good", "shard-bad", "shard-also-good"}}
+	connRefused := errors.New("connection refused")
 	open := &fakeEnsurer{
 		name: "shared_opensearch",
-		errs: map[string]error{"shard-bad": errors.New("connection refused")},
+		errs: map[string]error{"shard-bad": connRefused},
 	}
 	var logBuf bytes.Buffer
 	logger := log.New(&logBuf, "", 0)
-	if err := EnsureSharedIndexes(context.Background(), logger, shards, []SharedIndexEnsurer{open}); err != nil {
-		t.Fatalf("EnsureSharedIndexes: %v (want nil — per-shard errors must not propagate)", err)
+	err := EnsureSharedIndexes(context.Background(), logger, shards, []SharedIndexEnsurer{open})
+	if err == nil {
+		t.Fatal("EnsureSharedIndexes returned nil; want aggregate EnsureSharedIndexesError")
 	}
 	wantAll := []string{"shard-good", "shard-bad", "shard-also-good"}
 	if !equalSlices(open.calls, wantAll) {
-		t.Errorf("open.calls = %v, want all three shards visited %v", open.calls, wantAll)
+		t.Errorf("open.calls = %v, want all three shards visited %v (a partial-failure must NOT abort the loop)", open.calls, wantAll)
 	}
 	if !strings.Contains(logBuf.String(), "shard=shard-bad") || !strings.Contains(logBuf.String(), "connection refused") {
 		t.Errorf("log did not record the per-shard failure: %q", logBuf.String())
+	}
+	var agg *EnsureSharedIndexesError
+	if !errors.As(err, &agg) {
+		t.Fatalf("err is not *EnsureSharedIndexesError: %T (%v)", err, err)
+	}
+	if agg.Attempted != 3 {
+		t.Errorf("agg.Attempted = %d, want 3", agg.Attempted)
+	}
+	if len(agg.Failures) != 1 {
+		t.Fatalf("agg.Failures len = %d, want 1", len(agg.Failures))
+	}
+	f := agg.Failures[0]
+	if f.Backend != "shared_opensearch" || f.ShardID != "shard-bad" {
+		t.Errorf("agg.Failures[0] = %+v, want (shared_opensearch, shard-bad)", f)
+	}
+	if !errors.Is(f.Err, connRefused) {
+		t.Errorf("agg.Failures[0].Err = %v, want connRefused sentinel", f.Err)
+	}
+	// errors.Is on the aggregate MUST surface the underlying
+	// error (via Unwrap) so future callers can branch on e.g.
+	// context.DeadlineExceeded without losing the count via
+	// Error().
+	if !errors.Is(err, connRefused) {
+		t.Errorf("errors.Is(err, connRefused) = false; want true (Unwrap should surface first failure)")
+	}
+	if !strings.Contains(err.Error(), "1 of 3") {
+		t.Errorf("aggregate Error() = %q, want it to include count '1 of 3'", err.Error())
+	}
+}
+
+// TestEnsureSharedIndexes_AllShardsFailReturnsAggregate pins
+// the worst-case where every shard fails (e.g. the upstream
+// search backend is entirely unreachable). The function must
+// still return an aggregate error rather than nil, so an
+// operator alert can fire on the high-signal log line.
+func TestEnsureSharedIndexes_AllShardsFailReturnsAggregate(t *testing.T) {
+	shards := &fakeShardLister{ids: []string{"shard-a", "shard-b"}}
+	boom := errors.New("backend unreachable")
+	open := &fakeEnsurer{
+		name: "shared_opensearch",
+		errs: map[string]error{"shard-a": boom, "shard-b": boom},
+	}
+	err := EnsureSharedIndexes(context.Background(), nil, shards, []SharedIndexEnsurer{open})
+	var agg *EnsureSharedIndexesError
+	if !errors.As(err, &agg) {
+		t.Fatalf("err is not *EnsureSharedIndexesError: %T (%v)", err, err)
+	}
+	if agg.Attempted != 2 || len(agg.Failures) != 2 {
+		t.Errorf("agg = {Attempted: %d, Failures: %d}, want {2, 2}", agg.Attempted, len(agg.Failures))
+	}
+	if !strings.Contains(err.Error(), "2 of 2") {
+		t.Errorf("aggregate Error() = %q, want '2 of 2'", err.Error())
+	}
+}
+
+// TestEnsureSharedIndexes_SuccessReturnsNil pins that the
+// aggregate-error path is opt-in only on failure: the happy
+// path stays `nil` so existing `if err != nil { log... }`
+// pattern in main.go stays clean.
+func TestEnsureSharedIndexes_SuccessReturnsNil(t *testing.T) {
+	shards := &fakeShardLister{ids: []string{"shard-a", "shard-b"}}
+	open := &fakeEnsurer{name: "shared_opensearch"}
+	if err := EnsureSharedIndexes(context.Background(), nil, shards, []SharedIndexEnsurer{open}); err != nil {
+		t.Fatalf("EnsureSharedIndexes (happy path) returned %v; want nil", err)
 	}
 }
 
