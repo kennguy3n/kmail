@@ -54,10 +54,25 @@ type ShardLister interface {
 // logged and do NOT abort the loop — a single misbehaving
 // upstream must not block the rest of the fleet from starting.
 //
-// The caller is expected to invoke this in a goroutine at
-// startup. The function blocks until every (backend, shard)
-// pair has been attempted, so the caller can wait on it during
-// graceful shutdown if needed.
+// Designed to be called SYNCHRONOUSLY from `main` at startup so
+// the admin / search surface can fail-fast on a misconfigured
+// shared backend (e.g. wrong endpoint, bad credentials) rather
+// than letting the first user-facing search call surface the
+// problem. The current call site is `cmd/kmail-api/main.go`,
+// which blocks the BFF startup until this returns. Do NOT wrap
+// the call in `go EnsureSharedIndexes(...)`: that would race
+// the first IndexMessage / SearchMessages call against the
+// per-shard index creation and either skip the keyword mapping
+// or hit `resource_already_exists_exception` on the lazy path.
+//
+// The function blocks until every (backend, shard) pair has
+// been attempted. Failures are surfaced only through the
+// provided logger; the return value is `nil` unless a setup
+// precondition fails (nil shard lister). The synchronous call
+// is bounded by `(backends × shards) × per-call timeout` and
+// in practice completes in a few seconds even for fleets with
+// dozens of shards because `EnsureIndex` is idempotent and
+// cheap on the steady-state path.
 func EnsureSharedIndexes(ctx context.Context, logger *log.Logger, shards ShardLister, backends []SharedIndexEnsurer) error {
 	if logger == nil {
 		logger = log.Default()

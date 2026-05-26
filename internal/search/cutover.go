@@ -95,11 +95,28 @@ type CandidateFilter struct {
 	// TargetBackend is the backend the worker intends to promote
 	// the tenant TO. The store keys job rows by
 	// `(tenant_id, target_backend)` (migration 051) so a tenant
-	// previously promoted to a different target is NOT shielded
+	// previously promoted to a DIFFERENT target is NOT shielded
 	// by an old `completed` row when a new transition needs to
-	// run — e.g. an operator manually reverts a tenant from
-	// `shared_opensearch` to `shared_meilisearch` and the worker
-	// must be able to re-promote it. Required.
+	// run — e.g. a tenant who was promoted from legacy
+	// `meilisearch` to `opensearch` (target=opensearch row
+	// completed), later moved by an operator onto the modern
+	// shared path (`search_backend = shared_meilisearch`), MUST
+	// remain eligible for the `shared_meilisearch ->
+	// shared_opensearch` transition when its mailbox crosses the
+	// size threshold again. With a non-composite key the old
+	// `completed` row would block the scan; with the composite
+	// key the lookup is scoped to `target_backend = shared_opensearch`
+	// and the row from the previous transition is invisible.
+	//
+	// Note: same-target re-promotion (e.g. operator reverts a
+	// tenant from `shared_opensearch` back to `shared_meilisearch`
+	// and wants the worker to immediately re-promote on the same
+	// target) is intentionally NOT supported by the candidate
+	// scan — the prior `completed` row on the same target still
+	// matches and excludes the tenant. That path requires an
+	// operator-issued job-row reset (DELETE the completed row, or
+	// flip its state to `failed` so the back-off path picks it up).
+	// Required.
 	TargetBackend string
 	// MaxFailures excludes tenants whose `failure_count` has
 	// reached this value.
