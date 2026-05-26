@@ -74,6 +74,28 @@ const (
 	// at the boundary instead of silently holding the row for a
 	// decade. One year is the documented platform ceiling.
 	MaxScheduleHorizon = 365 * 24 * time.Hour
+
+	// DispatchLeaseInterval is how far `next_retry_at` is pushed
+	// forward inside the `claimDue` transaction so the row is
+	// ineligible for re-claim by another replica while THIS
+	// replica is dispatching. Without this lease, the
+	// pgx.BeginFunc commit releases the FOR UPDATE lock the
+	// moment the claim transaction ends, and the row — still
+	// `status='pending'` with `send_at <= now()` and
+	// `next_retry_at <= now()` — becomes immediately eligible
+	// for a second replica's `claimDue` to pick up, producing a
+	// duplicate Stalwart submission. 5 minutes is long enough
+	// to comfortably absorb a slow JMAP round trip plus the
+	// post-Dispatch bookkeeping (`markDispatched` / `markFailed`
+	// / `scheduleRetry`) and short enough that an actually-
+	// crashed worker only delays the row by 5 minutes before a
+	// replacement replica re-claims. Compare with
+	// `internal/export/service.go` which uses an intermediate
+	// `status='running'` for the same purpose; we use a lease
+	// timestamp instead to keep the status enum minimal and
+	// because `next_retry_at` is the natural re-eligibility
+	// gate already plumbed into the partial index.
+	DispatchLeaseInterval = 5 * time.Minute
 )
 
 // Errors surfaced to the HTTP and proxy-hook layers.
@@ -226,14 +248,26 @@ func (s *Service) validateSchedule(in ScheduleInput) error {
 	return nil
 }
 
-// Get reads a row by id with tenant scoping.
+// Get reads a row by id with (tenant, kchat_user_id) scoping.
 //
-// Returns ErrTenantMismatch when the row exists but belongs to a
-// different tenant — the handler maps that to 404 to avoid
-// leaking the existence of cross-tenant ids.
-func (s *Service) Get(ctx context.Context, tenantID, id string) (*ScheduledSend, error) {
+// `kchatUserID` is required because the scheduled-send authz
+// model is per-user, NOT per-tenant: any user in the tenant
+// could otherwise guess UUIDs and read another user's pending
+// send. (Workspace/shared-inbox semantics, if they're ever added,
+// will live behind a separate explicit ACL surface — they don't
+// fall out of the API by accident.)
+//
+// Returns:
+//   - ErrNotFound: row missing or scoped to a different user
+//   - ErrTenantMismatch: row belongs to a different tenant (the
+//     handler collapses both into 404 to avoid leaking the
+//     existence of cross-tenant ids)
+func (s *Service) Get(ctx context.Context, tenantID, kchatUserID, id string) (*ScheduledSend, error) {
 	if strings.TrimSpace(tenantID) == "" {
 		return nil, errors.New("scheduledsend.Get: tenantID is required")
+	}
+	if strings.TrimSpace(kchatUserID) == "" {
+		return nil, errors.New("scheduledsend.Get: kchatUserID is required")
 	}
 	if strings.TrimSpace(id) == "" {
 		return nil, ErrNotFound
@@ -243,6 +277,13 @@ func (s *Service) Get(ctx context.Context, tenantID, id string) (*ScheduledSend,
 		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
 			return err
 		}
+		// The (tenant_id, kchat_user_id) belt on the SELECT is
+		// the actual authz fence. RLS would also exclude
+		// cross-tenant rows except the BFF role is exempt from
+		// forced RLS (see migration 051 + package doc); without
+		// this explicit predicate, the cross-USER hole stays
+		// open even with RLS healthy because RLS only enforces
+		// tenant.
 		row := tx.QueryRow(ctx, `
 			SELECT id::text, tenant_id::text, kchat_user_id,
 			       stalwart_account_id, email_id, identity_id,
@@ -250,8 +291,8 @@ func (s *Service) Get(ctx context.Context, tenantID, id string) (*ScheduledSend,
 			       last_error, next_retry_at, sent_at,
 			       created_at, updated_at
 			FROM scheduled_sends
-			WHERE id = $1::uuid
-		`, id)
+			WHERE id = $1::uuid AND tenant_id = $2::uuid AND kchat_user_id = $3
+		`, id, tenantID, kchatUserID)
 		return scanRow(row, &ss)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -315,9 +356,17 @@ func (s *Service) ListByUser(ctx context.Context, tenantID, kchatUserID string) 
 
 // Cancel marks a still-pending row as cancelled. Idempotent — a
 // double-click returns ErrAlreadyCancelled instead of throwing.
-func (s *Service) Cancel(ctx context.Context, tenantID, id string) error {
+//
+// `kchatUserID` is required because the scheduled-send authz
+// model is per-user (see Get above). Without this scoping, any
+// user in the tenant could cancel another user's pending send by
+// guessing UUIDs.
+func (s *Service) Cancel(ctx context.Context, tenantID, kchatUserID, id string) error {
 	if strings.TrimSpace(tenantID) == "" {
 		return errors.New("scheduledsend.Cancel: tenantID is required")
+	}
+	if strings.TrimSpace(kchatUserID) == "" {
+		return errors.New("scheduledsend.Cancel: kchatUserID is required")
 	}
 	if strings.TrimSpace(id) == "" {
 		return ErrNotFound
@@ -338,14 +387,19 @@ func (s *Service) Cancel(ctx context.Context, tenantID, id string) error {
 		// lock, then re-evaluates the WHERE clause against the
 		// post-commit snapshot, so we either claim the row (1 row
 		// affected) or no-op (0 rows affected) and disambiguate
-		// the precise reason below. The redundant
-		// `tenant_id = $2::uuid` belt protects against a wrong-
-		// tenant clobber even if the GUC is somehow misconfigured.
+		// the precise reason below. The `tenant_id` AND
+		// `kchat_user_id` belts together form the authz fence so
+		// a cross-user cancel is a no-op that re-reads as
+		// "not found" rather than silently clobbering a peer's
+		// row.
 		result, err := tx.Exec(ctx, `
 			UPDATE scheduled_sends
 			SET status = 'cancelled'
-			WHERE id = $1::uuid AND tenant_id = $2::uuid AND status = 'pending'
-		`, id, tenantID)
+			WHERE id = $1::uuid
+			  AND tenant_id = $2::uuid
+			  AND kchat_user_id = $3
+			  AND status = 'pending'
+		`, id, tenantID, kchatUserID)
 		if err != nil {
 			return err
 		}
@@ -353,17 +407,26 @@ func (s *Service) Cancel(ctx context.Context, tenantID, id string) error {
 			return nil
 		}
 		// 0 rows: re-read to map (missing | tenant-mismatch |
-		// sent | cancelled | failed) to the precise sentinel
-		// error the handler surfaces to the client.
-		var status, t string
+		// user-mismatch | sent | cancelled | failed) to the
+		// precise sentinel error the handler surfaces to the
+		// client. The re-read is scoped to id only because we
+		// need to disambiguate user-mismatch from
+		// already-dispatched and the latter requires reading
+		// the row.
+		var status, t, owner string
 		row := tx.QueryRow(ctx, `
-			SELECT status, tenant_id::text FROM scheduled_sends WHERE id = $1::uuid
+			SELECT status, tenant_id::text, kchat_user_id FROM scheduled_sends WHERE id = $1::uuid
 		`, id)
-		if err := row.Scan(&status, &t); err != nil {
+		if err := row.Scan(&status, &t, &owner); err != nil {
 			return err
 		}
 		if t != tenantID {
 			return ErrTenantMismatch
+		}
+		if owner != kchatUserID {
+			// Cross-user — surface as not-found to avoid
+			// leaking the existence of another user's send.
+			return ErrNotFound
 		}
 		switch status {
 		case StatusCancelled:
@@ -393,12 +456,26 @@ func (s *Service) Cancel(ctx context.Context, tenantID, id string) error {
 //
 // `FOR UPDATE OF s SKIP LOCKED` makes the claim safe across N
 // worker replicas: each transaction sees a different unlocked row
-// and the UPDATE within the same transaction holds the lock until
-// commit. If the worker crashes mid-dispatch, the lock dies with
-// the connection and another replica picks the row up on the
-// next tick.
+// while the claim transaction is open. But the lock dies when the
+// transaction commits — and the dispatch + bookkeeping happens
+// OUTSIDE this transaction (see `DispatchWorker.dispatchOne`). To
+// keep the row off the menu while THIS replica is dispatching,
+// the same UPDATE that bumps `attempts` also pushes
+// `next_retry_at` forward by `DispatchLeaseInterval`. The
+// re-eligibility WHERE clause above (`next_retry_at <= now()`)
+// then excludes this row for the full lease duration. If the
+// worker crashes mid-dispatch the row sits idle for one lease
+// interval before another replica re-claims (acceptable under
+// at-least-once delivery); on success `markDispatched` flips
+// `status='sent'` and the row drops out of the partial index;
+// on failure `scheduleRetry` overwrites `next_retry_at` with
+// the real backoff value, so the lease is a strict floor and
+// never extends a retry. Without this push, BeginFunc commits,
+// the lock disappears, and a second replica's `claimDue` picks
+// up the same row a few milliseconds later — duplicate send.
 func (s *Service) claimDue(ctx context.Context) (*ScheduledSend, error) {
 	var ss ScheduledSend
+	leaseUntil := s.now().UTC().Add(DispatchLeaseInterval)
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		row := tx.QueryRow(ctx, `
 			SELECT id::text, tenant_id::text, kchat_user_id,
@@ -418,8 +495,11 @@ func (s *Service) claimDue(ctx context.Context) (*ScheduledSend, error) {
 			return err
 		}
 		if _, err := tx.Exec(ctx, `
-			UPDATE scheduled_sends SET attempts = attempts + 1 WHERE id = $1::uuid
-		`, ss.ID); err != nil {
+			UPDATE scheduled_sends
+			SET attempts = attempts + 1,
+			    next_retry_at = $2
+			WHERE id = $1::uuid
+		`, ss.ID, leaseUntil); err != nil {
 			return err
 		}
 		// scanRow captured the PRE-increment value above; the UPDATE
@@ -431,6 +511,7 @@ func (s *Service) claimDue(ctx context.Context) (*ScheduledSend, error) {
 		// Without this, the worker would retry one extra time AND
 		// use the wrong backoff slot — both off-by-one bugs.
 		ss.Attempts++
+		ss.NextRetryAt = leaseUntil
 		return nil
 	})
 	if errors.Is(err, pgx.ErrNoRows) {

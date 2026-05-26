@@ -20,9 +20,15 @@ type fakeManager struct {
 	getErr     error
 	listErr    error
 	cancelErr  error
+	getArgs    struct {
+		tenantID    string
+		kchatUserID string
+		id          string
+	}
 	cancelArgs struct {
-		tenantID string
-		id       string
+		tenantID    string
+		kchatUserID string
+		id          string
 	}
 }
 
@@ -33,15 +39,19 @@ func (f *fakeManager) ListByUser(_ context.Context, _, _ string) ([]ScheduledSen
 	return f.rows, nil
 }
 
-func (f *fakeManager) Get(_ context.Context, _, _ string) (*ScheduledSend, error) {
+func (f *fakeManager) Get(_ context.Context, tenantID, kchatUserID, id string) (*ScheduledSend, error) {
+	f.getArgs.tenantID = tenantID
+	f.getArgs.kchatUserID = kchatUserID
+	f.getArgs.id = id
 	if f.getErr != nil {
 		return nil, f.getErr
 	}
 	return f.getResult, nil
 }
 
-func (f *fakeManager) Cancel(_ context.Context, tenantID, id string) error {
+func (f *fakeManager) Cancel(_ context.Context, tenantID, kchatUserID, id string) error {
 	f.cancelArgs.tenantID = tenantID
+	f.cancelArgs.kchatUserID = kchatUserID
 	f.cancelArgs.id = id
 	return f.cancelErr
 }
@@ -148,6 +158,45 @@ func TestCancel_HappyPath(t *testing.T) {
 	}
 	if fm.cancelArgs.tenantID != "tenant-a" {
 		t.Fatalf("cancel tenant = %q, want tenant-a", fm.cancelArgs.tenantID)
+	}
+	if fm.cancelArgs.kchatUserID != "kchat-a" {
+		t.Fatalf("cancel kchat_user_id = %q, want kchat-a", fm.cancelArgs.kchatUserID)
+	}
+}
+
+// TestCancel_PerUserScopedAtHandlerLayer pins the per-user authz
+// fence at the handler layer. The handler MUST plumb
+// kchat_user_id from the request context through to Service.Cancel
+// so a peer in the tenant cannot cancel by guessing the UUID. A
+// regression that drops the userID arg would silently degrade the
+// authz model to tenant-only.
+func TestCancel_PerUserScopedAtHandlerLayer(t *testing.T) {
+	fm := &fakeManager{}
+	router := newRouterForTest(fm)
+	w := httptest.NewRecorder()
+	r := handlerRequest("DELETE", "/api/v1/scheduled-sends/ss-x", "")
+	router.ServeHTTP(w, r)
+	if fm.cancelArgs.kchatUserID == "" {
+		t.Fatalf("handler did not pass kchat_user_id to Service.Cancel; per-user authz fence missing")
+	}
+	if fm.cancelArgs.kchatUserID != "kchat-a" {
+		t.Fatalf("cancel kchat_user_id = %q, want kchat-a", fm.cancelArgs.kchatUserID)
+	}
+}
+
+// TestGet_PerUserScopedAtHandlerLayer mirrors
+// TestCancel_PerUserScopedAtHandlerLayer for the read path.
+func TestGet_PerUserScopedAtHandlerLayer(t *testing.T) {
+	fm := &fakeManager{getResult: &ScheduledSend{ID: "ss-x", TenantID: "tenant-a", Status: StatusPending}}
+	router := newRouterForTest(fm)
+	w := httptest.NewRecorder()
+	r := handlerRequest("GET", "/api/v1/scheduled-sends/ss-x", "")
+	router.ServeHTTP(w, r)
+	if fm.getArgs.kchatUserID == "" {
+		t.Fatalf("handler did not pass kchat_user_id to Service.Get; per-user authz fence missing")
+	}
+	if fm.getArgs.kchatUserID != "kchat-a" {
+		t.Fatalf("get kchat_user_id = %q, want kchat-a", fm.getArgs.kchatUserID)
 	}
 }
 

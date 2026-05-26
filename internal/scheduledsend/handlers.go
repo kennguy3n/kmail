@@ -15,8 +15,8 @@ import (
 // Tests substitute an in-memory fake.
 type manager interface {
 	ListByUser(ctx context.Context, tenantID, kchatUserID string) ([]ScheduledSend, error)
-	Get(ctx context.Context, tenantID, id string) (*ScheduledSend, error)
-	Cancel(ctx context.Context, tenantID, id string) error
+	Get(ctx context.Context, tenantID, kchatUserID, id string) (*ScheduledSend, error)
+	Cancel(ctx context.Context, tenantID, kchatUserID, id string) error
 }
 
 // Handlers exposes the scheduled-send REST surface.
@@ -78,8 +78,9 @@ func (h *Handlers) list(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handlers) get(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.TenantIDFrom(r.Context())
-	if tenantID == "" {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "missing tenant context"})
+	kchatUserID := middleware.KChatUserIDFrom(r.Context())
+	if tenantID == "" || kchatUserID == "" {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "missing auth context"})
 		return
 	}
 	id := strings.TrimSpace(r.PathValue("id"))
@@ -87,7 +88,12 @@ func (h *Handlers) get(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "missing id"})
 		return
 	}
-	ss, err := h.svc.Get(r.Context(), tenantID, id)
+	// Per-USER scope (not just tenant): a scheduled send is
+	// owned by the user that scheduled it, and an inadvertent
+	// fall-through to tenant-only scoping would let any user in
+	// the tenant read another user's pending sends by guessing
+	// UUIDs.
+	ss, err := h.svc.Get(r.Context(), tenantID, kchatUserID, id)
 	switch {
 	case err == nil:
 		writeJSON(w, http.StatusOK, toResponse(ss))
@@ -102,8 +108,9 @@ func (h *Handlers) get(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handlers) cancel(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.TenantIDFrom(r.Context())
-	if tenantID == "" {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "missing tenant context"})
+	kchatUserID := middleware.KChatUserIDFrom(r.Context())
+	if tenantID == "" || kchatUserID == "" {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "missing auth context"})
 		return
 	}
 	id := strings.TrimSpace(r.PathValue("id"))
@@ -111,7 +118,11 @@ func (h *Handlers) cancel(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "missing id"})
 		return
 	}
-	err := h.svc.Cancel(r.Context(), tenantID, id)
+	// Per-USER scope (not just tenant): without this, any user
+	// in the tenant could cancel another user's pending send by
+	// guessing UUIDs. The Service.Cancel guarded UPDATE has the
+	// matching `kchat_user_id` predicate as belt-and-suspenders.
+	err := h.svc.Cancel(r.Context(), tenantID, kchatUserID, id)
 	switch {
 	case err == nil:
 		writeJSON(w, http.StatusOK, map[string]any{"cancelled": true})

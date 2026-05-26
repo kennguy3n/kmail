@@ -49,6 +49,17 @@ func (f *fakeStore) claimDue(_ context.Context) (*ScheduledSend, error) {
 	ss := f.pending[0]
 	f.pending = f.pending[1:]
 	ss.Attempts++
+	// Mirror the real Service.claimDue dispatch-lease behaviour:
+	// push NextRetryAt forward by DispatchLeaseInterval so the
+	// row is ineligible for re-claim by a concurrent replica
+	// while this dispatch is in flight. The real path uses the
+	// transaction time (`now()`); the fake uses a wall-clock-
+	// independent constant to keep tests deterministic. The
+	// production behaviour we're modelling is "claimed rows hide
+	// from claimDue for one lease interval", which is what the
+	// production SQL enforces via the
+	// `next_retry_at <= now()` WHERE clause.
+	ss.NextRetryAt = time.Unix(1_700_000_000, 0).Add(DispatchLeaseInterval)
 	return ss, nil
 }
 

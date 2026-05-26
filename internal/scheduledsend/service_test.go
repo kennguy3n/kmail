@@ -134,15 +134,23 @@ func TestNewService_RejectsNilPool(t *testing.T) {
 
 func TestGet_RejectsEmptyTenant(t *testing.T) {
 	svc := nilService(nil)
-	_, err := svc.Get(context.Background(), "", "some-id")
+	_, err := svc.Get(context.Background(), "", "kchat-a", "some-id")
 	if err == nil {
 		t.Fatalf("expected error for empty tenantID")
 	}
 }
 
+func TestGet_RejectsEmptyUser(t *testing.T) {
+	svc := nilService(nil)
+	_, err := svc.Get(context.Background(), "tenant-a", "", "some-id")
+	if err == nil {
+		t.Fatalf("expected error for empty kchatUserID (per-user authz fence)")
+	}
+}
+
 func TestGet_EmptyIDReturnsNotFound(t *testing.T) {
 	svc := nilService(nil)
-	_, err := svc.Get(context.Background(), "tenant-a", "")
+	_, err := svc.Get(context.Background(), "tenant-a", "kchat-a", "")
 	if !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
@@ -150,15 +158,23 @@ func TestGet_EmptyIDReturnsNotFound(t *testing.T) {
 
 func TestCancel_RejectsEmptyTenant(t *testing.T) {
 	svc := nilService(nil)
-	err := svc.Cancel(context.Background(), "", "some-id")
+	err := svc.Cancel(context.Background(), "", "kchat-a", "some-id")
 	if err == nil {
 		t.Fatalf("expected error for empty tenantID")
 	}
 }
 
+func TestCancel_RejectsEmptyUser(t *testing.T) {
+	svc := nilService(nil)
+	err := svc.Cancel(context.Background(), "tenant-a", "", "some-id")
+	if err == nil {
+		t.Fatalf("expected error for empty kchatUserID (per-user authz fence)")
+	}
+}
+
 func TestCancel_EmptyIDReturnsNotFound(t *testing.T) {
 	svc := nilService(nil)
-	err := svc.Cancel(context.Background(), "tenant-a", "")
+	err := svc.Cancel(context.Background(), "tenant-a", "kchat-a", "")
 	if !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
