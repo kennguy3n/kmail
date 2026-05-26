@@ -178,7 +178,14 @@ func (h *Handlers) create(w http.ResponseWriter, r *http.Request) {
 		body.OriginalMailboxIDs, body.SnoozedMailboxID,
 		false,
 	); err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "snooze: stalwart refused move: " + err.Error()})
+		// Stalwart's verbatim error message is logged at
+		// `applyMove` and is not re-surfaced to the client to
+		// avoid leaking internal infrastructure detail (server
+		// names, mailbox ids that didn't resolve, etc.). The
+		// 502 is enough for the user; an operator pulls the
+		// surrounding log lines for triage.
+		h.logger.Printf("snooze: stalwart refused snooze move: tenant=%s user=%s email_id=%s err=%v", tenantID, kchatUserID, body.EmailID, err)
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "stalwart refused move"})
 		return
 	}
 	row, err := h.svc.Snooze(r.Context(), SnoozeInput{
@@ -194,10 +201,15 @@ func (h *Handlers) create(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		// Persistence failed — best-effort revert the JMAP
 		// patch so the user doesn't see a phantom-snoozed
-		// email. If the revert itself fails we still surface
-		// the original error to the client AND log the orphan
-		// state at ERROR level so an operator can find the
-		// email in the user's Snoozed folder and patch it back
+		// email. The revert is the WAKE-patch shape: pass the
+		// original mailbox set as `originals` AND the snoozed
+		// folder as `snoozedMailboxID`, with
+		// `restoreOriginals=true` so `applyMove` adds the
+		// originals back and drops the snoozed folder. If the
+		// revert itself fails we still surface the original
+		// error to the client AND log the orphan state at
+		// ERROR level so an operator can find the email in
+		// the user's Snoozed folder and patch it back
 		// manually. Without the log the orphan would only be
 		// recoverable via the user noticing a phantom-snoozed
 		// email — silent data loss from an operations
@@ -205,8 +217,7 @@ func (h *Handlers) create(w http.ResponseWriter, r *http.Request) {
 		if revertErr := h.applyMove(
 			r.Context(),
 			tenantID, kchatUserID, accountID, body.EmailID,
-			map[string]bool{body.SnoozedMailboxID: true},
-			"", // no snoozed-mailbox to drop on revert; we'll add originals + drop snoozed
+			body.OriginalMailboxIDs, body.SnoozedMailboxID,
 			true,
 		); revertErr != nil {
 			h.logger.Printf(
@@ -320,7 +331,10 @@ func (h *Handlers) wakeNow(w http.ResponseWriter, r *http.Request) {
 		orig, row.SnoozedMailboxID,
 		true,
 	); err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "snooze: stalwart refused wake: " + err.Error()})
+		// As in `create`: don't echo Stalwart's verbatim
+		// error to the client — log it, return a generic 502.
+		h.logger.Printf("snooze: stalwart refused wake: tenant=%s user=%s email_id=%s err=%v", tenantID, kchatUserID, row.EmailID, err)
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "stalwart refused wake"})
 		return
 	}
 	if err := h.svc.Cancel(r.Context(), tenantID, kchatUserID, id); err != nil {

@@ -71,14 +71,36 @@ CREATE INDEX snoozed_emails_pending_idx
 CREATE INDEX snoozed_emails_tenant_user_idx
     ON snoozed_emails (tenant_id, kchat_user_id, created_at DESC);
 
--- One snooze per (tenant, email) at a time. A second snooze on
--- an already-snoozed email is almost always a UI race — the
--- caller should cancel the existing row first. Enforced as a
--- unique partial index on the active states only so an old
--- `unsnoozed` row doesn't block a future snooze of the same
--- email.
+-- One active snooze per (tenant, user, email) at a time. The
+-- scope includes `kchat_user_id` deliberately:
+--
+--   * Each KMail user has their own Stalwart account so JMAP
+--     `email_id`s are namespaced per-account. For "personal"
+--     mailboxes a single email_id is only ever visible to one
+--     user and a tighter (tenant, email_id) scope would also be
+--     correct — but it's also strictly weaker.
+--   * KChat exposes shared inboxes (`sales@`, `support@`) via
+--     MLS-group decryption on top of a single backing Stalwart
+--     account, so multiple users CAN see the same JMAP email_id
+--     for the same underlying message. In that scenario, each
+--     user must be able to snooze their own copy independently
+--     — a (tenant, email_id) constraint would let the first
+--     snoozer block every other user from snoozing the same
+--     shared email until the first one wakes/cancels, which is
+--     a user-visible cross-user fairness bug.
+--   * Per-user authz is enforced at the Service layer (Get and
+--     Cancel both require kchat_user_id in the WHERE clause).
+--     A unique index that doesn't agree with that scoping would
+--     be a structural footgun the next time someone adds a
+--     "shared snooze view" feature.
+--
+-- A second snooze of the SAME user's SAME email is still
+-- rejected (UI race; the caller should cancel the existing row
+-- first). Partial index covers only `status='snoozed'` so an
+-- old terminal row (unsnoozed/cancelled/failed) doesn't block a
+-- future re-snooze.
 CREATE UNIQUE INDEX snoozed_emails_active_unique
-    ON snoozed_emails (tenant_id, email_id)
+    ON snoozed_emails (tenant_id, kchat_user_id, email_id)
     WHERE status = 'snoozed';
 
 CREATE TRIGGER snoozed_emails_set_updated_at

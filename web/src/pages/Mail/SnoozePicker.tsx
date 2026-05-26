@@ -47,7 +47,7 @@ export default function SnoozePicker({
       setError(`"${label}" is in the past — pick another time`);
       return;
     }
-      onPick(target);
+    onPick(target);
   }
 
   function handleCustom() {

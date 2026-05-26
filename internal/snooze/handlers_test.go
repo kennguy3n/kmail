@@ -239,7 +239,11 @@ func TestCreate_RejectsSnoozedMailboxInOriginals(t *testing.T) {
 
 func TestCreate_StalwartRefusalReturns502(t *testing.T) {
 	fm := &fakeManager{}
-	fd := &fakeDispatcher{err: errors.New("502 from stalwart")}
+	// The Stalwart error text must NOT appear in the response
+	// body — leaking it would expose internal infrastructure
+	// detail (server names, mailbox ids that didn't resolve,
+	// etc.) to the client.
+	fd := &fakeDispatcher{err: errors.New("internal-host-42:9123 EOF")}
 	router := newRouterForTest(fm, fd)
 
 	w := httptest.NewRecorder()
@@ -250,6 +254,9 @@ func TestCreate_StalwartRefusalReturns502(t *testing.T) {
 	}
 	if len(fm.created) != 0 {
 		t.Fatalf("must NOT persist row when JMAP move fails: %d rows created", len(fm.created))
+	}
+	if strings.Contains(w.Body.String(), "internal-host-42") {
+		t.Fatalf("response body must NOT leak Stalwart error text; got %s", w.Body.String())
 	}
 }
 
@@ -263,6 +270,41 @@ func TestCreate_DuplicateSnoozeReturns409(t *testing.T) {
 	router.ServeHTTP(w, r)
 	if w.Code != http.StatusConflict {
 		t.Fatalf("status = %d, want 409 for duplicate active snooze", w.Code)
+	}
+}
+
+// TestCreate_PersistFailureRevertsByRestoringOriginalsAndDroppingSnoozed
+// pins the BUG_0001 fix: when DB persistence fails after the
+// move-to-snoozed succeeded, the best-effort revert dispatch
+// must produce the WAKE patch (add originals + drop snoozed)
+// — NOT a no-op patch that only re-asserts the snoozed mailbox
+// and leaves the email orphaned in the Snoozed folder.
+func TestCreate_PersistFailureRevertsByRestoringOriginalsAndDroppingSnoozed(t *testing.T) {
+	fm := &fakeManager{snoozeErr: errors.New("postgres exploded")}
+	fd := &fakeDispatcher{}
+	router := newRouterForTest(fm, fd)
+
+	w := httptest.NewRecorder()
+	r := handlerRequest("POST", "/api/v1/snooze", makeCreateBody())
+	router.ServeHTTP(w, r)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 when persist fails", w.Code)
+	}
+	// Two dispatches expected: 1) move-to-snoozed (the forward
+	// patch), 2) revert (the wake-shape patch).
+	if fd.calls != 2 {
+		t.Fatalf("expected 2 dispatches (forward + revert), got %d", fd.calls)
+	}
+	// Inspect the SECOND dispatch — must be a true wake patch.
+	args, _ := fd.requests[1].MethodCalls[0][1].(map[string]any)
+	update, _ := args["update"].(map[string]any)
+	patch, _ := update["email-1"].(map[string]any)
+	if patch["mailboxIds/mb-inbox"] != any(true) {
+		t.Errorf("revert must ADD original mb-inbox back, got %v", patch["mailboxIds/mb-inbox"])
+	}
+	if v, has := patch["mailboxIds/mb-snoozed"]; !has || v != any(nil) {
+		t.Errorf("revert must DROP mb-snoozed (set to nil), got %v (has=%v)", v, has)
 	}
 }
 
@@ -414,7 +456,9 @@ func TestWakeNow_StalwartRefusalReturns502(t *testing.T) {
 			Status:             StatusSnoozed,
 		},
 	}
-	fd := &fakeDispatcher{err: errors.New("connect refused")}
+	// Stalwart error text must NOT appear in the response —
+	// same hardening as TestCreate_StalwartRefusalReturns502.
+	fd := &fakeDispatcher{err: errors.New("internal-host-42:9123 connect refused")}
 	router := newRouterForTest(fm, fd)
 	w := httptest.NewRecorder()
 	r := handlerRequest("DELETE", "/api/v1/snoozed/s-1", "")
@@ -424,6 +468,9 @@ func TestWakeNow_StalwartRefusalReturns502(t *testing.T) {
 	}
 	if len(fm.cancels) != 0 {
 		t.Fatalf("must NOT cancel row when JMAP wake failed: %v", fm.cancels)
+	}
+	if strings.Contains(w.Body.String(), "internal-host-42") {
+		t.Fatalf("response body must NOT leak Stalwart error text; got %s", w.Body.String())
 	}
 }
 
