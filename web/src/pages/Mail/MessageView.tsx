@@ -6,9 +6,6 @@ import { snoozeEmail } from "../../api/snooze";
 import SnoozePicker from "./SnoozePicker";
 import type { Email, EmailBodyPart } from "../../types";
 
-/** Display name for the lazily-provisioned per-user Snoozed mailbox. */
-const SNOOZED_MAILBOX_NAME = "Snoozed";
-
 /**
  * MessageView is the single-message reading pane.
  *
@@ -108,15 +105,11 @@ export default function MessageView() {
     if (!email || snoozeBusy) return;
     setSnoozeBusy(true);
     try {
-      const mailboxList = await jmapClient.getMailboxes();
-      const existing =
-        mailboxList.find((m) => m.role === "snoozed") ??
-        mailboxList.find(
-          (m) => m.name.toLowerCase() === SNOOZED_MAILBOX_NAME.toLowerCase(),
-        );
-      const snoozedId = existing
-        ? existing.id
-        : await jmapClient.createMailbox(SNOOZED_MAILBOX_NAME);
+      // Centralised lookup-or-create. The helper fetches the
+      // LIVE mailbox list and recovers from concurrent-create
+      // races so Inbox and MessageView can't double-create the
+      // Snoozed mailbox from different views.
+      const snoozedId = await jmapClient.resolveOrCreateSnoozedMailbox();
       const originals = { ...email.mailboxIds } as Record<string, boolean>;
       if (originals[snoozedId]) {
         throw new Error(

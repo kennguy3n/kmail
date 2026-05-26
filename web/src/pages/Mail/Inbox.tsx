@@ -6,9 +6,6 @@ import { snoozeEmail } from "../../api/snooze";
 import SnoozePicker from "./SnoozePicker";
 import type { Email, Mailbox } from "../../types";
 
-/** Display name for the lazily-provisioned per-user Snoozed mailbox. */
-const SNOOZED_MAILBOX_NAME = "Snoozed";
-
 /**
  * Inbox is the primary Mail list view.
  *
@@ -249,21 +246,6 @@ export default function Inbox() {
     [mailboxes],
   );
 
-  // Resolve the Snoozed mailbox lazily. We don't auto-create it
-  // up-front because most users never snooze; we provision it on
-  // first use inside `handleSnooze` instead. The lookup matches
-  // either the (uncommon) `"snoozed"` JMAP role or the
-  // conventional mailbox name we create.
-  const snoozedMailboxId = useMemo(() => {
-    const list = mailboxes ?? [];
-    const byRole = list.find((m) => m.role === "snoozed");
-    if (byRole) return byRole.id;
-    const byName = list.find(
-      (m) => m.name.toLowerCase() === SNOOZED_MAILBOX_NAME.toLowerCase(),
-    );
-    return byName?.id ?? null;
-  }, [mailboxes]);
-
   // Open snooze picker state — one at a time, keyed by email id.
   // Closing == setting to null. The actual handler lives below
   // bumpAfterWrite (state shape here, behaviour after writes).
@@ -323,13 +305,15 @@ export default function Inbox() {
       if (snoozeBusy) return;
       setSnoozeBusy(true);
       try {
-        // Lazily create the Snoozed mailbox on first use. If a
-        // pre-existing mailbox is present (either by role or by
-        // name) we reuse it.
-        let snoozedId = snoozedMailboxId;
-        if (!snoozedId) {
-          snoozedId = await jmapClient.createMailbox(SNOOZED_MAILBOX_NAME);
-        }
+        // Always go through `resolveOrCreateSnoozedMailbox`
+        // rather than the local `snoozedMailboxId` memo: the memo
+        // reads from React state (`mailboxes`) which may be stale
+        // if MessageView just provisioned the mailbox on this
+        // session. The shared helper fetches the LIVE list and
+        // recovers from concurrent-create races (e.g. two
+        // tabs / a re-fetch in flight) by re-looking-up on
+        // createMailbox failure.
+        const snoozedId = await jmapClient.resolveOrCreateSnoozedMailbox();
         // The user might already have toggled the email into the
         // snoozed mailbox manually; refuse the no-op case so the
         // BFF doesn't reject `snoozed_mailbox_id ∈ originals`.
@@ -354,7 +338,7 @@ export default function Inbox() {
         setSnoozeBusy(false);
       }
     },
-    [bumpAfterWrite, snoozeBusy, snoozedMailboxId],
+    [bumpAfterWrite, snoozeBusy],
   );
 
   const handleToggleRead = useCallback(

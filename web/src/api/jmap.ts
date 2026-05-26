@@ -35,6 +35,14 @@ export const JMAP_BASE_URL = "/jmap";
 export const JMAP_SESSION_URL = "/jmap/session";
 
 /**
+ * The conventional name for the lazily-provisioned per-user
+ * Snoozed mailbox. Exported so both `Inbox.tsx` and
+ * `MessageView.tsx` agree on the same lookup-and-create target —
+ * neither view should embed its own copy of this string.
+ */
+export const SNOOZED_MAILBOX_NAME = "Snoozed";
+
+/**
  * Dev-bypass bearer token. The Go BFF's OIDC middleware accepts a
  * static token when `KMAIL_DEV_BYPASS_TOKEN` matches — in local dev
  * we run the stack with `KMAIL_DEV_BYPASS_TOKEN=kmail-dev`, so the
@@ -868,6 +876,58 @@ export class JMAPClient {
       );
     }
     return created.mb.id;
+  }
+
+  /**
+   * Resolve or lazily create the per-user "Snoozed" mailbox and
+   * return its id.
+   *
+   * Centralised here so that `Inbox.tsx` and `MessageView.tsx`
+   * cannot drift into their own copies of the lookup-and-create
+   * dance. Without this, a user who snoozes from MessageView
+   * (which calls `getMailboxes()` + `createMailbox()` on first
+   * use) can then navigate to Inbox before the Inbox's React
+   * `mailboxes` state has refetched, and trigger a second
+   * `createMailbox("Snoozed")` from the Inbox path — which the
+   * JMAP server may reject as a duplicate name and surface as a
+   * user-visible error for a mailbox that already exists.
+   *
+   * This helper always fetches the LIVE mailbox list (not cached
+   * React state) so the lookup sees any mailbox just created by
+   * another view. On `createMailbox` failure it re-fetches and
+   * looks up by role/name as a recovery path — a concurrent
+   * create from another view/tab will surface as a server-side
+   * rejection here, and the recovery re-fetch is how we
+   * reconcile to the now-existing mailbox instead of bubbling
+   * the duplicate-name error to the user.
+   */
+  async resolveOrCreateSnoozedMailbox(): Promise<string> {
+    const findSnoozed = (list: Mailbox[]): string | null => {
+      const byRole = list.find((m) => m.role === "snoozed");
+      if (byRole) return byRole.id;
+      const byName = list.find(
+        (m) =>
+          m.name.toLowerCase() === SNOOZED_MAILBOX_NAME.toLowerCase(),
+      );
+      return byName?.id ?? null;
+    };
+
+    const list = await this.getMailboxes();
+    const existing = findSnoozed(list);
+    if (existing) return existing;
+
+    try {
+      return await this.createMailbox(SNOOZED_MAILBOX_NAME);
+    } catch (err) {
+      // Recovery path: a concurrent create from another view /
+      // tab may have raced ahead between our initial getMailboxes
+      // and our createMailbox. Re-fetch and look up again before
+      // surfacing the error to the caller.
+      const list2 = await this.getMailboxes();
+      const recovered = findSnoozed(list2);
+      if (recovered) return recovered;
+      throw err;
+    }
   }
 
   // ----------------------------------------------------------------
