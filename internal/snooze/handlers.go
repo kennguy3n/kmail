@@ -374,6 +374,25 @@ func (h *Handlers) wakeNow(w http.ResponseWriter, r *http.Request) {
 		orig, row.SnoozedMailboxID,
 		true, row.MarkUnreadOnWake,
 	); err != nil {
+		// Narrow TOCTOU window: between our Get above and this
+		// applyMove, the worker may have claimed the row,
+		// dispatched its OWN wake patch, and called
+		// markUnsnoozed. In that case Stalwart's mailboxIds for
+		// this email no longer contain the snoozed folder — our
+		// patch's "drop snoozed mailbox" leg either no-ops (the
+		// folder isn't there to drop) or, if Stalwart rejects
+		// the redundant patch via `notUpdated`, our applyMove
+		// returns an error. Either way the email is correctly
+		// at its target location and the user's intent was
+		// satisfied. Re-read the row; if the worker already
+		// moved it to a terminal state, treat the operation as
+		// success rather than surfacing a spurious 502 for a
+		// fully-successful wake.
+		if row2, getErr := h.svc.Get(r.Context(), tenantID, kchatUserID, id); getErr == nil && row2.Status != StatusSnoozed {
+			h.logger.Printf("snooze: wakeNow saw applyMove err=%v but worker won the race (status=%s); returning 200", err, row2.Status)
+			writeJSON(w, http.StatusOK, map[string]any{"cancelled": true})
+			return
+		}
 		// As in `create`: don't echo Stalwart's verbatim
 		// error to the client — log it, return a generic 502.
 		h.logger.Printf("snooze: stalwart refused wake: tenant=%s user=%s email_id=%s err=%v", tenantID, kchatUserID, row.EmailID, err)

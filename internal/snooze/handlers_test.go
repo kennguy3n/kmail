@@ -22,10 +22,17 @@ type fakeManager struct {
 	snoozeResult *Snooze
 	snoozeErr    error
 	getResult    *Snooze
-	getErr       error
-	listErr      error
-	cancelErr    error
-	created      []SnoozeInput
+	// getResultSecond, when non-nil, is returned on the SECOND
+	// and subsequent Get calls. Models the wakeNow TOCTOU window
+	// where the worker has moved the row to a terminal state
+	// between the handler's first Get and its post-applyMove
+	// re-read.
+	getResultSecond *Snooze
+	getCalls        int
+	getErr          error
+	listErr         error
+	cancelErr       error
+	created         []SnoozeInput
 	// getArgs / cancelArgs capture the (tenant, kchat_user, id)
 	// triple the handler passed in. The per-user authz tests
 	// pin these so a refactor that drops kchatUserID can't slip
@@ -76,9 +83,14 @@ func (f *fakeManager) Get(_ context.Context, tenantID, kchatUserID, id string) (
 	f.getArgs.tenantID = tenantID
 	f.getArgs.kchatUserID = kchatUserID
 	f.getArgs.id = id
+	f.getCalls++
+	calls := f.getCalls
 	f.mu.Unlock()
 	if f.getErr != nil {
 		return nil, f.getErr
+	}
+	if calls >= 2 && f.getResultSecond != nil {
+		return f.getResultSecond, nil
 	}
 	return f.getResult, nil
 }
@@ -676,6 +688,52 @@ func TestWakeNow_StalwartRefusalReturns502(t *testing.T) {
 	}
 	if strings.Contains(w.Body.String(), "internal-host-42") {
 		t.Fatalf("response body must NOT leak Stalwart error text; got %s", w.Body.String())
+	}
+}
+
+// TestWakeNow_StalwartRefusalAfterWorkerWokeReturns200 pins the
+// Round 5 TOCTOU fix: between the handler's initial Get and the
+// JMAP applyMove, the worker may have claimed the row,
+// dispatched its own wake patch, and marked the row unsnoozed.
+// Stalwart may then reject the handler's redundant applyMove
+// (notUpdated for stale mailboxIds), but the email is correctly
+// at its target location — returning 502 would surface a
+// spurious error for a fully-successful wake. The handler must
+// re-read the row; if the worker won the race (status !=
+// snoozed), return 200.
+func TestWakeNow_StalwartRefusalAfterWorkerWokeReturns200(t *testing.T) {
+	first := &Snooze{
+		ID:                 "s-1",
+		TenantID:           "tenant-a",
+		KChatUserID:        "kchat-a",
+		StalwartAccountID:  "acct-a",
+		EmailID:            "email-1",
+		OriginalMailboxIDs: json.RawMessage(`{"mb-inbox":true}`),
+		SnoozedMailboxID:   "mb-snoozed",
+		Status:             StatusSnoozed,
+	}
+	// Models the worker landing markUnsnoozed between the
+	// handler's first and second Get.
+	second := *first
+	second.Status = StatusUnsnoozed
+	fm := &fakeManager{
+		getResult:       first,
+		getResultSecond: &second,
+	}
+	fd := &fakeDispatcher{err: errors.New("internal-host-42:9123 stalwart notUpdated stale mailbox")}
+	router := newRouterForTest(fm, fd)
+	w := httptest.NewRecorder()
+	r := handlerRequest("DELETE", "/api/v1/snoozed/s-1", "")
+	router.ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s, want 200 when worker won the wake race", w.Code, w.Body.String())
+	}
+	if len(fm.cancels) != 0 {
+		t.Fatalf("must NOT call Cancel when worker already woke; got %v", fm.cancels)
+	}
+	if strings.Contains(w.Body.String(), "internal-host-42") {
+		t.Fatalf("200-after-race response body must NOT leak Stalwart error text; got %s", w.Body.String())
 	}
 }
 
