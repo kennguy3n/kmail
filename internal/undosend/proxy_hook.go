@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 
@@ -47,11 +48,17 @@ type HookConfig struct {
 	// the surface as a function so the hook isn't bound to the
 	// concrete proxy type (and tests can substitute a fixed id).
 	AccountResolver func(ctx context.Context, tenantID, kchatUserID string) (string, error)
+	// Logger receives the post-Dispatch error diagnostics on the
+	// orphan-draft recovery path (see Intercept). Optional;
+	// defaults to log.Default() when nil so a bare HookConfig{}
+	// still emits operator-visible diagnostics.
+	Logger *log.Logger
 }
 
 // Hook is the `jmap.SendInterceptor` implementation.
 type Hook struct {
-	cfg HookConfig
+	cfg    HookConfig
+	logger *log.Logger
 }
 
 // NewHook validates HookConfig and returns a *Hook ready to be
@@ -66,7 +73,11 @@ func NewHook(cfg HookConfig) (*Hook, error) {
 	if cfg.AccountResolver == nil {
 		return nil, errors.New("undosend.NewHook: AccountResolver is required")
 	}
-	return &Hook{cfg: cfg}, nil
+	logger := cfg.Logger
+	if logger == nil {
+		logger = log.Default()
+	}
+	return &Hook{cfg: cfg, logger: logger}, nil
 }
 
 // Intercept implements jmap.SendInterceptor.
@@ -122,6 +133,14 @@ func (h *Hook) Intercept(ctx context.Context, w http.ResponseWriter, r *http.Req
 	// referenced `#<emailCreateKey>`; the worker needs the real
 	// Stalwart id. Pull it out of the response createdIds map (RFC
 	// 8620 §3.4).
+	//
+	// From this point on the Stalwart draft is already committed
+	// upstream. Every subsequent error path MUST return
+	// `(intercepted=true, ...)` so the proxy does NOT fall through
+	// to its ServeHTTP path — falling through would re-forward the
+	// FULL original body (Email/set + EmailSubmission/set) to
+	// Stalwart, creating a second draft AND submitting it
+	// immediately, completely defeating the undo-send semantics.
 	emailID, ok := resolveCreatedEmailID(stalwartResp, intent.emailCreateKey)
 	if !ok {
 		// The Email/set itself succeeded but the response shape is
@@ -134,7 +153,18 @@ func (h *Hook) Intercept(ctx context.Context, w http.ResponseWriter, r *http.Req
 	// back-references.
 	submissionPayload, err := normaliseSubmissionPayload(intent.submissionCreate, intent.emailCreateKey, emailID)
 	if err != nil {
-		return false, fmt.Errorf("undosend.Hook: normalise payload: %w", err)
+		// The draft is already minted upstream. We CANNOT return
+		// `(false, err)` here — that would have the proxy re-forward
+		// the FULL body and create a duplicate draft + immediate
+		// submission. Surface the half-committed state by writing
+		// the Stalwart response (which carries the draft's `created`
+		// map) and log the normalise failure so operators can chase
+		// it down via the standard log pipeline. The JMAP client
+		// sees Email/set succeed with no EmailSubmission/set
+		// response — the React Compose view interprets this as
+		// "draft saved, send failed" and the user can retry.
+		h.logger.Printf("undosend.Hook: normalise payload after dispatch tenant=%s email=%s: %v", tenantID, emailID, err)
+		return writeJMAPResponse(w, stalwartResp, http.StatusOK)
 	}
 
 	ps, err := h.cfg.Service.Hold(ctx, HoldInput{
@@ -147,7 +177,15 @@ func (h *Hook) Intercept(ctx context.Context, w http.ResponseWriter, r *http.Req
 		SubmissionPayload: submissionPayload,
 	})
 	if err != nil {
-		return false, fmt.Errorf("undosend.Hook: hold: %w", err)
+		// Same orphan-draft rationale as the normalise branch above:
+		// the Stalwart draft is already minted, so returning a
+		// fall-through `(false, err)` would duplicate-submit. Write
+		// the Stalwart response verbatim; the client can re-issue
+		// the submission via a normal (non-undo-send) flow. The
+		// Valkey error is logged so the operator can correlate with
+		// upstream Redis incidents.
+		h.logger.Printf("undosend.Hook: hold after dispatch tenant=%s email=%s: %v", tenantID, emailID, err)
+		return writeJMAPResponse(w, stalwartResp, http.StatusOK)
 	}
 
 	// Synthesise the EmailSubmission/set response so the JMAP

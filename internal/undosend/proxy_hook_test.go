@@ -209,6 +209,54 @@ func TestIntercept_NoEmailSubmissionFallsThrough(t *testing.T) {
 	}
 }
 
+// TestIntercept_HoldFailureReturnsInterceptedNotFalse pins the
+// orphan-draft safety property: when Service.Hold fails AFTER the
+// Stalwart draft has already been minted via the stripped
+// Dispatch, the hook MUST return `(intercepted=true, ...)` so the
+// proxy does NOT fall through and re-forward the full original
+// body to Stalwart. Falling through would create a SECOND draft
+// and immediately submit it, completely defeating the undo-send
+// semantics.
+func TestIntercept_HoldFailureReturnsInterceptedNotFalse(t *testing.T) {
+	svc, mr, _ := newTestService(t)
+	// Close miniredis so Service.Hold fails on its SET+ZADD
+	// pipeline. The Stalwart Dispatch above is independent.
+	mr.Close()
+
+	fwd := &stubForwarder{response: stalwartStrippedResponse("draft", "REAL-email-1")}
+	hook := newTestHook(t, svc, fwd)
+
+	body := buildSendBody("draft", "submission", "ident-1")
+	ctx := contextWithIdentity("tenant-a", "kchat-a")
+	r := newJMAPRequest(t, body, ctx, true)
+	w := httptest.NewRecorder()
+
+	intercepted, err := hook.Intercept(ctx, w, r, body)
+	if err != nil {
+		t.Fatalf("Intercept after Hold failure should return nil err with intercepted=true; got err=%v", err)
+	}
+	if !intercepted {
+		t.Fatalf("Intercept must return intercepted=true after a post-Dispatch Hold failure, otherwise the proxy falls through and creates a duplicate draft + submission")
+	}
+	if fwd.called != 1 {
+		t.Fatalf("Forwarder.Dispatch was called %d times; want exactly 1 (the stripped draft mint). Any more means the hook also fell through to the proxy.", fwd.called)
+	}
+	respBytes, err := io.ReadAll(w.Result().Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	var resp jmap.JmapResponse
+	if err := json.Unmarshal(respBytes, &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	// The synthetic EmailSubmission/set response is absent because
+	// the hold failed; the client sees Email/set succeeded and can
+	// surface a "draft saved, send failed" UI.
+	if len(resp.MethodResponses) != 1 {
+		t.Fatalf("expected 1 method response (raw Stalwart draft response), got %d: %+v", len(resp.MethodResponses), resp.MethodResponses)
+	}
+}
+
 func TestIntercept_StalwartErrorPropagated(t *testing.T) {
 	svc, _, _ := newTestService(t)
 	fwd := &stubForwarder{err: errors.New("connect refused")}

@@ -48,6 +48,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -152,7 +153,71 @@ type Service struct {
 	maxDelay time.Duration
 	ttlSlack time.Duration
 	now     func() time.Time
+
+	// cancelScriptOnce / cancelScript hold the compiled Lua
+	// handle for the atomic verify-and-revoke step Cancel runs
+	// against Valkey. `redis.NewScript` caches the script SHA so
+	// subsequent EVALSHAs avoid the script-payload round-trip.
+	cancelScriptOnce sync.Once
+	cancelScript     *redis.Script
 }
+
+// cancelLua atomically (a) reads the companion key, (b) verifies
+// the persisted tenant_id matches the caller's, and (c) revokes
+// ownership by removing the sorted-set entry FIRST and only then
+// deleting the companion key. Performing the ZREM before the DEL
+// is the load-bearing safety property: it closes the TOCTOU race
+// between Cancel and the dispatch worker.
+//
+// Without atomicity, the Cancel path was: GET companion + verify
+// tenant + DEL companion + ZREM sorted_set (as a pipeline). A
+// worker could ZREM the sorted-set entry between Cancel's GET
+// and Cancel's DEL+ZREM, win the dispatch race, read the still-
+// present companion key, and submit the email to Stalwart. Cancel
+// would then succeed (its ZREM returned 0 but Exec ignored that
+// signal) and return nil to the HTTP layer — so the user saw
+// "cancelled" but the email was already in flight.
+//
+// The script returns one of:
+//
+//	"missing"  -> companion key absent (already dispatched / TTL'd /
+//	              never existed). Cancel surfaces ErrAlreadySent.
+//	"mismatch" -> tenant_id check failed. Cancel surfaces
+//	              ErrTenantMismatch.
+//	"claimed"  -> the sorted-set ZREM returned 0, meaning the
+//	              dispatch worker has ALREADY claimed ownership
+//	              and is committed to submitting. Cancel surfaces
+//	              ErrAlreadySent. Critically the companion key is
+//	              NOT deleted on this path — the worker still
+//	              needs the payload to dispatch.
+//	"ok"       -> Cancel owns the revocation; both keys are deleted.
+//
+// `decode_error` and `internal_error` are returned only when the
+// persisted payload is corrupt; both map to a wrapped error from
+// Cancel so the HTTP layer can surface a 5xx and operators can
+// follow up via the failed-sends list.
+//
+// Encoded as a const string so `redis.NewScript` compiles once at
+// NewService time and EVALSHA wins on every call.
+const cancelLua = `
+local raw = redis.call("GET", KEYS[1])
+if not raw or raw == false or raw == "" then
+  return "missing"
+end
+local ok, decoded = pcall(cjson.decode, raw)
+if not ok or type(decoded) ~= "table" then
+  return "decode_error"
+end
+if decoded.tenant_id ~= ARGV[1] then
+  return "mismatch"
+end
+local removed = redis.call("ZREM", KEYS[2], ARGV[2])
+if removed == 0 then
+  return "claimed"
+end
+redis.call("DEL", KEYS[1])
+return "ok"
+`
 
 // Config configures the Service. The zero value of every field
 // triggers a documented default.
@@ -193,14 +258,27 @@ func NewService(cfg Config) (*Service, error) {
 	if now == nil {
 		now = time.Now
 	}
-	return &Service{
+	s := &Service{
 		client:   cfg.Client,
 		logger:   logger,
 		delay:    delay,
 		maxDelay: maxDelay,
 		ttlSlack: ttlSlack,
 		now:      now,
-	}, nil
+	}
+	s.ensureCancelScript()
+	return s, nil
+}
+
+// ensureCancelScript compiles `cancelLua` exactly once across the
+// lifetime of the Service. sync.Once also gives us happens-before
+// for the `cancelScript` write so subsequent concurrent callers
+// observe the compiled handle without a data race even when the
+// Service was built via the struct literal in tests.
+func (s *Service) ensureCancelScript() {
+	s.cancelScriptOnce.Do(func() {
+		s.cancelScript = redis.NewScript(cancelLua)
+	})
 }
 
 // Delay returns the configured hold window. Exposed so the proxy
@@ -309,10 +387,21 @@ func (s *Service) Get(ctx context.Context, id string) (*PendingSend, error) {
 }
 
 // Cancel removes the pending send. Verifies tenant ownership
-// first to prevent cross-tenant leaks.
+// AND revokes the dispatch claim atomically via a Lua script —
+// the verify, ZREM, and companion-DEL all execute as a single
+// Valkey command. Without this atomicity the cancel path races
+// the dispatch worker: a worker could ZREM-claim ownership
+// between Cancel's GET and Cancel's DEL+ZREM pipeline, dispatch
+// the email to Stalwart, while Cancel still returned nil — the
+// user would see "cancelled" but the message would already be in
+// flight. See the cancelLua doc comment for the protocol.
 //
-// Returns ErrAlreadySent when the key is gone (worker has
-// already dispatched, or the user is double-clicking).
+// Returns ErrAlreadySent when (a) the companion key is gone
+// (worker has already dispatched, TTL fired, or the caller is
+// double-clicking), OR (b) the dispatch worker has just claimed
+// ownership via its own ZREM and is committed to submitting. In
+// both cases Cancel cannot honor the request and the HTTP layer
+// surfaces 410 Gone.
 func (s *Service) Cancel(ctx context.Context, id, tenantID string) error {
 	if strings.TrimSpace(id) == "" {
 		return ErrNotFound
@@ -320,27 +409,30 @@ func (s *Service) Cancel(ctx context.Context, id, tenantID string) error {
 	if strings.TrimSpace(tenantID) == "" {
 		return errors.New("undosend.Cancel: tenantID is required")
 	}
-	ps, err := s.readByID(ctx, id)
+	s.ensureCancelScript()
+	raw, err := s.cancelScript.Run(
+		ctx,
+		s.client,
+		[]string{companionKey(id), sortedSetKey},
+		tenantID,
+		id,
+	).Result()
 	if err != nil {
-		if errors.Is(err, ErrNotFound) {
-			return ErrAlreadySent
-		}
-		return err
+		return fmt.Errorf("undosend.Cancel: eval: %w", err)
 	}
-	if ps.TenantID != tenantID {
+	result, _ := raw.(string)
+	switch result {
+	case "ok":
+		return nil
+	case "missing", "claimed":
+		return ErrAlreadySent
+	case "mismatch":
 		return ErrTenantMismatch
+	case "decode_error":
+		return fmt.Errorf("undosend.Cancel: corrupt payload for id=%s", id)
+	default:
+		return fmt.Errorf("undosend.Cancel: unexpected script result %q", result)
 	}
-	// Best-effort: delete the companion key AND remove from the
-	// sorted set. We don't return on a partial failure because
-	// the TTL on the companion key is the eventual-consistency
-	// safety net.
-	pipe := s.client.TxPipeline()
-	pipe.Del(ctx, companionKey(id))
-	pipe.ZRem(ctx, sortedSetKey, id)
-	if _, err := pipe.Exec(ctx); err != nil {
-		return fmt.Errorf("undosend.Cancel: remove keys: %w", err)
-	}
-	return nil
 }
 
 func (s *Service) readByID(ctx context.Context, id string) (*PendingSend, error) {

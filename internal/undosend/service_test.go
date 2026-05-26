@@ -164,6 +164,78 @@ func TestCancel_MissingReturnsAlreadySent(t *testing.T) {
 	}
 }
 
+// TestCancel_RacingWorkerClaimYieldsAlreadySent pins the TOCTOU
+// safety property of the Lua-atomic Cancel path: when the worker
+// has just ZREM'd the sorted-set entry (the protocol's
+// ownership-grab signal), a subsequent Cancel call against the
+// still-present companion key MUST return ErrAlreadySent and MUST
+// NOT delete the companion. The pre-Lua implementation would
+// happily DEL the companion out from under the worker, leaving
+// the worker with nothing to dispatch even though it had won the
+// race \u2014 OR, more dangerously, would return nil after the worker
+// had already dispatched, telling the user "cancelled" while the
+// email was in flight.
+func TestCancel_RacingWorkerClaimYieldsAlreadySent(t *testing.T) {
+	svc, mr, _ := newTestService(t)
+	ctx := context.Background()
+	ps, err := svc.Hold(ctx, HoldInput{
+		TenantID:          "tenant-a",
+		KChatUserID:       "kchat-a",
+		StalwartAccountID: "acct-a",
+		EmailID:           "email-1",
+		SubmissionPayload: []byte(`{"emailId":"email-1"}`),
+	})
+	if err != nil {
+		t.Fatalf("Hold: %v", err)
+	}
+	// Simulate the worker winning the dispatch race: it ZREMs
+	// the sorted-set entry first, taking ownership.
+	owned, err := svc.claim(ctx, ps.ID)
+	if err != nil || !owned {
+		t.Fatalf("worker claim: owned=%v err=%v", owned, err)
+	}
+	// Cancel runs after the worker's ZREM but the companion key
+	// is still present (the worker hasn't dispatched / cleaned up
+	// yet). The script must report "claimed" and Cancel must
+	// surface ErrAlreadySent without deleting the payload.
+	if err := svc.Cancel(ctx, ps.ID, "tenant-a"); !errors.Is(err, ErrAlreadySent) {
+		t.Fatalf("Cancel after worker claim = %v, want ErrAlreadySent", err)
+	}
+	if !mr.Exists(companionKey(ps.ID)) {
+		t.Fatalf("companion key should still exist so the worker can dispatch; got deleted")
+	}
+}
+
+// TestCancel_TenantMismatchDoesNotZRem pins that a cross-tenant
+// cancel attempt cannot poison the sorted-set entry of another
+// tenant's pending send. Without atomicity, a stale tenant-mismatch
+// path was harmless because the pipeline never ran; with the Lua
+// script we explicitly check the mismatch BEFORE the ZREM so the
+// behaviour is the same \u2014 we want a regression test that pins it.
+func TestCancel_TenantMismatchDoesNotZRem(t *testing.T) {
+	svc, mr, _ := newTestService(t)
+	ctx := context.Background()
+	ps, err := svc.Hold(ctx, HoldInput{
+		TenantID:          "tenant-a",
+		KChatUserID:       "kchat-a",
+		StalwartAccountID: "acct-a",
+		EmailID:           "email-1",
+		SubmissionPayload: []byte(`{"emailId":"email-1"}`),
+	})
+	if err != nil {
+		t.Fatalf("Hold: %v", err)
+	}
+	if err := svc.Cancel(ctx, ps.ID, "tenant-OTHER"); !errors.Is(err, ErrTenantMismatch) {
+		t.Fatalf("Cancel cross-tenant = %v, want ErrTenantMismatch", err)
+	}
+	if !mr.Exists(companionKey(ps.ID)) {
+		t.Fatalf("companion key deleted on cross-tenant cancel \u2014 must not be touched")
+	}
+	if _, err := mr.ZScore(sortedSetKey, ps.ID); err != nil {
+		t.Fatalf("sorted set entry removed on cross-tenant cancel: %v", err)
+	}
+}
+
 func TestGet_ReadsBackPayload(t *testing.T) {
 	svc, _, _ := newTestService(t)
 	ctx := context.Background()

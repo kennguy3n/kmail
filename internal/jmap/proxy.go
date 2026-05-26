@@ -727,7 +727,12 @@ type sendInterceptorRef struct{ v SendInterceptor }
 
 // SetSendInterceptor swaps in (or clears) the Undo-Send hook at
 // runtime. Safe for concurrent use with `ServeHTTP`. Passing nil
-// disables interception.
+// disables interception entirely — the atomic.Pointer is the sole
+// source of truth for the interceptor, so a Store(nil) call wins
+// even if `ProxyConfig.SendInterceptor` was wired at NewProxy
+// time (the cfg value is migrated into the atomic on construction
+// so there is no orphaned fallback path that could resurrect a
+// disabled hook).
 //
 // Wiring callers should call this exactly once at startup, before
 // the HTTP listener starts accepting client traffic, so the
@@ -740,12 +745,14 @@ func (p *Proxy) SetSendInterceptor(s SendInterceptor) {
 	p.sendInterceptor.Store(&sendInterceptorRef{v: s})
 }
 
+// loadSendInterceptor returns the currently-wired interceptor or
+// nil if none. The atomic.Pointer is the single source of truth;
+// `ProxyConfig.SendInterceptor` is migrated into the atomic at
+// NewProxy time so there is no separate cfg fallback for
+// `SetSendInterceptor(nil)` to leak past.
 func (p *Proxy) loadSendInterceptor() SendInterceptor {
 	if ref := p.sendInterceptor.Load(); ref != nil {
 		return ref.v
-	}
-	if p.cfg.SendInterceptor != nil {
-		return p.cfg.SendInterceptor
 	}
 	return nil
 }
@@ -879,6 +886,18 @@ func NewProxy(cfg ProxyConfig) (*Proxy, error) {
 		target:  target,
 		stripPR: "/jmap",
 		breaker: breaker,
+	}
+	// Migrate the static `ProxyConfig.SendInterceptor` (if any) into
+	// the atomic so `loadSendInterceptor` has a single source of
+	// truth. Without this, `SetSendInterceptor(nil)` would silently
+	// fall back to the cfg-wired interceptor at later requests and
+	// the "Passing nil disables interception" contract on
+	// SetSendInterceptor would be a lie. In production the cfg field
+	// is never set (main.go always wires via SetSendInterceptor) so
+	// this is also a no-op there; the migration exists so test code
+	// and any future cfg-wiring caller share the same semantics.
+	if cfg.SendInterceptor != nil {
+		p.sendInterceptor.Store(&sendInterceptorRef{v: cfg.SendInterceptor})
 	}
 	base := http.DefaultTransport
 	if cfg.TLS != nil {

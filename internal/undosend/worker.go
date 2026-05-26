@@ -252,9 +252,12 @@ func (w *DispatchWorker) handleErr(ctx context.Context, ps *PendingSend, dispatc
 		}
 		return
 	}
-	// Exponential-ish backoff: 5s, 15s. We don't actually need the
-	// full Webhook-style 30min ladder here because the user is
-	// staring at the undo banner — long retries make the UX worse.
+	// Quadratic-ish backoff: 5s after attempt 1, 20s after attempt 2,
+	// then capped at 30s (`5 * attempts^2`, clamped). Attempts 3+ never
+	// reach this path because the maxAttempts gate above moves them to
+	// the dead-letter list. We don't need the full Webhook-style 30min
+	// ladder here because the user is staring at the undo banner —
+	// long retries make the UX worse.
 	backoff := time.Duration(5*ps.Attempts*ps.Attempts) * time.Second
 	if backoff > 30*time.Second {
 		backoff = 30 * time.Second
