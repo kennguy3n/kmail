@@ -306,6 +306,12 @@ func TestCreate_PersistFailureRevertsByRestoringOriginalsAndDroppingSnoozed(t *t
 	if v, has := patch["mailboxIds/mb-snoozed"]; !has || v != any(nil) {
 		t.Errorf("revert must DROP mb-snoozed (set to nil), got %v (has=%v)", v, has)
 	}
+	// Revert is restoring pre-snooze state, NOT waking the user
+	// (the snoozed-folder UI was never shown), so $seen must be
+	// left untouched.
+	if _, has := patch["keywords/$seen"]; has {
+		t.Errorf("revert must NOT touch keywords/$seen; got %v", patch["keywords/$seen"])
+	}
 }
 
 func TestCreate_InvalidJSONReturns400(t *testing.T) {
@@ -388,11 +394,11 @@ func TestWakeNow_HappyPath(t *testing.T) {
 	if len(fm.cancels) != 1 || fm.cancels[0] != "s-1" {
 		t.Fatalf("expected service.Cancel(s-1), got %v", fm.cancels)
 	}
-	// Verify the patch shape: originals restored, snoozed dropped,
-	// $seen cleared because MarkUnreadOnWake defaulted true on the
-	// fixture row's zero value... wait actually MarkUnreadOnWake
-	// is FALSE on the zero value. The wake patch from the handler
-	// honours the row's flag; let's verify mailbox parts only.
+	// Verify the patch shape: originals restored, snoozed dropped.
+	// The fixture row has MarkUnreadOnWake=false (zero value), so
+	// `keywords/$seen` MUST NOT be present in the patch. The
+	// happy-path test for MarkUnreadOnWake=true lives in
+	// TestWakeNow_HonoursMarkUnreadOnWake below.
 	args, _ := fd.requests[0].MethodCalls[0][1].(map[string]any)
 	update, _ := args["update"].(map[string]any)
 	patch, _ := update["email-1"].(map[string]any)
@@ -401,6 +407,62 @@ func TestWakeNow_HappyPath(t *testing.T) {
 	}
 	if patch["mailboxIds/mb-snoozed"] != any(nil) {
 		t.Errorf("expected mb-snoozed dropped on wake, got %v", patch["mailboxIds/mb-snoozed"])
+	}
+	if _, has := patch["keywords/$seen"]; has {
+		t.Errorf("expected NO $seen keyword change when MarkUnreadOnWake=false; got %v", patch["keywords/$seen"])
+	}
+}
+
+// TestWakeNow_HonoursMarkUnreadOnWake pins the BUG_pr-review-job-cba…0001
+// fix: the DELETE /api/v1/snoozed/{id} early-wake path must
+// emit the SAME JMAP patch the worker would have emitted at the
+// scheduled wake-time. The worker clears `keywords/$seen` via
+// buildWakePatch when MarkUnreadOnWake=true (worker.go:256-259);
+// the handler must honour the same flag so an early wake resurfaces
+// the email as new — otherwise the user sees the snoozed email
+// back in their inbox but still marked as read, defeating the
+// whole point of snooze.
+func TestWakeNow_HonoursMarkUnreadOnWake(t *testing.T) {
+	fm := &fakeManager{
+		getResult: &Snooze{
+			ID:                 "s-1",
+			TenantID:           "tenant-a",
+			KChatUserID:        "kchat-a",
+			StalwartAccountID:  "acct-a",
+			EmailID:            "email-1",
+			OriginalMailboxIDs: json.RawMessage(`{"mb-inbox":true}`),
+			SnoozedMailboxID:   "mb-snoozed",
+			Status:             StatusSnoozed,
+			MarkUnreadOnWake:   true,
+		},
+	}
+	fd := &fakeDispatcher{}
+	router := newRouterForTest(fm, fd)
+
+	w := httptest.NewRecorder()
+	r := handlerRequest("DELETE", "/api/v1/snoozed/s-1", "")
+	router.ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s, want 200", w.Code, w.Body.String())
+	}
+	args, _ := fd.requests[0].MethodCalls[0][1].(map[string]any)
+	update, _ := args["update"].(map[string]any)
+	patch, _ := update["email-1"].(map[string]any)
+	if patch["mailboxIds/mb-inbox"] != any(true) {
+		t.Errorf("expected mb-inbox restored on wake, got %v", patch["mailboxIds/mb-inbox"])
+	}
+	if patch["mailboxIds/mb-snoozed"] != any(nil) {
+		t.Errorf("expected mb-snoozed dropped on wake, got %v", patch["mailboxIds/mb-snoozed"])
+	}
+	// The load-bearing assertion: $seen MUST be cleared so the
+	// email resurfaces as new.
+	v, has := patch["keywords/$seen"]
+	if !has {
+		t.Errorf("expected keywords/$seen=nil in patch when MarkUnreadOnWake=true; missing entirely")
+	}
+	if v != any(nil) {
+		t.Errorf("expected keywords/$seen=nil, got %v", v)
 	}
 }
 

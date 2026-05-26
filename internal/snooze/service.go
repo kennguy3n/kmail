@@ -536,37 +536,73 @@ func (s *Service) claimDue(ctx context.Context) (*Snooze, error) {
 // markUnsnoozed transitions a row to `unsnoozed` after a
 // successful wake. Subsequent ticks skip the row because the
 // partial index excludes non-`snoozed` rows.
+//
+// A 0-row update here is operationally interesting: it means
+// either (a) a user cancelled the row between this worker's
+// claimDue and markUnsnoozed (Cancel won the race), or (b) a
+// second worker replica already finished the wake. Both are
+// safe — the guarded `AND status = 'snoozed'` clause prevents
+// invalid state transitions — but operators want a log line to
+// correlate the rare race scenario. Mirrors
+// `scheduledsend.Service.markDispatched`.
 func (s *Service) markUnsnoozed(ctx context.Context, id string, wokenAt time.Time) error {
-	_, err := s.pool.Exec(ctx, `
+	tag, err := s.pool.Exec(ctx, `
 		UPDATE snoozed_emails
 		SET status = 'unsnoozed', woken_at = $2, last_error = ''
 		WHERE id = $1::uuid AND status = 'snoozed'
 	`, id, wokenAt.UTC())
-	return err
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		s.logger.Printf("snooze: markUnsnoozed no-op (likely cancelled or already woken by peer): id=%s", id)
+	}
+	return nil
 }
 
 // markFailed transitions a row to `failed` after the retry cap
 // has been hit. Operators inspect the dead-letter rows via the
 // admin console.
+//
+// A 0-row update here is operationally interesting (same
+// reasoning as markUnsnoozed) — a user cancel can race the
+// worker's terminal failure. Mirrors
+// `scheduledsend.Service.markFailed`.
 func (s *Service) markFailed(ctx context.Context, id, lastErr string) error {
-	_, err := s.pool.Exec(ctx, `
+	tag, err := s.pool.Exec(ctx, `
 		UPDATE snoozed_emails
 		SET status = 'failed', last_error = $2
 		WHERE id = $1::uuid AND status = 'snoozed'
 	`, id, lastErr)
-	return err
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		s.logger.Printf("snooze: markFailed no-op (likely cancelled by user between claim and terminal failure): id=%s", id)
+	}
+	return nil
 }
 
 // scheduleRetry pushes `next_retry_at` into the future without
 // moving the row out of `snoozed`. Used by the worker after a
 // transient Stalwart failure.
+//
+// A 0-row update means the worker's retry write lost to a Cancel
+// commit; the row is correctly in `cancelled` and the worker
+// won't re-claim it (the partial index excludes non-`snoozed`).
 func (s *Service) scheduleRetry(ctx context.Context, id string, nextRetryAt time.Time, lastErr string) error {
-	_, err := s.pool.Exec(ctx, `
+	tag, err := s.pool.Exec(ctx, `
 		UPDATE snoozed_emails
 		SET next_retry_at = $2, last_error = $3
 		WHERE id = $1::uuid AND status = 'snoozed'
 	`, id, nextRetryAt.UTC(), lastErr)
-	return err
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		s.logger.Printf("snooze: scheduleRetry no-op (likely cancelled): id=%s", id)
+	}
+	return nil
 }
 
 // rowScanner is the slice of pgx.Row used by scanRow so the

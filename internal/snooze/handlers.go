@@ -176,7 +176,7 @@ func (h *Handlers) create(w http.ResponseWriter, r *http.Request) {
 		r.Context(),
 		tenantID, kchatUserID, accountID, body.EmailID,
 		body.OriginalMailboxIDs, body.SnoozedMailboxID,
-		false,
+		false, false,
 	); err != nil {
 		// Stalwart's verbatim error message is logged at
 		// `applyMove` and is not re-surfaced to the client to
@@ -205,20 +205,22 @@ func (h *Handlers) create(w http.ResponseWriter, r *http.Request) {
 		// original mailbox set as `originals` AND the snoozed
 		// folder as `snoozedMailboxID`, with
 		// `restoreOriginals=true` so `applyMove` adds the
-		// originals back and drops the snoozed folder. If the
-		// revert itself fails we still surface the original
-		// error to the client AND log the orphan state at
-		// ERROR level so an operator can find the email in
-		// the user's Snoozed folder and patch it back
-		// manually. Without the log the orphan would only be
-		// recoverable via the user noticing a phantom-snoozed
-		// email — silent data loss from an operations
-		// standpoint.
+		// originals back and drops the snoozed folder. Pass
+		// `markUnreadOnWake=false` here — this is restoring
+		// pre-snooze state, NOT 'waking' the user, so we
+		// don't touch `keywords/$seen`. If the revert itself
+		// fails we still surface the original error to the
+		// client AND log the orphan state at ERROR level so
+		// an operator can find the email in the user's
+		// Snoozed folder and patch it back manually. Without
+		// the log the orphan would only be recoverable via
+		// the user noticing a phantom-snoozed email — silent
+		// data loss from an operations standpoint.
 		if revertErr := h.applyMove(
 			r.Context(),
 			tenantID, kchatUserID, accountID, body.EmailID,
 			body.OriginalMailboxIDs, body.SnoozedMailboxID,
-			true,
+			true, false,
 		); revertErr != nil {
 			h.logger.Printf(
 				"snooze: ORPHAN — email moved to snoozed folder but DB persist failed AND revert failed; "+
@@ -325,11 +327,20 @@ func (h *Handlers) wakeNow(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "decode mailbox ids"})
 		return
 	}
+	// The DELETE path is 'unsnooze now': it applies the same
+	// JMAP patch the worker would have applied at wake-time, so
+	// it must honour the row's `MarkUnreadOnWake` flag to keep
+	// behaviour symmetric. Without this, the early-wake path
+	// would silently skip the mark-as-unread step that the
+	// worker performs at the scheduled wake-time, defeating the
+	// purpose of snooze resurfacing emails as new — the user
+	// would see the email back in their inbox but still marked
+	// as read. (Bug found by Devin Review.)
 	if err := h.applyMove(
 		r.Context(),
 		row.TenantID, row.KChatUserID, row.StalwartAccountID, row.EmailID,
 		orig, row.SnoozedMailboxID,
-		true,
+		true, row.MarkUnreadOnWake,
 	); err != nil {
 		// As in `create`: don't echo Stalwart's verbatim
 		// error to the client — log it, return a generic 502.
@@ -357,12 +368,21 @@ func (h *Handlers) wakeNow(w http.ResponseWriter, r *http.Request) {
 // `restoreOriginals=false` produces the snooze patch (drop the
 // originals, add the snoozed folder; $seen is left alone — the
 // user might have already opened the email).
+//
+// `markUnreadOnWake` is only honoured on the wake patch (it has
+// no meaning when entering the snoozed folder). When true AND
+// restoreOriginals=true the patch includes `keywords/$seen=nil`
+// so the email resurfaces as new — matching the worker's
+// `buildWakePatch` behaviour at the scheduled wake-time. The
+// create/revert path passes false here because the revert is
+// restoring pre-snooze state, not waking.
 func (h *Handlers) applyMove(
 	ctx context.Context,
 	tenantID, kchatUserID, accountID, emailID string,
 	originals map[string]bool,
 	snoozedMailboxID string,
 	restoreOriginals bool,
+	markUnreadOnWake bool,
 ) error {
 	patch := make(map[string]any, len(originals)+2)
 	if restoreOriginals {
@@ -374,6 +394,11 @@ func (h *Handlers) applyMove(
 		}
 		if snoozedMailboxID != "" {
 			patch["mailboxIds/"+snoozedMailboxID] = nil
+		}
+		if markUnreadOnWake {
+			// Clear the seen flag so the email shows as new
+			// on re-surface. Uses the JMAP keyword-patch syntax.
+			patch["keywords/$seen"] = nil
 		}
 	} else {
 		// Snoozing: drop every original, add the snoozed
