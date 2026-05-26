@@ -114,6 +114,20 @@ export default function Compose() {
   const [remainingMs, setRemainingMs] = useState(0);
   const [isCancelling, setCancelling] = useState(false);
 
+  // Scheduled Send (WS4) state. `sendMode` toggles the Send
+  // button between immediate dispatch and the schedule picker.
+  // The picker uses a single datetime-local input — converting to
+  // a Date for the BFF header is handled at submit time. When
+  // the BFF accepts the schedule it returns row id + resolved
+  // send-at; we surface those in `scheduledConfirm` so the user
+  // gets a "scheduled for X" toast plus a link to the page.
+  const [sendMode, setSendMode] = useState<"now" | "schedule">("now");
+  const [scheduleAtLocal, setScheduleAtLocal] = useState<string>(() =>
+    defaultScheduleLocalISO(),
+  );
+  const [scheduledConfirm, setScheduledConfirm] =
+    useState<{ id: string; sendAt: Date } | null>(null);
+
   useEffect(() => {
     return () => {
       if (navTimerRef.current) {
@@ -246,10 +260,34 @@ export default function Compose() {
     e.preventDefault();
     setError(null);
     setSuccessMessage(null);
+    setScheduledConfirm(null);
     const draft = buildDraft(true);
     if (!draft) {
       setError("Please supply at least one recipient and a sender identity.");
       return;
+    }
+    let scheduleAtDate: Date | null = null;
+    if (sendMode === "schedule") {
+      const d = parseLocalDatetime(scheduleAtLocal);
+      if (!d) {
+        setError("Please pick a valid date and time to schedule the send.");
+        return;
+      }
+      // Mirror the BFF MinScheduleHorizon (1 minute). Clicking
+      // "Send" with a past or imminent time would otherwise hit
+      // a 400 from the proxy hook; catching it client-side gives
+      // a friendlier message.
+      if (d.getTime() - Date.now() < 60_000) {
+        setError("Scheduled time must be at least 1 minute in the future.");
+        return;
+      }
+      scheduleAtDate = d;
+      if (privacyMode === "confidential-send") {
+        setError(
+          "Confidential Send can't be combined with Scheduled Send yet — uncheck the schedule or change the privacy mode.",
+        );
+        return;
+      }
     }
     setSending(true);
     try {
@@ -265,9 +303,27 @@ export default function Compose() {
       // existing flow for now and revisit when Compose adds a
       // schedule-time picker.
       const sendResult = await jmapClient.sendEmail(draft, savedDraftId, {
-        undoSend: privacyMode !== "confidential-send",
+        undoSend: privacyMode !== "confidential-send" && !scheduleAtDate,
+        scheduleAt: scheduleAtDate ?? undefined,
       });
       setSavedDraftId(null);
+
+      if (sendResult.scheduledSendId && sendResult.scheduledSendAt) {
+        // BFF persisted the submission to Postgres; the worker
+        // will dispatch it at send_at. Render a confirmation
+        // toast that links the user to the Scheduled Sends page
+        // where they can cancel/inspect the row.
+        setScheduledConfirm({
+          id: sendResult.scheduledSendId,
+          sendAt: sendResult.scheduledSendAt,
+        });
+        setSuccessMessage(null);
+        // Don't auto-navigate — leave the compose page so the
+        // user can confirm what was scheduled before moving on.
+        // The toast itself carries a link to /mail/scheduled.
+        setSending(false);
+        return;
+      }
 
       if (privacyMode === "confidential-send") {
         // For Confidential Send we *additionally* mint a one-time
@@ -404,6 +460,26 @@ export default function Compose() {
           >
             {isCancelling ? "Cancelling…" : "Undo"}
           </button>
+        </div>
+      )}
+      {scheduledConfirm && (
+        <div
+          style={styles.scheduledBanner}
+          role="status"
+          aria-live="polite"
+          data-testid="scheduled-send-confirm"
+        >
+          <span>
+            Scheduled for{" "}
+            {scheduledConfirm.sendAt.toLocaleString()}.{" "}
+            <button
+              type="button"
+              onClick={() => navigate("/mail/scheduled")}
+              style={styles.linkButton}
+            >
+              View scheduled sends
+            </button>
+          </span>
         </div>
       )}
       <form onSubmit={handleSend} style={styles.form}>
@@ -645,9 +721,36 @@ export default function Compose() {
               opacity: canSubmit ? 1 : 0.6,
               cursor: canSubmit ? "pointer" : "not-allowed",
             }}
+            data-testid="compose-send"
           >
-            {isSending ? "Sending…" : "Send"}
+            {isSending
+              ? "Sending…"
+              : sendMode === "schedule"
+                ? "Schedule send"
+                : "Send"}
           </button>
+          <select
+            aria-label="Send timing"
+            value={sendMode}
+            onChange={(e) => setSendMode(e.target.value as "now" | "schedule")}
+            disabled={isSending}
+            style={styles.secondarySelect}
+            data-testid="compose-send-mode"
+          >
+            <option value="now">Send now</option>
+            <option value="schedule">Schedule for later</option>
+          </select>
+          {sendMode === "schedule" && (
+            <input
+              type="datetime-local"
+              aria-label="Schedule send for"
+              value={scheduleAtLocal}
+              onChange={(e) => setScheduleAtLocal(e.target.value)}
+              disabled={isSending}
+              style={styles.scheduleInput}
+              data-testid="compose-schedule-at"
+            />
+          )}
           <button
             type="button"
             onClick={handleSaveDraft}
@@ -804,6 +907,44 @@ function errorMessage(err: unknown): string {
   return "Unknown error";
 }
 
+/**
+ * Compute the default value for the schedule-send
+ * `<input type="datetime-local">`. We pick "one hour from now,
+ * rounded down to the nearest minute" so the picker opens at a
+ * sensible time without forcing the user to clear today's stale
+ * value. The local-ISO format (`YYYY-MM-DDTHH:mm`, no timezone)
+ * is what `datetime-local` expects.
+ */
+function defaultScheduleLocalISO(): string {
+  const d = new Date(Date.now() + 60 * 60 * 1000);
+  d.setSeconds(0, 0);
+  return formatLocalISO(d);
+}
+
+function formatLocalISO(d: Date): string {
+  const pad = (n: number): string => n.toString().padStart(2, "0");
+  const year = d.getFullYear();
+  const month = pad(d.getMonth() + 1);
+  const day = pad(d.getDate());
+  const hour = pad(d.getHours());
+  const minute = pad(d.getMinutes());
+  return `${year}-${month}-${day}T${hour}:${minute}`;
+}
+
+/**
+ * Parse the value emitted by `<input type="datetime-local">`
+ * (YYYY-MM-DDTHH:mm) into a Date interpreted in the local
+ * timezone. Returns `null` if the string is malformed or the
+ * resulting Date is invalid — the caller surfaces a friendly
+ * error rather than firing a bad request at the BFF.
+ */
+function parseLocalDatetime(raw: string): Date | null {
+  if (!raw) return null;
+  const d = new Date(raw);
+  if (Number.isNaN(d.getTime())) return null;
+  return d;
+}
+
 const styles: Record<string, React.CSSProperties> = {
   root: {
     padding: "1rem",
@@ -931,5 +1072,39 @@ const styles: Record<string, React.CSSProperties> = {
     borderRadius: "0.25rem",
     cursor: "pointer",
     fontWeight: 600,
+  },
+  scheduledBanner: {
+    display: "flex",
+    alignItems: "center",
+    gap: "0.75rem",
+    padding: "0.5rem 0.75rem",
+    background: "#e0f2fe",
+    color: "#0c4a6e",
+    borderRadius: "0.25rem",
+    marginBottom: "0.5rem",
+  },
+  linkButton: {
+    background: "transparent",
+    border: "none",
+    padding: 0,
+    color: "#0369a1",
+    cursor: "pointer",
+    textDecoration: "underline",
+    font: "inherit",
+  },
+  secondarySelect: {
+    padding: "0.5rem 0.75rem",
+    fontSize: "0.9rem",
+    background: "#fff",
+    border: "1px solid #d1d5db",
+    borderRadius: "0.25rem",
+    color: "#374151",
+  },
+  scheduleInput: {
+    padding: "0.5rem 0.75rem",
+    fontSize: "0.9rem",
+    border: "1px solid #d1d5db",
+    borderRadius: "0.25rem",
+    color: "#111827",
   },
 };

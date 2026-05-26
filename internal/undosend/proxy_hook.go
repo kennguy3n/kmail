@@ -383,7 +383,18 @@ func parseJMAPRequest(body []byte) (jmap.JmapRequest, error) {
 func writeJMAPResponse(w http.ResponseWriter, resp *jmap.JmapResponse, status int) (bool, error) {
 	buf, err := json.Marshal(resp)
 	if err != nil {
-		return false, err
+		// The Stalwart draft is already minted by the time this
+		// helper is called. Returning (false, err) would let the
+		// proxy fall through to its ServeHTTP path and re-forward
+		// the FULL original body — producing a duplicate draft
+		// AND an immediate submission. The intercepted=true
+		// invariant documented in Hook.Intercept requires us to
+		// absorb the response side regardless. http.Error writes
+		// a text/plain 500 so the client gets a clear failure
+		// envelope and the proxy doesn't double-write headers.
+		// Mirrors the same fix in `scheduledsend/proxy_hook.go`.
+		http.Error(w, "undosend: response marshal failed", http.StatusInternalServerError)
+		return true, err
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)

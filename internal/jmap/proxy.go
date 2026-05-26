@@ -146,6 +146,51 @@ type SendInterceptor interface {
 	Intercept(ctx context.Context, w http.ResponseWriter, r *http.Request, body []byte) (intercepted bool, err error)
 }
 
+// ChainSendInterceptors composes multiple SendInterceptors into
+// a single one. Each member is offered the request in order. The
+// first member that returns `intercepted=true` (or any non-nil
+// error) wins; subsequent members are not invoked.
+//
+// The chain is the architecturally clean way to register N
+// independent send hooks (Undo Send + Scheduled Send today;
+// future features tomorrow) without coupling them to each other.
+// Each hook is header-gated and self-contained, so the order
+// inside the chain only matters when a single request could
+// match more than one — in which case the first-registered hook
+// wins by design.
+func ChainSendInterceptors(hooks ...SendInterceptor) SendInterceptor {
+	filtered := make([]SendInterceptor, 0, len(hooks))
+	for _, h := range hooks {
+		if h != nil {
+			filtered = append(filtered, h)
+		}
+	}
+	if len(filtered) == 0 {
+		return nil
+	}
+	if len(filtered) == 1 {
+		return filtered[0]
+	}
+	return &chainedSendInterceptor{hooks: filtered}
+}
+
+type chainedSendInterceptor struct {
+	hooks []SendInterceptor
+}
+
+func (c *chainedSendInterceptor) Intercept(ctx context.Context, w http.ResponseWriter, r *http.Request, body []byte) (bool, error) {
+	for _, h := range c.hooks {
+		intercepted, err := h.Intercept(ctx, w, r, body)
+		if err != nil {
+			return intercepted, err
+		}
+		if intercepted {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // ClientTLSConfig configures the BFF→Stalwart mTLS transport.
 //
 // The expected layout in production is that cert-manager issues a
@@ -1149,14 +1194,24 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			if sendInterceptor != nil {
 				intercepted, err := sendInterceptor.Intercept(ctx, w, r.WithContext(ctx), body)
+				// `intercepted` is the source of truth for whether the
+				// hook (or its writeJMAPResponse helper) has already
+				// committed bytes to the ResponseWriter. We MUST honor
+				// it regardless of `err` — falling through after the
+				// hook wrote a response would have `p.rp.ServeHTTP`
+				// attempt a second WriteHeader and either panic or
+				// corrupt the connection. `err` is purely diagnostic
+				// past this point.
 				if err != nil {
-					p.logger.Printf("jmap proxy: send interceptor error tenant=%s err=%v", tenantID, err)
-					// Don't 5xx here unless the interceptor truly couldn't decide; we still let
-					// the request fall through to Stalwart so a transient Valkey blip can't break
-					// the send path entirely.
-				} else if intercepted {
+					p.logger.Printf("jmap proxy: send interceptor error tenant=%s err=%v intercepted=%v", tenantID, err, intercepted)
+				}
+				if intercepted {
 					return
 				}
+				// err != nil AND !intercepted means the hook decided
+				// not to handle the request but produced a diagnostic.
+				// Fall through to Stalwart so a transient Valkey /
+				// Postgres blip can't break the send path entirely.
 			}
 		}
 		r.Body = io.NopCloser(bytes.NewReader(body))

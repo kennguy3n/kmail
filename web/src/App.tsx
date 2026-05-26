@@ -7,6 +7,7 @@ import MessageView from "./pages/Mail/MessageView";
 import SharedInboxView from "./pages/Mail/SharedInboxView";
 import VaultView from "./pages/Mail/VaultView";
 import ProtectedFolderView from "./pages/Mail/ProtectedFolderView";
+import ScheduledSends from "./pages/Mail/ScheduledSends";
 import SecurePortal from "./pages/Mail/SecurePortal";
 import CalendarView from "./pages/Calendar/CalendarView";
 import EventCreate from "./pages/Calendar/EventCreate";
@@ -63,6 +64,7 @@ export default function App() {
         <Route path="mail/shared" element={<SharedInboxView />} />
         <Route path="mail/vault" element={<VaultView />} />
         <Route path="mail/protected-folders" element={<ProtectedFolderView />} />
+        <Route path="mail/scheduled" element={<ScheduledSends />} />
         <Route path="mail/:mailboxId/:emailId" element={<MessageView />} />
 
         <Route path="calendar" element={<CalendarView />} />
