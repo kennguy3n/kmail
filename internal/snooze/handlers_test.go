@@ -151,9 +151,16 @@ func handlerRequest(method, target, body string) *http.Request {
 	return r.WithContext(ctx)
 }
 
+// testNow is the fixed clock the handler test seam injects via
+// newHandlersWith. All test fixtures that produce a SnoozeUntil
+// must anchor relative to testNow (not wall-clock time.Now())
+// so the handler's horizon-check sees a value within
+// [MinSnoozeHorizon, MaxSnoozeHorizon] of its injected clock.
+var testNow = time.Unix(1_700_000_000, 0)
+
 func newRouterForTest(m manager, d dispatcher) *http.ServeMux {
 	mux := http.NewServeMux()
-	h := newHandlersWith(m, d, func() time.Time { return time.Unix(1_700_000_000, 0) })
+	h := newHandlersWith(m, d, func() time.Time { return testNow })
 	mux.HandleFunc("POST /api/v1/snooze", h.create)
 	mux.HandleFunc("GET /api/v1/snoozed", h.list)
 	mux.HandleFunc("GET /api/v1/snoozed/{id}", h.get)
@@ -162,7 +169,7 @@ func newRouterForTest(m manager, d dispatcher) *http.ServeMux {
 }
 
 func makeCreateBody() string {
-	until := time.Now().Add(2 * time.Hour).UTC().Format(time.RFC3339)
+	until := testNow.Add(2 * time.Hour).UTC().Format(time.RFC3339)
 	body := map[string]any{
 		"email_id":             "email-1",
 		"original_mailbox_ids": map[string]bool{"mb-inbox": true},
@@ -222,7 +229,7 @@ func TestCreate_RejectsSnoozedMailboxInOriginals(t *testing.T) {
 		"email_id":             "email-1",
 		"original_mailbox_ids": map[string]bool{"mb-snoozed": true, "mb-inbox": true},
 		"snoozed_mailbox_id":   "mb-snoozed",
-		"snooze_until":         time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+		"snooze_until":         testNow.Add(time.Hour).UTC().Format(time.RFC3339),
 	}
 	b, _ := json.Marshal(bodyMap)
 
@@ -311,6 +318,142 @@ func TestCreate_PersistFailureRevertsByRestoringOriginalsAndDroppingSnoozed(t *t
 	// left untouched.
 	if _, has := patch["keywords/$seen"]; has {
 		t.Errorf("revert must NOT touch keywords/$seen; got %v", patch["keywords/$seen"])
+	}
+}
+
+// TestCreate_HorizonTooShortFastFailsBeforeDispatch pins the
+// ANALYSIS_0002 fix: an out-of-horizon snooze_until must 400
+// before the JMAP forward-move dispatches, so a clearly-invalid
+// request doesn't burn two Stalwart round-trips (move + revert).
+func TestCreate_HorizonTooShortFastFailsBeforeDispatch(t *testing.T) {
+	fm := &fakeManager{}
+	fd := &fakeDispatcher{}
+	router := newRouterForTest(fm, fd)
+
+	bodyMap := map[string]any{
+		"email_id":             "email-1",
+		"original_mailbox_ids": map[string]bool{"mb-inbox": true},
+		"snoozed_mailbox_id":   "mb-snoozed",
+		// 30s in the future — below MinSnoozeHorizon (1m).
+		"snooze_until": testNow.Add(30 * time.Second).UTC().Format(time.RFC3339),
+	}
+	b, _ := json.Marshal(bodyMap)
+	w := httptest.NewRecorder()
+	r := handlerRequest("POST", "/api/v1/snooze", string(b))
+	router.ServeHTTP(w, r)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body=%s, want 400 for sub-min horizon", w.Code, w.Body.String())
+	}
+	if fd.calls != 0 {
+		t.Fatalf("expected ZERO dispatches when horizon validation rejects up-front, got %d", fd.calls)
+	}
+	if len(fm.created) != 0 {
+		t.Fatalf("expected ZERO service.Snooze calls when horizon validation rejects up-front, got %d", len(fm.created))
+	}
+}
+
+// TestCreate_HorizonTooFarFastFailsBeforeDispatch is the upper-
+// bound twin of TestCreate_HorizonTooShortFastFailsBeforeDispatch.
+func TestCreate_HorizonTooFarFastFailsBeforeDispatch(t *testing.T) {
+	fm := &fakeManager{}
+	fd := &fakeDispatcher{}
+	router := newRouterForTest(fm, fd)
+
+	bodyMap := map[string]any{
+		"email_id":             "email-1",
+		"original_mailbox_ids": map[string]bool{"mb-inbox": true},
+		"snoozed_mailbox_id":   "mb-snoozed",
+		// 366 days out — beyond MaxSnoozeHorizon (365d).
+		"snooze_until": testNow.Add(366 * 24 * time.Hour).UTC().Format(time.RFC3339),
+	}
+	b, _ := json.Marshal(bodyMap)
+	w := httptest.NewRecorder()
+	r := handlerRequest("POST", "/api/v1/snooze", string(b))
+	router.ServeHTTP(w, r)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body=%s, want 400 for above-max horizon", w.Code, w.Body.String())
+	}
+	if fd.calls != 0 {
+		t.Fatalf("expected ZERO dispatches when horizon validation rejects up-front, got %d", fd.calls)
+	}
+}
+
+// TestCreate_DuplicateSnoozeSkipsRevert pins the ANALYSIS_0001
+// fix: when Snooze() returns ErrAlreadySnoozed, the prior snooze
+// is already in the Snoozed folder, so the forward JMAP patch
+// was a no-op. A revert here would undo the FIRST snooze's JMAP
+// state. The handler must skip the revert dispatch entirely.
+func TestCreate_DuplicateSnoozeSkipsRevert(t *testing.T) {
+	fm := &fakeManager{snoozeErr: ErrAlreadySnoozed}
+	fd := &fakeDispatcher{}
+	router := newRouterForTest(fm, fd)
+
+	w := httptest.NewRecorder()
+	r := handlerRequest("POST", "/api/v1/snooze", makeCreateBody())
+	router.ServeHTTP(w, r)
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 for duplicate active snooze", w.Code)
+	}
+	// One dispatch expected: the forward move-to-snoozed. The
+	// revert MUST NOT fire (would undo the first snooze).
+	if fd.calls != 1 {
+		t.Fatalf("expected exactly 1 dispatch (forward only, no revert), got %d", fd.calls)
+	}
+}
+
+// TestWakeNow_AlreadyAwakeReturns200 pins the BUG_0002 fix: if
+// the worker beat the user's DELETE (ErrAlreadyAwake), the email
+// is already at its target location and the operation is
+// fully-successful. Returning 500 in this case would surface a
+// spurious error for a no-op cancel.
+func TestWakeNow_AlreadyAwakeReturns200(t *testing.T) {
+	row := &Snooze{
+		ID: "s-1", TenantID: "tenant-a", KChatUserID: "kchat-a",
+		StalwartAccountID:  "acct-a",
+		EmailID:            "email-1",
+		Status:             StatusSnoozed,
+		OriginalMailboxIDs: json.RawMessage(`{"mb-inbox":true}`),
+		SnoozedMailboxID:   "mb-snoozed",
+	}
+	fm := &fakeManager{getResult: row, cancelErr: ErrAlreadyAwake}
+	fd := &fakeDispatcher{}
+	router := newRouterForTest(fm, fd)
+
+	w := httptest.NewRecorder()
+	r := handlerRequest("DELETE", "/api/v1/snoozed/s-1", "")
+	router.ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s, want 200 when worker already woke", w.Code, w.Body.String())
+	}
+}
+
+// TestWakeNow_AlreadyCancelledReturns200 is the sibling case to
+// TestWakeNow_AlreadyAwakeReturns200: when another user-driven
+// cancel already landed, the row is terminal+successful and the
+// repeat request should idempotently return 200.
+func TestWakeNow_AlreadyCancelledReturns200(t *testing.T) {
+	row := &Snooze{
+		ID: "s-1", TenantID: "tenant-a", KChatUserID: "kchat-a",
+		StalwartAccountID:  "acct-a",
+		EmailID:            "email-1",
+		Status:             StatusSnoozed,
+		OriginalMailboxIDs: json.RawMessage(`{"mb-inbox":true}`),
+		SnoozedMailboxID:   "mb-snoozed",
+	}
+	fm := &fakeManager{getResult: row, cancelErr: ErrAlreadyCancelled}
+	fd := &fakeDispatcher{}
+	router := newRouterForTest(fm, fd)
+
+	w := httptest.NewRecorder()
+	r := handlerRequest("DELETE", "/api/v1/snoozed/s-1", "")
+	router.ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s, want 200 on idempotent cancel", w.Code, w.Body.String())
 	}
 }
 

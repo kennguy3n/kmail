@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"strings"
@@ -140,6 +141,25 @@ func (h *Handlers) create(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "snooze_until is required"})
 		return
 	}
+	// Validate the snooze horizon BEFORE the JMAP forward-move so
+	// an out-of-range snooze_until gets a fast 400 without burning
+	// two wasted JMAP round-trips (forward-move + revert). The
+	// Service layer re-validates inside Snooze() as defence-in-
+	// depth, but by then the JMAP patch has already been applied
+	// and would need to be reverted.
+	horizon := body.SnoozeUntil.Sub(h.now().UTC())
+	if horizon < MinSnoozeHorizon {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": fmt.Sprintf("snooze_until must be at least %s in the future", MinSnoozeHorizon),
+		})
+		return
+	}
+	if horizon > MaxSnoozeHorizon {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": fmt.Sprintf("snooze_until must be within %s", MaxSnoozeHorizon),
+		})
+		return
+	}
 	// Refuse a snooze whose target mailbox is also in the
 	// "originals" set — the post-wake patch would otherwise
 	// have to invent a deterministic ordering for null-vs-true
@@ -201,32 +221,44 @@ func (h *Handlers) create(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		// Persistence failed — best-effort revert the JMAP
 		// patch so the user doesn't see a phantom-snoozed
-		// email. The revert is the WAKE-patch shape: pass the
-		// original mailbox set as `originals` AND the snoozed
-		// folder as `snoozedMailboxID`, with
-		// `restoreOriginals=true` so `applyMove` adds the
-		// originals back and drops the snoozed folder. Pass
-		// `markUnreadOnWake=false` here — this is restoring
-		// pre-snooze state, NOT 'waking' the user, so we
-		// don't touch `keywords/$seen`. If the revert itself
-		// fails we still surface the original error to the
-		// client AND log the orphan state at ERROR level so
-		// an operator can find the email in the user's
-		// Snoozed folder and patch it back manually. Without
-		// the log the orphan would only be recoverable via
-		// the user noticing a phantom-snoozed email — silent
-		// data loss from an operations standpoint.
-		if revertErr := h.applyMove(
-			r.Context(),
-			tenantID, kchatUserID, accountID, body.EmailID,
-			body.OriginalMailboxIDs, body.SnoozedMailboxID,
-			true, false,
-		); revertErr != nil {
-			h.logger.Printf(
-				"snooze: ORPHAN — email moved to snoozed folder but DB persist failed AND revert failed; "+
-					"manual patch required: tenant_id=%s kchat_user_id=%s stalwart_account_id=%s email_id=%s snoozed_mailbox_id=%s persist_err=%v revert_err=%v",
-				tenantID, kchatUserID, accountID, body.EmailID, body.SnoozedMailboxID, err, revertErr,
-			)
+		// email. The revert is the WAKE-patch shape
+		// (`restoreOriginals=true`) but with
+		// `markUnreadOnWake=false` because we're restoring
+		// pre-snooze state, NOT 'waking' the user.
+		//
+		// EXCEPTION: skip the revert when the error is
+		// ErrAlreadySnoozed. If a prior snooze row already
+		// exists for this (tenant, user, email), the forward
+		// JMAP patch was effectively a no-op (the email was
+		// already in the snoozed folder from the first
+		// snooze). Reverting here would undo the FIRST
+		// snooze's JMAP state, leaving its DB row pointing at
+		// a mailbox set that no longer matches reality —
+		// e.g. when `snooze_until` arrives, the worker would
+		// find the email already in originals. Requires a
+		// dual-tab / stale-data race but is not hypothetical.
+		//
+		// If the revert itself fails on any other error path
+		// we still surface the original error to the client
+		// AND log the orphan state at ERROR level so an
+		// operator can find the email in the user's Snoozed
+		// folder and patch it back manually. Without the log
+		// the orphan would only be recoverable via the user
+		// noticing a phantom-snoozed email — silent data loss
+		// from an operations standpoint.
+		if !errors.Is(err, ErrAlreadySnoozed) {
+			if revertErr := h.applyMove(
+				r.Context(),
+				tenantID, kchatUserID, accountID, body.EmailID,
+				body.OriginalMailboxIDs, body.SnoozedMailboxID,
+				true, false,
+			); revertErr != nil {
+				h.logger.Printf(
+					"snooze: ORPHAN — email moved to snoozed folder but DB persist failed AND revert failed; "+
+						"manual patch required: tenant_id=%s kchat_user_id=%s stalwart_account_id=%s email_id=%s snoozed_mailbox_id=%s persist_err=%v revert_err=%v",
+					tenantID, kchatUserID, accountID, body.EmailID, body.SnoozedMailboxID, err, revertErr,
+				)
+			}
 		}
 		switch {
 		case errors.Is(err, ErrInvalidSnooze):
@@ -349,10 +381,19 @@ func (h *Handlers) wakeNow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.svc.Cancel(r.Context(), tenantID, kchatUserID, id); err != nil {
-		// JMAP move succeeded but DB flip failed — surface as
-		// 500 so an operator can investigate; the worker
-		// won't re-dispatch because the email is already at
-		// its target location.
+		// If the worker already woke the email (ErrAlreadyAwake)
+		// or another cancel request already landed
+		// (ErrAlreadyCancelled), the email is correctly at its
+		// target location and the DB row is terminal — surface
+		// 200 so the user doesn't see a spurious error for a
+		// fully-successful operation.
+		if errors.Is(err, ErrAlreadyAwake) || errors.Is(err, ErrAlreadyCancelled) {
+			writeJSON(w, http.StatusOK, map[string]any{"cancelled": true})
+			return
+		}
+		// Genuine DB failure — surface as 500 so an operator
+		// can investigate; the worker won't re-dispatch because
+		// the email is already at its target location.
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
 		return
 	}
@@ -436,9 +477,12 @@ func (h *Handlers) applyMove(
 	if resp == nil {
 		return errors.New("snooze: empty dispatch response")
 	}
-	_, args, ok := resp.CallByID("snz")
+	name, args, ok := resp.CallByID("snz")
 	if !ok {
 		return errors.New("snooze: dispatch response missing client id")
+	}
+	if name != "Email/set" {
+		return fmt.Errorf("snooze: unexpected dispatch response method %q", name)
 	}
 	if notUpdated, ok := args["notUpdated"].(map[string]any); ok {
 		if reason, ok := notUpdated[emailID]; ok {
