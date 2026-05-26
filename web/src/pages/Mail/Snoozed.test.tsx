@@ -119,4 +119,42 @@ describe("<Snoozed />", () => {
       await screen.findByText(/don't have any snoozed emails/i),
     ).toBeInTheDocument();
   });
+
+  it("renders a Retry wake button for failed rows and retries the wake", async () => {
+    // Pins the Round 6 fix at the UI layer: failed rows (worker
+    // exhausted retries → email still stuck) must offer a
+    // user-facing self-service recovery path, not a dash.
+    const failedRow: SnoozeSnapshot = {
+      id: "s-failed",
+      status: "failed",
+      email_id: "email-3",
+      snoozed_mailbox_id: "mb-snoozed",
+      snooze_until: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
+      mark_unread_on_wake: true,
+      attempts: 3,
+      last_error: "internal-host-42:9123 connect refused",
+      created_at: new Date(Date.now() - 4 * 60 * 60 * 1000).toISOString(),
+    };
+    listSnoozes.mockResolvedValueOnce([failedRow]);
+    wakeSnooze.mockResolvedValueOnce({ cancelled: true });
+    listSnoozes.mockResolvedValueOnce([
+      { ...failedRow, status: "cancelled" as const },
+    ]);
+
+    const user = userEvent.setup();
+    renderPage();
+    const retryBtn = await screen.findByTestId("retry-snooze-s-failed");
+    expect(retryBtn).toHaveTextContent(/retry wake/i);
+    await user.click(retryBtn);
+
+    await waitFor(() =>
+      expect(wakeSnooze).toHaveBeenCalledWith("s-failed"),
+    );
+    expect(
+      await screen.findByText(/wake retried/i),
+    ).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.queryByTestId("retry-snooze-s-failed")).toBeNull(),
+    );
+  });
 });

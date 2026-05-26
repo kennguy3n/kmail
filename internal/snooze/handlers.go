@@ -346,12 +346,31 @@ func (h *Handlers) wakeNow(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
 		return
 	}
-	if row.Status != StatusSnoozed {
-		// Already terminal — make the call idempotent: 200
-		// with the same body the happy path returns, so a
-		// double-click from the UI doesn't surface as an
-		// error.
+	switch row.Status {
+	case StatusSnoozed:
+		// Normal path: snoozed → attempt the wake move below.
+	case StatusFailed:
+		// `failed` is NOT a terminal-success status — the
+		// worker exhausted retries and the email is STILL
+		// stuck in the user's Snoozed folder. Returning 200
+		// here without acting would mislead the caller into
+		// thinking the wake succeeded. Instead, fall through
+		// to applyMove + Cancel: the user has effectively
+		// asked us to retry the worker's failed wake, and the
+		// guarded UPDATE in Service.Cancel now accepts
+		// `failed → cancelled` (see service.go) so the recovery
+		// path is end-to-end coherent.
+	case StatusUnsnoozed, StatusCancelled:
+		// Genuinely terminal-success — email is already at its
+		// target location. Make the call idempotent so a
+		// double-click from the UI doesn't surface as an error.
 		writeJSON(w, http.StatusOK, map[string]any{"cancelled": true})
+		return
+	default:
+		// Defence-in-depth for schema drift / new status
+		// values that haven't been threaded through here yet.
+		h.logger.Printf("snooze: wakeNow saw unexpected status=%q on row id=%s; treating as not-found", row.Status, id)
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "not found"})
 		return
 	}
 	var orig map[string]bool
@@ -388,7 +407,16 @@ func (h *Handlers) wakeNow(w http.ResponseWriter, r *http.Request) {
 		// moved it to a terminal state, treat the operation as
 		// success rather than surfacing a spurious 502 for a
 		// fully-successful wake.
-		if row2, getErr := h.svc.Get(r.Context(), tenantID, kchatUserID, id); getErr == nil && row2.Status != StatusSnoozed {
+		// Only return 200 when the re-read shows a genuinely
+		// terminal-success status (unsnoozed or cancelled).
+		// `failed` is NOT terminal-success — the worker may
+		// have flipped the row to `failed` during our applyMove
+		// window, in which case the email is still stuck in the
+		// snoozed folder and the user's wake genuinely failed.
+		// Falling through to 502 surfaces the failure honestly
+		// rather than masking a stuck email as success.
+		if row2, getErr := h.svc.Get(r.Context(), tenantID, kchatUserID, id); getErr == nil &&
+			(row2.Status == StatusUnsnoozed || row2.Status == StatusCancelled) {
 			h.logger.Printf("snooze: wakeNow saw applyMove err=%v but worker won the race (status=%s); returning 200", err, row2.Status)
 			writeJSON(w, http.StatusOK, map[string]any{"cancelled": true})
 			return
@@ -408,6 +436,19 @@ func (h *Handlers) wakeNow(w http.ResponseWriter, r *http.Request) {
 		// fully-successful operation.
 		if errors.Is(err, ErrAlreadyAwake) || errors.Is(err, ErrAlreadyCancelled) {
 			writeJSON(w, http.StatusOK, map[string]any{"cancelled": true})
+			return
+		}
+		// ErrSnoozeFailed: the DB row is in `failed` state and
+		// somehow the guarded UPDATE didn't flip it (only
+		// reachable via a third concurrent writer racing us).
+		// applyMove already succeeded so the email IS at its
+		// target location; surface a 500 so an operator can
+		// reconcile the DB row, but DO NOT confuse this with
+		// the email-still-stuck case (which surfaces upstream
+		// as a 502 from applyMove).
+		if errors.Is(err, ErrSnoozeFailed) {
+			h.logger.Printf("snooze: wakeNow applyMove succeeded but Cancel saw failed status (concurrent writer race); manual reconcile needed: tenant=%s user=%s id=%s", tenantID, kchatUserID, id)
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
 			return
 		}
 		// Genuine DB failure — surface as 500 so an operator

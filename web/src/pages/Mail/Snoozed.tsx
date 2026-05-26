@@ -38,12 +38,23 @@ export default function Snoozed() {
     void reload();
   }, [reload]);
 
-  const handleWake = async (id: string) => {
+  // handleWake is shared by the "Wake now" button (snoozed rows)
+  // AND the "Retry wake" button (failed rows). Both call the
+  // same DELETE /api/v1/snoozed/{id} endpoint; the backend
+  // distinguishes the two cases internally (failed rows fall
+  // through to applyMove + Cancel just like snoozed rows). The
+  // distinct verb / success copy is purely cosmetic — the
+  // semantics are: "move this email back to its inbox now".
+  const handleWake = async (id: string, retrying = false) => {
     setWaking((m) => ({ ...m, [id]: true }));
     setStatusMessage(null);
     try {
       await wakeSnooze(id);
-      setStatusMessage("Snooze cancelled — the email is back in its mailbox.");
+      setStatusMessage(
+        retrying
+          ? "Wake retried — the email is back in its mailbox."
+          : "Snooze cancelled — the email is back in its mailbox.",
+      );
       await reload();
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : String(err));
@@ -139,6 +150,24 @@ export default function Snoozed() {
                       data-testid={`wake-snooze-${row.id}`}
                     >
                       {waking[row.id] ? "Waking…" : "Wake now"}
+                    </button>
+                  ) : row.status === "failed" ? (
+                    // The worker exhausted retries and gave up;
+                    // the email is still stuck in the Snoozed
+                    // folder. "Retry wake" gives the user a
+                    // self-service path to re-attempt the JMAP
+                    // move (and, on success, flip the row to
+                    // cancelled). Without this, users would
+                    // have to ask an operator to manually patch
+                    // mailboxIds in Stalwart.
+                    <button
+                      type="button"
+                      onClick={() => void handleWake(row.id, true)}
+                      disabled={!!waking[row.id]}
+                      style={styles.wakeButton}
+                      data-testid={`retry-snooze-${row.id}`}
+                    >
+                      {waking[row.id] ? "Retrying…" : "Retry wake"}
                     </button>
                   ) : row.status === "unsnoozed" ? (
                     <span style={styles.muted}>

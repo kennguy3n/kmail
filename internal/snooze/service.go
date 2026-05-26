@@ -94,6 +94,14 @@ var (
 	ErrInvalidSnooze    = errors.New("snooze: invalid snooze_until")
 	ErrTenantMismatch   = errors.New("snooze: tenant mismatch")
 	ErrAlreadySnoozed   = errors.New("snooze: email is already snoozed")
+	// ErrSnoozeFailed signals a row in the terminal `failed`
+	// state, where the worker exhausted retries trying to wake
+	// the email and the email is still in the user's Snoozed
+	// folder. Semantically distinct from ErrAlreadyAwake (the
+	// email is NOT awake — the row just stopped trying) so the
+	// handler doesn't surface 200 to a caller whose intent was
+	// "move this email back" but whose email is still stuck.
+	ErrSnoozeFailed = errors.New("snooze: row in failed state, email still in snoozed folder")
 )
 
 // Snooze mirrors one row in `snoozed_emails`. The
@@ -404,13 +412,22 @@ func (s *Service) Cancel(ctx context.Context, tenantID, kchatUserID, id string) 
 		// together form the authz fence so a cross-user cancel is a
 		// no-op that re-reads as "not found" rather than silently
 		// clobbering a peer's row.
+		// status IN ('snoozed', 'failed'): a user-initiated wake
+		// is allowed to take over from a row the worker has given
+		// up on. The wakeNow handler retries the JMAP move BEFORE
+		// calling Cancel, so by the time we land here the email
+		// is either back in its originals (success) or the
+		// applyMove already returned 502 and we never get called.
+		// Flipping `failed` → `cancelled` here records the
+		// user-driven recovery in the audit trail and stops the
+		// row from showing up in any future failed-state UI.
 		result, err := tx.Exec(ctx, `
 			UPDATE snoozed_emails
 			SET status = 'cancelled'
 			WHERE id = $1::uuid
 			  AND tenant_id = $2::uuid
 			  AND kchat_user_id = $3
-			  AND status = 'snoozed'
+			  AND status IN ('snoozed', 'failed')
 		`, id, tenantID, kchatUserID)
 		if err != nil {
 			return err
@@ -445,11 +462,18 @@ func (s *Service) Cancel(ctx context.Context, tenantID, kchatUserID, id string) 
 		case StatusCancelled:
 			return ErrAlreadyCancelled
 		case StatusFailed:
-			return ErrAlreadyAwake
+			// Defence-in-depth: should be unreachable because the
+			// guarded UPDATE above accepts ('snoozed', 'failed').
+			// A surprise here means a third concurrent writer
+			// flipped the row out from under us — surface as a
+			// distinct sentinel so the handler doesn't fold the
+			// failure into a misleading "already awake" response.
+			return ErrSnoozeFailed
 		default:
 			// Shouldn't happen — the guarded UPDATE only no-ops
-			// when status != 'snoozed'. A surprise here is a
-			// schema-drift bug worth surfacing loudly.
+			// when status is outside ('snoozed', 'failed'). A
+			// surprise here is a schema-drift bug worth surfacing
+			// loudly.
 			return fmt.Errorf("snooze.Cancel: guarded UPDATE no-op with unexpected status=%q", status)
 		}
 	})

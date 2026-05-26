@@ -771,6 +771,123 @@ func TestGet_PerUserScopedAtHandlerLayer(t *testing.T) {
 	}
 }
 
+// TestWakeNow_FailedStatusRetriesWakeAndCancels pins the Round 6
+// fix: when the row is in terminal `failed` state, the worker
+// exhausted retries and the email is STILL stuck in the snoozed
+// folder. wakeNow must NOT short-circuit to 200 — it must retry
+// the JMAP move (attempt the worker's failed wake again) and on
+// success flip the row to `cancelled` via Service.Cancel.
+// Returning 200 without acting would mislead the user into
+// thinking the wake succeeded while the email is still hidden.
+func TestWakeNow_FailedStatusRetriesWakeAndCancels(t *testing.T) {
+	fm := &fakeManager{
+		getResult: &Snooze{
+			ID:                 "s-1",
+			TenantID:           "tenant-a",
+			KChatUserID:        "kchat-a",
+			StalwartAccountID:  "acct-a",
+			EmailID:            "email-1",
+			OriginalMailboxIDs: json.RawMessage(`{"mb-inbox":true}`),
+			SnoozedMailboxID:   "mb-snoozed",
+			Status:             StatusFailed,
+		},
+	}
+	fd := &fakeDispatcher{}
+	router := newRouterForTest(fm, fd)
+	w := httptest.NewRecorder()
+	r := handlerRequest("DELETE", "/api/v1/snoozed/s-1", "")
+	router.ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s, want 200 after user-driven retry succeeds", w.Code, w.Body.String())
+	}
+	if fd.calls != 1 {
+		t.Fatalf("expected exactly 1 dispatch (retry wake) for failed-status row, got %d", fd.calls)
+	}
+	if len(fm.cancels) != 1 || fm.cancels[0] != "s-1" {
+		t.Fatalf("expected Service.Cancel(s-1) after successful retry, got %v", fm.cancels)
+	}
+}
+
+// TestWakeNow_FailedStatusRetryThatFailsAgainReturns502 pins
+// the honest-failure path: if the user-driven retry of a failed
+// row ALSO fails at Stalwart, the handler must surface 502
+// (email still stuck) rather than masking the failure as 200.
+func TestWakeNow_FailedStatusRetryThatFailsAgainReturns502(t *testing.T) {
+	failed := &Snooze{
+		ID:                 "s-1",
+		TenantID:           "tenant-a",
+		KChatUserID:        "kchat-a",
+		StalwartAccountID:  "acct-a",
+		EmailID:            "email-1",
+		OriginalMailboxIDs: json.RawMessage(`{"mb-inbox":true}`),
+		SnoozedMailboxID:   "mb-snoozed",
+		Status:             StatusFailed,
+	}
+	// Re-read still sees the same `failed` row: applyMove
+	// genuinely failed and the email IS still in the snoozed
+	// folder.
+	stillFailed := *failed
+	fm := &fakeManager{
+		getResult:       failed,
+		getResultSecond: &stillFailed,
+	}
+	fd := &fakeDispatcher{err: errors.New("internal-host-42:9123 connect refused")}
+	router := newRouterForTest(fm, fd)
+	w := httptest.NewRecorder()
+	r := handlerRequest("DELETE", "/api/v1/snoozed/s-1", "")
+	router.ServeHTTP(w, r)
+
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d body=%s, want 502 when retry fails and email still stuck", w.Code, w.Body.String())
+	}
+	if len(fm.cancels) != 0 {
+		t.Fatalf("must NOT call Cancel when retry wake failed and row still failed; got %v", fm.cancels)
+	}
+	if strings.Contains(w.Body.String(), "internal-host-42") {
+		t.Fatalf("response body must NOT leak Stalwart error text; got %s", w.Body.String())
+	}
+}
+
+// TestWakeNow_TOCTOUReReadDoesNotMaskFailedAsSuccess pins the
+// narrower TOCTOU edge of Round 6: a row was `snoozed` at the
+// initial Get, applyMove failed, and the re-read sees `failed`
+// (the worker concurrently exhausted retries during our move
+// window). The email is STILL stuck — we must NOT return 200.
+func TestWakeNow_TOCTOUReReadDoesNotMaskFailedAsSuccess(t *testing.T) {
+	first := &Snooze{
+		ID:                 "s-1",
+		TenantID:           "tenant-a",
+		KChatUserID:        "kchat-a",
+		StalwartAccountID:  "acct-a",
+		EmailID:            "email-1",
+		OriginalMailboxIDs: json.RawMessage(`{"mb-inbox":true}`),
+		SnoozedMailboxID:   "mb-snoozed",
+		Status:             StatusSnoozed,
+	}
+	// Models the worker flipping the row to `failed` between
+	// the handler's first and second Get — the email is still
+	// stuck in the snoozed folder.
+	second := *first
+	second.Status = StatusFailed
+	fm := &fakeManager{
+		getResult:       first,
+		getResultSecond: &second,
+	}
+	fd := &fakeDispatcher{err: errors.New("stalwart refused")}
+	router := newRouterForTest(fm, fd)
+	w := httptest.NewRecorder()
+	r := handlerRequest("DELETE", "/api/v1/snoozed/s-1", "")
+	router.ServeHTTP(w, r)
+
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d body=%s, want 502 — TOCTOU re-read sees `failed` (email still stuck), not terminal-success", w.Code, w.Body.String())
+	}
+	if len(fm.cancels) != 0 {
+		t.Fatalf("must NOT call Cancel when re-read sees `failed`; got %v", fm.cancels)
+	}
+}
+
 // TestWakeNow_PerUserScopedAtHandlerLayer — same as above for the
 // DELETE path. Both Get (to read the row) AND Cancel (to flip
 // terminal state) must carry kchatUserID.
