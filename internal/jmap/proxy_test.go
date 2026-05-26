@@ -392,3 +392,104 @@ func TestShardFailoverTransport_LastShardBreaker(t *testing.T) {
 		t.Errorf("breaker for %s did not open after 3 consecutive 5xx", srvURL.Host)
 	}
 }
+
+// fakeSendInterceptor returns a fixed (intercepted, err) pair and
+// optionally writes a canned body to the ResponseWriter. Used to
+// pin the proxy's handling of the four (intercepted, err) corners
+// — in particular `(true, err)` which must NOT fall through to
+// the upstream proxy (or `p.rp.ServeHTTP` would re-write headers
+// on an already-committed connection).
+type fakeSendInterceptor struct {
+	intercepted bool
+	err         error
+	body        string
+}
+
+func (f *fakeSendInterceptor) Intercept(_ context.Context, w http.ResponseWriter, _ *http.Request, _ []byte) (bool, error) {
+	if f.intercepted && f.body != "" {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(f.body))
+	}
+	return f.intercepted, f.err
+}
+
+// TestServeHTTP_InterceptedHonoredEvenWhenInterceptorErrors pins
+// the contract: when a SendInterceptor returns
+// `(intercepted=true, err≠nil)` — which writeJMAPResponse can
+// produce after the helper has already written headers — the
+// proxy MUST short-circuit instead of falling through to
+// `p.rp.ServeHTTP`. Falling through would attempt a second
+// WriteHeader on the committed ResponseWriter and either panic
+// or corrupt the connection.
+func TestServeHTTP_InterceptedHonoredEvenWhenInterceptorErrors(t *testing.T) {
+	p := newTestProxy(t)
+	p.SetSendInterceptor(&fakeSendInterceptor{
+		intercepted: true,
+		err:         fmt.Errorf("hold-after-dispatch failed: simulated"),
+		body:        `{"methodResponses":[["EmailSubmission/set",{"created":{"sub-1":{"id":"submission-1"}}},"c1"]]}`,
+	})
+
+	// Prime the account cache so resolveAccount short-circuits and
+	// the request reaches the interceptor branch instead of
+	// failing at the upstream Postgres lookup.
+	p.PrimeAccountCache("tenant-a", "kuser-a", "stalwart-acc-1")
+
+	// Build a request that hits the JMAP-submit path with a body
+	// that contains an EmailSubmission/set method call so the
+	// interceptor branch is reached.
+	body := strings.NewReader(`{"methodCalls":[["EmailSubmission/set",{"create":{"sub-1":{"emailId":"#draft"}}},"c1"]]}`)
+	req := httptest.NewRequest(http.MethodPost, "http://kmail-api/jmap", body)
+	ctx := req.Context()
+	ctx = middleware.WithTenantID(ctx, "tenant-a")
+	ctx = middleware.WithKChatUserID(ctx, "kuser-a")
+	ctx = middleware.WithStalwartAccountID(ctx, "stalwart-acc-1")
+	req = req.WithContext(ctx)
+	rec := httptest.NewRecorder()
+
+	p.ServeHTTP(rec, req)
+
+	// Body must come from the interceptor; if the proxy fell
+	// through it would have attempted to dial stalwart.test (the
+	// configured backend) and produced a 502.
+	got := rec.Body.String()
+	if !strings.Contains(got, `"created"`) {
+		t.Errorf("response body = %q, want the interceptor's canned response", got)
+	}
+	if rec.Code == http.StatusBadGateway {
+		t.Fatalf("proxy returned 502 — the (intercepted=true, err≠nil) path fell through to the upstream proxy, which is the exact regression this test pins")
+	}
+}
+
+// TestServeHTTP_InterceptorErrorWithoutInterceptedFallsThrough
+// is the negative of the above: a `(intercepted=false, err≠nil)`
+// return means the hook explicitly declined to handle the
+// request but had a diagnostic. The proxy is expected to log + fall
+// through to Stalwart, preserving the "transient Valkey blip can't
+// break the send path" degradation contract.
+func TestServeHTTP_InterceptorErrorWithoutInterceptedFallsThrough(t *testing.T) {
+	p := newTestProxy(t)
+	p.SetSendInterceptor(&fakeSendInterceptor{
+		intercepted: false,
+		err:         fmt.Errorf("non-fatal probe failure"),
+	})
+	p.PrimeAccountCache("tenant-a", "kuser-a", "stalwart-acc-1")
+
+	body := strings.NewReader(`{"methodCalls":[["EmailSubmission/set",{"create":{"sub-1":{"emailId":"#draft"}}},"c1"]]}`)
+	req := httptest.NewRequest(http.MethodPost, "http://kmail-api/jmap", body)
+	ctx := req.Context()
+	ctx = middleware.WithTenantID(ctx, "tenant-a")
+	ctx = middleware.WithKChatUserID(ctx, "kuser-a")
+	ctx = middleware.WithStalwartAccountID(ctx, "stalwart-acc-1")
+	req = req.WithContext(ctx)
+	rec := httptest.NewRecorder()
+
+	p.ServeHTTP(rec, req)
+
+	// With no upstream wired and a fall-through, the request lands
+	// in the reverse-proxy path which fails dialing stalwart.test
+	// → errorHandler → 502. That confirms the proxy did NOT
+	// short-circuit on the (false, err) corner.
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("status = %d, want 502 (fall-through to unreachable backend). Got body=%q", rec.Code, rec.Body.String())
+	}
+}

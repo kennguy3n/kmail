@@ -395,10 +395,21 @@ func (s *Service) claimDue(ctx context.Context) (*ScheduledSend, error) {
 		if err := scanRow(row, &ss); err != nil {
 			return err
 		}
-		_, err := tx.Exec(ctx, `
+		if _, err := tx.Exec(ctx, `
 			UPDATE scheduled_sends SET attempts = attempts + 1 WHERE id = $1::uuid
-		`, ss.ID)
-		return err
+		`, ss.ID); err != nil {
+			return err
+		}
+		// scanRow captured the PRE-increment value above; the UPDATE
+		// has now bumped the DB row but the returned struct must
+		// reflect the same post-increment value so the worker's
+		// `handleErr` (which compares `ss.Attempts >= maxAttempts`
+		// to decide retry vs. dead-letter, and uses `ss.Attempts` as
+		// the backoff index) sees a value consistent with the DB.
+		// Without this, the worker would retry one extra time AND
+		// use the wrong backoff slot — both off-by-one bugs.
+		ss.Attempts++
+		return nil
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound

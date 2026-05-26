@@ -1194,14 +1194,24 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			if sendInterceptor != nil {
 				intercepted, err := sendInterceptor.Intercept(ctx, w, r.WithContext(ctx), body)
+				// `intercepted` is the source of truth for whether the
+				// hook (or its writeJMAPResponse helper) has already
+				// committed bytes to the ResponseWriter. We MUST honor
+				// it regardless of `err` — falling through after the
+				// hook wrote a response would have `p.rp.ServeHTTP`
+				// attempt a second WriteHeader and either panic or
+				// corrupt the connection. `err` is purely diagnostic
+				// past this point.
 				if err != nil {
-					p.logger.Printf("jmap proxy: send interceptor error tenant=%s err=%v", tenantID, err)
-					// Don't 5xx here unless the interceptor truly couldn't decide; we still let
-					// the request fall through to Stalwart so a transient Valkey blip can't break
-					// the send path entirely.
-				} else if intercepted {
+					p.logger.Printf("jmap proxy: send interceptor error tenant=%s err=%v intercepted=%v", tenantID, err, intercepted)
+				}
+				if intercepted {
 					return
 				}
+				// err != nil AND !intercepted means the hook decided
+				// not to handle the request but produced a diagnostic.
+				// Fall through to Stalwart so a transient Valkey /
+				// Postgres blip can't break the send path entirely.
 			}
 		}
 		r.Body = io.NopCloser(bytes.NewReader(body))

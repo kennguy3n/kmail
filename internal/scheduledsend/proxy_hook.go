@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -41,6 +42,10 @@ type HookConfig struct {
 	Service         *Service
 	Forwarder       InternalSubmitter
 	AccountResolver func(ctx context.Context, tenantID, kchatUserID string) (string, error)
+	// Logger receives the post-Dispatch diagnostics on the
+	// orphan-draft recovery path (see Intercept). Optional;
+	// defaults to log.Default() when nil.
+	Logger *log.Logger
 }
 
 // scheduler is the slice of Service the hook depends on. Tests
@@ -55,6 +60,7 @@ type Hook struct {
 	scheduler       scheduler
 	forwarder       InternalSubmitter
 	accountResolver func(ctx context.Context, tenantID, kchatUserID string) (string, error)
+	logger          *log.Logger
 }
 
 // NewHook validates HookConfig and returns a *Hook ready to be
@@ -66,12 +72,12 @@ func NewHook(cfg HookConfig) (*Hook, error) {
 	if cfg.Service == nil {
 		return nil, errors.New("scheduledsend.NewHook: Service is required")
 	}
-	return newHookWithScheduler(cfg.Service, cfg.Forwarder, cfg.AccountResolver)
+	return newHookWithScheduler(cfg.Service, cfg.Forwarder, cfg.AccountResolver, cfg.Logger)
 }
 
 // newHookWithScheduler is the test seam: lets tests substitute a
 // fake scheduler for the real `*Service`.
-func newHookWithScheduler(s scheduler, forwarder InternalSubmitter, resolver func(ctx context.Context, tenantID, kchatUserID string) (string, error)) (*Hook, error) {
+func newHookWithScheduler(s scheduler, forwarder InternalSubmitter, resolver func(ctx context.Context, tenantID, kchatUserID string) (string, error), logger *log.Logger) (*Hook, error) {
 	if s == nil {
 		return nil, errors.New("scheduledsend.NewHook: scheduler is required")
 	}
@@ -81,7 +87,10 @@ func newHookWithScheduler(s scheduler, forwarder InternalSubmitter, resolver fun
 	if resolver == nil {
 		return nil, errors.New("scheduledsend.NewHook: AccountResolver is required")
 	}
-	return &Hook{scheduler: s, forwarder: forwarder, accountResolver: resolver}, nil
+	if logger == nil {
+		logger = log.Default()
+	}
+	return &Hook{scheduler: s, forwarder: forwarder, accountResolver: resolver, logger: logger}, nil
 }
 
 // Intercept implements `jmap.SendInterceptor`.
@@ -141,6 +150,14 @@ func (h *Hook) Intercept(ctx context.Context, w http.ResponseWriter, r *http.Req
 		return writeJMAPResponse(w, stalwartResp, http.StatusOK)
 	}
 
+	// From here on the Stalwart draft is already committed
+	// upstream. Every subsequent error path MUST return
+	// `(intercepted=true, ...)` so the proxy does NOT fall through
+	// to its ServeHTTP path — falling through would re-forward the
+	// FULL original body (Email/set + EmailSubmission/set) to
+	// Stalwart, creating a second draft AND submitting it
+	// immediately, completely defeating the scheduled-send
+	// semantics. Same invariant as `undosend/proxy_hook.go`.
 	emailID, ok := resolveCreatedEmailID(stalwartResp, intent.emailCreateKey)
 	if !ok {
 		// Email/set succeeded but the response shape is
@@ -150,7 +167,14 @@ func (h *Hook) Intercept(ctx context.Context, w http.ResponseWriter, r *http.Req
 
 	submissionPayload, err := normaliseSubmissionPayload(intent.submissionCreate, intent.emailCreateKey, emailID)
 	if err != nil {
-		return false, fmt.Errorf("scheduledsend.Hook: normalise payload: %w", err)
+		// Draft is already minted; we CANNOT return `(false, err)`
+		// here — that would have the proxy re-forward the FULL body
+		// and create a duplicate draft + immediate submission.
+		// Surface the half-committed Stalwart response (carrying the
+		// `created` map) so the client sees "draft saved, scheduling
+		// failed" and log the failure so operators can investigate.
+		h.logger.Printf("scheduledsend.Hook: normalise payload after dispatch tenant=%s email=%s: %v", tenantID, emailID, err)
+		return writeJMAPResponse(w, stalwartResp, http.StatusOK)
 	}
 	identityID := intent.identityID
 	ss, err := h.scheduler.Schedule(ctx, ScheduleInput{
@@ -170,7 +194,13 @@ func (h *Hook) Intercept(ctx context.Context, w http.ResponseWriter, r *http.Req
 			http.Error(w, fmt.Sprintf("scheduledsend: %v", err), http.StatusBadRequest)
 			return true, nil
 		}
-		return false, fmt.Errorf("scheduledsend.Hook: schedule: %w", err)
+		// Same orphan-draft rationale as the normalise branch above:
+		// the Stalwart draft is already minted, so a `(false, err)`
+		// return would have the proxy re-forward the FULL body and
+		// duplicate-submit. Log + surface the bare Stalwart Email/set
+		// response; the client can retry via the immediate-send path.
+		h.logger.Printf("scheduledsend.Hook: schedule after dispatch tenant=%s email=%s: %v", tenantID, emailID, err)
+		return writeJMAPResponse(w, stalwartResp, http.StatusOK)
 	}
 
 	merged := mergeWithSyntheticSubmission(stalwartResp, intent, ss.ID, ss.SendAt)

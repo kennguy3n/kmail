@@ -592,6 +592,7 @@ func main() {
 			Service:         undoSvc,
 			Forwarder:       internalJmap,
 			AccountResolver: proxy.ResolveAccountID,
+			Logger:          logger,
 		})
 		if err != nil {
 			logger.Fatalf("undosend.NewHook: %v", err)
@@ -629,6 +630,7 @@ func main() {
 		Service:         scheduledSvc,
 		Forwarder:       internalJmap,
 		AccountResolver: proxy.ResolveAccountID,
+		Logger:          logger,
 	})
 	if err != nil {
 		logger.Fatalf("scheduledsend.NewHook: %v", err)

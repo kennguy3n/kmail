@@ -132,7 +132,7 @@ func newHookForTest(t *testing.T, sched scheduler, fwd InternalSubmitter) *Hook 
 	t.Helper()
 	h, err := newHookWithScheduler(sched, fwd, func(_ context.Context, _, _ string) (string, error) {
 		return "acct-a", nil
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("newHookWithScheduler: %v", err)
 	}
@@ -333,6 +333,67 @@ func TestNormaliseSubmissionPayload_ResolvesBackReference(t *testing.T) {
 		t.Fatalf("emailId = %v, want real-id", out["emailId"])
 	}
 }
+
+// TestIntercept_ScheduleFailureAfterDispatchReturnsInterceptedNotFalse
+// pins the orphan-draft fix: once the stripped Email/set has been
+// forwarded to Stalwart (draft minted), any subsequent error
+// (Postgres scheduling failure, normalise failure, etc.) MUST
+// return `(intercepted=true, ...)` so the proxy does NOT fall
+// through to its ServeHTTP reverse-proxy path. Falling through
+// would re-forward the FULL original body (Email/set +
+// EmailSubmission/set) to Stalwart, creating a duplicate draft
+// AND submitting it immediately — completely defeating the
+// scheduled-send semantics.
+func TestIntercept_ScheduleFailureAfterDispatchReturnsInterceptedNotFalse(t *testing.T) {
+	future := time.Now().Add(10 * time.Minute).Unix()
+	sched := &fakeScheduler{err: errSchedulerBoom}
+	fwd := &stubForwarder{response: emailSetCreatedResponse("draft", "REAL-email-1")}
+	hook := newHookForTest(t, sched, fwd)
+
+	body := buildScheduleBody("draft", "submission", "ident-1")
+	ctx := ctxWithIdentity("tenant-a", "kchat-a")
+	r := newJMAPRequest(t, body, ctx, strconv.FormatInt(future, 10))
+	w := httptest.NewRecorder()
+
+	intercepted, err := hook.Intercept(ctx, w, r, body)
+	if err != nil {
+		t.Fatalf("Intercept returned err=%v, want nil (orphan-draft fix surfaces the half-committed Stalwart response instead of bubbling)", err)
+	}
+	if !intercepted {
+		t.Fatalf("intercepted=false on scheduler failure after Dispatch — proxy would fall through and create a duplicate draft + immediate submission. This is the exact regression the fix pins.")
+	}
+	// Forwarder must have been called exactly once (the stripped
+	// Email/set). If the proxy fell through, the full body would
+	// then reach Stalwart via the reverse-proxy path; the hook
+	// test cannot observe that directly, but `intercepted=true`
+	// is the contract the proxy honors.
+	if fwd.called != 1 {
+		t.Fatalf("forwarder called %d times, want 1 (stripped Email/set)", fwd.called)
+	}
+	// Response should be the half-committed Stalwart response —
+	// the client sees the draft was saved but no
+	// EmailSubmission/set response, signaling scheduling failed.
+	respBody, err := io.ReadAll(w.Result().Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	var jr jmap.JmapResponse
+	if err := json.Unmarshal(respBody, &jr); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(jr.MethodResponses) != 1 {
+		t.Fatalf("expected 1 method response (Email/set only — scheduling failed), got %d", len(jr.MethodResponses))
+	}
+	if name, _ := jr.MethodResponses[0][0].(string); name != "Email/set" {
+		t.Fatalf("only response method = %q, want Email/set", name)
+	}
+}
+
+var errSchedulerBoom = &scheduleBoomErr{}
+
+type scheduleBoomErr struct{}
+
+func (*scheduleBoomErr) Error() string { return "simulated scheduler failure" }
 
 func TestResolveCreatedEmailID_HappyPath(t *testing.T) {
 	resp := emailSetCreatedResponse("draft", "REAL-1")
