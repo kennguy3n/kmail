@@ -33,6 +33,25 @@
 
 BEGIN;
 
+-- 0. Acquire ACCESS EXCLUSIVE on `search_cutover_jobs` for the
+--    duration of the transaction. The PK swap below
+--    (DROP CONSTRAINT + ADD CONSTRAINT PRIMARY KEY) briefly
+--    leaves the table without a primary key, and even though
+--    `search_cutover_jobs` is only written by the background
+--    cutover worker (which we expect to be quiesced during a
+--    migration window), an in-flight worker INSERT racing the
+--    swap could create a duplicate (tenant_id, target_backend)
+--    row that the new PK would then reject — leaving the row
+--    behind to break ListCandidates forever.
+--
+--    `ALTER TABLE ... ADD/DROP CONSTRAINT` already takes
+--    ACCESS EXCLUSIVE, but it does so for each statement
+--    individually and releases between statements. An explicit
+--    LOCK at the top of the transaction keeps the exclusion
+--    contiguous across the whole swap so the worker cannot
+--    sneak an INSERT into the window between DROP and ADD.
+LOCK TABLE search_cutover_jobs IN ACCESS EXCLUSIVE MODE;
+
 -- 1. Add the column NULLable first so the backfill can complete
 --    without violating NOT NULL on rows that existed pre-051.
 ALTER TABLE search_cutover_jobs

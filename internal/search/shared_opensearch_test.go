@@ -557,6 +557,64 @@ func TestSharedOpenSearch_ExportTermFiltersByTenant(t *testing.T) {
 	}
 }
 
+// TestSharedOpenSearch_MigrateIndexPartialBulkFailureSurfaces
+// is the regression guard for the Devin-Review flag that the
+// previous code returned nil on HTTP 200 even when the bulk
+// response body's `errors:true` flag was set. The cutover worker
+// would then have called `MarkCompleted` while a fraction of the
+// tenant's messages were missing from the destination shared
+// index — a silent data-loss path.
+func TestSharedOpenSearch_MigrateIndexPartialBulkFailureSurfaces(t *testing.T) {
+	const tenantID = "tenant-partial"
+	b, _ := newSharedOpenSearch(t, "shard-1", func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/_bulk") {
+			// HTTP 200 but `errors:true` with a per-item
+			// rejection — exactly the silent-failure shape the
+			// bot flagged.
+			_, _ = io.WriteString(w, `{
+				"took": 5,
+				"errors": true,
+				"items": [
+					{"index": {"_id": "tenant-partial:m1", "status": 201}},
+					{"index": {"_id": "tenant-partial:m2", "status": 400, "error": {"type": "mapper_parsing_exception", "reason": "field [tenant_id] is text, expected keyword"}}}
+				]
+			}`)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	msgs := []Message{
+		{TenantID: tenantID, MessageID: "m1"},
+		{TenantID: tenantID, MessageID: "m2"},
+	}
+	err := b.MigrateIndex(context.Background(), tenantID, msgs)
+	if err == nil {
+		t.Fatal("MigrateIndex returned nil on errors:true; expected error to bubble so the cutover worker does NOT MarkCompleted")
+	}
+	if !errors.Is(err, errBulkPartialFailure) {
+		t.Errorf("err = %v, want wrapped errBulkPartialFailure", err)
+	}
+	if !strings.Contains(err.Error(), "tenant-partial:m2") {
+		t.Errorf("err = %q, want item id 'tenant-partial:m2' in message", err.Error())
+	}
+}
+
+// TestSharedOpenSearch_MigrateIndexBulkErrorsFalseSucceeds pins
+// the no-op path so an entirely-successful bulk (the common case)
+// does NOT erroneously trip the partial-failure check.
+func TestSharedOpenSearch_MigrateIndexBulkErrorsFalseSucceeds(t *testing.T) {
+	b, _ := newSharedOpenSearch(t, "shard-1", func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/_bulk") {
+			_, _ = io.WriteString(w, `{"took":3,"errors":false,"items":[{"index":{"_id":"t:1","status":201}}]}`)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	if err := b.MigrateIndex(context.Background(), "t", []Message{{TenantID: "t", MessageID: "1"}}); err != nil {
+		t.Fatalf("MigrateIndex on clean bulk returned %v, want nil", err)
+	}
+}
+
 // TestSharedOpenSearch_ResolverErrorIsBubbled confirms a shard
 // resolver failure bubbles up so callers (writes, reads, the
 // init loop) can decide whether to retry or alert.

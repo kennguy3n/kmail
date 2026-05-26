@@ -139,9 +139,24 @@ func (o *OpenSearchBackend) MigrateIndex(ctx context.Context, tenantID string, m
 		return err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 256*1024))
+	// Read up to 1 MiB so a bulk response describing per-item
+	// failures isn't truncated. The previous 256 KiB cap was set
+	// when only the wire status was inspected; now that we parse
+	// the body for `errors: true`, we need enough room for a
+	// realistic items[] array (each entry is ~150 B → ~6.7k items
+	// before truncation, well past a single bulk payload).
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
 	if resp.StatusCode >= 400 {
 		return fmt.Errorf("opensearch bulk: %d %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	// OpenSearch `_bulk` returns HTTP 200 even when individual
+	// items fail (the response body's `errors:true` flag is the
+	// real signal). Without this check, a partial bulk failure
+	// during cutover would silently let the worker proceed to
+	// `MarkCompleted` with a fraction of the tenant's messages
+	// missing from the destination index.
+	if err := parseBulkResponse(body); err != nil {
+		return err
 	}
 	return nil
 }

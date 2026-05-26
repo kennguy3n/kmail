@@ -451,7 +451,16 @@ func (f ShardResolverFunc) ShardForTenant(ctx context.Context, tenantID string) 
 
 // pathEscape is `url.PathEscape` exposed through the package so
 // the backend drivers depend on a single helper. Path escaping is
-// required (rather than QueryEscape) because the only caller uses
-// it for a path segment (`/_doc/{id}`) where a literal space must
-// be `%20`, not `+`.
+// required (rather than QueryEscape) when the caller is building a
+// path segment (`/_doc/{id}`) where a literal space must be
+// `%20`, not `+`.
 var pathEscape = url.PathEscape
+
+// queryEscape is `url.QueryEscape` exposed through the package
+// for the same reason as `pathEscape`. Use this for the VALUE of
+// a `?key=value` URL parameter so reserved characters that are
+// legal in a path (`=`, `'`, `&`) are encoded — otherwise the
+// Meilisearch / OpenSearch URL parser would interpret them as
+// structural delimiters and either return 400 or, worse, silently
+// truncate the filter expression and run the query without it.
+var queryEscape = url.QueryEscape

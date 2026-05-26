@@ -246,9 +246,24 @@ func (o *SharedOpenSearchBackend) MigrateIndex(ctx context.Context, tenantID str
 		return err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 256*1024))
+	// See OpenSearchBackend.MigrateIndex for the rationale on the
+	// 1 MiB read cap and the `parseBulkResponse` post-check.
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
 	if resp.StatusCode >= 400 {
 		return fmt.Errorf("opensearch shared bulk: %d %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	// `_bulk` returns HTTP 200 even when individual items fail.
+	// In the shared-index model a partial failure is especially
+	// dangerous: the cutover worker would mark the (tenant, target)
+	// row `completed` while a fraction of the tenant's messages
+	// never made it into the destination shared index, and the
+	// next user search against the new backend would return
+	// silently incomplete results. The lazy-mapping self-heal in
+	// `ensureMapping` covers the "tenant_id was dynamically
+	// mapped as text" case for new shards but cannot rescue a
+	// per-item rejection on the destination side.
+	if err := parseBulkResponse(body); err != nil {
+		return fmt.Errorf("opensearch shared bulk: %w", err)
 	}
 	return nil
 }

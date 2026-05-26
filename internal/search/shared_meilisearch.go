@@ -228,9 +228,17 @@ func (m *SharedMeilisearchBackend) ExportMessages(ctx context.Context, tenantID 
 	for {
 		// Meilisearch's `GET /documents` accepts a `filter`
 		// query-string param of the same shape as the search
-		// filter expression; we URL-encode the value below.
+		// filter expression. The value is `tenant_id = '<uuid>'`
+		// which contains the reserved characters `=`, `'`, and
+		// (for some tenant ids) `&` / `+` — so we MUST use
+		// QueryEscape, not PathEscape. PathEscape leaves `=` and
+		// `'` literal which would corrupt the URL's parameter
+		// structure (the parser would interpret the `=` inside
+		// the filter as another query-string separator and
+		// silently drop the filter, returning EVERY document in
+		// the shared index — a tenant-isolation break).
 		endpoint := fmt.Sprintf("%s/indexes/%s/documents?limit=%d&offset=%d&filter=%s",
-			m.BaseURL, index, pageSize, offset, pathEscape(tenantFilter(tenantID)))
+			m.BaseURL, index, pageSize, offset, queryEscape(tenantFilter(tenantID)))
 		var resp struct {
 			Results []Message `json:"results"`
 			Total   int       `json:"total"`
