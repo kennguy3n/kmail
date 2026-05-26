@@ -663,6 +663,34 @@ func main() {
 	// shared_meili->shared_opensearch by default), so the
 	// fleet's hot tenants move forward regardless of which
 	// model they were provisioned under.
+	//
+	// We deliberately gate on the LEGACY backend names
+	// (`BackendMeilisearch` / `BackendOpenSearch`) rather than
+	// the four-name tuple of {meili, shared_meili, opensearch,
+	// shared_opensearch}, because the wiring above at
+	// `KMAIL_MEILISEARCH_URL` / `KMAIL_OPENSEARCH_URL`
+	// CO-REGISTERS both the per-tenant AND the shared backend
+	// variants for each URL. So:
+	//   - `KMAIL_MEILISEARCH_URL` set  =>  hasMeili = true  AND
+	//                                       BackendSharedMeilisearch
+	//                                       is also wired
+	//   - `KMAIL_OPENSEARCH_URL` set   =>  hasOpen = true  AND
+	//                                       BackendSharedOpenSearch
+	//                                       is also wired
+	// The legacy-name guard is therefore a sufficient proxy
+	// for "both transitions in `DefaultCutoverTransitions` have
+	// valid Source AND Target backends registered." If a future
+	// PR introduces a search backend that ISN'T URL-co-registered
+	// (e.g. a hot-tier Meilisearch from its own env var), the
+	// right move at that point is to switch this guard to a
+	// per-transition predicate (`hasTransitionSource(tr)` /
+	// `hasTransitionTarget(tr)`) walking
+	// `DefaultCutoverTransitions` rather than counting backend
+	// names. Devin Review round 8 (finding 3300377295) flagged
+	// this implicit coupling — the explicit comment now makes
+	// the URL-env-var invariant visible to the next reader so
+	// they don't have to dig through the wiring block above to
+	// understand why the two-name guard is correct.
 	hasMeili, hasOpen := false, false
 	for _, b := range searchBackends {
 		switch b.Name() {

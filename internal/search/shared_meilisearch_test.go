@@ -551,3 +551,116 @@ func TestSharedMeilisearch_MigrateIndexStampsCompositeDocID(t *testing.T) {
 		}
 	}
 }
+
+// TestSharedMeilisearch_EnsureSettingsRefusesWrongPrimaryKey
+// pins the defensive PK-verification path added in round 8. When
+// the shared index was created by a previous code version (or by
+// a race where a write landed before ensureSettings) without the
+// composite `doc_id` PK, Meilisearch refuses every attempt to
+// change it on the existing index. The BFF MUST detect this
+// misconfiguration explicitly and surface a loud operator-actionable
+// error rather than silently patching only the filterable / searchable
+// attributes — silent patching would leave the shared index keyed
+// on the bare `message_id`, which is per-account, not per-shard,
+// breaking the tenant-isolation invariant via cross-tenant
+// overwrites.
+func TestSharedMeilisearch_EnsureSettingsRefusesWrongPrimaryKey(t *testing.T) {
+	var (
+		mu                sync.Mutex
+		createIndexCalls  int
+		patchSettingsHit  bool
+	)
+	b, _ := newSharedMeili(t, "shard-1", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/indexes":
+			createIndexCalls++
+			// Simulate index_already_exists by returning the
+			// real Meilisearch 400 + structured payload.
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"code":"index_already_exists","message":"Index ` + "`" + sharedIndexNameFor("shard-1") + "`" + ` already exists","type":"invalid_request"}`))
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/indexes/"):
+			// Existing index reports a STALE primary key
+			// (the bug surface).
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"uid":"` + sharedIndexNameFor("shard-1") + `","primaryKey":"message_id"}`))
+		case r.Method == http.MethodPatch && strings.Contains(r.URL.Path, "/settings"):
+			patchSettingsHit = true
+			w.WriteHeader(http.StatusAccepted)
+		default:
+			w.WriteHeader(http.StatusAccepted)
+		}
+	})
+	err := b.IndexMessage(context.Background(), Message{TenantID: "t1", MessageID: "m1"})
+	if err == nil {
+		t.Fatal("IndexMessage returned nil; want loud error refusing to patch wrong-PK index")
+	}
+	for _, want := range []string{
+		"primaryKey=\"message_id\"",
+		"expected \"doc_id\"",
+		"drop the index",
+		"tenant isolation",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q missing expected fragment %q", err.Error(), want)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if createIndexCalls != 1 {
+		t.Errorf("create-index calls = %d, want 1", createIndexCalls)
+	}
+	if patchSettingsHit {
+		t.Errorf("PATCH /indexes/.../settings was called against a wrong-PK index; the verify step must short-circuit before settings are patched (otherwise the BFF would silently mark the index as 'good' in settingsApplied)")
+	}
+}
+
+// TestSharedMeilisearch_EnsureSettingsHappyPathOnConflictWithGoodPK
+// is the inverse of the refuse case: when POST /indexes returns
+// a conflict AND the existing index already has the correct
+// composite PK, ensureSettings MUST fall through to the
+// settings PATCH and complete successfully. This pins the path
+// for the (extremely common) restart case where a previous BFF
+// process already created the index correctly.
+func TestSharedMeilisearch_EnsureSettingsHappyPathOnConflictWithGoodPK(t *testing.T) {
+	var (
+		mu               sync.Mutex
+		createIndexCalls int
+		verifyCalls      int
+		patchSettingsHit bool
+	)
+	b, _ := newSharedMeili(t, "shard-1", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/indexes":
+			createIndexCalls++
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"code":"index_already_exists","message":"Index ` + "`" + sharedIndexNameFor("shard-1") + "`" + ` already exists","type":"invalid_request"}`))
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/indexes/"):
+			verifyCalls++
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"uid":"` + sharedIndexNameFor("shard-1") + `","primaryKey":"doc_id"}`))
+		case r.Method == http.MethodPatch && strings.Contains(r.URL.Path, "/settings"):
+			patchSettingsHit = true
+			w.WriteHeader(http.StatusAccepted)
+		default:
+			w.WriteHeader(http.StatusAccepted)
+		}
+	})
+	if err := b.IndexMessage(context.Background(), Message{TenantID: "t1", MessageID: "m1"}); err != nil {
+		t.Fatalf("IndexMessage: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if createIndexCalls != 1 {
+		t.Errorf("create-index calls = %d, want 1", createIndexCalls)
+	}
+	if verifyCalls != 1 {
+		t.Errorf("verify GET calls = %d, want 1 (must run on conflict fall-through)", verifyCalls)
+	}
+	if !patchSettingsHit {
+		t.Errorf("PATCH /indexes/.../settings was NOT called after good-PK verify; the conflict path must still apply filterable/searchable attributes")
+	}
+}

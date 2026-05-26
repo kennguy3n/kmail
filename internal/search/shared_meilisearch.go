@@ -305,6 +305,21 @@ func (m *SharedMeilisearchBackend) ensureSettings(ctx context.Context, index str
 		if !isConflict(err) {
 			return err
 		}
+		// Meilisearch does NOT permit changing `primaryKey` on
+		// an existing index. If the shared index was created by
+		// a previous code version that didn't set the composite
+		// `doc_id` PK (or by a race where a document write landed
+		// before `ensureSettings`), silently patching only
+		// settings here would leave the shared index keyed on
+		// the bare per-account `message_id` — breaking the
+		// tenant-isolation invariant via cross-tenant overwrites.
+		// Verify the existing PK explicitly and refuse to
+		// proceed with a loud, operator-actionable error if it
+		// doesn't match what we need. (Devin Review round 8 fix
+		// on commit dd89751.)
+		if err := m.verifyExistingPrimaryKey(ctx, index); err != nil {
+			return err
+		}
 	}
 
 	settingsBody := map[string]any{
@@ -319,6 +334,50 @@ func (m *SharedMeilisearchBackend) ensureSettings(ctx context.Context, index str
 	m.settingsMu.Lock()
 	m.settingsApplied[index] = true
 	m.settingsMu.Unlock()
+	return nil
+}
+
+// verifyExistingPrimaryKey fetches the existing shared index's
+// metadata and refuses to proceed unless `primaryKey` matches the
+// composite `doc_id` we depend on. Meilisearch does NOT permit
+// changing the primary key on an existing index — the only remedy
+// is for an operator to drop and recreate the index manually.
+// Catching the misconfiguration here turns a silent
+// cross-tenant data corruption (two tenants on the same shard
+// overwriting each other on the bare `message_id`) into a loud,
+// actionable startup / first-write error.
+//
+// The error message explicitly tells the operator:
+//   - which index is misconfigured
+//   - what we found vs. what we need
+//   - the exact remedy (DELETE the index, the BFF will recreate
+//     it with the correct PK on the next ensureSettings call)
+//
+// We intentionally do NOT cache the bad state in
+// `settingsApplied`: a transient GET failure should be retried on
+// the next call, and after the operator fixes the PK the BFF
+// must re-run `ensureSettings` to push the filterable /
+// searchable attributes against the freshly-created index.
+func (m *SharedMeilisearchBackend) verifyExistingPrimaryKey(ctx context.Context, index string) error {
+	endpoint := m.BaseURL + "/indexes/" + index
+	var resp struct {
+		UID        string `json:"uid"`
+		PrimaryKey string `json:"primaryKey"`
+	}
+	if err := httpJSON(ctx, m.HTTPClient, http.MethodGet, endpoint, m.headers(), nil, &resp); err != nil {
+		return fmt.Errorf("verify primary key for index %q: %w", index, err)
+	}
+	if resp.PrimaryKey != "doc_id" {
+		return fmt.Errorf(
+			"shared meilisearch index %q has primaryKey=%q, expected %q. "+
+				"Meilisearch does not permit changing the primary key on an existing index, "+
+				"so the BFF cannot self-heal this misconfiguration. "+
+				"To recover, drop the index (DELETE %s/indexes/%s) and re-run the BFF — "+
+				"ensureSettings will recreate it with the correct composite (tenant_id:message_id) PK. "+
+				"Keeping the wrong PK in place would break tenant isolation on this shared index "+
+				"(cross-tenant message_id collisions would silently overwrite documents).",
+			index, resp.PrimaryKey, "doc_id", m.BaseURL, index)
+	}
 	return nil
 }
 
