@@ -723,6 +723,13 @@ func (s *PostgresCutoverStore) MarkFailed(ctx context.Context, tenantID, targetB
 // (caller-provided via `cfg.Now()`) so the dashboard reflects the
 // recovery and integration tests can drive a deterministic clock.
 func (s *PostgresCutoverStore) ReconcileCompleted(ctx context.Context, targetBackend string, before, now time.Time) (int64, error) {
+	// Both `j.target_backend = $1` and `t.search_backend = $1`
+	// intentionally compare the same `$1` parameter: the row is
+	// only a reconcile candidate when the JOB targeted this
+	// backend AND the tenant has already been flipped to this
+	// backend (SetBackend committed but MarkCompleted didn't). A
+	// mismatched pair is either the wrong transition or the
+	// stuck state ReconcileStale handles.
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE search_cutover_jobs j
 		   SET cutover_state = 'completed',
