@@ -631,11 +631,15 @@ func main() {
 	// missing index on the first SearchMessages call.
 	// Failures inside `EnsureSharedIndexes` are per-(backend,
 	// shard) and logged; only a fatal lister error aborts here,
-	// in which case the BFF can still start (the call returns
-	// the lister error and we log it, but we do not block the
-	// rest of startup).
+	// in which case the BFF can still start. Both shared
+	// backends (`shared_meilisearch` and `shared_opensearch`)
+	// have lazy mapping/settings paths in their write methods,
+	// so a missed-at-startup shard is created with the correct
+	// mapping on its first IndexMessage / MigrateIndex call —
+	// the BFF is degraded (latency on the first write) rather
+	// than broken (wrong mapping breaking the tenant filter).
 	if err := search.EnsureSharedIndexes(ctx, logger, shardSvc, sharedInitBackends); err != nil {
-		logger.Printf("search.EnsureSharedIndexes: %v (continuing — shared indexes will be created lazily)", err)
+		logger.Printf("search.EnsureSharedIndexes: %v (continuing — shared indexes will be created lazily on first write)", err)
 	}
 
 	// Phase 5 / Phase 8: auto-cutover. Disabled when either

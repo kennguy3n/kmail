@@ -21,6 +21,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -33,6 +34,21 @@ type SharedOpenSearchBackend struct {
 	Password   string
 	HTTPClient *http.Client
 	Shards     ShardResolver
+
+	// mappingApplied tracks which shared indexes have already
+	// had their mapping (in particular `tenant_id: keyword`)
+	// pushed in this process. We track this so the lazy path
+	// in `IndexMessage` / `MigrateIndex` pays the PUT cost at
+	// most once per shard per process — but the lazy path
+	// itself is load-bearing because without it OpenSearch
+	// auto-creates the index with dynamic mapping on first
+	// write, which silently turns `tenant_id` into a
+	// `text`-analyzed field and breaks the `term` tenant
+	// filter for every tenant on that shard. The map is small
+	// (~one entry per Stalwart shard) and a single Mutex is
+	// sufficient.
+	mappingMu      sync.Mutex
+	mappingApplied map[string]bool
 }
 
 // NewSharedOpenSearchBackend builds a SharedOpenSearchBackend
@@ -45,11 +61,12 @@ func NewSharedOpenSearchBackend(baseURL, username, password string, shards Shard
 		return nil, errors.New("search.NewSharedOpenSearchBackend: shards resolver is required")
 	}
 	return &SharedOpenSearchBackend{
-		BaseURL:    baseURL,
-		Username:   username,
-		Password:   password,
-		HTTPClient: &http.Client{Timeout: 10 * time.Second},
-		Shards:     shards,
+		BaseURL:        baseURL,
+		Username:       username,
+		Password:       password,
+		HTTPClient:     &http.Client{Timeout: 10 * time.Second},
+		Shards:         shards,
+		mappingApplied: map[string]bool{},
 	}, nil
 }
 
@@ -60,10 +77,22 @@ func (o *SharedOpenSearchBackend) Name() string { return BackendSharedOpenSearch
 // composed of `{tenant_id}:{message_id}` so two tenants sharing
 // the same Stalwart-issued message id (which is per-account, not
 // per-shard) cannot collide in the shared index.
+//
+// The mapping is ensured lazily on the first write per shard per
+// process. Without that, a write that races ahead of
+// `EnsureSharedIndexes` (e.g. startup ensure failed, or a new
+// shard was registered after startup) would let OpenSearch
+// auto-create the index with dynamic mapping — `tenant_id` would
+// become a `text` field, the `term` filter would no longer match
+// any document, and every tenant on the shard would silently get
+// empty search results.
 func (o *SharedOpenSearchBackend) IndexMessage(ctx context.Context, msg Message) error {
 	index, err := o.indexFor(ctx, msg.TenantID)
 	if err != nil {
 		return err
+	}
+	if err := o.ensureMapping(ctx, index); err != nil {
+		return fmt.Errorf("ensure mapping: %w", err)
 	}
 	docID := sharedDocID(msg.TenantID, msg.MessageID)
 	endpoint := o.BaseURL + "/" + index + "/_doc/" + pathEscape(docID)
@@ -181,6 +210,13 @@ func (o *SharedOpenSearchBackend) MigrateIndex(ctx context.Context, tenantID str
 	if err != nil {
 		return err
 	}
+	// Same lazy mapping invariant as `IndexMessage`: the bulk
+	// path is the cutover worker's write path and it MUST NOT
+	// be the first call to touch a fresh shared index without
+	// pinning `tenant_id: keyword` first.
+	if err := o.ensureMapping(ctx, index); err != nil {
+		return fmt.Errorf("migrate: ensure mapping: %w", err)
+	}
 	endpoint := o.BaseURL + "/_bulk"
 	var buf bytes.Buffer
 	for _, m := range msgs {
@@ -274,33 +310,81 @@ func (o *SharedOpenSearchBackend) ExportMessages(ctx context.Context, tenantID s
 // mapping required for tenant filtering (`tenant_id` as a
 // `keyword` so the term filter hits the inverted index instead
 // of a text analyzer). Idempotent — a 400 response with
-// `resource_already_exists_exception` is treated as success.
+// `resource_already_exists_exception` falls through to a
+// `PUT /<index>/_mapping` call that re-asserts the mapping on
+// the existing index. That self-heal step matters when an earlier
+// process let OpenSearch dynamically map `tenant_id` as `text`
+// (e.g. because a write raced an EnsureIndex failure) — without
+// it a BFF restart could never recover the misconfigured index.
 func (o *SharedOpenSearchBackend) EnsureIndex(ctx context.Context, shardID string) error {
 	if shardID == "" {
 		return errors.New("shardID required")
 	}
-	index := sharedIndexNameFor(shardID)
-	body := map[string]any{
-		"mappings": map[string]any{
-			"properties": map[string]any{
-				"tenant_id":   map[string]any{"type": "keyword"},
-				"mailbox_id":  map[string]any{"type": "keyword"},
-				"message_id":  map[string]any{"type": "keyword"},
-				"subject":     map[string]any{"type": "text"},
-				"snippet":     map[string]any{"type": "text"},
-				"from":        map[string]any{"type": "text"},
-				"to":          map[string]any{"type": "text"},
-				"received_at": map[string]any{"type": "date"},
-			},
-		},
+	return o.ensureMapping(ctx, sharedIndexNameFor(shardID))
+}
+
+// ensureMapping is the lazy variant of EnsureIndex used by the
+// per-message and bulk write paths. The expensive PUT calls run
+// at most once per shared index per process. Safe to call
+// concurrently — the underlying OpenSearch endpoints are
+// idempotent on the mapping payload we send.
+func (o *SharedOpenSearchBackend) ensureMapping(ctx context.Context, index string) error {
+	if index == "" {
+		return errors.New("index required")
 	}
-	if err := o.do(ctx, http.MethodPut, o.BaseURL+"/"+index, body, nil); err != nil {
-		// OpenSearch returns 400 (`resource_already_exists_exception`)
-		// when the index is present from a previous startup.
-		if isAlreadyExists(err) {
-			return nil
-		}
+	o.mappingMu.Lock()
+	if o.mappingApplied[index] {
+		o.mappingMu.Unlock()
+		return nil
+	}
+	o.mappingMu.Unlock()
+
+	if err := o.applyIndexMapping(ctx, index); err != nil {
 		return err
+	}
+
+	o.mappingMu.Lock()
+	o.mappingApplied[index] = true
+	o.mappingMu.Unlock()
+	return nil
+}
+
+// applyIndexMapping performs the network calls underlying
+// `ensureMapping` without touching the cache map. Split out so
+// tests (and a future force-refresh code path) can drive the
+// PUT explicitly. It first PUTs the full index (mappings +
+// settings); on `resource_already_exists_exception` it falls
+// through to a PUT `/<index>/_mapping` that re-applies just the
+// `properties` block so an existing index with a stale dynamic
+// mapping is healed at startup or on the first lazy call.
+func (o *SharedOpenSearchBackend) applyIndexMapping(ctx context.Context, index string) error {
+	props := map[string]any{
+		"tenant_id":   map[string]any{"type": "keyword"},
+		"mailbox_id":  map[string]any{"type": "keyword"},
+		"message_id":  map[string]any{"type": "keyword"},
+		"subject":     map[string]any{"type": "text"},
+		"snippet":     map[string]any{"type": "text"},
+		"from":        map[string]any{"type": "text"},
+		"to":          map[string]any{"type": "text"},
+		"received_at": map[string]any{"type": "date"},
+	}
+	createBody := map[string]any{
+		"mappings": map[string]any{"properties": props},
+	}
+	if err := o.do(ctx, http.MethodPut, o.BaseURL+"/"+index, createBody, nil); err != nil {
+		if !isAlreadyExists(err) {
+			return err
+		}
+		// Index pre-existed — re-assert the mapping in case it was
+		// dynamically created on first write with `tenant_id` as a
+		// `text` field. OpenSearch will reject incompatible type
+		// changes with a clear error (e.g. `mapper [tenant_id]
+		// cannot be changed from type [text] to [keyword]`); we
+		// surface that error so operators can recreate the index.
+		mappingBody := map[string]any{"properties": props}
+		if err := o.do(ctx, http.MethodPut, o.BaseURL+"/"+index+"/_mapping", mappingBody, nil); err != nil {
+			return fmt.Errorf("update mapping on existing index %q: %w", index, err)
+		}
 	}
 	return nil
 }

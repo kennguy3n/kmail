@@ -347,16 +347,178 @@ func TestSharedOpenSearch_EnsureIndexCreatesWithMapping(t *testing.T) {
 	}
 }
 
-// TestSharedOpenSearch_EnsureIndexResourceExistsIsSuccess
-// guards the idempotency contract — `EnsureIndex` is called at
-// every BFF startup, so an existing-index response must be
-// treated as success.
-func TestSharedOpenSearch_EnsureIndexResourceExistsIsSuccess(t *testing.T) {
+// TestSharedOpenSearch_EnsureIndexSelfHealsExistingIndex pins
+// the self-heal contract: when the shared index already exists
+// (e.g. it was previously auto-created with a dynamic
+// `tenant_id: text` mapping after a startup ensure failed),
+// `EnsureIndex` must follow up with a `PUT /<index>/_mapping`
+// that re-asserts the correct keyword mapping. Without this
+// step a BFF restart could never recover the misconfigured
+// index — operators would have to manually rebuild it.
+func TestSharedOpenSearch_EnsureIndexSelfHealsExistingIndex(t *testing.T) {
+	var (
+		mu             sync.Mutex
+		createCalls    int
+		mappingCalls   int
+		mappingBody    map[string]any
+		mappingMethod  string
+	)
 	b, _ := newSharedOpenSearch(t, "ignored", func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, `{"error":{"type":"resource_already_exists_exception"}}`, http.StatusBadRequest)
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/_mapping"):
+			mappingCalls++
+			mappingMethod = r.Method
+			body, _ := io.ReadAll(r.Body)
+			_ = json.Unmarshal(body, &mappingBody)
+			w.WriteHeader(http.StatusOK)
+		default:
+			createCalls++
+			// Simulate "index already exists" on the create PUT.
+			http.Error(w, `{"error":{"type":"resource_already_exists_exception"}}`, http.StatusBadRequest)
+		}
 	})
 	if err := b.EnsureIndex(context.Background(), "shard-1"); err != nil {
-		t.Errorf("EnsureIndex on existing index returned %v, want nil", err)
+		t.Fatalf("EnsureIndex on existing index returned %v, want nil", err)
+	}
+	if createCalls != 1 {
+		t.Errorf("createCalls = %d, want 1 (initial PUT /<index> must be attempted)", createCalls)
+	}
+	if mappingCalls != 1 {
+		t.Fatalf("mappingCalls = %d, want 1 (PUT /<index>/_mapping must run as self-heal)", mappingCalls)
+	}
+	if mappingMethod != http.MethodPut {
+		t.Errorf("mapping method = %q, want PUT", mappingMethod)
+	}
+	props, _ := mappingBody["properties"].(map[string]any)
+	tenantProp, _ := props["tenant_id"].(map[string]any)
+	if tenantProp["type"] != "keyword" {
+		t.Errorf("self-heal mapping tenant_id = %v, want keyword", tenantProp["type"])
+	}
+}
+
+// TestSharedOpenSearch_EnsureIndexSelfHealFailureBubbles guards
+// the fail-loud contract: if the existing index has `tenant_id`
+// dynamically mapped as `text`, OpenSearch will reject the
+// `PUT /_mapping` with `illegal_argument_exception`. We must
+// surface that error rather than silently caching the index as
+// "healed", so operators see the indexing failures and recreate
+// the index.
+func TestSharedOpenSearch_EnsureIndexSelfHealFailureBubbles(t *testing.T) {
+	b, _ := newSharedOpenSearch(t, "ignored", func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/_mapping"):
+			http.Error(w, `{"error":{"type":"illegal_argument_exception","reason":"mapper [tenant_id] cannot be changed from type [text] to [keyword]"}}`, http.StatusBadRequest)
+		default:
+			http.Error(w, `{"error":{"type":"resource_already_exists_exception"}}`, http.StatusBadRequest)
+		}
+	})
+	err := b.EnsureIndex(context.Background(), "shard-1")
+	if err == nil {
+		t.Fatal("EnsureIndex returned nil, want error from incompatible mapping update")
+	}
+	if !strings.Contains(err.Error(), "update mapping on existing index") {
+		t.Errorf("err = %v, want wrapped 'update mapping on existing index'", err)
+	}
+	// Second call should NOT cache the failure as success — the
+	// mapping was never applied, so the lazy path must keep
+	// retrying until the operator fixes the underlying mapping.
+	err2 := b.EnsureIndex(context.Background(), "shard-1")
+	if err2 == nil {
+		t.Errorf("second EnsureIndex returned nil; failures must not be cached as success")
+	}
+}
+
+// TestSharedOpenSearch_IndexMessageLazyMapping pins the
+// load-bearing lazy mapping invariant: a write that races
+// EnsureSharedIndexes (or arrives after a new shard is
+// registered post-startup) MUST trigger a PUT /<index> with
+// `tenant_id: keyword` BEFORE the document write hits
+// OpenSearch — otherwise OpenSearch's dynamic mapping would
+// auto-create the index with `tenant_id` as a `text` field and
+// silently break the tenant filter for every tenant on that
+// shard. After the first call the mapping is cached, so the
+// second IndexMessage skips the ensure step.
+func TestSharedOpenSearch_IndexMessageLazyMapping(t *testing.T) {
+	var (
+		mu             sync.Mutex
+		mappingPuts    int
+		docPuts        int
+		firstCallOrder []string
+	)
+	b, _ := newSharedOpenSearch(t, "shard-lazy", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case strings.Contains(r.URL.Path, "/_doc/"):
+			docPuts++
+			firstCallOrder = append(firstCallOrder, "doc")
+			w.WriteHeader(http.StatusCreated)
+		default:
+			// PUT /<index> for the create — succeeds (no
+			// already_exists) so no follow-up mapping call.
+			mappingPuts++
+			firstCallOrder = append(firstCallOrder, "mapping")
+			w.WriteHeader(http.StatusOK)
+		}
+	})
+	msg := Message{TenantID: "tenant-lazy", MessageID: "m1"}
+	if err := b.IndexMessage(context.Background(), msg); err != nil {
+		t.Fatalf("IndexMessage #1: %v", err)
+	}
+	if err := b.IndexMessage(context.Background(), msg); err != nil {
+		t.Fatalf("IndexMessage #2: %v", err)
+	}
+	if mappingPuts != 1 {
+		t.Errorf("mappingPuts = %d, want 1 (cached after first call)", mappingPuts)
+	}
+	if docPuts != 2 {
+		t.Errorf("docPuts = %d, want 2", docPuts)
+	}
+	if len(firstCallOrder) < 2 || firstCallOrder[0] != "mapping" || firstCallOrder[1] != "doc" {
+		t.Errorf("call order = %v, want [mapping, doc, ...] (mapping must precede first doc write)", firstCallOrder)
+	}
+}
+
+// TestSharedOpenSearch_MigrateIndexLazyMapping verifies the
+// bulk migration path also lazy-ensures the mapping before its
+// `_bulk` payload lands — the cutover worker is precisely the
+// path most likely to write into a fresh shared index, so its
+// first call has to pin the keyword mapping.
+func TestSharedOpenSearch_MigrateIndexLazyMapping(t *testing.T) {
+	var (
+		mu          sync.Mutex
+		mappingPuts int
+		bulkPosts   int
+		order       []string
+	)
+	b, _ := newSharedOpenSearch(t, "shard-mig", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/_bulk"):
+			bulkPosts++
+			order = append(order, "bulk")
+			_, _ = io.WriteString(w, `{"errors":false,"items":[]}`)
+		default:
+			mappingPuts++
+			order = append(order, "mapping")
+			w.WriteHeader(http.StatusOK)
+		}
+	})
+	msgs := []Message{{TenantID: "tenant-mig", MessageID: "m1"}}
+	if err := b.MigrateIndex(context.Background(), "tenant-mig", msgs); err != nil {
+		t.Fatalf("MigrateIndex: %v", err)
+	}
+	if mappingPuts != 1 {
+		t.Errorf("mappingPuts = %d, want 1 (mapping must be ensured before bulk)", mappingPuts)
+	}
+	if bulkPosts != 1 {
+		t.Errorf("bulkPosts = %d, want 1", bulkPosts)
+	}
+	if len(order) != 2 || order[0] != "mapping" || order[1] != "bulk" {
+		t.Errorf("call order = %v, want [mapping, bulk]", order)
 	}
 }
 
