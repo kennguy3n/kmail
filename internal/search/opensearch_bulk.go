@@ -18,12 +18,15 @@
 // preserves the existing "bulk: %d %s" shape — only the bot-flagged
 // "200 with errors:true in body" path is added.
 //
-// Returned error messages are intentionally backend-neutral (no
-// "opensearch bulk:" / "opensearch shared bulk:" prefix). Each
-// caller wraps the result with its own backend-specific prefix so
-// the final log line identifies which backend the failure came
-// from without producing a double-prefixed message like
-// "opensearch shared bulk: opensearch bulk: ...".
+// Returned error messages are intentionally backend-AND-stage
+// neutral: no "opensearch bulk:" / "opensearch shared bulk:"
+// prefix AND no leading "bulk:" segment. Each caller wraps the
+// result with its own backend-specific prefix (e.g.
+// "opensearch bulk: %w") which already names the stage, so the
+// final log line says "opensearch bulk: per-item failure: ..."
+// — one "bulk:" segment, not two. Keeping the helper neutral on
+// both axes is the only shape that avoids ANY double-prefixing
+// across the two callers.
 package search
 
 import (
@@ -53,10 +56,13 @@ type bulkItem struct {
 // `parseBulkResponse` when the response body's top-level `errors`
 // flag is true. Callers wrap it with their own context (which
 // backend + endpoint) so the surfaced error pinpoints the failing
-// _bulk call. The sentinel itself is backend-neutral on purpose:
-// the per-tenant and shared callers each add their own
-// "opensearch bulk:" / "opensearch shared bulk:" prefix.
-var errBulkPartialFailure = errors.New("bulk: per-item failure")
+// _bulk call. The sentinel itself is backend-AND-stage neutral on
+// purpose: callers already add "opensearch bulk:" / "opensearch
+// shared bulk:" prefix (which names BOTH the backend and the
+// stage), so embedding a second "bulk:" here would produce a
+// double-prefixed message like "opensearch bulk: bulk: per-item
+// failure".
+var errBulkPartialFailure = errors.New("per-item failure")
 
 // parseBulkResponse decodes the raw `_bulk` response body and
 // returns a non-nil error iff at least one item failed. The
@@ -71,11 +77,11 @@ var errBulkPartialFailure = errors.New("bulk: per-item failure")
 // the exact correctness gap Devin Review flagged.
 func parseBulkResponse(body []byte) error {
 	if len(body) == 0 {
-		return fmt.Errorf("bulk: empty response body")
+		return fmt.Errorf("empty response body")
 	}
 	var resp bulkResponse
 	if err := json.Unmarshal(body, &resp); err != nil {
-		return fmt.Errorf("bulk: decode response: %w", err)
+		return fmt.Errorf("decode response: %w", err)
 	}
 	if !resp.Errors {
 		return nil

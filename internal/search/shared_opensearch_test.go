@@ -599,13 +599,22 @@ func TestSharedOpenSearch_MigrateIndexPartialBulkFailureSurfaces(t *testing.T) {
 	}
 	// Pin the no-double-prefix invariant. The shared caller wraps
 	// the helper's neutral message with "opensearch shared bulk:",
-	// so the final shape MUST contain that prefix exactly once and
-	// MUST NOT contain "opensearch bulk:" anywhere.
+	// so the final shape MUST:
+	//   - contain "opensearch shared bulk:" exactly once
+	//   - NOT contain "opensearch bulk:" anywhere (would mean the
+	//     per-tenant prefix leaked into a shared-path log line)
+	//   - contain exactly one "bulk:" segment overall (would mean
+	//     the helper re-added its own "bulk:" producing
+	//     "opensearch shared bulk: bulk: per-item failure", the
+	//     real Devin Review flag we are guarding against).
 	if !strings.Contains(err.Error(), "opensearch shared bulk:") {
 		t.Errorf("err = %q, want 'opensearch shared bulk:' prefix", err.Error())
 	}
 	if strings.Contains(err.Error(), "opensearch bulk:") {
 		t.Errorf("err = %q, must not double-prefix with 'opensearch bulk:' inside the shared wrapper", err.Error())
+	}
+	if got := strings.Count(err.Error(), "bulk:"); got != 1 {
+		t.Errorf("err = %q, want exactly one 'bulk:' segment, got %d (double-stage prefix regression)", err.Error(), got)
 	}
 }
 

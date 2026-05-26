@@ -155,9 +155,12 @@ func (o *OpenSearchBackend) MigrateIndex(ctx context.Context, tenantID string, m
 	// during cutover would silently let the worker proceed to
 	// `MarkCompleted` with a fraction of the tenant's messages
 	// missing from the destination index. The helper returns a
-	// backend-neutral message; we wrap with "opensearch bulk:"
-	// here so the per-tenant and shared backends produce
-	// distinguishable log lines without double-prefixing.
+	// backend-AND-stage-neutral message (no "opensearch bulk:"
+	// prefix AND no embedded "bulk:" segment); we wrap with
+	// "opensearch bulk:" here so the per-tenant and shared
+	// backends produce distinguishable log lines like
+	// "opensearch bulk: per-item failure: 1 of 1000 items
+	// failed" without ever doubling the "bulk:" segment.
 	if err := parseBulkResponse(body); err != nil {
 		return fmt.Errorf("opensearch bulk: %w", err)
 	}

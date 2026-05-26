@@ -58,6 +58,16 @@ func TestParseBulkResponse_PartialFailure(t *testing.T) {
 	if strings.Contains(err.Error(), "opensearch shared bulk:") {
 		t.Errorf("parseBulkResponse must not embed backend names; got %q", err.Error())
 	}
+	// The helper MUST also NOT include a leading "bulk:" segment,
+	// because each caller already wraps with "opensearch bulk: %w"
+	// / "opensearch shared bulk: %w" which already names the
+	// stage. A second "bulk:" here would produce double-prefixed
+	// output like "opensearch bulk: bulk: per-item failure" —
+	// the exact regression Devin Review flagged on commit
+	// 6443f4c.
+	if strings.Contains(err.Error(), "bulk:") {
+		t.Errorf("parseBulkResponse must be stage-neutral too; got %q which would double-stage when wrapped", err.Error())
+	}
 }
 
 // TestParseBulkResponse_AllFailures keeps the failure count honest
@@ -111,6 +121,12 @@ func TestParseBulkResponse_MalformedBody(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "opensearch bulk:") {
 		t.Errorf("malformed-body error must be backend-neutral; got %q", err.Error())
+	}
+	// Same stage-neutrality check as the partial-failure path:
+	// the caller adds "bulk:" via its prefix, so the helper must
+	// not duplicate it.
+	if strings.Contains(err.Error(), "bulk:") {
+		t.Errorf("malformed-body error must be stage-neutral; got %q would double-stage when wrapped", err.Error())
 	}
 }
 
