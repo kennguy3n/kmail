@@ -48,6 +48,16 @@ func TestParseBulkResponse_PartialFailure(t *testing.T) {
 			t.Errorf("expected error to contain %q, got %q", want, err.Error())
 		}
 	}
+	// The helper MUST NOT prefix with "opensearch bulk:" itself —
+	// each backend wraps with its own backend-specific prefix so
+	// the shared backend's log line is not "opensearch shared
+	// bulk: opensearch bulk: ..." (a real Devin Review flag).
+	if strings.Contains(err.Error(), "opensearch bulk:") {
+		t.Errorf("parseBulkResponse must be backend-neutral; got %q which would double-prefix when wrapped", err.Error())
+	}
+	if strings.Contains(err.Error(), "opensearch shared bulk:") {
+		t.Errorf("parseBulkResponse must not embed backend names; got %q", err.Error())
+	}
 }
 
 // TestParseBulkResponse_AllFailures keeps the failure count honest
@@ -98,6 +108,9 @@ func TestParseBulkResponse_MalformedBody(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "decode response") {
 		t.Errorf("expected 'decode response' in error, got %q", err.Error())
+	}
+	if strings.Contains(err.Error(), "opensearch bulk:") {
+		t.Errorf("malformed-body error must be backend-neutral; got %q", err.Error())
 	}
 }
 

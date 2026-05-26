@@ -597,6 +597,16 @@ func TestSharedOpenSearch_MigrateIndexPartialBulkFailureSurfaces(t *testing.T) {
 	if !strings.Contains(err.Error(), "tenant-partial:m2") {
 		t.Errorf("err = %q, want item id 'tenant-partial:m2' in message", err.Error())
 	}
+	// Pin the no-double-prefix invariant. The shared caller wraps
+	// the helper's neutral message with "opensearch shared bulk:",
+	// so the final shape MUST contain that prefix exactly once and
+	// MUST NOT contain "opensearch bulk:" anywhere.
+	if !strings.Contains(err.Error(), "opensearch shared bulk:") {
+		t.Errorf("err = %q, want 'opensearch shared bulk:' prefix", err.Error())
+	}
+	if strings.Contains(err.Error(), "opensearch bulk:") {
+		t.Errorf("err = %q, must not double-prefix with 'opensearch bulk:' inside the shared wrapper", err.Error())
+	}
 }
 
 // TestSharedOpenSearch_MigrateIndexBulkErrorsFalseSucceeds pins

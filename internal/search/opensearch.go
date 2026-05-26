@@ -154,9 +154,12 @@ func (o *OpenSearchBackend) MigrateIndex(ctx context.Context, tenantID string, m
 	// real signal). Without this check, a partial bulk failure
 	// during cutover would silently let the worker proceed to
 	// `MarkCompleted` with a fraction of the tenant's messages
-	// missing from the destination index.
+	// missing from the destination index. The helper returns a
+	// backend-neutral message; we wrap with "opensearch bulk:"
+	// here so the per-tenant and shared backends produce
+	// distinguishable log lines without double-prefixing.
 	if err := parseBulkResponse(body); err != nil {
-		return err
+		return fmt.Errorf("opensearch bulk: %w", err)
 	}
 	return nil
 }

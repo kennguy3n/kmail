@@ -17,6 +17,13 @@
 // >= 400) errors stay separate so the caller's error message
 // preserves the existing "bulk: %d %s" shape — only the bot-flagged
 // "200 with errors:true in body" path is added.
+//
+// Returned error messages are intentionally backend-neutral (no
+// "opensearch bulk:" / "opensearch shared bulk:" prefix). Each
+// caller wraps the result with its own backend-specific prefix so
+// the final log line identifies which backend the failure came
+// from without producing a double-prefixed message like
+// "opensearch shared bulk: opensearch bulk: ...".
 package search
 
 import (
@@ -46,8 +53,10 @@ type bulkItem struct {
 // `parseBulkResponse` when the response body's top-level `errors`
 // flag is true. Callers wrap it with their own context (which
 // backend + endpoint) so the surfaced error pinpoints the failing
-// _bulk call.
-var errBulkPartialFailure = errors.New("opensearch bulk: per-item failure")
+// _bulk call. The sentinel itself is backend-neutral on purpose:
+// the per-tenant and shared callers each add their own
+// "opensearch bulk:" / "opensearch shared bulk:" prefix.
+var errBulkPartialFailure = errors.New("bulk: per-item failure")
 
 // parseBulkResponse decodes the raw `_bulk` response body and
 // returns a non-nil error iff at least one item failed. The
@@ -62,11 +71,11 @@ var errBulkPartialFailure = errors.New("opensearch bulk: per-item failure")
 // the exact correctness gap Devin Review flagged.
 func parseBulkResponse(body []byte) error {
 	if len(body) == 0 {
-		return fmt.Errorf("opensearch bulk: empty response body")
+		return fmt.Errorf("bulk: empty response body")
 	}
 	var resp bulkResponse
 	if err := json.Unmarshal(body, &resp); err != nil {
-		return fmt.Errorf("opensearch bulk: decode response: %w", err)
+		return fmt.Errorf("bulk: decode response: %w", err)
 	}
 	if !resp.Errors {
 		return nil
