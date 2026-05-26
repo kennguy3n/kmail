@@ -394,3 +394,160 @@ func TestSharedMeilisearch_ResolverErrorIsBubbled(t *testing.T) {
 		t.Errorf("IndexMessage err = %v, want 'resolve shard' wrapped", err)
 	}
 }
+
+// TestSharedMeilisearch_EnsureSettingsRegistersCompositePrimaryKey
+// pins the load-bearing behaviour fixed by the composite-PK fix:
+// the index-creation body MUST set `primaryKey: "doc_id"` so the
+// shared index dedupes on `<tenant>:<message>` and not on the
+// per-account `message_id` (two tenants on the same shard with
+// the same Stalwart-issued message id would otherwise overwrite
+// each other).
+func TestSharedMeilisearch_EnsureSettingsRegistersCompositePrimaryKey(t *testing.T) {
+	var (
+		mu               sync.Mutex
+		createBody       map[string]any
+		createIndexCalls int
+	)
+	b, _ := newSharedMeili(t, "shard-1", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		if r.Method == http.MethodPost && r.URL.Path == "/indexes" {
+			createIndexCalls++
+			body, _ := io.ReadAll(r.Body)
+			_ = json.Unmarshal(body, &createBody)
+		}
+		w.WriteHeader(http.StatusAccepted)
+	})
+	if err := b.IndexMessage(context.Background(), Message{TenantID: "t1", MessageID: "m1"}); err != nil {
+		t.Fatalf("IndexMessage: %v", err)
+	}
+	if createIndexCalls != 1 {
+		t.Fatalf("create-index calls = %d, want 1", createIndexCalls)
+	}
+	if got, _ := createBody["primaryKey"].(string); got != "doc_id" {
+		t.Errorf("primaryKey = %q, want %q (composite tenant-scoped id)", got, "doc_id")
+	}
+}
+
+// TestSharedMeilisearch_IndexMessageStampsCompositeDocID verifies
+// every IndexMessage request body carries a `doc_id` field that
+// composes `<tenant_id>:<message_id>`. This is the per-write
+// counterpart to the primary-key registration: even with a
+// correct primaryKey hint, a missing `doc_id` field would cause
+// Meilisearch to generate a surrogate id and break dedupe.
+func TestSharedMeilisearch_IndexMessageStampsCompositeDocID(t *testing.T) {
+	var (
+		mu      sync.Mutex
+		gotDocs []map[string]any
+	)
+	b, _ := newSharedMeili(t, "shard-1", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/documents") {
+			body, _ := io.ReadAll(r.Body)
+			_ = json.Unmarshal(body, &gotDocs)
+		}
+		w.WriteHeader(http.StatusAccepted)
+	})
+	msg := Message{TenantID: "tenant-A", MessageID: "msg-shared"}
+	if err := b.IndexMessage(context.Background(), msg); err != nil {
+		t.Fatalf("IndexMessage: %v", err)
+	}
+	if len(gotDocs) != 1 {
+		t.Fatalf("body docs = %d, want 1", len(gotDocs))
+	}
+	if got, _ := gotDocs[0]["doc_id"].(string); got != "tenant-A:msg-shared" {
+		t.Errorf("doc_id = %q, want %q", got, "tenant-A:msg-shared")
+	}
+	// The embedded Message fields must still be present so search
+	// hits and the `tenant_id` filter keep working.
+	if got, _ := gotDocs[0]["tenant_id"].(string); got != "tenant-A" {
+		t.Errorf("tenant_id in body = %q, want %q", got, "tenant-A")
+	}
+	if got, _ := gotDocs[0]["message_id"].(string); got != "msg-shared" {
+		t.Errorf("message_id in body = %q, want %q", got, "msg-shared")
+	}
+}
+
+// TestSharedMeilisearch_CrossTenantSameMessageIDProducesDistinctDocIDs
+// is the regression test for the cross-tenant collision bug
+// surfaced by Devin Review on commit 6015fea. Two tenants on the
+// same shard with the same Stalwart-issued message_id MUST end
+// up with different Meilisearch primary keys. Before the fix,
+// both writes were keyed on `message_id` alone and the second
+// silently overwrote the first.
+func TestSharedMeilisearch_CrossTenantSameMessageIDProducesDistinctDocIDs(t *testing.T) {
+	var (
+		mu      sync.Mutex
+		gotIDs  []string
+	)
+	b, _ := newSharedMeili(t, "shard-1", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/documents") {
+			body, _ := io.ReadAll(r.Body)
+			var docs []map[string]any
+			_ = json.Unmarshal(body, &docs)
+			for _, d := range docs {
+				if id, ok := d["doc_id"].(string); ok {
+					gotIDs = append(gotIDs, id)
+				}
+			}
+		}
+		w.WriteHeader(http.StatusAccepted)
+	})
+	ctx := context.Background()
+	if err := b.IndexMessage(ctx, Message{TenantID: "tenant-A", MessageID: "shared-id"}); err != nil {
+		t.Fatalf("IndexMessage A: %v", err)
+	}
+	if err := b.IndexMessage(ctx, Message{TenantID: "tenant-B", MessageID: "shared-id"}); err != nil {
+		t.Fatalf("IndexMessage B: %v", err)
+	}
+	if len(gotIDs) != 2 {
+		t.Fatalf("captured doc_ids = %v, want 2", gotIDs)
+	}
+	if gotIDs[0] == gotIDs[1] {
+		t.Fatalf("doc_ids collided across tenants: %v", gotIDs)
+	}
+	if gotIDs[0] != "tenant-A:shared-id" || gotIDs[1] != "tenant-B:shared-id" {
+		t.Errorf("doc_ids = %v, want [tenant-A:shared-id tenant-B:shared-id]", gotIDs)
+	}
+}
+
+// TestSharedMeilisearch_MigrateIndexStampsCompositeDocID is the
+// bulk-path equivalent of IndexMessageStampsCompositeDocID — the
+// migration body must carry doc_id on every row, not just the
+// per-message write path.
+func TestSharedMeilisearch_MigrateIndexStampsCompositeDocID(t *testing.T) {
+	var (
+		mu      sync.Mutex
+		gotDocs []map[string]any
+	)
+	b, _ := newSharedMeili(t, "shard-1", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/documents") {
+			body, _ := io.ReadAll(r.Body)
+			_ = json.Unmarshal(body, &gotDocs)
+		}
+		w.WriteHeader(http.StatusAccepted)
+	})
+	msgs := []Message{
+		{TenantID: "tenant-A", MessageID: "m1"},
+		{TenantID: "tenant-A", MessageID: "m2"},
+		{TenantID: "tenant-A", MessageID: "m3"},
+	}
+	if err := b.MigrateIndex(context.Background(), "tenant-A", msgs); err != nil {
+		t.Fatalf("MigrateIndex: %v", err)
+	}
+	if len(gotDocs) != 3 {
+		t.Fatalf("body docs = %d, want 3", len(gotDocs))
+	}
+	wantIDs := []string{"tenant-A:m1", "tenant-A:m2", "tenant-A:m3"}
+	for i, want := range wantIDs {
+		got, _ := gotDocs[i]["doc_id"].(string)
+		if got != want {
+			t.Errorf("doc[%d].doc_id = %q, want %q", i, got, want)
+		}
+	}
+}

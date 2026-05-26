@@ -27,6 +27,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 
@@ -41,6 +42,17 @@ var ErrInvalidInput = errors.New("invalid input")
 
 // ErrNotFound is returned when a tenant or backend lookup misses.
 var ErrNotFound = errors.New("not found")
+
+// ErrBackendUnavailable is returned when a caller asks the
+// Service to switch a tenant to a backend whose Go implementation
+// is not wired into this BFF process. The name is recognised
+// (passes `IsValidBackend`) but `Config.Backends` did not include
+// a matching impl. This distinguishes a deployment-time gap
+// ("this BFF does not ship `dedicated_opensearch`") from an
+// outright typo, so the admin UI can render a clear "not
+// available in this deployment" hint without falling through to
+// a 500 on every subsequent search call.
+var ErrBackendUnavailable = errors.New("backend not available in this deployment")
 
 // Backend names recognised by the service. Stored verbatim in
 // `tenants.search_backend`.
@@ -190,15 +202,54 @@ func (s *Service) GetBackend(ctx context.Context, tenantID string) (string, erro
 	return backend, nil
 }
 
+// AvailableBackends returns the names of every backend whose Go
+// implementation is wired into this Service, sorted
+// alphabetically. Used by the admin UI to render the backend
+// selector without exposing values that would silently fail on
+// the first search call after a flip.
+func (s *Service) AvailableBackends() []string {
+	names := make([]string, 0, len(s.backends))
+	for name := range s.backends {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// IsBackendAvailable reports whether a backend with the given
+// name is registered on this Service. Distinct from
+// `IsValidBackend`: a value can be syntactically valid (e.g.
+// `dedicated_opensearch`) but unavailable in this BFF process if
+// the deployment did not ship that implementation.
+func (s *Service) IsBackendAvailable(name string) bool {
+	_, ok := s.backends[name]
+	return ok
+}
+
 // SetBackend updates the tenant's search backend. Validates the
 // name against the recognised values so a typo can't put a
-// tenant into an unreachable state.
+// tenant into an unreachable state, and against the wired
+// implementations so the admin UI cannot strand a tenant on a
+// backend this BFF does not ship.
 func (s *Service) SetBackend(ctx context.Context, tenantID, backend string) error {
 	if tenantID == "" || backend == "" {
 		return fmt.Errorf("%w: tenantID and backend required", ErrInvalidInput)
 	}
 	if !IsValidBackend(backend) {
 		return fmt.Errorf("%w: backend %q is not a recognised value", ErrInvalidInput, backend)
+	}
+	// Belt-and-suspenders against the case where migration 050's
+	// CHECK constraint admits a value (e.g. `dedicated_opensearch`)
+	// that this BFF does not have an implementation for. Without
+	// this guard the flip succeeds and every subsequent
+	// IndexMessage / SearchMessages call returns the generic
+	// `backend not configured` 404. Failing the flip itself with a
+	// distinct sentinel lets the admin UI tell the operator
+	// exactly why the value is unselectable. Runs BEFORE the pool
+	// short-circuit so the same rejection applies in metadata-only
+	// mode (e.g. unit tests that build a Service with no pool).
+	if !s.IsBackendAvailable(backend) {
+		return fmt.Errorf("%w: %q", ErrBackendUnavailable, backend)
 	}
 	if s.pool == nil {
 		return nil
@@ -260,6 +311,12 @@ func (s *Service) ReindexTo(ctx context.Context, tenantID, backend string, msgs 
 	}
 	if !IsValidBackend(backend) {
 		return fmt.Errorf("%w: backend %q is not a recognised value", ErrInvalidInput, backend)
+	}
+	// Same gating as SetBackend: refuse to write into a backend
+	// this BFF does not ship, so the cutover worker fails fast
+	// with a clear error instead of silently no-op'ing.
+	if !s.IsBackendAvailable(backend) {
+		return fmt.Errorf("%w: %q", ErrBackendUnavailable, backend)
 	}
 	return s.reindexInto(ctx, tenantID, backend, msgs)
 }

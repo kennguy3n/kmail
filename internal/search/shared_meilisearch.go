@@ -22,6 +22,28 @@ import (
 	"time"
 )
 
+// sharedMeiliDoc is the document shape sent to Meilisearch in
+// the shared-index model. It embeds the public `Message` shape
+// and adds a composite `DocID` that scopes the Meilisearch
+// primary key by tenant.
+//
+// This is load-bearing: Stalwart-issued `message_id`s are
+// per-ACCOUNT, not globally unique across tenants on the same
+// shard. Without the composite key, two tenants on the same
+// shard with the same `message_id` would collide in the shared
+// index and the second write would silently overwrite the first.
+// `SharedOpenSearchBackend` already uses the same
+// `sharedDocID(tenant, message)` shape via the OpenSearch `_id`
+// header; this type is the Meilisearch equivalent so both shared
+// backends preserve tenant isolation under the same invariant.
+type sharedMeiliDoc struct {
+	Message
+	// DocID is the Meilisearch document primary key. Set by
+	// the backend before every write. Format:
+	// `<tenant_id>:<message_id>`.
+	DocID string `json:"doc_id"`
+}
+
 // SharedMeilisearchBackend implements SearchBackend against a
 // shared Meilisearch index per Stalwart shard. Every document
 // carries a `tenant_id` field; reads and deletes filter on that
@@ -82,8 +104,12 @@ func (m *SharedMeilisearchBackend) IndexMessage(ctx context.Context, msg Message
 	if err := m.ensureSettings(ctx, index); err != nil {
 		return fmt.Errorf("ensure settings: %w", err)
 	}
+	doc := sharedMeiliDoc{
+		Message: msg,
+		DocID:   sharedDocID(msg.TenantID, msg.MessageID),
+	}
 	endpoint := m.BaseURL + "/indexes/" + index + "/documents"
-	return httpJSON(ctx, m.HTTPClient, http.MethodPost, endpoint, m.headers(), []Message{msg}, nil)
+	return httpJSON(ctx, m.HTTPClient, http.MethodPost, endpoint, m.headers(), []sharedMeiliDoc{doc}, nil)
 }
 
 // SearchMessages calls `POST /indexes/:i/search` with a
@@ -172,8 +198,19 @@ func (m *SharedMeilisearchBackend) MigrateIndex(ctx context.Context, tenantID st
 	if err := m.ensureSettings(ctx, index); err != nil {
 		return fmt.Errorf("migrate: ensure settings: %w", err)
 	}
+	// Same composite-primary-key invariant as IndexMessage: wrap
+	// every Message with a `doc_id = <tenant>:<message>` so the
+	// bulk import can't collide two tenants with the same
+	// Stalwart-issued message id.
+	docs := make([]sharedMeiliDoc, len(msgs))
+	for i, msg := range msgs {
+		docs[i] = sharedMeiliDoc{
+			Message: msg,
+			DocID:   sharedDocID(msg.TenantID, msg.MessageID),
+		}
+	}
 	endpoint := m.BaseURL + "/indexes/" + index + "/documents"
-	return httpJSON(ctx, m.HTTPClient, http.MethodPost, endpoint, m.headers(), msgs, nil)
+	return httpJSON(ctx, m.HTTPClient, http.MethodPost, endpoint, m.headers(), docs, nil)
 }
 
 // ExportMessages pages through every document owned by `tenantID`
@@ -242,12 +279,16 @@ func (m *SharedMeilisearchBackend) ensureSettings(ctx context.Context, index str
 
 	// Meilisearch auto-creates an index on first document write,
 	// but only the documents-write path picks up the primaryKey
-	// hint. We push the primary key explicitly so subsequent
-	// upserts dedupe by `message_id` instead of generating a
-	// per-call surrogate id.
+	// hint. We push the primary key explicitly as `doc_id`
+	// (composite `<tenant_id>:<message_id>` via `sharedDocID`)
+	// so the shared index can never collide two tenants on the
+	// same Stalwart-issued `message_id`. `message_id` alone is
+	// per-account, not per-shard — keying on it directly would
+	// silently overwrite cross-tenant documents. See the
+	// `sharedMeiliDoc` doc comment for the full invariant.
 	createBody := map[string]any{
 		"uid":        index,
-		"primaryKey": "message_id",
+		"primaryKey": "doc_id",
 	}
 	if err := httpJSON(ctx, m.HTTPClient, http.MethodPost, m.BaseURL+"/indexes", m.headers(), createBody, nil); err != nil {
 		// `400` is returned when the index already exists, in

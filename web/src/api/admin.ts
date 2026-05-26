@@ -1981,6 +1981,23 @@ export async function reindexSearch(tenantId: string): Promise<void> {
   );
 }
 
+/**
+ * Returns the set of search backends whose Go implementation is
+ * wired into this BFF process. Mirrors `Service.AvailableBackends`
+ * (`internal/search/service.go`). The admin UI uses this to gate
+ * the selector — values like `dedicated_opensearch` are recognised
+ * by the migration-050 CHECK constraint but may not be shipped
+ * by every BFF deployment, and the UI must not let an operator
+ * flip onto a backend that would then fail every search call.
+ */
+export async function listAvailableSearchBackends(): Promise<SearchBackendName[]> {
+  const resp = await requestJSON<{ available: SearchBackendName[] }>(
+    `${ADMIN_API_BASE}/search/backends`,
+    { method: "GET", headers: adminAuthHeaders(undefined, { Accept: "application/json" }) },
+  );
+  return resp.available ?? [];
+}
+
 export interface DkimKey {
   id: string;
   selector: string;

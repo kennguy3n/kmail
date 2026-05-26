@@ -17,6 +17,7 @@ import { useCallback, useEffect, useState } from "react";
 
 import {
   getSearchBackend,
+  listAvailableSearchBackends,
   reindexSearch,
   SEARCH_BACKENDS,
   setSearchBackend,
@@ -59,6 +60,14 @@ export default function SearchAdmin() {
   const [error, setError] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
+  // `available` is the set of backend names this BFF actually has
+  // a Go implementation for. The CHECK constraint admits values
+  // like `dedicated_opensearch` that not every deployment ships
+  // — so we disable those cards rather than letting the operator
+  // flip a tenant onto a backend that would 404 on every search.
+  // `null` until the fetch completes; we disable ALL cards in
+  // that initial state so a fast-clicker can't beat the gate.
+  const [available, setAvailable] = useState<Set<SearchBackendName> | null>(null);
 
   const reload = useCallback((tid: string) => {
     setError(null);
@@ -70,6 +79,15 @@ export default function SearchAdmin() {
   useEffect(() => {
     if (selectedTenantId) reload(selectedTenantId);
   }, [selectedTenantId, reload]);
+
+  // Fetch the wired-backend list once per mount. The endpoint is
+  // not tenant-scoped (deployment-wide config), so we do not
+  // re-fetch when `selectedTenantId` changes.
+  useEffect(() => {
+    listAvailableSearchBackends()
+      .then((names) => setAvailable(new Set(names)))
+      .catch((e: unknown) => setError(String(e)));
+  }, []);
 
   const onSelect = async (backend: SearchBackendName) => {
     if (!selectedTenantId) return;
@@ -135,18 +153,28 @@ export default function SearchAdmin() {
             {SEARCH_BACKENDS.map((backend) => {
               const desc = BACKEND_DESCRIPTIONS[backend];
               const isCurrent = config.backend === backend;
+              // Disable until the availability lookup returns so
+              // an operator clicking faster than the network can
+              // settle can't slip past the gate.
+              const isAvailable = available !== null && available.has(backend);
+              const isDisabled = pending || isCurrent || !isAvailable;
               return (
                 <li key={backend} className={isCurrent ? "current" : ""}>
                   <button
                     type="button"
                     role="radio"
                     aria-checked={isCurrent}
-                    disabled={pending || isCurrent}
+                    aria-disabled={isDisabled}
+                    disabled={isDisabled}
                     onClick={() => onSelect(backend)}
+                    title={!isAvailable && available !== null ? "Not available in this deployment — no implementation wired into this BFF." : undefined}
                   >
                     <strong>{desc.label}</strong>
                     <span className="backend-name muted">{backend}</span>
                     <span className="backend-description">{desc.description}</span>
+                    {!isAvailable && available !== null && (
+                      <span className="backend-unavailable muted">Not available in this deployment</span>
+                    )}
                   </button>
                 </li>
               );
