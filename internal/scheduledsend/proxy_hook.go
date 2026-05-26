@@ -114,6 +114,27 @@ func (h *Hook) Intercept(ctx context.Context, w http.ResponseWriter, r *http.Req
 		return true, nil
 	}
 
+	// Horizon validation BEFORE Dispatch. The same check lives
+	// in `Service.validateSchedule` as defence-in-depth for non-
+	// proxy callers, but performing it here short-circuits the
+	// hook before we ask Stalwart to mint the draft. Without this
+	// pre-check, a clock-skewed client (sendAt 30s away when the
+	// server requires ≥1m, or sendAt 400d away when the cap is
+	// 365d) would have the draft committed upstream and *then*
+	// learn that `Service.Schedule` rejects it — leaving an
+	// orphan draft in Stalwart that the user never sees in any
+	// Scheduled list. The horizon constants live on the Service
+	// for a single source of truth.
+	horizon := sendAt.Sub(time.Now().UTC())
+	switch {
+	case horizon < MinScheduleHorizon:
+		http.Error(w, fmt.Sprintf("scheduledsend: send_at must be at least %s in the future", MinScheduleHorizon), http.StatusBadRequest)
+		return true, nil
+	case horizon > MaxScheduleHorizon:
+		http.Error(w, fmt.Sprintf("scheduledsend: send_at must be within %s", MaxScheduleHorizon), http.StatusBadRequest)
+		return true, nil
+	}
+
 	jr, err := parseJMAPRequest(body)
 	if err != nil {
 		// Malformed body — let Stalwart produce the canonical
@@ -394,7 +415,17 @@ func parseJMAPRequest(body []byte) (jmap.JmapRequest, error) {
 func writeJMAPResponse(w http.ResponseWriter, resp *jmap.JmapResponse, status int) (bool, error) {
 	buf, err := json.Marshal(resp)
 	if err != nil {
-		return false, err
+		// The Stalwart draft is already minted by the time this
+		// helper is called. Returning (false, err) would let the
+		// proxy fall through to its ServeHTTP path and re-forward
+		// the FULL original body — producing a duplicate draft
+		// AND an immediate submission. The intercepted=true
+		// invariant documented in Hook.Intercept requires us to
+		// absorb the response side regardless. http.Error writes
+		// a text/plain 500 so the client gets a clear failure
+		// envelope and the proxy doesn't double-write headers.
+		http.Error(w, "scheduledsend: response marshal failed", http.StatusInternalServerError)
+		return true, err
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)

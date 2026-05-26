@@ -241,6 +241,70 @@ func TestIntercept_MalformedHeaderReturns400(t *testing.T) {
 	}
 }
 
+// TestIntercept_BelowHorizonRejectedBeforeDispatch pins the
+// pre-dispatch horizon validation. Without the pre-check, a
+// sendAt < MinScheduleHorizon would have Stalwart mint the draft
+// FIRST and only learn about the horizon-violation when
+// Service.Schedule rejected it — leaving an orphan draft. The
+// fix returns 400 before calling Dispatch; this test verifies
+// the forwarder was never invoked.
+func TestIntercept_BelowHorizonRejectedBeforeDispatch(t *testing.T) {
+	sched := &fakeScheduler{}
+	fwd := &stubForwarder{}
+	hook := newHookForTest(t, sched, fwd)
+	body := buildScheduleBody("draft", "submission", "ident-1")
+	ctx := ctxWithIdentity("tenant-a", "kchat-a")
+	// 30s in the future — well below MinScheduleHorizon (1m).
+	tooSoon := time.Now().Add(30 * time.Second).Unix()
+	r := newJMAPRequest(t, body, ctx, strconv.FormatInt(tooSoon, 10))
+	w := httptest.NewRecorder()
+
+	intercepted, err := hook.Intercept(ctx, w, r, body)
+	if err != nil {
+		t.Fatalf("Intercept: %v", err)
+	}
+	if !intercepted {
+		t.Fatalf("expected hook to take ownership of the response (intercepted=true) when rejecting below-horizon schedule")
+	}
+	if w.Result().StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", w.Result().StatusCode)
+	}
+	if fwd.called != 0 {
+		t.Fatalf("forwarder should NOT have been called on below-horizon path; got %d calls (would have orphaned a draft)", fwd.called)
+	}
+	if sched.calls != 0 {
+		t.Fatalf("scheduler should NOT have been called on below-horizon path; got %d calls", sched.calls)
+	}
+}
+
+// TestIntercept_AboveHorizonRejectedBeforeDispatch is the
+// symmetric pin for the upper bound.
+func TestIntercept_AboveHorizonRejectedBeforeDispatch(t *testing.T) {
+	sched := &fakeScheduler{}
+	fwd := &stubForwarder{}
+	hook := newHookForTest(t, sched, fwd)
+	body := buildScheduleBody("draft", "submission", "ident-1")
+	ctx := ctxWithIdentity("tenant-a", "kchat-a")
+	// 400 days out — above MaxScheduleHorizon (365 days).
+	tooFar := time.Now().Add(400 * 24 * time.Hour).Unix()
+	r := newJMAPRequest(t, body, ctx, strconv.FormatInt(tooFar, 10))
+	w := httptest.NewRecorder()
+
+	intercepted, err := hook.Intercept(ctx, w, r, body)
+	if err != nil {
+		t.Fatalf("Intercept: %v", err)
+	}
+	if !intercepted {
+		t.Fatalf("expected hook to take ownership of the response (intercepted=true) when rejecting above-horizon schedule")
+	}
+	if w.Result().StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", w.Result().StatusCode)
+	}
+	if fwd.called != 0 {
+		t.Fatalf("forwarder should NOT have been called on above-horizon path; got %d calls (would have orphaned a draft)", fwd.called)
+	}
+}
+
 func TestIntercept_NoEmailSubmissionFallsThrough(t *testing.T) {
 	sched := &fakeScheduler{}
 	fwd := &stubForwarder{}

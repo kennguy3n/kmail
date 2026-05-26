@@ -322,20 +322,43 @@ func (s *Service) Cancel(ctx context.Context, tenantID, id string) error {
 	if strings.TrimSpace(id) == "" {
 		return ErrNotFound
 	}
-	var status string
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
 			return err
 		}
-		// Read first to distinguish missing / already-sent /
-		// already-cancelled from a successful cancel. We can't
-		// rely on `UPDATE ... WHERE status='pending' RETURNING`
-		// alone because the operator wants a precise reason in
-		// the response body.
+		// Optimistic guarded UPDATE. The `AND status = 'pending'`
+		// clause closes the TOCTOU window vs. the worker's claim:
+		// in READ COMMITTED, a pre-UPDATE SELECT can read
+		// `status='pending'` while the worker simultaneously
+		// commits `status='sent'`, and a subsequent unguarded
+		// `UPDATE ... WHERE id=$1` would clobber the sent state
+		// with `cancelled` — silently producing a row that says
+		// `cancelled` for a mail that already shipped. Postgres
+		// blocks the guarded UPDATE behind the worker's FOR UPDATE
+		// lock, then re-evaluates the WHERE clause against the
+		// post-commit snapshot, so we either claim the row (1 row
+		// affected) or no-op (0 rows affected) and disambiguate
+		// the precise reason below. The redundant
+		// `tenant_id = $2::uuid` belt protects against a wrong-
+		// tenant clobber even if the GUC is somehow misconfigured.
+		result, err := tx.Exec(ctx, `
+			UPDATE scheduled_sends
+			SET status = 'cancelled'
+			WHERE id = $1::uuid AND tenant_id = $2::uuid AND status = 'pending'
+		`, id, tenantID)
+		if err != nil {
+			return err
+		}
+		if result.RowsAffected() == 1 {
+			return nil
+		}
+		// 0 rows: re-read to map (missing | tenant-mismatch |
+		// sent | cancelled | failed) to the precise sentinel
+		// error the handler surfaces to the client.
+		var status, t string
 		row := tx.QueryRow(ctx, `
 			SELECT status, tenant_id::text FROM scheduled_sends WHERE id = $1::uuid
 		`, id)
-		var t string
 		if err := row.Scan(&status, &t); err != nil {
 			return err
 		}
@@ -343,17 +366,16 @@ func (s *Service) Cancel(ctx context.Context, tenantID, id string) error {
 			return ErrTenantMismatch
 		}
 		switch status {
-		case StatusSent:
-			return ErrAlreadyDispatched
 		case StatusCancelled:
 			return ErrAlreadyCancelled
-		case StatusFailed:
+		case StatusSent, StatusFailed:
 			return ErrAlreadyDispatched
+		default:
+			// Shouldn't happen — the guarded UPDATE only no-ops
+			// when status != 'pending'. A surprise here is a
+			// schema-drift bug worth surfacing loudly.
+			return fmt.Errorf("scheduledsend.Cancel: guarded UPDATE no-op with unexpected status=%q", status)
 		}
-		_, err := tx.Exec(ctx, `
-			UPDATE scheduled_sends SET status = 'cancelled' WHERE id = $1::uuid
-		`, id)
-		return err
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrNotFound
@@ -424,24 +446,52 @@ func (s *Service) claimDue(ctx context.Context) (*ScheduledSend, error) {
 // Stalwart submission. The worker calls this after the dispatch
 // succeeds; subsequent ticks skip the row because the index is
 // partial on `status = 'pending'`.
+//
+// A 0-row UPDATE here means a concurrent Cancel won the race
+// between `claimDue` and the post-Dispatch bookkeeping. The mail
+// shipped successfully, but the row says `cancelled`. From the
+// user's point of view the cancel wins (they clicked cancel, they
+// got the cancel confirmation, but the mail had already left the
+// building). This is the correct outcome, but we log it so
+// operators can correlate the rare "I cancelled but the recipient
+// got it" support tickets with a real Stalwart submission.
 func (s *Service) markDispatched(ctx context.Context, id string, sentAt time.Time) error {
-	_, err := s.pool.Exec(ctx, `
+	tag, err := s.pool.Exec(ctx, `
 		UPDATE scheduled_sends
 		SET status = 'sent', sent_at = $2, last_error = ''
 		WHERE id = $1::uuid AND status = 'pending'
 	`, id, sentAt.UTC())
-	return err
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		s.logger.Printf("scheduledsend.markDispatched: id=%s no-op (cancelled racing dispatch); mail was sent but row says cancelled", id)
+	}
+	return nil
 }
 
 // markFailed transitions a row to `failed` after the retry cap
 // has been hit. The row is kept for operator inspection.
+//
+// A 0-row UPDATE here means a concurrent Cancel won the race
+// between `claimDue` and the post-Dispatch bookkeeping after the
+// retry budget was exhausted. The cancel sticks; the row stays
+// `cancelled`. We log so operators can spot the rare case where
+// the worker exhausted retries but the user's cancel masked the
+// failure.
 func (s *Service) markFailed(ctx context.Context, id, lastErr string) error {
-	_, err := s.pool.Exec(ctx, `
+	tag, err := s.pool.Exec(ctx, `
 		UPDATE scheduled_sends
 		SET status = 'failed', last_error = $2
 		WHERE id = $1::uuid AND status = 'pending'
 	`, id, lastErr)
-	return err
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		s.logger.Printf("scheduledsend.markFailed: id=%s no-op (cancelled racing post-retry bookkeeping); last_error=%q", id, lastErr)
+	}
+	return nil
 }
 
 // scheduleRetry pushes `next_retry_at` into the future without

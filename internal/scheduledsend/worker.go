@@ -248,7 +248,17 @@ func (w *DispatchWorker) handleErr(ctx context.Context, ss *ScheduledSend, dispa
 		30 * time.Minute,
 		30 * time.Minute,
 	}
-	idx := ss.Attempts
+	// `ss.Attempts` is the POST-increment count from claimDue
+	// (1 on the first failure, 2 on the second, ...), so the
+	// backoff slot for "N-th failure" is `backoffs[N-1]`. Without
+	// the `-1`, the first failure would skip backoffs[0]=1m and
+	// jump straight to backoffs[1]=5m — defeating the
+	// "intentionally aggressive first retry" the comment above
+	// promises. Clamp to the last slot once we run off the end.
+	idx := ss.Attempts - 1
+	if idx < 0 {
+		idx = 0
+	}
 	if idx >= len(backoffs) {
 		idx = len(backoffs) - 1
 	}

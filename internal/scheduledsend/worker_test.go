@@ -3,6 +3,7 @@ package scheduledsend
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"errors"
 	"sync"
 	"testing"
@@ -205,6 +206,53 @@ func TestWorker_ExhaustedAttemptsMarksFailed(t *testing.T) {
 	}
 }
 
+// TestWorker_BackoffFirstFailureUses1m pins the off-by-one fix
+// in handleErr: ss.Attempts is the POST-increment count (1 on the
+// first failure), so the backoff index must be `Attempts - 1` to
+// pick `backoffs[0] = 1m`. A regression to `idx := ss.Attempts`
+// would yield `backoffs[1] = 5m` on the first failure, skipping
+// the intentionally-aggressive 1m slot the doc-comment promises.
+func TestWorker_BackoffFirstFailureUses1m(t *testing.T) {
+	store := newFakeStore()
+	store.push(sampleScheduledSend("ss-1"))
+	sub := &fakeSubmitter{err: errors.New("connect refused")}
+	w := newWorker(t, store, sub, DefaultMaxAttempts)
+	w.Tick(context.Background())
+
+	at, ok := store.retries["ss-1"]
+	if !ok {
+		t.Fatalf("expected scheduleRetry on first failure")
+	}
+	want := time.Unix(1_700_000_000, 0).Add(1 * time.Minute)
+	if !at.Equal(want) {
+		t.Fatalf("first-failure retry: want %v (now+1m), got %v (delta=%v)", want, at, at.Sub(time.Unix(1_700_000_000, 0)))
+	}
+}
+
+// TestWorker_BackoffSecondFailureUses5m pins the next slot so a
+// regression in the other direction (e.g. `idx := ss.Attempts - 2`)
+// is caught too.
+func TestWorker_BackoffSecondFailureUses5m(t *testing.T) {
+	store := newFakeStore()
+	ss := sampleScheduledSend("ss-1")
+	// Simulate "already failed once" — claimDue will bump
+	// Attempts from 1 to 2 before handleErr runs.
+	ss.Attempts = 1
+	store.push(ss)
+	sub := &fakeSubmitter{err: errors.New("connect refused")}
+	w := newWorker(t, store, sub, DefaultMaxAttempts)
+	w.Tick(context.Background())
+
+	at, ok := store.retries["ss-1"]
+	if !ok {
+		t.Fatalf("expected scheduleRetry on second failure")
+	}
+	want := time.Unix(1_700_000_000, 0).Add(5 * time.Minute)
+	if !at.Equal(want) {
+		t.Fatalf("second-failure retry: want %v (now+5m), got %v", want, at)
+	}
+}
+
 func TestWorker_NotCreatedTreatedAsError(t *testing.T) {
 	store := newFakeStore()
 	store.push(sampleScheduledSend("ss-1"))
@@ -224,7 +272,7 @@ func TestWorker_NotCreatedTreatedAsError(t *testing.T) {
 func TestWorker_TickDrainsToEmpty(t *testing.T) {
 	store := newFakeStore()
 	for i := 0; i < 3; i++ {
-		store.push(sampleScheduledSend("ss-" + string(rune('a'+i))))
+		store.push(sampleScheduledSend(fmt.Sprintf("ss-%d", i)))
 	}
 	sub := &fakeSubmitter{resp: okSubmissionResponse()}
 	w := newWorker(t, store, sub, DefaultMaxAttempts)
