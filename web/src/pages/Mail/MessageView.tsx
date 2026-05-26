@@ -2,6 +2,8 @@ import { useEffect, useMemo, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 
 import { jmapClient } from "../../api/jmap";
+import { snoozeEmail } from "../../api/snooze";
+import SnoozePicker from "./SnoozePicker";
 import type { Email, EmailBodyPart } from "../../types";
 
 /**
@@ -21,6 +23,11 @@ export default function MessageView() {
   const [email, setEmail] = useState<Email | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setLoading] = useState(true);
+  const [snoozePickerOpen, setSnoozePickerOpen] = useState(false);
+  const [snoozeBusy, setSnoozeBusy] = useState(false);
+  const [snoozeConfirmation, setSnoozeConfirmation] = useState<string | null>(
+    null,
+  );
 
   useEffect(() => {
     if (!emailId) {
@@ -94,6 +101,39 @@ export default function MessageView() {
     });
   };
 
+  const handleSnooze = async (until: Date) => {
+    if (!email || snoozeBusy) return;
+    setSnoozeBusy(true);
+    try {
+      // Centralised lookup-or-create. The helper fetches the
+      // LIVE mailbox list and recovers from concurrent-create
+      // races so Inbox and MessageView can't double-create the
+      // Snoozed mailbox from different views.
+      const snoozedId = await jmapClient.resolveOrCreateSnoozedMailbox();
+      const originals = { ...email.mailboxIds } as Record<string, boolean>;
+      if (originals[snoozedId]) {
+        throw new Error(
+          "Email is already in the Snoozed mailbox — wake it first.",
+        );
+      }
+      await snoozeEmail({
+        email_id: email.id,
+        original_mailbox_ids: originals,
+        snoozed_mailbox_id: snoozedId,
+        snooze_until: until.toISOString(),
+        mark_unread_on_wake: true,
+      });
+      setSnoozePickerOpen(false);
+      setSnoozeConfirmation(
+        `Snoozed until ${until.toLocaleString()}. The message will return to your inbox then.`,
+      );
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Unknown error");
+    } finally {
+      setSnoozeBusy(false);
+    }
+  };
+
   const handleForward = () => {
     if (!email) return;
     navigate("/mail/compose", {
@@ -120,6 +160,9 @@ export default function MessageView() {
       </div>
       {isLoading && <p style={viewStyles.muted}>Loading message…</p>}
       {error && <div style={viewStyles.error}>{error}</div>}
+      {snoozeConfirmation && (
+        <div style={viewStyles.snoozeConfirmation}>{snoozeConfirmation}</div>
+      )}
       {email && (
         <article style={viewStyles.article}>
           <header style={viewStyles.header}>
@@ -149,6 +192,26 @@ export default function MessageView() {
                 >
                   Forward
                 </button>
+                <div style={viewStyles.snoozeWrap}>
+                  <button
+                    type="button"
+                    onClick={() => setSnoozePickerOpen((open) => !open)}
+                    style={viewStyles.actionButton}
+                    disabled={snoozeBusy}
+                    aria-haspopup="dialog"
+                    aria-expanded={snoozePickerOpen}
+                  >
+                    {snoozeBusy ? "Snoozing…" : "Snooze"}
+                  </button>
+                  {snoozePickerOpen && (
+                    <SnoozePicker
+                      onPick={(until) => {
+                        void handleSnooze(until);
+                      }}
+                      onCancel={() => setSnoozePickerOpen(false)}
+                    />
+                  )}
+                </div>
               </div>
             </div>
             <dl style={viewStyles.headerList}>
@@ -361,6 +424,19 @@ const viewStyles: Record<string, React.CSSProperties> = {
     borderRadius: "0.25rem",
     cursor: "pointer",
     color: "#374151",
+  },
+  snoozeWrap: {
+    position: "relative",
+    display: "inline-block",
+  },
+  snoozeConfirmation: {
+    background: "#ecfdf5",
+    color: "#065f46",
+    border: "1px solid #a7f3d0",
+    borderRadius: "0.25rem",
+    padding: "0.5rem 0.75rem",
+    fontSize: "0.85rem",
+    marginBottom: "0.75rem",
   },
   attachmentsBox: {
     marginTop: "1rem",

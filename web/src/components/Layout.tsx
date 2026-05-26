@@ -21,6 +21,7 @@ export default function Layout() {
           <li><Link to="/mail/vault">Zero-Access Vault</Link></li>
           <li><Link to="/mail/protected-folders">Protected folders</Link></li>
           <li><Link to="/mail/scheduled">Scheduled</Link></li>
+          <li><Link to="/mail/snoozed">Snoozed</Link></li>
           <li><Link to="/calendar">Calendar</Link></li>
           <li><Link to="/calendar/new">New event</Link></li>
           <li><Link to="/calendar/shared">Shared calendars</Link></li>

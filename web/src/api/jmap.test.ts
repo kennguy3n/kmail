@@ -288,6 +288,183 @@ describe("JMAPClient.searchEmails", () => {
   });
 });
 
+describe("JMAPClient.resolveOrCreateSnoozedMailbox", () => {
+  // Helper to build a Mailbox/get response envelope.
+  function mailboxResp(boxes: Array<{ id: string; name: string; role: string | null }>): JmapResponse {
+    return {
+      sessionState: "00",
+      methodResponses: [
+        [
+          "Mailbox/get",
+          {
+            accountId: "acct-1",
+            state: "00",
+            list: boxes.map((b) => ({
+              id: b.id,
+              name: b.name,
+              role: b.role,
+              parentId: null,
+              totalEmails: 0,
+              unreadEmails: 0,
+              totalThreads: 0,
+              unreadThreads: 0,
+              myRights: {
+                mayReadItems: true,
+                mayAddItems: true,
+                mayRemoveItems: true,
+                maySetSeen: true,
+                maySetKeywords: true,
+                mayCreateChild: true,
+                mayRename: true,
+                mayDelete: true,
+                maySubmit: true,
+              },
+              isSubscribed: true,
+            })),
+            notFound: [],
+          },
+          "0",
+        ],
+      ],
+    };
+  }
+
+  // Helper to build a Mailbox/set create response.
+  function mailboxCreateResp(id: string): JmapResponse {
+    return {
+      sessionState: "00",
+      methodResponses: [
+        [
+          "Mailbox/set",
+          {
+            accountId: "acct-1",
+            newState: "01",
+            created: { mb: { id } },
+          },
+          "0",
+        ],
+      ],
+    };
+  }
+
+  function mailboxCreateRejected(reason: string): JmapResponse {
+    return {
+      sessionState: "00",
+      methodResponses: [
+        [
+          "Mailbox/set",
+          {
+            accountId: "acct-1",
+            newState: "00",
+            notCreated: {
+              mb: { type: "invalidProperties", description: reason },
+            },
+          },
+          "0",
+        ],
+      ],
+    };
+  }
+
+  it("returns the existing snoozed-by-role mailbox without calling Mailbox/set", async () => {
+    const fetchMock = mockFetch(
+      jsonResponse(buildSession()),
+      jsonResponse(
+        mailboxResp([
+          { id: "mb-snoozed", name: "Whatever", role: "snoozed" },
+          { id: "mb-inbox", name: "Inbox", role: "inbox" },
+        ]),
+      ),
+    );
+    const client = new JMAPClient();
+
+    const id = await client.resolveOrCreateSnoozedMailbox();
+
+    expect(id).toBe("mb-snoozed");
+    // session GET + one Mailbox/get POST — NO Mailbox/set create.
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("returns the existing snoozed-by-name mailbox case-insensitively", async () => {
+    const fetchMock = mockFetch(
+      jsonResponse(buildSession()),
+      jsonResponse(
+        mailboxResp([
+          { id: "mb-inbox", name: "Inbox", role: "inbox" },
+          { id: "mb-snz", name: "snoozed", role: null },
+        ]),
+      ),
+    );
+    const client = new JMAPClient();
+
+    const id = await client.resolveOrCreateSnoozedMailbox();
+
+    expect(id).toBe("mb-snz");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("creates a new Snoozed mailbox when no existing match", async () => {
+    const fetchMock = mockFetch(
+      jsonResponse(buildSession()),
+      jsonResponse(mailboxResp([{ id: "mb-inbox", name: "Inbox", role: "inbox" }])),
+      jsonResponse(mailboxCreateResp("mb-new")),
+    );
+    const client = new JMAPClient();
+
+    const id = await client.resolveOrCreateSnoozedMailbox();
+
+    expect(id).toBe("mb-new");
+    // session + Mailbox/get + Mailbox/set create.
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("recovers from a concurrent-create race by re-fetching and returning the now-existing id", async () => {
+    // Models the cross-view race: between our initial Mailbox/get
+    // and our Mailbox/set, another view/tab created the Snoozed
+    // mailbox. Our Mailbox/set is rejected (duplicate name), and
+    // the helper re-fetches and finds the mailbox now exists.
+    const fetchMock = mockFetch(
+      jsonResponse(buildSession()),
+      // First Mailbox/get: nothing.
+      jsonResponse(mailboxResp([{ id: "mb-inbox", name: "Inbox", role: "inbox" }])),
+      // Mailbox/set: server rejects (duplicate / concurrent create won).
+      jsonResponse(mailboxCreateRejected("name already in use")),
+      // Recovery Mailbox/get: now the mailbox exists.
+      jsonResponse(
+        mailboxResp([
+          { id: "mb-inbox", name: "Inbox", role: "inbox" },
+          { id: "mb-race-winner", name: "Snoozed", role: null },
+        ]),
+      ),
+    );
+    const client = new JMAPClient();
+
+    const id = await client.resolveOrCreateSnoozedMailbox();
+
+    expect(id).toBe("mb-race-winner");
+    // session + Mailbox/get + failed Mailbox/set + recovery Mailbox/get.
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
+
+  it("surfaces the create error when the mailbox still isn't found on recovery re-fetch", async () => {
+    // Models a genuine non-recoverable failure: create rejected
+    // AND the re-fetch still doesn't show the mailbox (so it
+    // wasn't a concurrent-create race; the create just failed
+    // for a real reason).
+    mockFetch(
+      jsonResponse(buildSession()),
+      jsonResponse(mailboxResp([{ id: "mb-inbox", name: "Inbox", role: "inbox" }])),
+      jsonResponse(mailboxCreateRejected("quota exceeded")),
+      jsonResponse(mailboxResp([{ id: "mb-inbox", name: "Inbox", role: "inbox" }])),
+    );
+    const client = new JMAPClient();
+
+    await expect(client.resolveOrCreateSnoozedMailbox()).rejects.toThrow(
+      /quota exceeded/,
+    );
+  });
+});
+
 describe("JmapMethodError", () => {
   it("exposes the method/callId/result triple from an error invocation", () => {
     const err = new JmapMethodError([
