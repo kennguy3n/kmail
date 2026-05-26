@@ -160,14 +160,25 @@ func TestSnooze_BoundaryMin(t *testing.T) {
 
 func TestGet_RejectsEmptyTenant(t *testing.T) {
 	svc := nilService(nil)
-	if _, err := svc.Get(context.Background(), "", "some-id"); err == nil {
+	if _, err := svc.Get(context.Background(), "", "user-a", "some-id"); err == nil {
 		t.Fatalf("expected error for empty tenantID")
+	}
+}
+
+// TestGet_RejectsEmptyUser pins the per-user authz guard at the
+// Service layer: a zero-value kchatUserID must be rejected
+// BEFORE the SQL fires so an inadvertent fall-through to
+// tenant-only scoping can never widen the row visibility.
+func TestGet_RejectsEmptyUser(t *testing.T) {
+	svc := nilService(nil)
+	if _, err := svc.Get(context.Background(), "tenant-a", "", "some-id"); err == nil {
+		t.Fatalf("expected error for empty kchatUserID")
 	}
 }
 
 func TestGet_EmptyIDReturnsNotFound(t *testing.T) {
 	svc := nilService(nil)
-	_, err := svc.Get(context.Background(), "tenant-a", "")
+	_, err := svc.Get(context.Background(), "tenant-a", "user-a", "")
 	if !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
@@ -175,14 +186,22 @@ func TestGet_EmptyIDReturnsNotFound(t *testing.T) {
 
 func TestCancel_RejectsEmptyTenant(t *testing.T) {
 	svc := nilService(nil)
-	if err := svc.Cancel(context.Background(), "", "some-id"); err == nil {
+	if err := svc.Cancel(context.Background(), "", "user-a", "some-id"); err == nil {
 		t.Fatalf("expected error for empty tenantID")
+	}
+}
+
+// TestCancel_RejectsEmptyUser — same shape as the Get test.
+func TestCancel_RejectsEmptyUser(t *testing.T) {
+	svc := nilService(nil)
+	if err := svc.Cancel(context.Background(), "tenant-a", "", "some-id"); err == nil {
+		t.Fatalf("expected error for empty kchatUserID")
 	}
 }
 
 func TestCancel_EmptyIDReturnsNotFound(t *testing.T) {
 	svc := nilService(nil)
-	err := svc.Cancel(context.Background(), "tenant-a", "")
+	err := svc.Cancel(context.Background(), "tenant-a", "user-a", "")
 	if !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expected ErrNotFound, got %v", err)
 	}

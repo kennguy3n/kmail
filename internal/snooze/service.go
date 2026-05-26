@@ -61,6 +61,29 @@ const (
 	// 365 days mirrors scheduledsend; longer than that is
 	// almost certainly a timezone/year bug.
 	MaxSnoozeHorizon = 365 * 24 * time.Hour
+
+	// DispatchLeaseInterval is how far `next_retry_at` is
+	// pushed forward inside the `claimDue` transaction so the
+	// row is ineligible for re-claim by another replica while
+	// THIS replica is dispatching. Without this lease,
+	// pgx.BeginFunc commits and releases the FOR UPDATE lock the
+	// moment the claim transaction ends, and the row — still
+	// `status='snoozed'` with `snooze_until <= now()` and
+	// `next_retry_at <= now()` — becomes immediately eligible
+	// for a second replica's `claimDue` to pick up, producing a
+	// duplicate JMAP `Email/set update` patch. Two-or-more
+	// concurrent patches with the same payload aren't strictly
+	// destructive (the second one is a no-op on the now-final
+	// mailbox set), but the second wake also fires the
+	// `markUnsnoozed` write that races with the worker's own
+	// scheduleRetry / markFailed bookkeeping. Five minutes is
+	// long enough to comfortably absorb a slow JMAP round trip
+	// + post-Dispatch bookkeeping, and short enough that an
+	// actually-crashed worker only delays the row by 5 minutes
+	// before a replacement replica re-claims. Mirrors the same
+	// constant in `internal/scheduledsend` deliberately so the
+	// two workers share the same operational profile.
+	DispatchLeaseInterval = 5 * time.Minute
 )
 
 // Errors surfaced to the HTTP and worker layers.
@@ -238,11 +261,24 @@ func (s *Service) validateSnooze(in SnoozeInput) error {
 
 // Get reads a row by id with tenant scoping.
 //
-// Returns ErrTenantMismatch when the row exists but belongs to a
-// different tenant; the handler collapses that into 404.
-func (s *Service) Get(ctx context.Context, tenantID, id string) (*Snooze, error) {
+// Returns:
+//   - ErrNotFound: row missing or scoped to a different user
+//   - ErrTenantMismatch: row belongs to a different tenant (the
+//     handler collapses both into 404 to avoid leaking the
+//     existence of cross-tenant ids)
+//
+// `kchatUserID` is required because the snooze authz model is
+// per-user, NOT per-tenant: a snooze row is private to the user
+// who created it, and an inadvertent fall-through to tenant-only
+// scoping would let any user in the tenant read another user's
+// snoozed-email metadata (mailbox-id sets, EmailIDs) by guessing
+// UUIDs.
+func (s *Service) Get(ctx context.Context, tenantID, kchatUserID, id string) (*Snooze, error) {
 	if strings.TrimSpace(tenantID) == "" {
 		return nil, errors.New("snooze.Get: tenantID is required")
+	}
+	if strings.TrimSpace(kchatUserID) == "" {
+		return nil, errors.New("snooze.Get: kchatUserID is required")
 	}
 	if strings.TrimSpace(id) == "" {
 		return nil, ErrNotFound
@@ -252,6 +288,12 @@ func (s *Service) Get(ctx context.Context, tenantID, id string) (*Snooze, error)
 		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
 			return err
 		}
+		// The (tenant_id, kchat_user_id) belt on the SELECT is the
+		// actual authz fence. RLS would also exclude cross-tenant
+		// rows except the BFF role is exempt from forced RLS (see
+		// migration 052 + package doc); without this explicit
+		// predicate, the cross-USER hole stays open even with RLS
+		// healthy because RLS only enforces tenant.
 		r := tx.QueryRow(ctx, `
 			SELECT id::text, tenant_id::text, kchat_user_id,
 			       stalwart_account_id, email_id,
@@ -261,8 +303,8 @@ func (s *Service) Get(ctx context.Context, tenantID, id string) (*Snooze, error)
 			       next_retry_at, woken_at,
 			       created_at, updated_at
 			FROM snoozed_emails
-			WHERE id = $1::uuid
-		`, id)
+			WHERE id = $1::uuid AND tenant_id = $2::uuid AND kchat_user_id = $3
+		`, id, tenantID, kchatUserID)
 		return scanRow(r, &row)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -327,9 +369,16 @@ func (s *Service) ListByUser(ctx context.Context, tenantID, kchatUserID string) 
 // the email back. The caller is responsible for triggering the
 // JMAP mailbox patch (the worker / unsnoose-now handler does
 // it). Idempotent — a double-click returns ErrAlreadyCancelled.
-func (s *Service) Cancel(ctx context.Context, tenantID, id string) error {
+//
+// `kchatUserID` is required because the snooze authz model is
+// per-user (see Get above). Without this scoping, any user in
+// the tenant could cancel another user's snooze by guessing UUIDs.
+func (s *Service) Cancel(ctx context.Context, tenantID, kchatUserID, id string) error {
 	if strings.TrimSpace(tenantID) == "" {
 		return errors.New("snooze.Cancel: tenantID is required")
+	}
+	if strings.TrimSpace(kchatUserID) == "" {
+		return errors.New("snooze.Cancel: kchatUserID is required")
 	}
 	if strings.TrimSpace(id) == "" {
 		return ErrNotFound
@@ -338,15 +387,57 @@ func (s *Service) Cancel(ctx context.Context, tenantID, id string) error {
 		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
 			return err
 		}
-		var status, t string
+		// Optimistic guarded UPDATE. The `AND status = 'snoozed'`
+		// clause closes the TOCTOU window vs. the worker's claim:
+		// in READ COMMITTED, a prior SELECT could read
+		// `status='snoozed'` while the worker simultaneously commits
+		// `markUnsnoozed` → `status='unsnoozed'`, and a subsequent
+		// unguarded `UPDATE ... WHERE id=$1` would clobber the
+		// already-unsnoozed state with `cancelled` — producing a
+		// row that says `cancelled` for an email that's already
+		// back in the user's inbox. Postgres blocks the guarded
+		// UPDATE behind the worker's FOR UPDATE lock, then
+		// re-evaluates the WHERE clause against the post-commit
+		// snapshot, so we either claim the row (1 row affected) or
+		// no-op (0 rows affected) and disambiguate the precise
+		// reason below. The `tenant_id` AND `kchat_user_id` belts
+		// together form the authz fence so a cross-user cancel is a
+		// no-op that re-reads as "not found" rather than silently
+		// clobbering a peer's row.
+		result, err := tx.Exec(ctx, `
+			UPDATE snoozed_emails
+			SET status = 'cancelled'
+			WHERE id = $1::uuid
+			  AND tenant_id = $2::uuid
+			  AND kchat_user_id = $3
+			  AND status = 'snoozed'
+		`, id, tenantID, kchatUserID)
+		if err != nil {
+			return err
+		}
+		if result.RowsAffected() == 1 {
+			return nil
+		}
+		// 0 rows: re-read to map (missing | tenant-mismatch |
+		// user-mismatch | unsnoozed | cancelled | failed) to the
+		// precise sentinel error the handler surfaces to the
+		// client. The re-read is scoped to id only because we
+		// need to disambiguate user-mismatch from
+		// already-unsnoozed and the latter requires reading the row.
+		var status, t, owner string
 		row := tx.QueryRow(ctx, `
-			SELECT status, tenant_id::text FROM snoozed_emails WHERE id = $1::uuid
+			SELECT status, tenant_id::text, kchat_user_id FROM snoozed_emails WHERE id = $1::uuid
 		`, id)
-		if err := row.Scan(&status, &t); err != nil {
+		if err := row.Scan(&status, &t, &owner); err != nil {
 			return err
 		}
 		if t != tenantID {
 			return ErrTenantMismatch
+		}
+		if owner != kchatUserID {
+			// Cross-user — surface as not-found to avoid leaking
+			// the existence of another user's snooze row.
+			return ErrNotFound
 		}
 		switch status {
 		case StatusUnsnoozed:
@@ -355,11 +446,12 @@ func (s *Service) Cancel(ctx context.Context, tenantID, id string) error {
 			return ErrAlreadyCancelled
 		case StatusFailed:
 			return ErrAlreadyAwake
+		default:
+			// Shouldn't happen — the guarded UPDATE only no-ops
+			// when status != 'snoozed'. A surprise here is a
+			// schema-drift bug worth surfacing loudly.
+			return fmt.Errorf("snooze.Cancel: guarded UPDATE no-op with unexpected status=%q", status)
 		}
-		_, err := tx.Exec(ctx, `
-			UPDATE snoozed_emails SET status = 'cancelled' WHERE id = $1::uuid
-		`, id)
-		return err
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrNotFound
@@ -369,13 +461,37 @@ func (s *Service) Cancel(ctx context.Context, tenantID, id string) error {
 
 // claimDue is the worker's hot path: pick the next due row that
 // no other replica is already processing, bump `attempts`, and
-// return the row.
+// return the row to the caller. Returns (nil, ErrNotFound) when
+// the queue is drained.
 //
-// Returns (nil, ErrNotFound) when the queue is drained — same
-// shape as scheduledsend.Service.claimDue, so the worker logic
-// is symmetric across the two packages.
+// `FOR UPDATE OF s SKIP LOCKED` makes the claim safe across N
+// worker replicas: each transaction sees a different unlocked row
+// while the claim transaction is open. But the lock dies when the
+// transaction commits — and the dispatch + bookkeeping happen
+// OUTSIDE this transaction (see `DispatchWorker.process`). To
+// keep the row off the menu while THIS replica is dispatching,
+// the same UPDATE that bumps `attempts` also pushes
+// `next_retry_at` forward by `DispatchLeaseInterval`. The
+// re-eligibility WHERE clause above (`next_retry_at <= now()`)
+// then excludes this row for the full lease duration. If the
+// worker crashes mid-dispatch the row sits idle for one lease
+// interval before another replica re-claims (acceptable under
+// at-least-once delivery); on success `markUnsnoozed` flips
+// `status='unsnoozed'` and the row drops out of the partial
+// index; on failure `scheduleRetry` overwrites `next_retry_at`
+// with the real backoff value, so the lease is a strict floor
+// and never extends a retry. Without this push, BeginFunc commits,
+// the lock disappears, and a second replica's `claimDue` picks
+// up the same row a few milliseconds later — duplicate JMAP
+// patch dispatch.
+//
+// `row.Attempts` is set to the POST-increment value (worker's
+// handleErr compares it against maxAttempts; an off-by-one here
+// would cause the worker to retry one more time than intended).
+// Mirrors `internal/scheduledsend/service.go`.
 func (s *Service) claimDue(ctx context.Context) (*Snooze, error) {
 	var row Snooze
+	leaseUntil := s.now().UTC().Add(DispatchLeaseInterval)
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		r := tx.QueryRow(ctx, `
 			SELECT id::text, tenant_id::text, kchat_user_id,
@@ -396,10 +512,17 @@ func (s *Service) claimDue(ctx context.Context) (*Snooze, error) {
 		if err := scanRow(r, &row); err != nil {
 			return err
 		}
-		_, err := tx.Exec(ctx, `
-			UPDATE snoozed_emails SET attempts = attempts + 1 WHERE id = $1::uuid
-		`, row.ID)
-		return err
+		if _, err := tx.Exec(ctx, `
+			UPDATE snoozed_emails
+			SET attempts = attempts + 1,
+			    next_retry_at = $2
+			WHERE id = $1::uuid
+		`, row.ID, leaseUntil); err != nil {
+			return err
+		}
+		row.Attempts++
+		row.NextRetryAt = leaseUntil
+		return nil
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound

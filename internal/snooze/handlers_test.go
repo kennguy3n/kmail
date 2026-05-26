@@ -17,16 +17,30 @@ import (
 
 // fakeManager implements the handlers' manager interface.
 type fakeManager struct {
-	mu        sync.Mutex
-	rows      []Snooze
+	mu           sync.Mutex
+	rows         []Snooze
 	snoozeResult *Snooze
-	snoozeErr error
-	getResult *Snooze
-	getErr    error
-	listErr   error
-	cancelErr error
-	created   []SnoozeInput
-	cancels   []string
+	snoozeErr    error
+	getResult    *Snooze
+	getErr       error
+	listErr      error
+	cancelErr    error
+	created      []SnoozeInput
+	// getArgs / cancelArgs capture the (tenant, kchat_user, id)
+	// triple the handler passed in. The per-user authz tests
+	// pin these so a refactor that drops kchatUserID can't slip
+	// silently into Service-call shape.
+	getArgs struct {
+		tenantID    string
+		kchatUserID string
+		id          string
+	}
+	cancelArgs struct {
+		tenantID    string
+		kchatUserID string
+		id          string
+	}
+	cancels []string
 }
 
 func (f *fakeManager) Snooze(_ context.Context, in SnoozeInput) (*Snooze, error) {
@@ -57,7 +71,12 @@ func (f *fakeManager) Snooze(_ context.Context, in SnoozeInput) (*Snooze, error)
 	}, nil
 }
 
-func (f *fakeManager) Get(_ context.Context, _, _ string) (*Snooze, error) {
+func (f *fakeManager) Get(_ context.Context, tenantID, kchatUserID, id string) (*Snooze, error) {
+	f.mu.Lock()
+	f.getArgs.tenantID = tenantID
+	f.getArgs.kchatUserID = kchatUserID
+	f.getArgs.id = id
+	f.mu.Unlock()
 	if f.getErr != nil {
 		return nil, f.getErr
 	}
@@ -71,9 +90,12 @@ func (f *fakeManager) ListByUser(_ context.Context, _, _ string) ([]Snooze, erro
 	return f.rows, nil
 }
 
-func (f *fakeManager) Cancel(_ context.Context, _, id string) error {
+func (f *fakeManager) Cancel(_ context.Context, tenantID, kchatUserID, id string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.cancelArgs.tenantID = tenantID
+	f.cancelArgs.kchatUserID = kchatUserID
+	f.cancelArgs.id = id
 	f.cancels = append(f.cancels, id)
 	return f.cancelErr
 }
@@ -402,5 +424,76 @@ func TestWakeNow_StalwartRefusalReturns502(t *testing.T) {
 	}
 	if len(fm.cancels) != 0 {
 		t.Fatalf("must NOT cancel row when JMAP wake failed: %v", fm.cancels)
+	}
+}
+
+// TestGet_PerUserScopedAtHandlerLayer pins the per-user authz
+// fence at the handler entry point: the handler must extract
+// `kchat_user_id` from the auth context and pass it to
+// `Service.Get`. Without this regression guard, a refactor of
+// the handler that drops the second arg (or hard-codes "") would
+// compile and pass every other test, but silently re-open the
+// cross-user UUID-guessing hole the Service layer's belt closes.
+func TestGet_PerUserScopedAtHandlerLayer(t *testing.T) {
+	fm := &fakeManager{
+		getResult: &Snooze{
+			ID:          "s-1",
+			TenantID:    "tenant-a",
+			KChatUserID: "kchat-a",
+			Status:      StatusSnoozed,
+		},
+	}
+	router := newRouterForTest(fm, &fakeDispatcher{})
+	w := httptest.NewRecorder()
+	r := handlerRequest("GET", "/api/v1/snoozed/s-1", "")
+	router.ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s, want 200", w.Code, w.Body.String())
+	}
+	if fm.getArgs.tenantID != "tenant-a" {
+		t.Errorf("handler must pass tenantID=tenant-a to Service.Get, got %q", fm.getArgs.tenantID)
+	}
+	if fm.getArgs.kchatUserID != "kchat-a" {
+		t.Errorf("handler must pass kchatUserID=kchat-a to Service.Get, got %q", fm.getArgs.kchatUserID)
+	}
+	if fm.getArgs.id != "s-1" {
+		t.Errorf("handler must pass id=s-1 to Service.Get, got %q", fm.getArgs.id)
+	}
+}
+
+// TestWakeNow_PerUserScopedAtHandlerLayer — same as above for the
+// DELETE path. Both Get (to read the row) AND Cancel (to flip
+// terminal state) must carry kchatUserID.
+func TestWakeNow_PerUserScopedAtHandlerLayer(t *testing.T) {
+	fm := &fakeManager{
+		getResult: &Snooze{
+			ID:                 "s-1",
+			TenantID:           "tenant-a",
+			KChatUserID:        "kchat-a",
+			StalwartAccountID:  "acct-a",
+			EmailID:            "email-1",
+			OriginalMailboxIDs: json.RawMessage(`{"mb-inbox":true}`),
+			SnoozedMailboxID:   "mb-snoozed",
+			Status:             StatusSnoozed,
+		},
+	}
+	router := newRouterForTest(fm, &fakeDispatcher{})
+	w := httptest.NewRecorder()
+	r := handlerRequest("DELETE", "/api/v1/snoozed/s-1", "")
+	router.ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s, want 200", w.Code, w.Body.String())
+	}
+	if fm.getArgs.kchatUserID != "kchat-a" {
+		t.Errorf("wakeNow must pass kchatUserID=kchat-a to Service.Get, got %q", fm.getArgs.kchatUserID)
+	}
+	if fm.cancelArgs.kchatUserID != "kchat-a" {
+		t.Errorf("wakeNow must pass kchatUserID=kchat-a to Service.Cancel, got %q", fm.cancelArgs.kchatUserID)
+	}
+	if fm.cancelArgs.tenantID != "tenant-a" {
+		t.Errorf("wakeNow must pass tenantID=tenant-a to Service.Cancel, got %q", fm.cancelArgs.tenantID)
+	}
+	if fm.cancelArgs.id != "s-1" {
+		t.Errorf("wakeNow must pass id=s-1 to Service.Cancel, got %q", fm.cancelArgs.id)
 	}
 }

@@ -44,7 +44,17 @@ func (f *fakeStore) claimDue(_ context.Context) (*Snooze, error) {
 	}
 	s := f.pending[0]
 	f.pending = f.pending[1:]
+	// Mirror the real Service.claimDue dispatch-lease behaviour:
+	// push NextRetryAt forward by DispatchLeaseInterval so the
+	// row is ineligible for re-claim by a concurrent replica
+	// while this dispatch is in flight. The real path uses the
+	// transaction time (`now()`); the fake uses a wall-clock-
+	// independent constant so the worker tests stay
+	// deterministic. Tests that inspect retry scheduling cover
+	// the case where scheduleRetry overwrites this lease with
+	// the real backoff.
 	s.Attempts++
+	s.NextRetryAt = time.Unix(1_700_000_000, 0).Add(DispatchLeaseInterval)
 	return s, nil
 }
 

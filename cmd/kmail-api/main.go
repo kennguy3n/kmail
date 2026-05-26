@@ -665,7 +665,7 @@ func main() {
 	if err != nil {
 		logger.Fatalf("snooze.NewService: %v", err)
 	}
-	snooze.NewHandlers(snoozeSvc, internalJmap).Register(mux, authMW)
+	snooze.NewHandlers(snoozeSvc, internalJmap, logger).Register(mux, authMW)
 	snoozeInterval := getenvDuration("KMAIL_SNOOZE_INTERVAL", 30*time.Second)
 	snoozeWorker, err := snooze.NewDispatchWorker(snooze.WorkerConfig{
 		Service:  snoozeSvc,

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -15,11 +16,18 @@ import (
 // manager is the slice of Service the REST surface depends on.
 // Tests substitute an in-memory fake so the handlers can be
 // exercised without a real Postgres pool.
+//
+// `Get` and `Cancel` take `kchatUserID` because the snooze authz
+// model is per-user, not per-tenant (a snooze row is private to
+// the user who created it). Threading the id through the
+// interface forces the handler to extract it from the auth
+// context and prevents a refactor from silently widening the
+// scope back to tenant-only.
 type manager interface {
 	Snooze(ctx context.Context, in SnoozeInput) (*Snooze, error)
-	Get(ctx context.Context, tenantID, id string) (*Snooze, error)
+	Get(ctx context.Context, tenantID, kchatUserID, id string) (*Snooze, error)
 	ListByUser(ctx context.Context, tenantID, kchatUserID string) ([]Snooze, error)
-	Cancel(ctx context.Context, tenantID, id string) error
+	Cancel(ctx context.Context, tenantID, kchatUserID, id string) error
 }
 
 // dispatcher is the subset of jmap.InternalClient the handlers
@@ -49,20 +57,29 @@ type dispatcher interface {
 type Handlers struct {
 	svc        manager
 	dispatcher dispatcher
+	logger     *log.Logger
 	now        func() time.Time
 }
 
 // NewHandlers constructs the REST surface. Panics on nil so a
 // wiring bug in main.go is loud — same pattern as
-// scheduledsend.NewHandlers.
-func NewHandlers(svc *Service, d dispatcher) *Handlers {
+// scheduledsend.NewHandlers. The logger is used for orphaned-
+// snooze visibility: when the JMAP move succeeds but the DB
+// persist fails AND the best-effort revert also fails, an
+// operator must be able to find the email in the user's
+// Snoozed folder and patch it back manually. Nil falls back to
+// `log.Default()`.
+func NewHandlers(svc *Service, d dispatcher, logger *log.Logger) *Handlers {
 	if svc == nil {
 		panic("snooze.NewHandlers: svc is required")
 	}
 	if d == nil {
 		panic("snooze.NewHandlers: dispatcher is required")
 	}
-	return &Handlers{svc: svc, dispatcher: d, now: time.Now}
+	if logger == nil {
+		logger = log.Default()
+	}
+	return &Handlers{svc: svc, dispatcher: d, logger: logger, now: time.Now}
 }
 
 // newHandlersWith is the test seam — both deps are interfaces,
@@ -71,7 +88,7 @@ func newHandlersWith(m manager, d dispatcher, now func() time.Time) *Handlers {
 	if now == nil {
 		now = time.Now
 	}
-	return &Handlers{svc: m, dispatcher: d, now: now}
+	return &Handlers{svc: m, dispatcher: d, logger: log.Default(), now: now}
 }
 
 // Register wires the routes behind the OIDC middleware. The
@@ -178,7 +195,13 @@ func (h *Handlers) create(w http.ResponseWriter, r *http.Request) {
 		// Persistence failed — best-effort revert the JMAP
 		// patch so the user doesn't see a phantom-snoozed
 		// email. If the revert itself fails we still surface
-		// the original error to the client.
+		// the original error to the client AND log the orphan
+		// state at ERROR level so an operator can find the
+		// email in the user's Snoozed folder and patch it back
+		// manually. Without the log the orphan would only be
+		// recoverable via the user noticing a phantom-snoozed
+		// email — silent data loss from an operations
+		// standpoint.
 		if revertErr := h.applyMove(
 			r.Context(),
 			tenantID, kchatUserID, accountID, body.EmailID,
@@ -186,10 +209,11 @@ func (h *Handlers) create(w http.ResponseWriter, r *http.Request) {
 			"", // no snoozed-mailbox to drop on revert; we'll add originals + drop snoozed
 			true,
 		); revertErr != nil {
-			// Log via the service's logger by attaching the
-			// nested error to the response; the client
-			// already sees an error envelope.
-			_ = revertErr
+			h.logger.Printf(
+				"snooze: ORPHAN — email moved to snoozed folder but DB persist failed AND revert failed; "+
+					"manual patch required: tenant_id=%s kchat_user_id=%s stalwart_account_id=%s email_id=%s snoozed_mailbox_id=%s persist_err=%v revert_err=%v",
+				tenantID, kchatUserID, accountID, body.EmailID, body.SnoozedMailboxID, err, revertErr,
+			)
 		}
 		switch {
 		case errors.Is(err, ErrInvalidSnooze):
@@ -221,8 +245,9 @@ func (h *Handlers) list(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handlers) get(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.TenantIDFrom(r.Context())
-	if tenantID == "" {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "missing tenant context"})
+	kchatUserID := middleware.KChatUserIDFrom(r.Context())
+	if tenantID == "" || kchatUserID == "" {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "missing auth context"})
 		return
 	}
 	id := strings.TrimSpace(r.PathValue("id"))
@@ -230,7 +255,12 @@ func (h *Handlers) get(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "missing id"})
 		return
 	}
-	row, err := h.svc.Get(r.Context(), tenantID, id)
+	// Per-USER scope (not just tenant): a snooze row is owned by
+	// the user that created it, and an inadvertent fall-through
+	// to tenant-only scoping would let any user in the tenant
+	// read another user's snoozed-email metadata (mailbox-id
+	// sets, EmailIDs) by guessing UUIDs.
+	row, err := h.svc.Get(r.Context(), tenantID, kchatUserID, id)
 	switch {
 	case err == nil:
 		writeJSON(w, http.StatusOK, toResponse(row))
@@ -248,8 +278,9 @@ func (h *Handlers) get(w http.ResponseWriter, r *http.Request) {
 // snooze_until.
 func (h *Handlers) wakeNow(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.TenantIDFrom(r.Context())
-	if tenantID == "" {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "missing tenant context"})
+	kchatUserID := middleware.KChatUserIDFrom(r.Context())
+	if tenantID == "" || kchatUserID == "" {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "missing auth context"})
 		return
 	}
 	id := strings.TrimSpace(r.PathValue("id"))
@@ -257,7 +288,10 @@ func (h *Handlers) wakeNow(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "missing id"})
 		return
 	}
-	row, err := h.svc.Get(r.Context(), tenantID, id)
+	// Per-USER scope (not just tenant): without this, any user
+	// in the tenant could wake another user's snoozed email by
+	// guessing UUIDs.
+	row, err := h.svc.Get(r.Context(), tenantID, kchatUserID, id)
 	switch {
 	case err == nil:
 	case errors.Is(err, ErrNotFound), errors.Is(err, ErrTenantMismatch):
@@ -289,7 +323,7 @@ func (h *Handlers) wakeNow(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "snooze: stalwart refused wake: " + err.Error()})
 		return
 	}
-	if err := h.svc.Cancel(r.Context(), tenantID, id); err != nil {
+	if err := h.svc.Cancel(r.Context(), tenantID, kchatUserID, id); err != nil {
 		// JMAP move succeeded but DB flip failed — surface as
 		// 500 so an operator can investigate; the worker
 		// won't re-dispatch because the email is already at
