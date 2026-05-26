@@ -31,6 +31,19 @@ func (h *Handlers) Register(mux *http.ServeMux, authMW *middleware.OIDC) {
 	mux.Handle("GET /api/v1/tenants/{id}/search/backend", authMW.Wrap(http.HandlerFunc(h.getBackend)))
 	mux.Handle("PUT /api/v1/tenants/{id}/search/backend", authMW.Wrap(http.HandlerFunc(h.putBackend)))
 	mux.Handle("POST /api/v1/tenants/{id}/search/reindex", authMW.Wrap(http.HandlerFunc(h.reindex)))
+	// Global (non-tenant-scoped) lookup: which backend
+	// implementations did this BFF process ship? The admin UI
+	// reads this to gate the selector — e.g. `dedicated_opensearch`
+	// is a recognised value (migration 050 CHECK constraint) but
+	// no Go impl is wired today, so the UI must not let an
+	// operator flip a tenant onto it.
+	mux.Handle("GET /api/v1/search/backends", authMW.Wrap(http.HandlerFunc(h.listBackends)))
+}
+
+func (h *Handlers) listBackends(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"available": h.svc.AvailableBackends(),
+	})
 }
 
 func (h *Handlers) getBackend(w http.ResponseWriter, r *http.Request) {
@@ -102,6 +115,12 @@ func writeError(w http.ResponseWriter, status int, err error) {
 func statusFor(err error) int {
 	switch {
 	case errors.Is(err, ErrInvalidInput):
+		return http.StatusBadRequest
+	case errors.Is(err, ErrBackendUnavailable):
+		// Distinct from a bad input value: the input parses, the
+		// backend is just not shipped by this BFF. 400 is the right
+		// code because the client must pick a different value;
+		// returning 404 here would imply the tenant is missing.
 		return http.StatusBadRequest
 	case errors.Is(err, ErrNotFound):
 		return http.StatusNotFound

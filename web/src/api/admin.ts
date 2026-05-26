@@ -1998,8 +1998,29 @@ export async function revokeAdminProxySession(
 
 // ─── Phase 7 Production hardening ─────────────────────────────────
 
+/**
+ * The set of search backends the BFF will accept on
+ * `PUT /api/v1/tenants/:id/search/backend`. Must stay in sync
+ * with `internal/search/service.go::IsValidBackend` and with the
+ * migration-050 CHECK constraint on `tenants.search_backend`.
+ *
+ *   meilisearch         — legacy per-tenant Meilisearch index
+ *   opensearch          — legacy per-tenant OpenSearch index
+ *   shared_meilisearch  — Phase 8 default; one index per shard
+ *   shared_opensearch   — Phase 8 cutover target for shared tenants
+ *   dedicated_opensearch — enterprise: per-tenant OpenSearch index
+ */
+export const SEARCH_BACKENDS = [
+  "meilisearch",
+  "opensearch",
+  "shared_meilisearch",
+  "shared_opensearch",
+  "dedicated_opensearch",
+] as const;
+export type SearchBackendName = (typeof SEARCH_BACKENDS)[number];
+
 export interface SearchBackendConfig {
-  backend: "meilisearch" | "opensearch";
+  backend: SearchBackendName;
 }
 
 export async function getSearchBackend(tenantId: string): Promise<SearchBackendConfig> {
@@ -2032,6 +2053,23 @@ export async function reindexSearch(tenantId: string): Promise<void> {
     { method: "POST", headers: adminAuthHeaders(tenantId) },
     { expectJson: false },
   );
+}
+
+/**
+ * Returns the set of search backends whose Go implementation is
+ * wired into this BFF process. Mirrors `Service.AvailableBackends`
+ * (`internal/search/service.go`). The admin UI uses this to gate
+ * the selector — values like `dedicated_opensearch` are recognised
+ * by the migration-050 CHECK constraint but may not be shipped
+ * by every BFF deployment, and the UI must not let an operator
+ * flip onto a backend that would then fail every search call.
+ */
+export async function listAvailableSearchBackends(): Promise<SearchBackendName[]> {
+  const resp = await requestJSON<{ available: SearchBackendName[] }>(
+    `${ADMIN_API_BASE}/search/backends`,
+    { method: "GET", headers: adminAuthHeaders(undefined, { Accept: "application/json" }) },
+  );
+  return resp.available ?? [];
 }
 
 export interface DkimKey {

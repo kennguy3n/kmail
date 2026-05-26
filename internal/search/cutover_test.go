@@ -12,23 +12,36 @@ import (
 
 // inMemoryCutoverStore exercises the worker's state machine
 // without a real Postgres. It mirrors the production schema
-// closely: a row per tenant with state, failure count, and
-// updated_at, plus a per-tenant `search_backend` value to mirror
-// the production SQL JOIN against the `tenants` table. The
-// SourceBackend filter is honoured exactly the same way as the
-// Postgres impl so a test failure here mirrors a production
-// regression.
+// closely: a row per (tenant, target_backend) with state, failure
+// count, and updated_at, plus a per-tenant `search_backend` value
+// to mirror the production SQL JOIN against the `tenants` table.
+// The composite key matches migration 051 — a single tenant can
+// carry multiple rows, one per target_backend, so cross-transition
+// state is fully isolated. SourceBackend / TargetBackend filters
+// are honoured exactly the same way as the Postgres impl so a test
+// failure here mirrors a production regression.
 type inMemoryCutoverStore struct {
 	mu sync.Mutex
 	// rows is the search_cutover_jobs equivalent — one entry per
-	// tenant that's ever been claimed.
-	rows map[string]*memRow
+	// (tenantID, targetBackend) that's ever been claimed.
+	rows map[memRowKey]*memRow
 	// tenantBackends mirrors `tenants.search_backend` so the
 	// store can filter by SourceBackend exactly like the
 	// production SQL JOIN does. Tests that need to simulate a
 	// SetBackend mid-cutover update this map directly via
 	// flipBackend().
 	tenantBackends map[string]string
+}
+
+// memRowKey is the in-memory equivalent of the (tenant_id,
+// target_backend) composite PK created by migration 051. Tests
+// that pre-date the migration used `string` keys; the
+// `rowByTenant` helper preserves the old single-row-per-tenant
+// assertion ergonomics for tests that only ever exercise the
+// default `meilisearch -> opensearch` transition.
+type memRowKey struct {
+	tenantID      string
+	targetBackend string
 }
 
 type memRow struct {
@@ -51,9 +64,35 @@ func newInMemoryStore(tenants []string) *inMemoryCutoverStore {
 		backends[id] = BackendMeilisearch
 	}
 	return &inMemoryCutoverStore{
-		rows:           map[string]*memRow{},
+		rows:           map[memRowKey]*memRow{},
 		tenantBackends: backends,
 	}
+}
+
+// rowByTenant is a convenience helper that returns the FIRST row
+// matching `tenantID` regardless of target_backend. Tests that
+// only drive the default `meilisearch -> opensearch` transition
+// can use this to keep assertions terse — there's exactly one
+// row in the store for each tenant in that scenario. Tests that
+// exercise multi-transition behaviour should index `rows` by an
+// explicit `memRowKey{tenantID, targetBackend}` instead.
+func (s *inMemoryCutoverStore) rowByTenant(tenantID string) *memRow {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for k, r := range s.rows {
+		if k.tenantID == tenantID {
+			return r
+		}
+	}
+	return nil
+}
+
+// rowFor returns the row keyed by the explicit (tenant, target)
+// pair, or nil if none exists. Used by multi-transition tests.
+func (s *inMemoryCutoverStore) rowFor(tenantID, targetBackend string) *memRow {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.rows[memRowKey{tenantID: tenantID, targetBackend: targetBackend}]
 }
 
 // flipBackend mirrors production's SetBackend write so the test
@@ -75,7 +114,9 @@ func (s *inMemoryCutoverStore) ListCandidates(_ context.Context, f CandidateFilt
 		if f.SourceBackend != "" && backend != f.SourceBackend {
 			continue
 		}
-		r, ok := s.rows[id]
+		// TargetBackend scopes the LEFT JOIN — a row for a
+		// different target leaves the tenant eligible.
+		r, ok := s.rows[memRowKey{tenantID: id, targetBackend: f.TargetBackend}]
 		switch {
 		case !ok:
 			ids = append(ids, id)
@@ -86,13 +127,14 @@ func (s *inMemoryCutoverStore) ListCandidates(_ context.Context, f CandidateFilt
 	return ids, nil
 }
 
-func (s *inMemoryCutoverStore) Claim(_ context.Context, tenantID string, size, threshold int64, now time.Time) (bool, error) {
+func (s *inMemoryCutoverStore) Claim(_ context.Context, tenantID, targetBackend string, size, threshold int64, now time.Time) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	r, ok := s.rows[tenantID]
+	k := memRowKey{tenantID: tenantID, targetBackend: targetBackend}
+	r, ok := s.rows[k]
 	if !ok {
 		r = &memRow{state: CutoverPending, mailboxSize: size, threshold: threshold, updatedAt: now}
-		s.rows[tenantID] = r
+		s.rows[k] = r
 	}
 	if r.state != CutoverPending && r.state != CutoverFailed {
 		return false, nil
@@ -104,10 +146,10 @@ func (s *inMemoryCutoverStore) Claim(_ context.Context, tenantID string, size, t
 	return true, nil
 }
 
-func (s *inMemoryCutoverStore) MarkCompleted(_ context.Context, tenantID string, now time.Time) error {
+func (s *inMemoryCutoverStore) MarkCompleted(_ context.Context, tenantID, targetBackend string, now time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	r, ok := s.rows[tenantID]
+	r, ok := s.rows[memRowKey{tenantID: tenantID, targetBackend: targetBackend}]
 	if !ok {
 		return errors.New("no row")
 	}
@@ -119,10 +161,10 @@ func (s *inMemoryCutoverStore) MarkCompleted(_ context.Context, tenantID string,
 	return nil
 }
 
-func (s *inMemoryCutoverStore) MarkFailed(_ context.Context, tenantID, reason string, now time.Time) error {
+func (s *inMemoryCutoverStore) MarkFailed(_ context.Context, tenantID, targetBackend, reason string, now time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	r, ok := s.rows[tenantID]
+	r, ok := s.rows[memRowKey{tenantID: tenantID, targetBackend: targetBackend}]
 	if !ok {
 		return errors.New("no row")
 	}
@@ -135,22 +177,26 @@ func (s *inMemoryCutoverStore) MarkFailed(_ context.Context, tenantID, reason st
 
 // ReconcileCompleted mirrors the production Postgres impl: walk
 // the rows, promote any `in_progress` row whose tenant is already
-// on `targetBackend` AND whose updated_at predates `before`. The
-// completion timestamp is the caller-supplied `now` so the test's
-// injected clock (CutoverConfig.Now) drives both the SQL path and
-// the in-memory test double identically.
+// on `targetBackend` AND whose row keys to the same target AND
+// whose updated_at predates `before`. The completion timestamp is
+// the caller-supplied `now` so the test's injected clock
+// (CutoverConfig.Now) drives both the SQL path and the in-memory
+// test double identically.
 func (s *inMemoryCutoverStore) ReconcileCompleted(_ context.Context, targetBackend string, before, now time.Time) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var n int64
-	for tenantID, r := range s.rows {
+	for k, r := range s.rows {
+		if k.targetBackend != targetBackend {
+			continue
+		}
 		if r.state != CutoverInProgress {
 			continue
 		}
 		if !r.updatedAt.Before(before) {
 			continue
 		}
-		if s.tenantBackends[tenantID] != targetBackend {
+		if s.tenantBackends[k.tenantID] != targetBackend {
 			continue
 		}
 		r.state = CutoverCompleted
@@ -165,21 +211,25 @@ func (s *inMemoryCutoverStore) ReconcileCompleted(_ context.Context, targetBacke
 
 // ReconcileStale is the mirror of ReconcileCompleted: it demotes
 // stale `in_progress` rows whose tenant is still on `sourceBackend`
-// back to `failed`. Increments `failureCount` and stamps a
-// synthetic `lastError` so the test can assert the recovery hook
-// fired exactly the same way the Postgres impl does.
-func (s *inMemoryCutoverStore) ReconcileStale(_ context.Context, sourceBackend string, before, now time.Time) (int64, error) {
+// AND whose row keys to `targetBackend` back to `failed`.
+// Increments `failureCount` and stamps a synthetic `lastError` so
+// the test can assert the recovery hook fired exactly the same way
+// the Postgres impl does.
+func (s *inMemoryCutoverStore) ReconcileStale(_ context.Context, sourceBackend, targetBackend string, before, now time.Time) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var n int64
-	for tenantID, r := range s.rows {
+	for k, r := range s.rows {
+		if k.targetBackend != targetBackend {
+			continue
+		}
 		if r.state != CutoverInProgress {
 			continue
 		}
 		if !r.updatedAt.Before(before) {
 			continue
 		}
-		if s.tenantBackends[tenantID] != sourceBackend {
+		if s.tenantBackends[k.tenantID] != sourceBackend {
 			continue
 		}
 		r.state = CutoverFailed
@@ -287,8 +337,8 @@ func TestCutoverWorker_BelowThresholdNoCutover(t *testing.T) {
 	if got := flipper.setBackendCall["tenant-a"]; got != "" {
 		t.Fatalf("SetBackend called for tenant-a: %q; want no-op", got)
 	}
-	if _, ok := store.rows["tenant-a"]; ok {
-		t.Fatal("under-threshold tenant got a state row")
+	if r := store.rowByTenant("tenant-a"); r != nil {
+		t.Fatalf("under-threshold tenant got a state row: %+v", r)
 	}
 }
 
@@ -316,7 +366,7 @@ func TestCutoverWorker_AboveThresholdFullCutover(t *testing.T) {
 	if got := flipper.setBackendCall["tenant-a"]; got != BackendOpenSearch {
 		t.Fatalf("SetBackend tenant-a = %q, want %q", got, BackendOpenSearch)
 	}
-	if r := store.rows["tenant-a"]; r == nil || r.state != CutoverCompleted {
+	if r := store.rowByTenant("tenant-a"); r == nil || r.state != CutoverCompleted {
 		t.Fatalf("row state = %+v, want CutoverCompleted", r)
 	}
 	if store.tenantBackends["tenant-a"] != BackendOpenSearch {
@@ -338,14 +388,14 @@ func TestCutoverWorker_ReindexFailureMarksFailedAndRetries(t *testing.T) {
 	})
 	w := buildWorker(t, store, flipper, sizer, source, 100_000, clock.Now)
 	w.Tick(context.Background())
-	if r := store.rows["tenant-a"]; r == nil || r.state != CutoverFailed || r.failureCount != 1 {
+	if r := store.rowByTenant("tenant-a"); r == nil || r.state != CutoverFailed || r.failureCount != 1 {
 		t.Fatalf("after failed reindex row = %+v, want failed/1", r)
 	}
 
 	// Immediately re-tick inside the back-off window: should NOT
 	// retry (failure_count still 1).
 	w.Tick(context.Background())
-	if r := store.rows["tenant-a"]; r.failureCount != 1 {
+	if r := store.rowByTenant("tenant-a"); r.failureCount != 1 {
 		t.Fatalf("back-off ignored: failureCount = %d, want 1", r.failureCount)
 	}
 
@@ -354,7 +404,7 @@ func TestCutoverWorker_ReindexFailureMarksFailedAndRetries(t *testing.T) {
 	clock.Advance(2 * time.Hour)
 	delete(flipper.reindexErr, "tenant-a")
 	w.Tick(context.Background())
-	if r := store.rows["tenant-a"]; r.state != CutoverCompleted {
+	if r := store.rowByTenant("tenant-a"); r.state != CutoverCompleted {
 		t.Fatalf("retry did not succeed: state = %s", r.state)
 	}
 }
@@ -380,13 +430,13 @@ func TestCutoverWorker_MaxFailuresGivesUp(t *testing.T) {
 		w.Tick(context.Background())
 		clock.Advance(2 * time.Hour)
 	}
-	if got := store.rows["tenant-a"].failureCount; got != 5 {
+	if got := store.rowByTenant("tenant-a").failureCount; got != 5 {
 		t.Fatalf("failureCount = %d, want exactly 5", got)
 	}
 
 	// 6th tick: the candidate filter excludes this tenant.
 	w.Tick(context.Background())
-	if got := store.rows["tenant-a"].failureCount; got != 5 {
+	if got := store.rowByTenant("tenant-a").failureCount; got != 5 {
 		t.Fatalf("worker retried past MaxFailures: count = %d", got)
 	}
 }
@@ -470,14 +520,14 @@ func TestCutoverWorker_MultipleTenants(t *testing.T) {
 	})
 	w := buildWorker(t, store, flipper, sizer, source, 100_000, func() time.Time { return now })
 	w.Tick(context.Background())
-	if r := store.rows["tenant-a"]; r == nil || r.state != CutoverCompleted {
+	if r := store.rowByTenant("tenant-a"); r == nil || r.state != CutoverCompleted {
 		t.Errorf("tenant-a state = %v, want completed", r)
 	}
-	if r := store.rows["tenant-b"]; r == nil || r.state != CutoverFailed {
+	if r := store.rowByTenant("tenant-b"); r == nil || r.state != CutoverFailed {
 		t.Errorf("tenant-b state = %v, want failed", r)
 	}
-	if _, ok := store.rows["tenant-c"]; ok {
-		t.Errorf("tenant-c got a row despite being below threshold")
+	if r := store.rowByTenant("tenant-c"); r != nil {
+		t.Errorf("tenant-c got a row despite being below threshold: %+v", r)
 	}
 }
 
@@ -495,6 +545,7 @@ func TestInMemoryCutoverStore_ListCandidatesFiltersByBackend(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	ids, err := store.ListCandidates(context.Background(), CandidateFilter{
 		SourceBackend:    BackendMeilisearch,
+		TargetBackend:    BackendOpenSearch,
 		MaxFailures:      5,
 		RetryAfterBefore: now.Add(time.Hour),
 	})
@@ -506,7 +557,11 @@ func TestInMemoryCutoverStore_ListCandidatesFiltersByBackend(t *testing.T) {
 	}
 
 	// Empty SourceBackend disables the filter — returns both.
+	// Tests still pass a TargetBackend so the LEFT JOIN scope is
+	// well-defined; with no rows in the store, every tenant
+	// passing the SourceBackend filter is a candidate.
 	ids, err = store.ListCandidates(context.Background(), CandidateFilter{
+		TargetBackend:    BackendOpenSearch,
 		MaxFailures:      5,
 		RetryAfterBefore: now.Add(time.Hour),
 	})
@@ -565,7 +620,7 @@ func TestCutoverWorker_SetBackendFailureLeavesTenantRetryable(t *testing.T) {
 	// backend column is STILL meilisearch (the worker never got
 	// to call SetBackend successfully), so the next tick can
 	// see the tenant under the SourceBackend=meilisearch filter.
-	if r := store.rows["tenant-a"]; r == nil || r.state != CutoverFailed {
+	if r := store.rowByTenant("tenant-a"); r == nil || r.state != CutoverFailed {
 		t.Fatalf("row = %+v, want failed", r)
 	}
 	if store.tenantBackends["tenant-a"] != BackendMeilisearch {
@@ -574,6 +629,7 @@ func TestCutoverWorker_SetBackendFailureLeavesTenantRetryable(t *testing.T) {
 	// Sanity: candidate filter still picks up the tenant.
 	ids, _ := store.ListCandidates(context.Background(), CandidateFilter{
 		SourceBackend:    BackendMeilisearch,
+		TargetBackend:    BackendOpenSearch,
 		MaxFailures:      5,
 		RetryAfterBefore: clock.Now().Add(time.Hour),
 	})
@@ -587,7 +643,7 @@ func TestCutoverWorker_SetBackendFailureLeavesTenantRetryable(t *testing.T) {
 	clock.Advance(2 * time.Hour)
 	delete(flipper.setBackendErr, "tenant-a")
 	w.Tick(context.Background())
-	if r := store.rows["tenant-a"]; r.state != CutoverCompleted {
+	if r := store.rowByTenant("tenant-a"); r.state != CutoverCompleted {
 		t.Fatalf("retry did not succeed: state = %s", r.state)
 	}
 }
@@ -626,7 +682,7 @@ func TestCutoverWorker_MarkCompletedTransientFailureRetries(t *testing.T) {
 		t.Fatalf("NewCutoverWorker: %v", err)
 	}
 	w.Tick(context.Background())
-	if r := store.rows["tenant-a"]; r == nil || r.state != CutoverCompleted {
+	if r := store.rowByTenant("tenant-a"); r == nil || r.state != CutoverCompleted {
 		t.Fatalf("row = %+v, want completed", r)
 	}
 	if wrapped.calls != 3 {
@@ -673,7 +729,7 @@ func TestCutoverWorker_MarkCompletedPersistentFailureReconcilesNextTick(t *testi
 	}
 
 	w.Tick(context.Background())
-	if r := store.rows["tenant-a"]; r == nil || r.state != CutoverInProgress {
+	if r := store.rowByTenant("tenant-a"); r == nil || r.state != CutoverInProgress {
 		t.Fatalf("after MarkCompleted exhaust, row = %+v, want in_progress", r)
 	}
 	if store.tenantBackends["tenant-a"] != BackendOpenSearch {
@@ -687,7 +743,7 @@ func TestCutoverWorker_MarkCompletedPersistentFailureReconcilesNextTick(t *testi
 	clock.Advance(time.Hour)
 
 	w.Tick(context.Background())
-	if r := store.rows["tenant-a"]; r == nil || r.state != CutoverCompleted {
+	if r := store.rowByTenant("tenant-a"); r == nil || r.state != CutoverCompleted {
 		t.Fatalf("after reconcile tick, row = %+v, want completed", r)
 	}
 }
@@ -738,10 +794,10 @@ func TestCutoverWorker_CrashDuringReindexRecoversViaReconcileStale(t *testing.T)
 	// Simulate the crash: claim the row but don't let the
 	// worker run. The row is now `in_progress`, tenant still on
 	// `meilisearch`, no follow-up MarkFailed/MarkCompleted.
-	if _, err := store.Claim(context.Background(), "tenant-a", 200_000, 100_000, clock.Now()); err != nil {
+	if _, err := store.Claim(context.Background(), "tenant-a", BackendOpenSearch, 200_000, 100_000, clock.Now()); err != nil {
 		t.Fatalf("manual Claim: %v", err)
 	}
-	if r := store.rows["tenant-a"]; r == nil || r.state != CutoverInProgress {
+	if r := store.rowByTenant("tenant-a"); r == nil || r.state != CutoverInProgress {
 		t.Fatalf("after simulated crash, row = %+v, want in_progress", r)
 	}
 	if store.tenantBackends["tenant-a"] != BackendMeilisearch {
@@ -752,7 +808,7 @@ func TestCutoverWorker_CrashDuringReindexRecoversViaReconcileStale(t *testing.T)
 	// the row — it could be a legitimate in-flight migration
 	// on another worker.
 	w.Tick(context.Background())
-	if r := store.rows["tenant-a"]; r == nil || r.state != CutoverInProgress {
+	if r := store.rowByTenant("tenant-a"); r == nil || r.state != CutoverInProgress {
 		t.Fatalf("pre-horizon Tick wrongly mutated row: %+v, want still in_progress", r)
 	}
 
@@ -760,7 +816,7 @@ func TestCutoverWorker_CrashDuringReindexRecoversViaReconcileStale(t *testing.T)
 	// `failed` so the normal retry path can pick it up.
 	clock.Advance(time.Hour)
 	w.Tick(context.Background())
-	r := store.rows["tenant-a"]
+	r := store.rowByTenant("tenant-a")
 	if r == nil || r.state != CutoverFailed {
 		t.Fatalf("post-horizon Tick row = %+v, want failed (demoted by ReconcileStale)", r)
 	}
@@ -775,7 +831,7 @@ func TestCutoverWorker_CrashDuringReindexRecoversViaReconcileStale(t *testing.T)
 	// the failed row; the next Tick should complete the cutover.
 	clock.Advance(2 * time.Minute)
 	w.Tick(context.Background())
-	r = store.rows["tenant-a"]
+	r = store.rowByTenant("tenant-a")
 	if r == nil || r.state != CutoverCompleted {
 		t.Fatalf("recovery Tick row = %+v, want completed", r)
 	}
@@ -794,13 +850,13 @@ type flakeyMarkCompleted struct {
 	calls        int
 }
 
-func (s *flakeyMarkCompleted) MarkCompleted(ctx context.Context, tenantID string, now time.Time) error {
+func (s *flakeyMarkCompleted) MarkCompleted(ctx context.Context, tenantID, targetBackend string, now time.Time) error {
 	s.calls++
 	if s.failuresLeft > 0 {
 		s.failuresLeft--
 		return errors.New("transient: postgres conn reset")
 	}
-	return s.CutoverStore.MarkCompleted(ctx, tenantID, now)
+	return s.CutoverStore.MarkCompleted(ctx, tenantID, targetBackend, now)
 }
 
 type fakeNow struct {
@@ -819,3 +875,174 @@ func (f *fakeNow) Advance(d time.Duration) {
 	f.now = f.now.Add(d)
 	f.mu.Unlock()
 }
+
+// TestCutoverWorker_MultiTransitionRunsAllConfiguredPairs is the
+// architectural pin that the worker handles ≥2 (source, target)
+// pairs in a single Tick. Without this guard the worker silently
+// drops back to a single pair (legacy meilisearch->opensearch)
+// and tenants on the shared variant stagnate forever.
+//
+// Setup:
+//   - tenant-legacy is on `meilisearch` with a 200k mailbox.
+//   - tenant-shared is on `shared_meilisearch` with a 200k mailbox.
+//
+// One Tick using DefaultCutoverTransitions must promote both:
+// the first transition flips tenant-legacy to `opensearch`, the
+// second flips tenant-shared to `shared_opensearch`.
+func TestCutoverWorker_MultiTransitionRunsAllConfiguredPairs(t *testing.T) {
+	store := newInMemoryStore([]string{"tenant-legacy", "tenant-shared"})
+	store.flipBackend("tenant-shared", BackendSharedMeilisearch)
+	flipper := newFakeFlipper(store)
+	now := time.Unix(1_700_000_000, 0)
+	sizer := MailboxSizerFunc(func(context.Context, string) (int64, error) {
+		return 200_000, nil
+	})
+	source := MessageSourceFunc(func(_ context.Context, tenantID string) ([]Message, error) {
+		return []Message{{TenantID: tenantID, MessageID: tenantID + "-m1"}}, nil
+	})
+	w := buildWorker(t, store, flipper, sizer, source, 100_000, func() time.Time { return now })
+	w.Tick(context.Background())
+
+	// tenant-legacy: meilisearch -> opensearch (transition 1).
+	if got := store.tenantBackends["tenant-legacy"]; got != BackendOpenSearch {
+		t.Errorf("tenant-legacy backend = %q, want %q", got, BackendOpenSearch)
+	}
+	if rec := flipper.reindexCall["tenant-legacy"]; rec.backend != BackendOpenSearch {
+		t.Errorf("tenant-legacy reindex target = %q, want %q", rec.backend, BackendOpenSearch)
+	}
+	if r := store.rowByTenant("tenant-legacy"); r == nil || r.state != CutoverCompleted {
+		t.Errorf("tenant-legacy row state = %+v, want CutoverCompleted", r)
+	}
+
+	// tenant-shared: shared_meilisearch -> shared_opensearch
+	// (transition 2). The worker must NOT promote it to plain
+	// `opensearch` — that would silently strip tenant isolation.
+	if got := store.tenantBackends["tenant-shared"]; got != BackendSharedOpenSearch {
+		t.Errorf("tenant-shared backend = %q, want %q", got, BackendSharedOpenSearch)
+	}
+	if rec := flipper.reindexCall["tenant-shared"]; rec.backend != BackendSharedOpenSearch {
+		t.Errorf("tenant-shared reindex target = %q, want %q", rec.backend, BackendSharedOpenSearch)
+	}
+	if r := store.rowByTenant("tenant-shared"); r == nil || r.state != CutoverCompleted {
+		t.Errorf("tenant-shared row state = %+v, want CutoverCompleted", r)
+	}
+}
+
+// TestCutoverWorker_CustomTransitionsOverride pins that the
+// operator-supplied `CutoverConfig.Transitions` actually replaces
+// the default — a misconfigured worker that fell back to the
+// defaults would silently broaden the set of tenants it touches
+// (e.g., a runbook intending to migrate ONLY shared tenants would
+// also flip every legacy tenant past the threshold).
+func TestCutoverWorker_CustomTransitionsOverride(t *testing.T) {
+	store := newInMemoryStore([]string{"tenant-legacy", "tenant-shared"})
+	store.flipBackend("tenant-shared", BackendSharedMeilisearch)
+	flipper := newFakeFlipper(store)
+	now := time.Unix(1_700_000_000, 0)
+	sizer := MailboxSizerFunc(func(context.Context, string) (int64, error) {
+		return 200_000, nil
+	})
+	source := MessageSourceFunc(func(_ context.Context, tenantID string) ([]Message, error) {
+		return []Message{{TenantID: tenantID, MessageID: "m1"}}, nil
+	})
+	w, err := NewCutoverWorker(CutoverConfig{
+		Store:       store,
+		Service:     flipper,
+		Sizer:       sizer,
+		Source:      source,
+		Logger:      silentLogger(),
+		Threshold:   100_000,
+		Interval:    time.Hour,
+		MaxFailures: 5,
+		MaxRetryGap: time.Hour,
+		Now:         func() time.Time { return now },
+		Sleep:       func(time.Duration) {},
+		Transitions: []CutoverTransition{
+			{Source: BackendSharedMeilisearch, Target: BackendSharedOpenSearch},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewCutoverWorker: %v", err)
+	}
+	w.Tick(context.Background())
+
+	// Custom transitions: shared moves, legacy must not.
+	if got := store.tenantBackends["tenant-shared"]; got != BackendSharedOpenSearch {
+		t.Errorf("tenant-shared backend = %q, want %q", got, BackendSharedOpenSearch)
+	}
+	if got := store.tenantBackends["tenant-legacy"]; got != BackendMeilisearch {
+		t.Errorf("tenant-legacy backend = %q, want %q (untouched)", got, BackendMeilisearch)
+	}
+}
+
+// TestCutoverWorker_SameTenantBothTransitionsKeyedIndependently is
+// the regression test for the (tenant_id, target_backend) PK swap
+// in migration 051. The same tenant can participate in TWO
+// transitions over time — first `shared_meilisearch ->
+// shared_opensearch`, then a runbook reverts the tenant back to
+// `shared_meilisearch` and the operator wants the next cutover
+// tick to re-promote it. Under the old (tenant_id-only) PK the
+// completed row for `shared_opensearch` would silently hide the
+// tenant from `ListCandidates` on the next tick. With the new
+// composite PK, each (tenant, target) pair carries its own state
+// row so the second promotion sees an empty slot and runs.
+//
+// We exercise the principle with a single tick covering both
+// DefaultCutoverTransitions: a tenant that's already-on
+// `opensearch` (transition 1 has completed historically) but
+// still on the source of transition 2 (`shared_meilisearch`)
+// must be promoted by transition 2 in this tick. Without the
+// composite key, the historical row for transition 1 hides the
+// tenant from transition 2's candidate list.
+func TestCutoverWorker_SameTenantBothTransitionsKeyedIndependently(t *testing.T) {
+	store := newInMemoryStore([]string{"tenant-x"})
+	// Tenant is on the SECOND transition's source. The FIRST
+	// transition has historically completed for this tenant
+	// (legacy meilisearch -> opensearch), so the worker's job
+	// row for opensearch is pre-seeded as completed.
+	store.flipBackend("tenant-x", BackendSharedMeilisearch)
+	store.rows[memRowKey{tenantID: "tenant-x", targetBackend: BackendOpenSearch}] = &memRow{
+		state:       CutoverCompleted,
+		completedAt: ptrTime(time.Unix(1_600_000_000, 0)),
+		updatedAt:   time.Unix(1_600_000_000, 0),
+	}
+
+	flipper := newFakeFlipper(store)
+	now := time.Unix(1_700_000_000, 0)
+	sizer := MailboxSizerFunc(func(context.Context, string) (int64, error) {
+		return 200_000, nil
+	})
+	source := MessageSourceFunc(func(_ context.Context, tenantID string) ([]Message, error) {
+		return []Message{{TenantID: tenantID, MessageID: tenantID + "-m1"}}, nil
+	})
+	w := buildWorker(t, store, flipper, sizer, source, 100_000, func() time.Time { return now })
+	w.Tick(context.Background())
+
+	// transition 2 must promote tenant-x to shared_opensearch.
+	if got := store.tenantBackends["tenant-x"]; got != BackendSharedOpenSearch {
+		t.Errorf("tenant-x backend = %q, want %q (transition 2 must promote)", got, BackendSharedOpenSearch)
+	}
+	if rec := flipper.reindexCall["tenant-x"]; rec.backend != BackendSharedOpenSearch {
+		t.Errorf("tenant-x reindex target = %q, want %q", rec.backend, BackendSharedOpenSearch)
+	}
+	// The shared_opensearch job row must exist and be completed.
+	if r := store.rowFor("tenant-x", BackendSharedOpenSearch); r == nil || r.state != CutoverCompleted {
+		t.Errorf("tenant-x shared_opensearch row = %+v, want CutoverCompleted", r)
+	}
+	// The PRE-EXISTING opensearch row must remain untouched —
+	// the new transition operates entirely on its own composite
+	// key, so the legacy row's completed_at / failure_count must
+	// not be perturbed.
+	legacy := store.rowFor("tenant-x", BackendOpenSearch)
+	if legacy == nil || legacy.state != CutoverCompleted {
+		t.Errorf("legacy opensearch row mutated: %+v, want still CutoverCompleted", legacy)
+	}
+	if legacy != nil && legacy.completedAt != nil && !legacy.completedAt.Equal(time.Unix(1_600_000_000, 0)) {
+		t.Errorf("legacy opensearch row completed_at = %v, want unchanged", legacy.completedAt)
+	}
+}
+
+// ptrTime is the canonical "take address of a time.Time literal"
+// helper. Used by the multi-transition test above so we can
+// inject a pre-existing job row with a populated `completedAt`.
+func ptrTime(t time.Time) *time.Time { return &t }

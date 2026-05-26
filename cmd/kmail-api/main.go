@@ -594,15 +594,35 @@ func main() {
 	}
 	dns.NewDKIMHandlers(dkimSvc, logger).Register(mux, authMW)
 
-	// Search backend abstraction (Phase 7). Meilisearch is the
-	// default; OpenSearch is opt-in per-tenant via the admin
-	// surface. The backend registry only contains the backends
-	// configured via env so dev compose stays lean.
+	// Search backend abstraction (Phase 7 + Phase 8). Meilisearch
+	// is the default; OpenSearch is opt-in per-tenant via the
+	// admin surface. The backend registry only contains the
+	// backends configured via env so dev compose stays lean.
+	//
+	// Phase 8 adds the shared-index variants (one index per
+	// Stalwart shard, tenant_id filter at query time). The
+	// shared backends are wired off the same env vars as the
+	// per-tenant ones and share the Stalwart shard resolver
+	// (`shardSvc.GetTenantShardID`) for index-name derivation —
+	// that keeps the index a tenant lands on aligned with the
+	// shard their JMAP traffic already routes to.
+	shardResolver := search.ShardResolverFunc(func(ctx context.Context, tenantID string) (string, error) {
+		return shardSvc.GetTenantShardID(ctx, tenantID)
+	})
 	var searchBackends []search.SearchBackend
+	var sharedInitBackends []search.SharedIndexEnsurer
 	if url := os.Getenv("KMAIL_MEILISEARCH_URL"); url != "" {
 		searchBackends = append(searchBackends, search.NewMeilisearchBackend(
 			url, os.Getenv("KMAIL_MEILISEARCH_API_KEY"),
 		))
+		shared, err := search.NewSharedMeilisearchBackend(
+			url, os.Getenv("KMAIL_MEILISEARCH_API_KEY"), shardResolver,
+		)
+		if err != nil {
+			logger.Fatalf("search.NewSharedMeilisearchBackend: %v", err)
+		}
+		searchBackends = append(searchBackends, shared)
+		sharedInitBackends = append(sharedInitBackends, shared)
 	}
 	if url := os.Getenv("KMAIL_OPENSEARCH_URL"); url != "" {
 		searchBackends = append(searchBackends, search.NewOpenSearchBackend(
@@ -610,6 +630,17 @@ func main() {
 			os.Getenv("KMAIL_OPENSEARCH_USER"),
 			os.Getenv("KMAIL_OPENSEARCH_PASS"),
 		))
+		shared, err := search.NewSharedOpenSearchBackend(
+			url,
+			os.Getenv("KMAIL_OPENSEARCH_USER"),
+			os.Getenv("KMAIL_OPENSEARCH_PASS"),
+			shardResolver,
+		)
+		if err != nil {
+			logger.Fatalf("search.NewSharedOpenSearchBackend: %v", err)
+		}
+		searchBackends = append(searchBackends, shared)
+		sharedInitBackends = append(sharedInitBackends, shared)
 	}
 	searchSvc := search.NewService(search.Config{
 		Pool:     pool,
@@ -618,11 +649,73 @@ func main() {
 	})
 	search.NewHandlers(searchSvc, logger).Register(mux, authMW)
 
-	// Phase 5: auto-cutover from Meilisearch to OpenSearch.
-	// Disabled when either backend is missing (we'd have nowhere
-	// to read from or write to). The worker polls hourly and
-	// promotes any tenant whose mailbox is past the configured
-	// byte threshold — see `internal/search/cutover.go`.
+	// Ensure every shared index exists with the correct
+	// settings before the first per-tenant write lands. We do
+	// this synchronously at startup so the admin / search
+	// surface can return early errors rather than discovering a
+	// missing index on the first SearchMessages call.
+	// Failures inside `EnsureSharedIndexes` are per-(backend,
+	// shard) and logged; only a fatal lister error aborts here,
+	// in which case the BFF can still start. Both shared
+	// backends (`shared_meilisearch` and `shared_opensearch`)
+	// have lazy mapping/settings paths in their write methods,
+	// so a missed-at-startup shard is created with the correct
+	// mapping on its first IndexMessage / MigrateIndex call —
+	// the BFF is degraded (latency on the first write) rather
+	// than broken (wrong mapping breaking the tenant filter).
+	//
+	// On partial failure we emit a HIGH-SIGNAL aggregate log
+	// line ("shared-indexes init partial-failure: N of M
+	// pairs failed") in addition to the per-shard lines the
+	// helper already wrote. This is the hook an operator wires
+	// to a startup-health metric / alert — they don't have to
+	// grep the per-shard noise to know if the fleet booted
+	// cleanly.
+	if err := search.EnsureSharedIndexes(ctx, logger, shardSvc, sharedInitBackends); err != nil {
+		var agg *search.EnsureSharedIndexesError
+		if errors.As(err, &agg) {
+			logger.Printf("search.EnsureSharedIndexes: shared-indexes init partial-failure: %d of %d (backend, shard) pairs failed (continuing — lazy paths will repair on first write)",
+				len(agg.Failures), agg.Attempted)
+		} else {
+			logger.Printf("search.EnsureSharedIndexes: %v (continuing — shared indexes will be created lazily on first write)", err)
+		}
+	}
+
+	// Phase 5 / Phase 8: auto-cutover. Disabled when either
+	// backend is missing (we'd have nowhere to read from or
+	// write to). The worker now walks every configured
+	// transition pair (meili->opensearch AND
+	// shared_meili->shared_opensearch by default), so the
+	// fleet's hot tenants move forward regardless of which
+	// model they were provisioned under.
+	//
+	// We deliberately gate on the LEGACY backend names
+	// (`BackendMeilisearch` / `BackendOpenSearch`) rather than
+	// the four-name tuple of {meili, shared_meili, opensearch,
+	// shared_opensearch}, because the wiring above at
+	// `KMAIL_MEILISEARCH_URL` / `KMAIL_OPENSEARCH_URL`
+	// CO-REGISTERS both the per-tenant AND the shared backend
+	// variants for each URL. So:
+	//   - `KMAIL_MEILISEARCH_URL` set  =>  hasMeili = true  AND
+	//                                       BackendSharedMeilisearch
+	//                                       is also wired
+	//   - `KMAIL_OPENSEARCH_URL` set   =>  hasOpen = true  AND
+	//                                       BackendSharedOpenSearch
+	//                                       is also wired
+	// The legacy-name guard is therefore a sufficient proxy
+	// for "both transitions in `DefaultCutoverTransitions` have
+	// valid Source AND Target backends registered." If a future
+	// PR introduces a search backend that ISN'T URL-co-registered
+	// (e.g. a hot-tier Meilisearch from its own env var), the
+	// right move at that point is to switch this guard to a
+	// per-transition predicate (`hasTransitionSource(tr)` /
+	// `hasTransitionTarget(tr)`) walking
+	// `DefaultCutoverTransitions` rather than counting backend
+	// names. Devin Review round 8 (finding 3300377295) flagged
+	// this implicit coupling — the explicit comment now makes
+	// the URL-env-var invariant visible to the next reader so
+	// they don't have to dig through the wiring block above to
+	// understand why the two-name guard is correct.
 	hasMeili, hasOpen := false, false
 	for _, b := range searchBackends {
 		switch b.Name() {

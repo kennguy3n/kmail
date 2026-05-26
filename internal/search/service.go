@@ -27,6 +27,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 
@@ -42,12 +43,48 @@ var ErrInvalidInput = errors.New("invalid input")
 // ErrNotFound is returned when a tenant or backend lookup misses.
 var ErrNotFound = errors.New("not found")
 
+// ErrBackendUnavailable is returned when a caller asks the
+// Service to switch a tenant to a backend whose Go implementation
+// is not wired into this BFF process. The name is recognised
+// (passes `IsValidBackend`) but `Config.Backends` did not include
+// a matching impl. This distinguishes a deployment-time gap
+// ("this BFF does not ship `dedicated_opensearch`") from an
+// outright typo, so the admin UI can render a clear "not
+// available in this deployment" hint without falling through to
+// a 500 on every subsequent search call.
+var ErrBackendUnavailable = errors.New("backend not available in this deployment")
+
 // Backend names recognised by the service. Stored verbatim in
 // `tenants.search_backend`.
+//
+// The three `shared_*` and `dedicated_*` values were added in
+// migration 050 (shared indexes). Older values (`meilisearch`,
+// `opensearch`) remain valid for backward compatibility — pre-
+// existing tenants stay on whatever they were promoted to under
+// the per-tenant-index model until an operator migrates them.
 const (
-	BackendMeilisearch = "meilisearch"
-	BackendOpenSearch  = "opensearch"
+	BackendMeilisearch         = "meilisearch"
+	BackendOpenSearch          = "opensearch"
+	BackendSharedMeilisearch   = "shared_meilisearch"
+	BackendSharedOpenSearch    = "shared_opensearch"
+	BackendDedicatedOpenSearch = "dedicated_opensearch"
 )
+
+// IsValidBackend reports whether `name` is one of the recognised
+// `tenants.search_backend` values. Used by `SetBackend` and by
+// the cutover worker before it writes the column so a typo can't
+// strand a tenant in an unreachable state.
+func IsValidBackend(name string) bool {
+	switch name {
+	case BackendMeilisearch,
+		BackendOpenSearch,
+		BackendSharedMeilisearch,
+		BackendSharedOpenSearch,
+		BackendDedicatedOpenSearch:
+		return true
+	}
+	return false
+}
 
 // Message is the per-message indexable shape passed to
 // `SearchBackend.IndexMessage`. Stalwart owns the canonical
@@ -134,14 +171,18 @@ func NewService(cfg Config) *Service {
 }
 
 // GetBackend returns the configured backend name for a tenant. If
-// the column is NULL or empty we default to BackendMeilisearch so
-// existing tenants keep working without a migration backfill.
+// the column is NULL or empty we default to BackendSharedMeilisearch
+// — that matches the migration-050 column default for newly-
+// provisioned tenants (`migrations/050_search_shared_indexes.sql`
+// `ALTER COLUMN ... SET DEFAULT 'shared_meilisearch'`) and is the
+// cheapest backend to land on if a row is somehow missing its
+// setting.
 func (s *Service) GetBackend(ctx context.Context, tenantID string) (string, error) {
 	if tenantID == "" {
 		return "", fmt.Errorf("%w: tenantID required", ErrInvalidInput)
 	}
 	if s.pool == nil {
-		return BackendMeilisearch, nil
+		return BackendSharedMeilisearch, nil
 	}
 	var backend string
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
@@ -158,22 +199,59 @@ func (s *Service) GetBackend(ctx context.Context, tenantID string) (string, erro
 		return "", fmt.Errorf("get backend: %w", err)
 	}
 	if backend == "" {
-		backend = BackendMeilisearch
+		backend = BackendSharedMeilisearch
 	}
 	return backend, nil
 }
 
+// AvailableBackends returns the names of every backend whose Go
+// implementation is wired into this Service, sorted
+// alphabetically. Used by the admin UI to render the backend
+// selector without exposing values that would silently fail on
+// the first search call after a flip.
+func (s *Service) AvailableBackends() []string {
+	names := make([]string, 0, len(s.backends))
+	for name := range s.backends {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// IsBackendAvailable reports whether a backend with the given
+// name is registered on this Service. Distinct from
+// `IsValidBackend`: a value can be syntactically valid (e.g.
+// `dedicated_opensearch`) but unavailable in this BFF process if
+// the deployment did not ship that implementation.
+func (s *Service) IsBackendAvailable(name string) bool {
+	_, ok := s.backends[name]
+	return ok
+}
+
 // SetBackend updates the tenant's search backend. Validates the
-// name against the registered backends so a typo can't put a
-// tenant into an unreachable state.
+// name against the recognised values so a typo can't put a
+// tenant into an unreachable state, and against the wired
+// implementations so the admin UI cannot strand a tenant on a
+// backend this BFF does not ship.
 func (s *Service) SetBackend(ctx context.Context, tenantID, backend string) error {
 	if tenantID == "" || backend == "" {
 		return fmt.Errorf("%w: tenantID and backend required", ErrInvalidInput)
 	}
-	switch backend {
-	case BackendMeilisearch, BackendOpenSearch:
-	default:
-		return fmt.Errorf("%w: backend must be %q or %q", ErrInvalidInput, BackendMeilisearch, BackendOpenSearch)
+	if !IsValidBackend(backend) {
+		return fmt.Errorf("%w: backend %q is not a recognised value", ErrInvalidInput, backend)
+	}
+	// Belt-and-suspenders against the case where migration 050's
+	// CHECK constraint admits a value (e.g. `dedicated_opensearch`)
+	// that this BFF does not have an implementation for. Without
+	// this guard the flip succeeds and every subsequent
+	// IndexMessage / SearchMessages call returns the generic
+	// `backend not configured` 404. Failing the flip itself with a
+	// distinct sentinel lets the admin UI tell the operator
+	// exactly why the value is unselectable. Runs BEFORE the pool
+	// short-circuit so the same rejection applies in metadata-only
+	// mode (e.g. unit tests that build a Service with no pool).
+	if !s.IsBackendAvailable(backend) {
+		return fmt.Errorf("%w: %q", ErrBackendUnavailable, backend)
 	}
 	if s.pool == nil {
 		return nil
@@ -233,10 +311,14 @@ func (s *Service) ReindexTo(ctx context.Context, tenantID, backend string, msgs 
 	if tenantID == "" || backend == "" {
 		return fmt.Errorf("%w: tenantID and backend required", ErrInvalidInput)
 	}
-	switch backend {
-	case BackendMeilisearch, BackendOpenSearch:
-	default:
-		return fmt.Errorf("%w: backend must be %q or %q", ErrInvalidInput, BackendMeilisearch, BackendOpenSearch)
+	if !IsValidBackend(backend) {
+		return fmt.Errorf("%w: backend %q is not a recognised value", ErrInvalidInput, backend)
+	}
+	// Same gating as SetBackend: refuse to write into a backend
+	// this BFF does not ship, so the cutover worker fails fast
+	// with a clear error instead of silently no-op'ing.
+	if !s.IsBackendAvailable(backend) {
+		return fmt.Errorf("%w: %q", ErrBackendUnavailable, backend)
 	}
 	return s.reindexInto(ctx, tenantID, backend, msgs)
 }
@@ -328,17 +410,59 @@ func httpJSON(ctx context.Context, client *http.Client, method, endpoint string,
 	return nil
 }
 
-// indexNameFor returns the per-tenant index identifier. Both
-// backends use the same shape so a tenant migrating between them
-// can keep their existing index identifier.
+// indexNameFor returns the per-tenant index identifier. The
+// dedicated (per-tenant) backends use this directly; the shared
+// backends derive their index from the tenant's Stalwart shard
+// instead (see `sharedIndexNameFor`).
 func indexNameFor(tenantID string) string {
 	clean := strings.ReplaceAll(tenantID, "-", "")
 	return "kmail_" + clean
 }
 
+// sharedIndexNameFor returns the shared-index identifier for a
+// given Stalwart shard. Every tenant assigned to that shard
+// shares this one index; tenant isolation is enforced at query
+// time via a `tenant_id` filter (see `SharedMeilisearchBackend`
+// and `SharedOpenSearchBackend`).
+//
+// Shard IDs are UUIDs in production; we strip the hyphens to
+// keep the index name compatible with the strictest of
+// Meilisearch's identifier rules (alphanumerics, `-`, `_`).
+func sharedIndexNameFor(shardID string) string {
+	clean := strings.ReplaceAll(shardID, "-", "")
+	return "kmail_shared_" + clean
+}
+
+// ShardResolver resolves the Stalwart shard ID a tenant is
+// assigned to. The shared backends use this to derive their
+// index name. Production wires this against
+// `tenant.ShardService.GetTenantShardID`; tests inject a fake
+// that returns a fixed ID without touching the database.
+type ShardResolver interface {
+	ShardForTenant(ctx context.Context, tenantID string) (string, error)
+}
+
+// ShardResolverFunc adapts a closure into the ShardResolver
+// interface for inline wiring in main.go and tests.
+type ShardResolverFunc func(ctx context.Context, tenantID string) (string, error)
+
+// ShardForTenant implements ShardResolver.
+func (f ShardResolverFunc) ShardForTenant(ctx context.Context, tenantID string) (string, error) {
+	return f(ctx, tenantID)
+}
+
 // pathEscape is `url.PathEscape` exposed through the package so
 // the backend drivers depend on a single helper. Path escaping is
-// required (rather than QueryEscape) because the only caller uses
-// it for a path segment (`/_doc/{id}`) where a literal space must
-// be `%20`, not `+`.
+// required (rather than QueryEscape) when the caller is building a
+// path segment (`/_doc/{id}`) where a literal space must be
+// `%20`, not `+`.
 var pathEscape = url.PathEscape
+
+// queryEscape is `url.QueryEscape` exposed through the package
+// for the same reason as `pathEscape`. Use this for the VALUE of
+// a `?key=value` URL parameter so reserved characters that are
+// legal in a path (`=`, `'`, `&`) are encoded — otherwise the
+// Meilisearch / OpenSearch URL parser would interpret them as
+// structural delimiters and either return 400 or, worse, silently
+// truncate the filter expression and run the query without it.
+var queryEscape = url.QueryEscape
