@@ -15,7 +15,7 @@ import (
 // closely: a row per (tenant, target_backend) with state, failure
 // count, and updated_at, plus a per-tenant `search_backend` value
 // to mirror the production SQL JOIN against the `tenants` table.
-// The composite key matches migration 051 — a single tenant can
+// The composite key matches the baseline schema — a single tenant can
 // carry multiple rows, one per target_backend, so cross-transition
 // state is fully isolated. SourceBackend / TargetBackend filters
 // are honoured exactly the same way as the Postgres impl so a test
@@ -34,8 +34,8 @@ type inMemoryCutoverStore struct {
 }
 
 // memRowKey is the in-memory equivalent of the (tenant_id,
-// target_backend) composite PK created by migration 051. Tests
-// that pre-date the migration used `string` keys; the
+// target_backend) composite PK on `search_cutover_jobs`. Tests
+// that pre-date the composite key used `string` keys; the
 // `rowByTenant` helper preserves the old single-row-per-tenant
 // assertion ergonomics for tests that only ever exercise the
 // default `meilisearch -> opensearch` transition.
@@ -976,8 +976,8 @@ func TestCutoverWorker_CustomTransitionsOverride(t *testing.T) {
 }
 
 // TestCutoverWorker_SameTenantBothTransitionsKeyedIndependently is
-// the regression test for the (tenant_id, target_backend) PK swap
-// in migration 051. The same tenant can participate in TWO
+// the regression test for the (tenant_id, target_backend) composite
+// PK on `search_cutover_jobs`. The same tenant can participate in TWO
 // transitions over time — first `shared_meilisearch ->
 // shared_opensearch`, then a runbook reverts the tenant back to
 // `shared_meilisearch` and the operator wants the next cutover

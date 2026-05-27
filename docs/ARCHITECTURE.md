@@ -439,33 +439,33 @@ The full list of Go packages under `internal/` (28 total):
 
 | Package              | Concern                                                                    | Backed by                                          |
 | -------------------- | -------------------------------------------------------------------------- | -------------------------------------------------- |
-| `adminproxy/`        | Reverse access proxy for SRE reads of tenant data (approval-gated, audited)| `admin_access_sessions` (mig 029), `audit`         |
-| `approval/`          | Admin access approval workflow (per-action gating, executor registry)      | `approval_requests`, `approval_config` (mig 022)   |
-| `audit/`             | Hash-chained audit log + verify + JSON/CSV export                          | `audit_log` (mig 004)                              |
+| `adminproxy/`        | Reverse access proxy for SRE reads of tenant data (approval-gated, audited)| `admin_access_sessions`, `audit`                    |
+| `approval/`          | Admin access approval workflow (per-action gating, executor registry)      | `approval_requests`, `approval_config`              |
+| `audit/`             | Hash-chained audit log + verify + JSON/CSV export                          | `audit_log`                                         |
 | `billing/`           | Quota / seat accounting, plan enforcement, Stripe lifecycle, dunning       | `billing_*`, `quotas`, `billing_subscriptions`     |
 | `calendarbridge/`    | CalDAV bridge, KChat scheduling, reminders, free/busy, sharing             | Stalwart CalDAV + KChat API + Valkey               |
 | `chatbridge/`        | KChat ↔ email bridge (notifications, routing, threading)                   | Stalwart + KChat API + `chat_bridge_routes`        |
 | `cmk/`               | Customer-managed keys (PEM upload, KMIP / PKCS#11 HSM envelope ops)        | `customer_managed_keys`, `cmk_hsm_configs`         |
-| `confidentialsend/`  | Confidential Send portal + MLS-derived envelope keys                       | `confidential_send_links` (mig 027) + KChat MLS    |
-| `contactbridge/`     | CardDAV bridge + tenant-wide global address list                           | Stalwart CardDAV + `gal_entries` (mig 035)         |
+| `confidentialsend/`  | Confidential Send portal + MLS-derived envelope keys                       | `confidential_send_links` + KChat MLS               |
+| `contactbridge/`     | CardDAV bridge + tenant-wide global address list                           | Stalwart CardDAV + `gal_entries`                    |
 | `deliverability/`    | IP pools, warmup, suppression, bounce, DMARC, FBL, abuse, alerts           | `ip_pools`, `suppression_list`, `dmarc_reports`, … |
-| `dns/`               | DNS onboarding, autoconfig / autodiscover, DKIM rotation                   | `tenant_domains`, `tenant_dns_records`, `dkim_keys`|
-| `export/`            | Worker-pool eDiscovery export jobs (mbox / eml / pst stub)                 | `export_jobs` (mig 023)                            |
+| `dns/`               | DNS onboarding, autoconfig / autodiscover, DKIM rotation                   | `domains`, `dkim_keys`                             |
+| `export/`            | Worker-pool eDiscovery export jobs (mbox / eml / pst stub)                 | `export_jobs`                                       |
 | `jmap/`              | JMAP proxy, shard-aware routing, attachment-to-link, malware pre-hook      | Stalwart JMAP + `attachment_links`                 |
 | `malware/`           | Malware scanning adapter (NoopScanner default, ClamAV INSTREAM)            | optional ClamAV TCP endpoint                       |
 | `middleware/`        | OIDC, RLS GUC, metrics, tracing, Loki log shipping, WebAuthn / TOTP        | Postgres + OTEL + Valkey                           |
-| `migration/`         | IMAP / Gmail / M365 migration orchestrator + staged sync + test-connection | `migration_jobs` (mig 002) + imapsync              |
+| `migration/`         | IMAP / Gmail / M365 migration orchestrator + staged sync + test-connection | `migration_jobs` + imapsync                         |
 | `monitoring/`        | SLO tracker + multi-region aggregator + degradation middleware             | Valkey-backed sorted sets                          |
 | `onboarding/`        | Guided onboarding checklist + auto-triggers from webhook events            | `onboarding_steps`, `onboarding_auto_triggers`     |
 | `push/`              | Push notifications (TransportRouter → APNs / FCM / Web Push / dev log)     | `push_subscriptions`, `notification_preferences`   |
-| `retention/`         | Retention / archive policy CRUD + 24 h evaluation worker                   | `retention_policies` (mig 021)                     |
-| `scim/`              | SCIM 2.0 provisioning (`/scim/v2/Users` + `/scim/v2/Groups`) + discovery   | `scim_tokens` (mig 028)                            |
-| `search/`            | Per-tenant search backend abstraction (Meilisearch / OpenSearch) + reindex | `search_backend` column (mig 039)                  |
+| `retention/`         | Retention / archive policy CRUD + 24 h evaluation worker                   | `retention_policies`                                |
+| `scim/`              | SCIM 2.0 provisioning (`/scim/v2/Users` + `/scim/v2/Groups`) + discovery   | `scim_tokens`                                       |
+| `search/`            | Per-tenant search backend abstraction (Meilisearch / OpenSearch) + reindex | `search_backend` column                             |
 | `sharedinbox/`       | Shared-inbox workflows (assign / note / status) + MLS group key rotation   | `shared_inbox_*` tables + KChat MLS                |
-| `sieve/`             | Per-tenant Sieve rule CRUD + validate + deploy                             | `sieve_rules` (mig 042)                            |
+| `sieve/`             | Per-tenant Sieve rule CRUD + validate + deploy                             | `sieve_rules`                                       |
 | `tenant/`            | Tenant lifecycle, shards, storage placement, billing lifecycle hooks       | `tenants`, `users`, `tenant_storage_credentials`   |
-| `vault/`             | Zero-Access Vault folders + Protected folders + access log                 | `vault_folders`, `protected_folders` (mig 024–026) |
-| `webhooks/`          | Tenant outbound webhooks with HMAC v1 + v2 signing (timestamp + nonce)     | `webhook_endpoints`, `webhook_deliveries` (mig 032)|
+| `vault/`             | Zero-Access Vault folders + Protected folders + access log                 | `vault_folders`, `protected_folders`                |
+| `webhooks/`          | Tenant outbound webhooks with HMAC v1 + v2 signing (timestamp + nonce)     | `webhook_endpoints`, `webhook_deliveries`           |
 
 `/jmap` and `/scim/v2/...` are the only routes outside the
 `/api/v1/...` REST namespace; both are required by their respective
@@ -628,7 +628,7 @@ kmail/
 ├── deploy/           # Helm, Grafana, Loki, Promtail, Prometheus, Stalwart HA
 ├── docs/             # All project documentation
 ├── internal/         # Go packages (28 packages — see §7.1)
-├── migrations/       # PostgreSQL migrations (001–045)
+├── migrations/       # PostgreSQL squashed baseline (001_baseline.sql)
 ├── scripts/          # Init, test, bench, load, chaos scripts
 ├── sdk/              # Rust SDK workspace (kmail-core / kmail-ffi /
 │                     # kmail-napi / kmail-cli). Powers the iOS,
@@ -650,9 +650,11 @@ kmail/
 - `deploy/` — `helm/kmail/` (chart + values + templates),
   `grafana/dashboards/` + `grafana/provisioning/`, `loki/`,
   `promtail/`, `prometheus/`, `stalwart-ha/` (per-shard HA template).
-- `migrations/` — additive-only, numbered, RLS-scoped Postgres
-  migrations. Runs in lexicographic order via `scripts/migrate.sh`
-  on first boot of `cmd/kmail-api/`.
+- `migrations/` — single squashed Postgres baseline schema
+  (`001_baseline.sql`) covering all RLS-scoped tables, indexes,
+  policies, triggers, and functions. Applied via
+  `scripts/migrate.sh` on first boot of `cmd/kmail-api/`; future
+  schema changes land as new additive numbered files.
 - `scripts/` — `test-e2e.sh`, `test-scim.sh`, `test-imap-smtp.sh`,
   `test-caldav.sh`, `test-stalwart-upgrade.sh`,
   `loadtest/load-jmap.go`, `load-smtp.sh`, `chaos-shard.sh`,

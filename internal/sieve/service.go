@@ -4,7 +4,7 @@
 // tenant admin can author rules from the React console without
 // hand-rolling JMAP admin calls.
 //
-// `sieve_rules` (migration 042) carries one row per rule. The
+// `sieve_rules` (see `migrations/001_baseline.sql`) carries one row per rule. The
 // canonical execution order is `priority` ascending, ties broken
 // by `created_at` ascending. Rules can be tenant-wide
 // (`user_id IS NULL`) or per-user.

@@ -69,7 +69,7 @@ kmail/
 ├── deploy/           # Helm, Grafana, Loki, Promtail, Prometheus, Stalwart HA
 ├── docs/             # All project documentation
 ├── internal/         # Go packages (28 packages — see docs/ARCHITECTURE.md §7.1)
-├── migrations/       # PostgreSQL migrations (001–045)
+├── migrations/       # PostgreSQL squashed baseline (001_baseline.sql)
 ├── scripts/          # Init, test, bench, load, chaos scripts
 ├── web/              # React frontend (TypeScript + Vite)
 ├── docker-compose.yml
@@ -315,7 +315,7 @@ The two remaining open items outside Phase 6 (Phase 1 MLS
 architecture review, Phase 3 private-beta onboarding) are external
 operational gates rather than code work.
 
-The schema now spans 45 migrations covering tenants, Stalwart
+The schema is a single squashed baseline covering tenants, Stalwart
 JMAP integration, retention, suppression and bounce ledgers,
 ledger-driven audit, BYOK / per-tenant CMK + HSM with real KMIP
 TTLV wire traffic, MLS-backed Confidential Send, the Tenant

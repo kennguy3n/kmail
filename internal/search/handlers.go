@@ -34,7 +34,7 @@ func (h *Handlers) Register(mux *http.ServeMux, authMW *middleware.OIDC) {
 	// Global (non-tenant-scoped) lookup: which backend
 	// implementations did this BFF process ship? The admin UI
 	// reads this to gate the selector — e.g. `dedicated_opensearch`
-	// is a recognised value (migration 050 CHECK constraint) but
+	// is a recognised value (per `tenants.search_backend` CHECK constraint) but
 	// no Go impl is wired today, so the UI must not let an
 	// operator flip a tenant onto it.
 	mux.Handle("GET /api/v1/search/backends", authMW.Wrap(http.HandlerFunc(h.listBackends)))

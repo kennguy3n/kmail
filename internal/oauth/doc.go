@@ -48,8 +48,8 @@
 //
 // # Storage
 //
-// Persistent state lives in the four tables created by
-// `migrations/046_oauth_clients.sql`:
+// Persistent state lives in the four oauth_* tables created by
+// `migrations/001_baseline.sql`:
 //
 //   - oauth_clients: registered applications.
 //   - oauth_authorization_codes: short-lived (60s) codes from

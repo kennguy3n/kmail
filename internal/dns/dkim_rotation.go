@@ -2,7 +2,7 @@
 //
 // Phase 7 adds a DKIM rotation service so a tenant can rotate
 // their signing key without the operator hand-rolling a Stalwart
-// JMAP admin call. The new `dkim_keys` table (migration 040)
+// JMAP admin call. The `dkim_keys` table (see `migrations/001_baseline.sql`)
 // stores the per-domain key history; one key is `active` at a
 // time, deprecated keys stay around until DNS publishes the
 // rotation, and revoked keys are tombstoned for audit.

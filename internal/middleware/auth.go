@@ -469,7 +469,7 @@ func WithKChatUserID(ctx context.Context, kchatUserID string) context.Context {
 // SetTenantGUC sets the `app.tenant_id` Postgres session variable on
 // the provided transaction. Row-level security policies on every
 // tenant-scoped table read this GUC — see
-// `migrations/001_initial_schema.sql` and `docs/SCHEMA.md` §4.
+// `migrations/001_baseline.sql` and `docs/SCHEMA.md` §4.
 //
 // The `true` third argument to `set_config` scopes the value to the
 // current transaction so callers cannot leak tenant context onto a

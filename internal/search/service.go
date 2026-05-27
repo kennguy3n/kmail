@@ -11,8 +11,8 @@
 // admin console.
 //
 // Tenants store their selected backend on `tenants.search_backend`
-// (migration 039). The Service owns reads/writes against that
-// column, plus dispatching to the backend implementation for
+// (see `migrations/001_baseline.sql`). The Service owns reads/writes
+// against that column, plus dispatching to the backend implementation for
 // per-message `IndexMessage` / `SearchMessages` / `DeleteIndex` /
 // `MigrateIndex` calls.
 package search
@@ -57,8 +57,8 @@ var ErrBackendUnavailable = errors.New("backend not available in this deployment
 // Backend names recognised by the service. Stored verbatim in
 // `tenants.search_backend`.
 //
-// The three `shared_*` and `dedicated_*` values were added in
-// migration 050 (shared indexes). Older values (`meilisearch`,
+// The three `shared_*` and `dedicated_*` values were introduced
+// alongside shared indexes. Older values (`meilisearch`,
 // `opensearch`) remain valid for backward compatibility — pre-
 // existing tenants stay on whatever they were promoted to under
 // the per-tenant-index model until an operator migrates them.
@@ -172,10 +172,10 @@ func NewService(cfg Config) *Service {
 
 // GetBackend returns the configured backend name for a tenant. If
 // the column is NULL or empty we default to BackendSharedMeilisearch
-// — that matches the migration-050 column default for newly-
-// provisioned tenants (`migrations/050_search_shared_indexes.sql`
-// `ALTER COLUMN ... SET DEFAULT 'shared_meilisearch'`) and is the
-// cheapest backend to land on if a row is somehow missing its
+// — that matches the baseline column default for newly-
+// provisioned tenants (`migrations/001_baseline.sql`
+// `tenants.search_backend TEXT NOT NULL DEFAULT 'shared_meilisearch'`)
+// and is the cheapest backend to land on if a row is somehow missing its
 // setting.
 func (s *Service) GetBackend(ctx context.Context, tenantID string) (string, error) {
 	if tenantID == "" {
@@ -240,8 +240,8 @@ func (s *Service) SetBackend(ctx context.Context, tenantID, backend string) erro
 	if !IsValidBackend(backend) {
 		return fmt.Errorf("%w: backend %q is not a recognised value", ErrInvalidInput, backend)
 	}
-	// Belt-and-suspenders against the case where migration 050's
-	// CHECK constraint admits a value (e.g. `dedicated_opensearch`)
+	// Belt-and-suspenders against the case where the
+	// `tenants.search_backend` CHECK constraint admits a value (e.g. `dedicated_opensearch`)
 	// that this BFF does not have an implementation for. Without
 	// this guard the flip succeeds and every subsequent
 	// IndexMessage / SearchMessages call returns the generic

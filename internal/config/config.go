@@ -35,7 +35,7 @@ type Config struct {
 
 	// Database is the control-plane Postgres connection string. The
 	// schema is defined in `docs/SCHEMA.md` and created by
-	// `migrations/001_initial_schema.sql`.
+	// `migrations/001_baseline.sql`.
 	DatabaseURL string
 
 	// StalwartURL is the internal Stalwart JMAP endpoint the BFF

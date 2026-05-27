@@ -422,7 +422,7 @@ func main() {
 			logger.Printf("stalwart alias sync disabled: %v", err)
 		} else {
 			tenantSvc = tenantSvc.WithStalwartAliasSync(aliasSync).WithLogger(logger)
-			// Drain `alias_stalwart_sync_queue` (migration 049)
+			// Drain `alias_stalwart_sync_queue` (see `migrations/001_baseline.sql`)
 			// in the background. The Tenant Service enqueues
 			// sync intents atomically with each alias write and
 			// then attempts Stalwart sync inline; this worker

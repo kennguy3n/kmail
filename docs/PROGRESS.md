@@ -1,5 +1,14 @@
 # KMail — Progress
 
+> **Note on migration references**: This is a per-phase historical
+> deliverable log. Inline references to `migrations/0NN_*.sql` files
+> (e.g. `migrations/021_retention_policies.sql`) describe the
+> migration that introduced each table at the time the work shipped.
+> After the pre-production migration squash, those files no longer
+> exist on disk — every schema object now lives in the consolidated
+> [`migrations/001_baseline.sql`](../migrations/001_baseline.sql).
+> The narrative is preserved so phase deliverables stay auditable.
+
 - **Project**: KMail — Privacy Email & Calendar for KChat B2B
 - **License**: Proprietary — All Rights Reserved. See [LICENSE](../LICENSE).
 - **Status**: In progress | ~95% — Phase 1 — Foundation (code complete, external
@@ -61,7 +70,7 @@ Checklist:
 - [x] Define PostgreSQL schema for tenant metadata, users, domains,
       mailbox state, and calendar metadata. See
       [SCHEMA.md](SCHEMA.md) and
-      [migrations/001_initial_schema.sql](../migrations/001_initial_schema.sql).
+      [migrations/001_baseline.sql](../migrations/001_baseline.sql).
 - [x] Define search tiering model (Core / Pro / Archive / Vault).
 - [x] Stalwart commercial license evaluation (AGPL-3.0 base vs
       enterprise dual license) and KMail licensing compatibility
@@ -1205,8 +1214,8 @@ Checklist:
 - [x] Autoconfig / autodiscover XML endpoints.
       `internal/dns/autoconfig.go` renders Thunderbird-style
       autoconfig and Outlook autodiscover XML against the
-      tenant's `tenant_domain` / `tenant_dns_records` rows
-      (resolving the tenant from the incoming email's domain).
+      tenant's `domains` row (resolving the tenant from the
+      incoming email's domain).
       `autoconfig_handlers.go` registers `GET /mail/config-v1.1.xml`,
       `POST /autodiscover/autodiscover.xml`, and
       `GET /.well-known/autoconfig/mail/config-v1.1.xml` without

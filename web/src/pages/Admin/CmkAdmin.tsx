@@ -5,8 +5,8 @@
  * fingerprint, rotate to a fresh key (deprecating the old one),
  * and revoke a key with confirmation.
  *
- * Backed by `internal/cmk` (migration 025 + RLS-protected
- * `customer_managed_keys` table). The handler enforces the
+ * Backed by `internal/cmk` (RLS-protected `customer_managed_keys`
+ * table — see `migrations/001_baseline.sql`). The handler enforces the
  * privacy-plan gate; this page additionally surfaces a friendly
  * banner so non-privacy tenants see why the form is disabled.
  */

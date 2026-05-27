@@ -94,7 +94,7 @@ type CandidateFilter struct {
 	SourceBackend string
 	// TargetBackend is the backend the worker intends to promote
 	// the tenant TO. The store keys job rows by
-	// `(tenant_id, target_backend)` (migration 051) so a tenant
+	// `(tenant_id, target_backend)` so a tenant
 	// previously promoted to a DIFFERENT target is NOT shielded
 	// by an old `completed` row when a new transition needs to
 	// run — e.g. a tenant who was promoted from legacy
@@ -209,7 +209,7 @@ type CutoverStore interface {
 //   - {meilisearch -> opensearch}: the legacy per-tenant index
 //     path that existed before the shared-index work landed.
 //   - {shared_meilisearch -> shared_opensearch}: the modern
-//     shared-index path for tenants on the migration-050 default.
+//     shared-index path for tenants on the shared-index default.
 //
 // Operators who need a custom pair (e.g. forcing a shared tenant
 // onto a dedicated index) inject their own slice via
@@ -442,7 +442,7 @@ func (w *CutoverWorker) Run(ctx context.Context) {
 //     completed-or-blocking job row for the pair's target.
 //  3. Migrates each candidate from source -> target.
 //
-// Migration 051 keys `search_cutover_jobs` rows by
+// `search_cutover_jobs` rows are keyed by
 // `(tenant_id, target_backend)`, so transitions are first-class:
 // a tenant previously promoted to one target can re-enter the
 // pipeline against a different target without a manual row
@@ -522,7 +522,7 @@ func (w *CutoverWorker) tickTransition(ctx context.Context, tr CutoverTransition
 // configured pair in turn, so the destination is not implicit.
 // Every store call threads `tr.Target` through so the claim, mark,
 // and reconcile paths all key on `(tenant_id, target_backend)`
-// per migration 051.
+// per the `search_cutover_jobs` composite PK.
 func (w *CutoverWorker) cutoverOne(ctx context.Context, tenantID string, size int64, tr CutoverTransition) error {
 	now := w.cfg.Now()
 	claimed, err := w.cfg.Store.Claim(ctx, tenantID, tr.Target, size, w.cfg.Threshold, now)
@@ -602,7 +602,7 @@ func (w *CutoverWorker) markCompletedWithRetry(ctx context.Context, tenantID, ta
 }
 
 // PostgresCutoverStore is the default CutoverStore wired against
-// Postgres. The schema lives in migration 046.
+// Postgres. The schema lives in `migrations/001_baseline.sql`.
 type PostgresCutoverStore struct {
 	pool *pgxpool.Pool
 }

@@ -3,8 +3,8 @@
 // pooled storage quota checks, and invoice generation.
 //
 // Authoritative for the `quotas` table in docs/SCHEMA.md §5.7 and
-// the `billing_events` append-only log added in
-// `migrations/005_billing.sql`. See docs/ARCHITECTURE.md §7 and
+// the `billing_events` append-only log defined in
+// `migrations/001_baseline.sql`. See docs/ARCHITECTURE.md §7 and
 // docs/PROPOSAL.md §11.
 package billing
 

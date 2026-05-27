@@ -8,6 +8,17 @@ architecture live in [`PROPOSAL.md`](PROPOSAL.md) and
 
 Entries are reverse-chronological (most recent batch first).
 
+> **Note on migration references**: Batches below cite specific
+> `migrations/0NN_*.sql` filenames and "migration NNN" identifiers
+> (e.g. "migration 043", "migrations 011–017") to describe what was
+> added in each batch. After the pre-production migration squash,
+> those files no longer exist on disk — every schema object now
+> lives in the consolidated
+> [`migrations/001_baseline.sql`](../migrations/001_baseline.sql).
+> The historical numbering is preserved so the batch narrative
+> stays auditable; cross-reference the table / column names against
+> the squashed baseline when investigating any specific entry.
+
 - **Last updated**: 2026-04-27 (Phase 8, batch 1) — Phase 8 GA-
   readiness ten-task batch flips Phase 8 from `PLANNED` to
   `IN PROGRESS`. Closes Phase 6 / 7 stubs, fills PROPOSAL.md

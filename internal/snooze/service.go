@@ -299,7 +299,7 @@ func (s *Service) Get(ctx context.Context, tenantID, kchatUserID, id string) (*S
 		// The (tenant_id, kchat_user_id) belt on the SELECT is the
 		// actual authz fence. RLS would also exclude cross-tenant
 		// rows except the BFF role is exempt from forced RLS (see
-		// migration 052 + package doc); without this explicit
+		// `migrations/001_baseline.sql` + package doc); without this explicit
 		// predicate, the cross-USER hole stays open even with RLS
 		// healthy because RLS only enforces tenant.
 		r := tx.QueryRow(ctx, `
