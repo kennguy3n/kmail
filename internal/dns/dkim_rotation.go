@@ -325,6 +325,18 @@ func (s *DKIMRotationService) PendingRotation(ctx context.Context, tenantID, dom
 	return nil, errors.New("no rotations pending")
 }
 
+// ErrEnvelopeMissingForWrappedKey signals that the service is
+// configured without a `cmk.SecretsEnvelope` but the row on disk
+// carries the `kmail-cmk-v1` magic prefix, meaning it was wrapped
+// by a previous run that DID have an envelope. We refuse to
+// return ciphertext bytes as if they were a plaintext PEM key —
+// that would surface downstream as opaque DKIM signature
+// failures (or, worse, Stalwart silently accepting garbage and
+// signing every outbound message with an invalid key). The
+// remediation is always the same: re-enable `KMAIL_SECRETS_KEY`
+// with the master key that wrote the row.
+var ErrEnvelopeMissingForWrappedKey = errors.New("dkim: private_key_encrypted row is envelope-wrapped but no SecretsEnvelope is configured (set KMAIL_SECRETS_KEY)")
+
 // wrapPrivateKey runs the configured envelope over the raw PEM
 // bytes. When no envelope is configured, it logs a loud warning
 // and returns the plaintext — production callers MUST inject
@@ -362,7 +374,28 @@ func (s *DKIMRotationService) LoadPrivateKey(ctx context.Context, tenantID, doma
 	if err != nil {
 		return "", err
 	}
+	return s.unwrapPrivateKey(blob)
+}
+
+// unwrapPrivateKey reverses wrapPrivateKey on a raw blob fetched
+// from `dkim_keys.private_key_encrypted`. Split out from
+// `LoadPrivateKey` so the unwrap state machine can be unit-tested
+// without standing up a Postgres pool — mirrors the
+// `unwrapSecretKey` shape used by the tenant storage path.
+//
+// When no envelope is configured (dev mode without
+// `KMAIL_SECRETS_KEY`), a blob carrying the `kmail-cmk-v1` magic
+// prefix — i.e. one that was written by a *previous* run that
+// DID have an envelope — is refused with
+// `ErrEnvelopeMissingForWrappedKey` so the operator sees a clear
+// "you removed the key" signal at this layer instead of opaque
+// DKIM signing failures downstream (Stalwart trying to parse
+// ciphertext as a PEM key).
+func (s *DKIMRotationService) unwrapPrivateKey(blob []byte) (string, error) {
 	if s.envelope == nil {
+		if cmk.HasMagic(blob) {
+			return "", ErrEnvelopeMissingForWrappedKey
+		}
 		return string(blob), nil
 	}
 	pt, _, err := s.envelope.Unwrap(blob)
