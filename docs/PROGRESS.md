@@ -1214,8 +1214,8 @@ Checklist:
 - [x] Autoconfig / autodiscover XML endpoints.
       `internal/dns/autoconfig.go` renders Thunderbird-style
       autoconfig and Outlook autodiscover XML against the
-      tenant's `tenant_domain` / `tenant_dns_records` rows
-      (resolving the tenant from the incoming email's domain).
+      tenant's `domains` row (resolving the tenant from the
+      incoming email's domain).
       `autoconfig_handlers.go` registers `GET /mail/config-v1.1.xml`,
       `POST /autodiscover/autodiscover.xml`, and
       `GET /.well-known/autoconfig/mail/config-v1.1.xml` without

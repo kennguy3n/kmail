@@ -449,7 +449,7 @@ The full list of Go packages under `internal/` (28 total):
 | `confidentialsend/`  | Confidential Send portal + MLS-derived envelope keys                       | `confidential_send_links` + KChat MLS               |
 | `contactbridge/`     | CardDAV bridge + tenant-wide global address list                           | Stalwart CardDAV + `gal_entries`                    |
 | `deliverability/`    | IP pools, warmup, suppression, bounce, DMARC, FBL, abuse, alerts           | `ip_pools`, `suppression_list`, `dmarc_reports`, … |
-| `dns/`               | DNS onboarding, autoconfig / autodiscover, DKIM rotation                   | `tenant_domains`, `tenant_dns_records`, `dkim_keys`|
+| `dns/`               | DNS onboarding, autoconfig / autodiscover, DKIM rotation                   | `domains`, `dkim_keys`                             |
 | `export/`            | Worker-pool eDiscovery export jobs (mbox / eml / pst stub)                 | `export_jobs`                                       |
 | `jmap/`              | JMAP proxy, shard-aware routing, attachment-to-link, malware pre-hook      | Stalwart JMAP + `attachment_links`                 |
 | `malware/`           | Malware scanning adapter (NoopScanner default, ClamAV INSTREAM)            | optional ClamAV TCP endpoint                       |
