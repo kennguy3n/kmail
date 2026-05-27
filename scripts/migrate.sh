@@ -78,11 +78,13 @@ is_applied() {
 
 record_applied() {
     local filename="$1"
+    # Matches is_applied() above: feed SQL on stdin so psql's `:'var'`
+    # interpolation expands. A herestring is used rather than a `<<-SQL`
+    # heredoc because `<<-` strips leading TABs (not spaces), which
+    # makes the script fragile to editors / linters that retab.
     psql "${DATABASE_URL}" -v ON_ERROR_STOP=1 \
-        -v "migfile=${filename}" -Atq <<-SQL >/dev/null
-	INSERT INTO schema_migrations (filename) VALUES (:'migfile')
-	ON CONFLICT (filename) DO NOTHING;
-	SQL
+        -v "migfile=${filename}" -Atq >/dev/null \
+        <<<"INSERT INTO schema_migrations (filename) VALUES (:'migfile') ON CONFLICT (filename) DO NOTHING;"
 }
 
 apply_migration() {
