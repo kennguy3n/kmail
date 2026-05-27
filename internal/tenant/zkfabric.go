@@ -237,7 +237,7 @@ func (p *ZKFabricProvisioner) Provision(ctx context.Context, tenantID, plan stri
 		TenantID:              tenantID,
 		BucketName:            bucket,
 		AccessKey:             accessKey,
-		EncryptedSecretKey:    secretKey, // see migrations/018 — KMS wrap is Phase 5.
+		EncryptedSecretKey:    secretKey, // tenant_storage_credentials.encrypted_secret_key — KMS wrap is Phase 5.
 		PlacementPolicyRef:    policyRef,
 		EncryptionModeDefault: encryptionMode,
 	}
