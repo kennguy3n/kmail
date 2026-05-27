@@ -167,6 +167,31 @@ func TestWrapSecretKey_NilEnvelopeFallback(t *testing.T) {
 	}
 }
 
+// TestUnwrapSecretKey_NilEnvelopeRefusesWrappedBlob verifies the
+// defense-in-depth guard added to catch a config regression: if
+// an operator previously ran with KMAIL_SECRETS_KEY (producing
+// envelope-wrapped rows), then removes the key,
+// unwrapSecretKey must refuse with ErrEnvelopeMissingForWrappedRow
+// rather than silently returning ciphertext as plaintext. The
+// downstream S3 SigV4 mismatch error would be opaque; this
+// surfaces the root cause at the unwrap layer.
+func TestUnwrapSecretKey_NilEnvelopeRefusesWrappedBlob(t *testing.T) {
+	// 1. Wrap with a real envelope (simulates the "before" state).
+	env := newTestEnvelope(t)
+	pWith, _ := newQuietProvisioner(env)
+	blob, err := pWith.wrapSecretKey("secret-before-config-regressed")
+	if err != nil {
+		t.Fatalf("wrapSecretKey (with env): %v", err)
+	}
+
+	// 2. Remove the envelope (simulates the "after" config regression).
+	pWithout, _ := newQuietProvisioner(nil)
+	_, _, err = pWithout.unwrapSecretKey(blob)
+	if !errors.Is(err, ErrEnvelopeMissingForWrappedRow) {
+		t.Fatalf("expected ErrEnvelopeMissingForWrappedRow, got %v", err)
+	}
+}
+
 // TestStorageCredential_WasEncryptedAccessor pins the accessor so
 // callers that observe migration progress (e.g. an admin
 // "outstanding plaintext rows" report) don't break if the

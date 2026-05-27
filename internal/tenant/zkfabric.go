@@ -411,6 +411,17 @@ func (p *ZKFabricProvisioner) wrapSecretKey(secretKey string) ([]byte, error) {
 	return p.Envelope.Wrap([]byte(secretKey))
 }
 
+// ErrEnvelopeMissingForWrappedRow signals that the provisioner
+// is configured without a `cmk.SecretsEnvelope` but the row on
+// disk carries the `kmail-cmk-v1` magic prefix, meaning it was
+// wrapped by a previous run that DID have an envelope. We refuse
+// to return ciphertext bytes as if they were a plaintext secret
+// key — that would surface downstream as an opaque S3 SigV4
+// signature mismatch and waste an operator's afternoon. The
+// remediation is always the same: re-enable `KMAIL_SECRETS_KEY`
+// with the master key that wrote the row.
+var ErrEnvelopeMissingForWrappedRow = errors.New("tenant: encrypted_secret_key row is envelope-wrapped but no SecretsEnvelope is configured (set KMAIL_SECRETS_KEY)")
+
 // unwrapSecretKey reverses wrapSecretKey. It returns the
 // plaintext secret, a flag indicating whether the blob was
 // actually wrapped (false for legacy plaintext rows written
@@ -422,8 +433,19 @@ func (p *ZKFabricProvisioner) wrapSecretKey(secretKey string) ([]byte, error) {
 // shared with DKIM and TOTP. Tampered ciphertext surfaces as
 // `cmk.ErrEnvelopeCorrupted`; callers MUST NOT silently fall
 // through to treat the raw blob as plaintext.
+//
+// When no envelope is configured (dev mode without
+// `KMAIL_SECRETS_KEY`), a blob carrying the `kmail-cmk-v1` magic
+// prefix — i.e. one that was written by a *previous* run that
+// DID have an envelope — is refused with
+// `ErrEnvelopeMissingForWrappedRow` so the operator sees a clear
+// "you removed the key" signal at this layer instead of an
+// opaque S3 SigV4-mismatch error downstream.
 func (p *ZKFabricProvisioner) unwrapSecretKey(blob []byte) (string, bool, error) {
 	if p.Envelope == nil {
+		if cmk.HasMagic(blob) {
+			return "", false, ErrEnvelopeMissingForWrappedRow
+		}
 		return string(blob), false, nil
 	}
 	pt, wasEnc, err := p.Envelope.Unwrap(blob)
