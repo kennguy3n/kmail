@@ -2,7 +2,8 @@
  * SearchAdmin lets a tenant admin select which search backend
  * powers their mail search. Five values are supported (see
  * `SEARCH_BACKENDS`); the production default for newly-
- * provisioned tenants is `shared_meilisearch` (migration 050).
+ * provisioned tenants is `shared_meilisearch` (per the
+ * `tenants.search_backend` default in `migrations/001_baseline.sql`).
  *
  * The UI exposes each backend as a selectable card so the operator
  * can see ALL the alternatives at once — the old two-button

@@ -37,8 +37,8 @@ VALUES (
 ON CONFLICT (id) DO NOTHING;
 
 -- Row-level security on `users` requires the `app.tenant_id` GUC
--- to match the row being inserted (see migration 001). Set it for
--- this transaction so the insert clears the policy check.
+-- to match the row being inserted (see `migrations/001_baseline.sql`).
+-- Set it for this transaction so the insert clears the policy check.
 SELECT set_config('app.tenant_id',
                   '00000000-0000-0000-0000-000000000000',
                   true);
