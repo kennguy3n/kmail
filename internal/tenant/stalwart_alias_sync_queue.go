@@ -1,6 +1,6 @@
 // Package tenant — alias-Stalwart sync queue helpers.
 //
-// Reads and writes to `alias_stalwart_sync_queue` (migration 049).
+// Reads and writes to `alias_stalwart_sync_queue` (see `migrations/001_baseline.sql`).
 // Shared between the inline sync attempt in `aliases.go` and the
 // background `AliasStalwartSyncWorker`. Lives in its own file so
 // the worker can be tested without dragging in the alias CRUD

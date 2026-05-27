@@ -59,7 +59,7 @@ func TestService_AvailableBackends_ReturnsSortedRegisteredNames(t *testing.T) {
 
 // TestService_IsBackendAvailable distinguishes the wired-backends
 // set from the IsValidBackend syntactic check. `dedicated_opensearch`
-// is valid (migration 050 admits it) but not implemented; without
+// is valid (the CHECK constraint admits it) but not implemented; without
 // the gate, a SetBackend onto it would silently succeed and every
 // subsequent search would 404.
 func TestService_IsBackendAvailable(t *testing.T) {
@@ -73,7 +73,7 @@ func TestService_IsBackendAvailable(t *testing.T) {
 		t.Error("unregistered backend reported available")
 	}
 	if !IsValidBackend(BackendDedicatedOpenSearch) {
-		t.Error("dedicated_opensearch is a recognised value per migration 050 — IsValidBackend should still return true")
+		t.Error("dedicated_opensearch is a recognised tenants.search_backend value — IsValidBackend should still return true")
 	}
 }
 

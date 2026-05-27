@@ -6,7 +6,8 @@
 // `filterableAttributes: ["tenant_id"]` setting plus an explicit
 // `filter` clause on every search and delete-by-query call.
 //
-// This is the production default for new tenants (migration 050).
+// This is the production default for new tenants (see
+// `tenants.search_backend` default in `migrations/001_baseline.sql`).
 // The per-tenant `MeilisearchBackend` stays around for legacy
 // tenants and is still used as a migration source by the cutover
 // worker.

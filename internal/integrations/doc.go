@@ -52,7 +52,7 @@
 // quota. The default is taken from
 // Service.DefaultClientDispatchPerHour at construction; an
 // operator can override per-client by setting
-// oauth_clients.dispatch_quota_per_hour (migration 047). Quota
+// oauth_clients.dispatch_quota_per_hour (see `migrations/001_baseline.sql`). Quota
 // is enforced via a Valkey INCR+EXPIRE bucket keyed on
 // (oauth_client_id, hourly bucket); on overflow the dispatcher
 // returns ErrClientQuotaExceeded so the caller can:

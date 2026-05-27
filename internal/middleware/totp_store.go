@@ -1,7 +1,7 @@
 // Package middleware — TOTP credential persistence.
 //
 // One row per (tenant_id, user_id) in `totp_credentials`
-// (migration 044). All reads and writes set the tenant GUC inside
+// (see `migrations/001_baseline.sql`). All reads and writes set the tenant GUC inside
 // a single transaction so RLS holds even on accidentally-broad
 // SQL.
 package middleware

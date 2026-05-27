@@ -329,8 +329,8 @@ func (s *Service) DeleteWebhook(ctx context.Context, tenantID, id string) error 
 // subscribed to the event type. Returns the number of deliveries
 // enqueued.
 //
-// SCOPE NOTE — admin-owned only. Migration 047 added the
-// `oauth_client_id` column to `webhook_endpoints` so a row can be
+// SCOPE NOTE — admin-owned only. The baseline schema includes the
+// `oauth_client_id` column on `webhook_endpoints` so a row can be
 // either:
 //   - admin-owned (`oauth_client_id IS NULL`): BFF-internal webhook
 //     wired by an operator, no per-client scope filtering applies.

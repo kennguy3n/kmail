@@ -23,7 +23,7 @@
 //     multi-replica safe), and the user-facing "Scheduled" list
 //     view is a normal indexed SELECT instead of a Valkey ZSCAN.
 //
-// Per `migrations/051_scheduled_sends.sql`, the table is RLS-
+// Per `migrations/001_baseline.sql`, the `scheduled_sends` table is RLS-
 // enabled and isolated by `app.tenant_id`. The worker runs across
 // tenants without setting the GUC and relies on the BFF role
 // being exempt from forced RLS — the same pattern used by
@@ -280,7 +280,7 @@ func (s *Service) Get(ctx context.Context, tenantID, kchatUserID, id string) (*S
 		// The (tenant_id, kchat_user_id) belt on the SELECT is
 		// the actual authz fence. RLS would also exclude
 		// cross-tenant rows except the BFF role is exempt from
-		// forced RLS (see migration 051 + package doc); without
+		// forced RLS (see `migrations/001_baseline.sql` + package doc); without
 		// this explicit predicate, the cross-USER hole stays
 		// open even with RLS healthy because RLS only enforces
 		// tenant.

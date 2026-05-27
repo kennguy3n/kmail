@@ -22,7 +22,7 @@ import (
 )
 
 // Service implements the OAuth2 authorization server backed by
-// the four tables created in migrations/046_oauth_clients.sql.
+// the four oauth_* tables created in migrations/001_baseline.sql.
 type Service struct {
 	pool *pgxpool.Pool
 
@@ -188,7 +188,7 @@ func (s *Service) RegisterClient(
 // to anyone outside the admin surface).
 //
 // Defence in depth: although SetTenantGUC already restricts the
-// row set via Postgres RLS (`migrations/046_oauth_clients.sql`
+// row set via Postgres RLS (`migrations/001_baseline.sql`
 // `rls_oauth_clients USING (tenant_id = current_setting(
 // 'app.tenant_id', true)::uuid)`), the WHERE clause ALSO carries
 // an explicit `tenant_id = $1::uuid` predicate. Two reasons:
@@ -252,8 +252,8 @@ func (s *Service) GetClient(ctx context.Context, tenantID, clientID string) (*Cl
 //
 // RLS interaction: this query does NOT call middleware.SetTenantGUC
 // before issuing the SELECT, so the row is read across all tenants.
-// That works today because `migrations/046_oauth_clients.sql` does
-// NOT use FORCE ROW LEVEL SECURITY — the table owner (the role the
+// That works today because `migrations/001_baseline.sql` does
+// NOT use FORCE ROW LEVEL SECURITY on `oauth_clients` — the table owner (the role the
 // BFF's pgxpool runs as) bypasses the RLS policy by default. This
 // matches the existing cross-tenant lookup pattern at
 // `internal/tenant/service.go:252` and `internal/scim/service.go:57`.
@@ -307,7 +307,7 @@ func (s *Service) LookupClientForExchange(ctx context.Context, clientID string) 
 // SELECT — VerifyClientSecret is invoked from the /oauth/token wire
 // path, where the tenant context is derived FROM the resolved client
 // row (which the caller has already obtained via LookupClientForExchange).
-// Cross-tenant access works today because `migrations/046_oauth_clients.sql`
+// Cross-tenant access works today because `migrations/001_baseline.sql`
 // does NOT use FORCE ROW LEVEL SECURITY on `oauth_clients`. If a future
 // migration toggles FORCE on, this query (and the two methods named
 // above) will silently return zero rows. Don't enable FORCE on
@@ -997,7 +997,7 @@ func (s *Service) revokeRefreshChain(ctx context.Context, tenantID, rootID strin
 // tenant_id is what populates the returned context's TenantID,
 // which is then used by downstream handlers to set the per-request
 // GUC for scoped queries). Cross-tenant SELECT works today because
-// `migrations/046_oauth_clients.sql` does NOT use FORCE ROW LEVEL
+// `migrations/001_baseline.sql` does NOT use FORCE ROW LEVEL
 // SECURITY on `oauth_access_tokens`. If a future migration toggles
 // FORCE on, every bearer-token validation will return zero rows.
 // Don't enable FORCE without redesigning the bearer wire protocol

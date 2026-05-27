@@ -2,7 +2,7 @@
 //
 // Aliases are secondary email addresses that route inbound mail to
 // a primary user (`users.email`). The schema for the `aliases`
-// table ships with `migrations/001_initial_schema.sql`; this file
+// table ships with `migrations/001_baseline.sql`; this file
 // implements the service / handler surface that operates on it.
 //
 // Persistence model: every row is tenant-scoped, RLS-isolated via
@@ -10,8 +10,8 @@
 // this package follows).
 //
 // Stalwart sync is best-effort and persisted via the
-// `alias_stalwart_sync_queue` table (migration 049). Each alias
-// CRUD writes the alias row AND the queue intent atomically, then
+// `alias_stalwart_sync_queue` table (see `migrations/001_baseline.sql`).
+// Each alias CRUD writes the alias row AND the queue intent atomically, then
 // attempts Stalwart sync inline. On inline success the queue row
 // is marked `synced` immediately; on inline failure the row stays
 // `pending` and the `AliasStalwartSyncWorker` retries it with
@@ -53,7 +53,7 @@ type CreateAliasInput struct {
 
 // ErrAliasInUse is returned by CreateAlias when the alias email
 // collides with another row (the `aliases.alias_email` column has a
-// global UNIQUE constraint — see migrations/001_initial_schema.sql).
+// global UNIQUE constraint — see migrations/001_baseline.sql).
 // Mapped to HTTP 409 by `statusForServiceError`.
 var ErrAliasInUse = errors.New("alias email already in use")
 

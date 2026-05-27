@@ -68,19 +68,21 @@ is_applied() {
     local count
     # Use psql's `-v` variable binding and `:'migfile'` interpolation
     # so the filename is properly quoted by psql rather than spliced
-    # into the SQL string by the shell.
+    # into the SQL string by the shell. psql only expands variables
+    # when the SQL is read from a script (stdin or `-f`), NOT when
+    # passed via `-c`, so the SQL is piped on stdin.
     count=$(psql "${DATABASE_URL}" -v ON_ERROR_STOP=1 \
-        -v "migfile=${filename}" -Atqc \
-        "SELECT count(*) FROM schema_migrations WHERE filename = :'migfile'")
+        -v "migfile=${filename}" -Atq <<<"SELECT count(*) FROM schema_migrations WHERE filename = :'migfile';")
     [ "${count}" = "1" ]
 }
 
 record_applied() {
     local filename="$1"
     psql "${DATABASE_URL}" -v ON_ERROR_STOP=1 \
-        -v "migfile=${filename}" -Atqc \
-        "INSERT INTO schema_migrations (filename) VALUES (:'migfile')
-         ON CONFLICT (filename) DO NOTHING" >/dev/null
+        -v "migfile=${filename}" -Atq <<-SQL >/dev/null
+	INSERT INTO schema_migrations (filename) VALUES (:'migfile')
+	ON CONFLICT (filename) DO NOTHING;
+	SQL
 }
 
 apply_migration() {

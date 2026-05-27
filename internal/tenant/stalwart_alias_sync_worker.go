@@ -8,9 +8,9 @@
 // `AliasSyncMaxAttempts` failures the row is flipped to `failed`
 // for operator inspection.
 //
-// Pattern mirrors `internal/webhooks/worker.go` (migration 032)
-// so an operator who already understands the webhook backlog can
-// reason about alias-sync backlog the same way.
+// Pattern mirrors `internal/webhooks/worker.go` so an operator who
+// already understands the webhook backlog can reason about
+// alias-sync backlog the same way.
 package tenant
 
 import (

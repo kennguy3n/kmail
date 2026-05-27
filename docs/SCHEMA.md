@@ -5,7 +5,7 @@
 > Status: Phase 1 — Foundation. This document describes the initial
 > PostgreSQL schema owned by the Go control plane. The canonical
 > DDL lives in
-> [migrations/001_initial_schema.sql](../migrations/001_initial_schema.sql).
+> [migrations/001_baseline.sql](../migrations/001_baseline.sql).
 > See [ARCHITECTURE.md §4](ARCHITECTURE.md) for the storage topology
 > and [ARCHITECTURE.md §6](ARCHITECTURE.md) for the multi-tenancy
 > model.

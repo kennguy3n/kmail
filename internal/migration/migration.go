@@ -135,7 +135,7 @@ func NewService(cfg Config) *Service {
 
 // MigrationJob is the wire + persisted shape of a single import
 // job. Mirrors the `migration_jobs` table in
-// `migrations/002_migration_jobs.sql`.
+// `migrations/001_baseline.sql`.
 type MigrationJob struct {
 	ID                      string     `json:"id"`
 	TenantID                string     `json:"tenant_id"`

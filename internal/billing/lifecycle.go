@@ -345,8 +345,9 @@ func (l *Lifecycle) upsertSubscription(ctx context.Context, tenantID, plan strin
 }
 
 // upsertSubscriptionWithStripe is the variant that also persists
-// the Stripe customer ID (Phase 8 migration 045). Empty strings
-// are treated as "do not update" via COALESCE.
+// the Stripe customer ID (see the `billing_subscriptions.stripe_customer_id`
+// column in `migrations/001_baseline.sql`). Empty strings are treated as
+// "do not update" via COALESCE.
 func (l *Lifecycle) upsertSubscriptionWithStripe(ctx context.Context, tenantID, plan string, status SubscriptionStatus, stripeID, stripeCustomerID string, periodStart, periodEnd time.Time) error {
 	if l.svc.cfg.Pool == nil {
 		return nil

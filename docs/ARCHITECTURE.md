@@ -650,9 +650,11 @@ kmail/
 - `deploy/` — `helm/kmail/` (chart + values + templates),
   `grafana/dashboards/` + `grafana/provisioning/`, `loki/`,
   `promtail/`, `prometheus/`, `stalwart-ha/` (per-shard HA template).
-- `migrations/` — additive-only, numbered, RLS-scoped Postgres
-  migrations. Runs in lexicographic order via `scripts/migrate.sh`
-  on first boot of `cmd/kmail-api/`.
+- `migrations/` — single squashed Postgres baseline schema
+  (`001_baseline.sql`) covering all RLS-scoped tables, indexes,
+  policies, triggers, and functions. Applied via
+  `scripts/migrate.sh` on first boot of `cmd/kmail-api/`; future
+  schema changes land as new additive numbered files.
 - `scripts/` — `test-e2e.sh`, `test-scim.sh`, `test-imap-smtp.sh`,
   `test-caldav.sh`, `test-stalwart-upgrade.sh`,
   `loadtest/load-jmap.go`, `load-smtp.sh`, `chaos-shard.sh`,
