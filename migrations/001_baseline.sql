@@ -972,13 +972,18 @@ CREATE INDEX shard_failover_config_priority_idx
 -- `encrypted_secret_key` is BYTEA (not TEXT) so it can carry the
 -- raw output of `cmk.SecretsEnvelope.Wrap` — a kmail-cmk-v1
 -- magic prefix + 12-byte GCM nonce + ciphertext+tag, written as
--- bytes without base64 round-trips. Mirrors the established
+-- random bytes without base64 round-trips. Random bytes would not
+-- survive in TEXT (not valid UTF-8). Mirrors the established
 -- `dkim_keys.private_key_encrypted` shape so both secrets use the
 -- same wrap/unwrap path through `internal/cmk`. The unencrypted
 -- per-tenant S3 secret_key is NEVER persisted; the application
 -- always wraps via `KMAIL_SECRETS_KEY` before INSERT, and unwraps
 -- on SELECT. Phase 5 will swap the master-key wrap for a per-
 -- tenant CMK envelope without a column-shape change.
+--
+-- Older dev databases that applied this baseline back when the
+-- column was declared TEXT are forward-migrated by
+-- `002_tenant_storage_credentials_secret_key_bytea.sql`.
 CREATE TABLE tenant_storage_credentials (
     tenant_id              UUID PRIMARY KEY REFERENCES tenants(id) ON DELETE RESTRICT,
     bucket_name            TEXT NOT NULL UNIQUE,
