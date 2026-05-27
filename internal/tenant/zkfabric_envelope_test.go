@@ -47,11 +47,14 @@ func TestWrapSecretKey_WithEnvelope_ProducesCiphertext(t *testing.T) {
 	p, sink := newQuietProvisioner(env)
 
 	plaintext := "AKIA-test-secret-key-1234567890"
-	blob, err := p.wrapSecretKey(plaintext)
+	blob, wrapped, err := p.wrapSecretKey(plaintext)
 	if err != nil {
 		t.Fatalf("wrapSecretKey: %v", err)
 	}
 
+	if !wrapped {
+		t.Fatal("wrapSecretKey reported wrapped=false despite envelope being set")
+	}
 	if bytes.Equal(blob, []byte(plaintext)) {
 		t.Fatal("wrap returned plaintext-equivalent bytes; envelope was not applied")
 	}
@@ -71,7 +74,7 @@ func TestUnwrapSecretKey_RoundTrip(t *testing.T) {
 	p, _ := newQuietProvisioner(env)
 
 	plaintext := "secret-with-+/=base64-shaped\x00bytes"
-	blob, err := p.wrapSecretKey(plaintext)
+	blob, _, err := p.wrapSecretKey(plaintext)
 	if err != nil {
 		t.Fatalf("wrapSecretKey: %v", err)
 	}
@@ -96,7 +99,7 @@ func TestUnwrapSecretKey_TamperedBlobSurfacesCorruption(t *testing.T) {
 	env := newTestEnvelope(t)
 	p, _ := newQuietProvisioner(env)
 
-	blob, err := p.wrapSecretKey("secret-original")
+	blob, _, err := p.wrapSecretKey("secret-original")
 	if err != nil {
 		t.Fatalf("wrapSecretKey: %v", err)
 	}
@@ -147,9 +150,12 @@ func TestWrapSecretKey_NilEnvelopeFallback(t *testing.T) {
 	p, sink := newQuietProvisioner(nil)
 
 	plaintext := "secret-without-envelope"
-	blob, err := p.wrapSecretKey(plaintext)
+	blob, wrapped, err := p.wrapSecretKey(plaintext)
 	if err != nil {
 		t.Fatalf("wrapSecretKey (nil env): %v", err)
+	}
+	if wrapped {
+		t.Errorf("wrapSecretKey reported wrapped=true with nil envelope")
 	}
 	if string(blob) != plaintext {
 		t.Errorf("nil-envelope wrap altered bytes: got %q want %q", blob, plaintext)
@@ -179,7 +185,7 @@ func TestUnwrapSecretKey_NilEnvelopeRefusesWrappedBlob(t *testing.T) {
 	// 1. Wrap with a real envelope (simulates the "before" state).
 	env := newTestEnvelope(t)
 	pWith, _ := newQuietProvisioner(env)
-	blob, err := pWith.wrapSecretKey("secret-before-config-regressed")
+	blob, _, err := pWith.wrapSecretKey("secret-before-config-regressed")
 	if err != nil {
 		t.Fatalf("wrapSecretKey (with env): %v", err)
 	}

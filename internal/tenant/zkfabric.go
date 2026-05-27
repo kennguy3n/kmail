@@ -129,11 +129,16 @@ type StorageCredential struct {
 	CreatedAt              time.Time `json:"created_at"`
 	UpdatedAt              time.Time `json:"updated_at"`
 
-	// wasEncrypted reflects whether the row read from the DB
-	// was wrapped by the envelope (true) or returned as legacy
-	// plaintext (false). Used by `LookupStorageCredential` to
-	// warn once when a legacy row is encountered so operators
-	// know a re-wrap is pending. Not persisted.
+	// wasEncrypted reflects whether the row's secret_key is
+	// envelope-wrapped on disk (true) or stored as plaintext
+	// (false). Set on both code paths so callers can rely on
+	// the field regardless of whether the StorageCredential was
+	// produced by `Provision` (write path) or by
+	// `LookupStorageCredential` (read path): write-side sets it
+	// from the wrap result, read-side sets it from the unwrap
+	// state machine. `LookupStorageCredential` additionally
+	// warns when a legacy plaintext row is encountered so
+	// operators know a re-wrap is pending. Not persisted.
 	wasEncrypted bool
 }
 
@@ -395,20 +400,31 @@ func (p *ZKFabricProvisioner) putPlacement(ctx context.Context, tenantID, mode s
 }
 
 // wrapSecretKey runs the configured kmail-secrets envelope over
-// the plaintext per-tenant S3 secret. When no envelope is
-// configured, it logs a loud WARNING and returns the plaintext
-// bytes so dev environments without `KMAIL_SECRETS_KEY` still
-// boot — production callers MUST inject `Envelope`. The warning
-// fires on every invocation (one per `Provision` call) so a
-// silent-after-the-first-line failure mode cannot creep in;
-// mirrors `DKIMRotationService.wrapPrivateKey` so both secrets
-// use the same code path and the same operator log line.
-func (p *ZKFabricProvisioner) wrapSecretKey(secretKey string) ([]byte, error) {
+// the plaintext per-tenant S3 secret. Returns the bytes destined
+// for the `encrypted_secret_key` column plus a flag indicating
+// whether AEAD wrapping was applied (false only when no envelope
+// is configured). `persist` propagates that flag into
+// `StorageCredential.wasEncrypted` so a freshly-provisioned row
+// reports its on-disk state truthfully.
+//
+// When no envelope is configured, it logs a loud WARNING and
+// returns the plaintext bytes so dev environments without
+// `KMAIL_SECRETS_KEY` still boot — production callers MUST inject
+// `Envelope`. The warning fires on every invocation (one per
+// `Provision` call) so a silent-after-the-first-line failure
+// mode cannot creep in; mirrors `DKIMRotationService.wrapPrivateKey`
+// so both secrets use the same code path and the same operator
+// log line.
+func (p *ZKFabricProvisioner) wrapSecretKey(secretKey string) ([]byte, bool, error) {
 	if p.Envelope == nil {
 		p.Logger.Printf("tenant: WARNING: no SecretsEnvelope configured; storing S3 SECRET KEY as plaintext in tenant_storage_credentials.encrypted_secret_key (set KMAIL_SECRETS_KEY)")
-		return []byte(secretKey), nil
+		return []byte(secretKey), false, nil
 	}
-	return p.Envelope.Wrap([]byte(secretKey))
+	blob, err := p.Envelope.Wrap([]byte(secretKey))
+	if err != nil {
+		return nil, false, err
+	}
+	return blob, true, nil
 }
 
 // ErrEnvelopeMissingForWrappedRow signals that the provisioner
@@ -460,11 +476,11 @@ func (p *ZKFabricProvisioner) unwrapSecretKey(blob []byte) (string, bool, error)
 // before INSERT so the raw value never reaches `pg_dump`, log
 // scrapers, or read-replica streams.
 func (p *ZKFabricProvisioner) persist(ctx context.Context, cred *StorageCredential) error {
-	blob, err := p.wrapSecretKey(cred.SecretKey)
+	blob, wrapped, err := p.wrapSecretKey(cred.SecretKey)
 	if err != nil {
 		return fmt.Errorf("wrap secret_key: %w", err)
 	}
-	return pgx.BeginFunc(ctx, p.Pool, func(tx pgx.Tx) error {
+	if err := pgx.BeginFunc(ctx, p.Pool, func(tx pgx.Tx) error {
 		if err := middleware.SetTenantGUC(ctx, tx, cred.TenantID); err != nil {
 			return err
 		}
@@ -482,7 +498,14 @@ func (p *ZKFabricProvisioner) persist(ctx context.Context, cred *StorageCredenti
 			RETURNING created_at, updated_at
 		`, cred.TenantID, cred.BucketName, cred.AccessKey, blob,
 			cred.PlacementPolicyRef, cred.EncryptionModeDefault).Scan(&cred.CreatedAt, &cred.UpdatedAt)
-	})
+	}); err != nil {
+		return err
+	}
+	// Mirror the on-disk state into the returned struct so callers
+	// of Provision can rely on cred.WasEncrypted() the same way
+	// callers of LookupStorageCredential do.
+	cred.wasEncrypted = wrapped
+	return nil
 }
 
 // LookupStorageCredential returns the persisted credential row
