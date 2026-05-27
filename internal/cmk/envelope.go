@@ -95,6 +95,21 @@ var envelopeMagic = [16]byte{
 // this error rather than treating the blob as legacy plaintext.
 var ErrEnvelopeCorrupted = errors.New("cmk envelope: wrapped blob failed AEAD authentication (key rotation or corruption)")
 
+// HasMagic reports whether the blob carries the kmail-cmk-v1
+// magic prefix that marks it as a Wrap output. Exported so
+// callers running without an envelope (e.g. dev mode with
+// KMAIL_SECRETS_KEY unset) can refuse to return previously-
+// wrapped bytes as if they were legacy plaintext — the same
+// safety net the Unwrap state machine provides on the
+// envelope-present path.
+//
+// Returns false for blobs shorter than 16 bytes (no magic could
+// fit) and for blobs whose first 16 bytes do not match the
+// magic constant exactly.
+func HasMagic(blob []byte) bool {
+	return len(blob) >= len(envelopeMagic) && bytes.Equal(blob[:len(envelopeMagic)], envelopeMagic[:])
+}
+
 // AESGCMEnvelope is the production implementation.
 type AESGCMEnvelope struct {
 	aead cipher.AEAD

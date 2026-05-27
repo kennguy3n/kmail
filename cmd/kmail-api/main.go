@@ -385,16 +385,47 @@ func main() {
 		Logger:              logger,
 	}).Register(mux)
 
+	// kmail-secrets envelope. KMAIL_SECRETS_KEY is the single
+	// master key from which every BFF-side at-rest encryption key
+	// derives — DKIM private keys, TOTP shared secrets, recovery
+	// codes, HSM credentials, per-tenant S3 secret keys. We load
+	// it exactly once, here, so the operational signal ("is the
+	// envelope wired up?") is logged once instead of four times,
+	// and so every consumer shares the same `*cmk.AESGCMEnvelope`
+	// value (cheaper, and makes future KMS-backed rotations a
+	// single swap).
+	secretsEnvelope, secretsEnvelopeErr := cmk.LoadEnvelope()
+	if secretsEnvelopeErr != nil {
+		// DKIM, TOTP, and the zk-object-fabric provisioner fall
+		// back to plaintext-on-disk when the envelope is unset
+		// (the legacy behaviour, kept for dev). HSM credential
+		// registration is *refused* in this state by the
+		// `ErrEnvelopeNotConfigured` guard in cmk/hsm.go — the
+		// API will return 503 for HSM registration. Keep the log
+		// message honest about that asymmetry so an operator who
+		// reads only this line doesn't believe HSM credentials
+		// are silently stored plaintext.
+		logger.Printf("secrets: KMAIL_SECRETS_KEY unset (%v) — DKIM/TOTP/storage secrets will be stored unwrapped, HSM registration will be refused (DEV ONLY)", secretsEnvelopeErr)
+		secretsEnvelope = nil
+	}
+
 	// Per-tenant zk-object-fabric provisioning. CreateTenant calls
 	// Provision after the DB insert so every new tenant gets its
 	// own bucket + API key + placement policy without an operator
-	// running a separate one-shot.
+	// running a separate one-shot. The shared `secretsEnvelope`
+	// loaded above wraps the per-tenant S3 secret_key minted by
+	// the fabric console before it lands in
+	// `tenant_storage_credentials.encrypted_secret_key`. Same
+	// master key as DKIM/TOTP/HSM creds — Phase 5 swaps the master
+	// for a per-tenant CMK envelope without touching the
+	// provisioner call site.
 	zkProvisioner := tenant.NewZKFabricProvisioner(tenant.ZKFabricProvisioner{
 		Pool:           pool,
 		S3URL:          cfg.ZKFabric.S3URL,
 		ConsoleURL:     cfg.ZKFabric.ConsoleURL,
 		AdminAccessKey: cfg.ZKFabric.AccessKey,
 		AdminSecretKey: cfg.ZKFabric.SecretKey,
+		Envelope:       secretsEnvelope,
 		Logger:         logger,
 	})
 	// Phase 8 — build the shared-inbox workflow service early so
@@ -683,27 +714,6 @@ func main() {
 		proxy.SetSendInterceptor(chained)
 	}
 
-	// kmail-secrets envelope. KMAIL_SECRETS_KEY is the single
-	// master key from which every BFF-side at-rest encryption key
-	// derives — DKIM private keys, TOTP shared secrets, recovery
-	// codes, HSM credentials. We load it exactly once, here, so
-	// the operational signal ("is the envelope wired up?") is
-	// logged once instead of three times, and so every consumer
-	// shares the same `*cmk.AESGCMEnvelope` value (cheaper, and
-	// makes future KMS-backed rotations a single swap).
-	secretsEnvelope, secretsEnvelopeErr := cmk.LoadEnvelope()
-	if secretsEnvelopeErr != nil {
-		// DKIM and TOTP fall back to plaintext-on-disk when the
-		// envelope is unset (the legacy behaviour, kept for dev).
-		// HSM credential registration is *refused* in this state by
-		// the `ErrEnvelopeNotConfigured` guard in cmk/hsm.go — the
-		// API will return 503 for HSM registration. Keep the log
-		// message honest about that asymmetry so an operator who
-		// reads only this line doesn't believe HSM credentials are
-		// silently stored plaintext.
-		logger.Printf("secrets: KMAIL_SECRETS_KEY unset (%v) — DKIM/TOTP secrets will be stored unwrapped, HSM registration will be refused (DEV ONLY)", secretsEnvelopeErr)
-		secretsEnvelope = nil
-	}
 
 	// DKIM rotation surface (Phase 7). Lives next to the DNS
 	// wizard so the wizard UI can show "rotation pending" rows
