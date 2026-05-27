@@ -396,11 +396,13 @@ func (p *ZKFabricProvisioner) putPlacement(ctx context.Context, tenantID, mode s
 
 // wrapSecretKey runs the configured kmail-secrets envelope over
 // the plaintext per-tenant S3 secret. When no envelope is
-// configured, it logs a single WARNING and returns the plaintext
+// configured, it logs a loud WARNING and returns the plaintext
 // bytes so dev environments without `KMAIL_SECRETS_KEY` still
-// boot — production callers MUST inject `Envelope`. Mirrors
-// `DKIMRotationService.wrapPrivateKey` so both secrets use the
-// same code path and the same operator log line.
+// boot — production callers MUST inject `Envelope`. The warning
+// fires on every invocation (one per `Provision` call) so a
+// silent-after-the-first-line failure mode cannot creep in;
+// mirrors `DKIMRotationService.wrapPrivateKey` so both secrets
+// use the same code path and the same operator log line.
 func (p *ZKFabricProvisioner) wrapSecretKey(secretKey string) ([]byte, error) {
 	if p.Envelope == nil {
 		p.Logger.Printf("tenant: WARNING: no SecretsEnvelope configured; storing S3 SECRET KEY as plaintext in tenant_storage_credentials.encrypted_secret_key (set KMAIL_SECRETS_KEY)")
@@ -468,10 +470,13 @@ func (p *ZKFabricProvisioner) persist(ctx context.Context, cred *StorageCredenti
 // The on-disk `encrypted_secret_key` BYTEA is unwrapped through
 // the provisioner's envelope; the returned `SecretKey` is
 // plaintext. Legacy rows written before the envelope landed are
-// returned with `WasEncrypted() == false` and a single WARNING
-// log line so operators see that a re-wrap is pending. Tampered
-// or rotated-key blobs surface `cmk.ErrEnvelopeCorrupted` rather
-// than silently returning ciphertext.
+// returned with `WasEncrypted() == false` and a WARNING log
+// line per lookup so operators see that a re-wrap is pending;
+// repeated lookups for the same tenant re-fire the warning by
+// design (no in-process dedupe — the loud-on-every-read shape
+// is the same one DKIM uses). Tampered or rotated-key blobs
+// surface `cmk.ErrEnvelopeCorrupted` rather than silently
+// returning ciphertext.
 func (p *ZKFabricProvisioner) LookupStorageCredential(ctx context.Context, tenantID string) (*StorageCredential, error) {
 	if p.Pool == nil {
 		return nil, ErrNotFound
