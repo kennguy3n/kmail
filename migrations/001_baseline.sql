@@ -969,11 +969,21 @@ CREATE INDEX shard_failover_config_priority_idx
 -- Per-tenant storage credentials (zk-object-fabric)
 -- ================================================================
 
+-- `encrypted_secret_key` is BYTEA (not TEXT) so it can carry the
+-- raw output of `cmk.SecretsEnvelope.Wrap` — a kmail-cmk-v1
+-- magic prefix + 12-byte GCM nonce + ciphertext+tag, written as
+-- bytes without base64 round-trips. Mirrors the established
+-- `dkim_keys.private_key_encrypted` shape so both secrets use the
+-- same wrap/unwrap path through `internal/cmk`. The unencrypted
+-- per-tenant S3 secret_key is NEVER persisted; the application
+-- always wraps via `KMAIL_SECRETS_KEY` before INSERT, and unwraps
+-- on SELECT. Phase 5 will swap the master-key wrap for a per-
+-- tenant CMK envelope without a column-shape change.
 CREATE TABLE tenant_storage_credentials (
     tenant_id              UUID PRIMARY KEY REFERENCES tenants(id) ON DELETE RESTRICT,
     bucket_name            TEXT NOT NULL UNIQUE,
     access_key             TEXT NOT NULL,
-    encrypted_secret_key   TEXT NOT NULL,
+    encrypted_secret_key   BYTEA NOT NULL,
     placement_policy_ref   TEXT NOT NULL DEFAULT '',
     encryption_mode_default TEXT NOT NULL DEFAULT 'managed'
                            CHECK (encryption_mode_default IN ('managed', 'client_side', 'public_distribution')),
