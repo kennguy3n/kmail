@@ -51,12 +51,6 @@ CREATE TABLE IF NOT EXISTS export_job_messages (
     PRIMARY KEY (job_id, message_id)
 );
 
--- Upgrade path for a database that created the table before
--- tenant_id was added (the column is part of the fresh definition
--- above; this no-ops on a fresh apply).
-ALTER TABLE export_job_messages
-    ADD COLUMN IF NOT EXISTS tenant_id UUID REFERENCES tenants(id) ON DELETE CASCADE;
-
 CREATE INDEX IF NOT EXISTS export_job_messages_job_idx
     ON export_job_messages (job_id, included_at);
 

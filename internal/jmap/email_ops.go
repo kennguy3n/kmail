@@ -50,12 +50,17 @@ type EmailOperator interface {
 	DestroyEmails(ctx context.Context, tenantID string, messageIDs []string) error
 
 	// QueryEmailsByDate returns up to `limit` account-qualified IDs
-	// of messages received strictly before `olderThan`, oldest
-	// first, across the tenant's accounts. When `mailboxID` is
-	// non-empty it scopes the query to that JMAP mailbox
-	// (`inMailbox`). The enforcer pages by repeatedly querying and
-	// destroying: because destroyed messages drop out of the
-	// `receivedBefore` window, the next call returns the next batch.
+	// of messages received strictly before `olderThan`. Ordering is
+	// oldest-first WITHIN each account (JMAP `receivedAt` ascending),
+	// and accounts are concatenated in enumeration order — the result
+	// is NOT a global cross-account merge by date. That is sufficient
+	// for the retention enforcer, which destroys every message in the
+	// `before` window regardless of order; callers needing a true
+	// global sort must merge themselves. When `mailboxID` is non-empty
+	// it scopes the query to that JMAP mailbox (`inMailbox`); accounts
+	// without that mailbox are skipped. The enforcer pages by
+	// repeatedly querying and destroying: because destroyed messages
+	// drop out of the window, the next call returns the next batch.
 	QueryEmailsByDate(ctx context.Context, tenantID, mailboxID string, olderThan time.Time, limit int) ([]string, error)
 }
 

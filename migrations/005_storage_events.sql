@@ -17,7 +17,9 @@
 -- `app.tenant_id` while still isolating any stray tenant-scoped
 -- session to its own rows.
 --
--- Idempotent: guarded with IF NOT EXISTS. Additive only.
+-- Idempotent: tables/indexes guarded with IF NOT EXISTS; the RLS
+-- policy is dropped-if-exists before CREATE (Postgres has no
+-- CREATE POLICY IF NOT EXISTS) so a re-run is a no-op. Additive only.
 -- ================================================================
 
 BEGIN;
@@ -36,6 +38,7 @@ CREATE INDEX IF NOT EXISTS storage_events_tenant_created_idx
     ON storage_events (tenant_id, created_at DESC);
 
 ALTER TABLE storage_events ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS storage_events_tenant_isolation ON storage_events;
 CREATE POLICY storage_events_tenant_isolation ON storage_events
     USING (
         current_setting('app.tenant_id', true) IS NULL
