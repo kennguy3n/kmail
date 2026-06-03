@@ -36,18 +36,37 @@ ALTER TABLE export_jobs
 
 -- export_job_messages: one row per message included in an export
 -- archive. The lifecycle is owned entirely by the parent
--- export_jobs row (ON DELETE CASCADE), and every read/write is
--- reached through a tenant-scoped export_jobs lookup, so no
--- separate tenant_id / RLS policy is carried here — the rows are
--- unreachable except via a job the caller's tenant already owns.
+-- export_jobs row (ON DELETE CASCADE). It carries its own
+-- `tenant_id` and RLS policy rather than relying on callers to
+-- always join through export_jobs: every other child/join table in
+-- the schema (e.g. shared_inbox_members) does the same, and
+-- defense-in-depth means a future direct query (analytics, bulk
+-- cleanup) can't bypass tenant isolation. The policy matches
+-- export_jobs (strict — requires app.tenant_id to be set).
 CREATE TABLE IF NOT EXISTS export_job_messages (
     job_id      UUID NOT NULL REFERENCES export_jobs(id) ON DELETE CASCADE,
+    tenant_id   UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
     message_id  TEXT NOT NULL,
     included_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (job_id, message_id)
 );
 
+-- Upgrade path for a database that created the table before
+-- tenant_id was added (the column is part of the fresh definition
+-- above; this no-ops on a fresh apply).
+ALTER TABLE export_job_messages
+    ADD COLUMN IF NOT EXISTS tenant_id UUID REFERENCES tenants(id) ON DELETE CASCADE;
+
 CREATE INDEX IF NOT EXISTS export_job_messages_job_idx
     ON export_job_messages (job_id, included_at);
+
+CREATE INDEX IF NOT EXISTS export_job_messages_tenant_idx
+    ON export_job_messages (tenant_id);
+
+ALTER TABLE export_job_messages ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS export_job_messages_tenant_isolation ON export_job_messages;
+CREATE POLICY export_job_messages_tenant_isolation ON export_job_messages
+    USING (tenant_id = current_setting('app.tenant_id', true)::uuid)
+    WITH CHECK (tenant_id = current_setting('app.tenant_id', true)::uuid);
 
 COMMIT;

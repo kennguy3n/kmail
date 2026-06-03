@@ -3,9 +3,12 @@ package jmap
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -139,6 +142,79 @@ func TestStalwartEmailExporter_FetchFullMessages(t *testing.T) {
 	m2 := got[1]
 	if m2.ID != "acc-1:e2" || len(m2.Attachments) != 0 || string(m2.Body) != "body2" {
 		t.Errorf("m2 = %+v", m2)
+	}
+}
+
+func TestStalwartEmailExporter_FetchFullMessages_BatchesPerAccount(t *testing.T) {
+	t.Parallel()
+
+	// More ids for one account than emailGetBatchSize must be split
+	// across multiple Email/get calls so we never trip the server's
+	// maxObjectsInGet limit.
+	const total = emailGetBatchSize + 5
+
+	var getCalls atomic.Int32
+	var maxBatch atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/jmap/download/") {
+			_, _ = w.Write([]byte("Subject: x\r\n\r\nbody"))
+			return
+		}
+		getCalls.Add(1)
+		body, _ := io.ReadAll(r.Body)
+		var req map[string]any
+		_ = json.Unmarshal(body, &req)
+		calls, _ := req["methodCalls"].([]any)
+		call, _ := calls[0].([]any)
+		args, _ := call[1].(map[string]any)
+		ids, _ := args["ids"].([]any)
+		for {
+			cur := maxBatch.Load()
+			if int64(len(ids)) <= cur || maxBatch.CompareAndSwap(cur, int64(len(ids))) {
+				break
+			}
+		}
+		list := make([]any, 0, len(ids))
+		for _, idv := range ids {
+			id, _ := idv.(string)
+			list = append(list, map[string]any{
+				"id":            id,
+				"blobId":        "blob-" + id,
+				"bodyStructure": map[string]any{"type": "text/plain", "partId": "1"},
+			})
+		}
+		resp := map[string]any{
+			"methodResponses": []any{
+				[]any{"Email/get", map[string]any{"list": list}, "g0"},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer srv.Close()
+
+	accts := []tenantAccount{{"u1", "acc-1"}}
+	c := newOperatorTestProxy(t, srv, accts)
+	ex, _ := NewStalwartEmailExporter(c, c.proxy.cfg.Pool, c.proxy.Logger())
+	ex.accountsFn = func(_ context.Context, _ string) ([]tenantAccount, error) { return accts, nil }
+
+	ids := make([]string, total)
+	for i := range ids {
+		ids[i] = QualifyEmailID("acc-1", fmt.Sprintf("e%04d", i))
+	}
+
+	got, err := ex.FetchFullMessages(context.Background(), "t1", ids)
+	if err != nil {
+		t.Fatalf("FetchFullMessages: %v", err)
+	}
+	if len(got) != total {
+		t.Fatalf("len = %d, want %d", len(got), total)
+	}
+	if want := int32(2); getCalls.Load() != want {
+		t.Errorf("Email/get calls = %d, want %d (batched)", getCalls.Load(), want)
+	}
+	if maxBatch.Load() > emailGetBatchSize {
+		t.Errorf("a batch had %d ids, exceeds emailGetBatchSize=%d", maxBatch.Load(), emailGetBatchSize)
 	}
 }
 

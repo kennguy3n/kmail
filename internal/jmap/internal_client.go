@@ -42,6 +42,13 @@ type InternalClient struct {
 	proxy   *Proxy
 	httpc   *http.Client
 	timeout time.Duration
+
+	// Byte caps on bodies read from Stalwart. Default to the
+	// package consts in NewInternalClient; held as fields so the
+	// oversize-guard tests can exercise the truncation path without
+	// allocating tens of MiB.
+	maxBlobBytes     int64
+	maxResponseBytes int64
 }
 
 // internalClientDefaultTimeout bounds the BFF→Stalwart request.
@@ -65,9 +72,11 @@ func NewInternalClient(proxy *Proxy) (*InternalClient, error) {
 		return nil, errors.New("jmap.NewInternalClient: proxy has no transport (uninitialised?)")
 	}
 	return &InternalClient{
-		proxy:   proxy,
-		httpc:   &http.Client{Transport: tr, Timeout: internalClientDefaultTimeout},
-		timeout: internalClientDefaultTimeout,
+		proxy:            proxy,
+		httpc:            &http.Client{Transport: tr, Timeout: internalClientDefaultTimeout},
+		timeout:          internalClientDefaultTimeout,
+		maxBlobBytes:     internalClientMaxBlobBytes,
+		maxResponseBytes: internalClientMaxResponseBytes,
 	}, nil
 }
 
@@ -131,12 +140,32 @@ func (r *JmapResponse) CallByID(id string) (string, map[string]any, bool) {
 	return "", nil, false
 }
 
+// MethodError is a JMAP method-level error (`["error", {...}, "cN"]`,
+// RFC 8620 §3.5.1) surfaced as a typed Go error so callers can
+// branch on the JMAP error `Type` rather than string-matching the
+// message. For example the retention sweep tolerates a per-account
+// `invalidArguments` raised by an `inMailbox` filter that names a
+// mailbox absent from that account (JMAP mailbox ids are
+// per-account, RFC 8621 §2).
+type MethodError struct {
+	Type        string
+	Description string
+}
+
+func (e *MethodError) Error() string {
+	if e.Description != "" {
+		return fmt.Sprintf("jmap method error: %s: %s", e.Type, e.Description)
+	}
+	return fmt.Sprintf("jmap method error: %s", e.Type)
+}
+
 // FirstCallError extracts the first JMAP method-level error from
 // the response, if any. The JMAP envelope itself is HTTP 200 even
 // when individual method calls fail (`["error", {...}, "c0"]` is
 // the canonical shape per RFC 8620 §3.5.1), so the bootstrap
 // handler must surface those to the SDK as a 502/5xx rather than
-// returning a partially-empty response.
+// returning a partially-empty response. The returned error is a
+// *MethodError so callers can inspect the JMAP error type.
 func (r *JmapResponse) FirstCallError() error {
 	for _, entry := range r.MethodResponses {
 		if len(entry) != 3 {
@@ -149,10 +178,7 @@ func (r *JmapResponse) FirstCallError() error {
 		args, _ := entry[1].(map[string]any)
 		typ, _ := args["type"].(string)
 		desc, _ := args["description"].(string)
-		if desc != "" {
-			return fmt.Errorf("jmap method error: %s: %s", typ, desc)
-		}
-		return fmt.Errorf("jmap method error: %s", typ)
+		return &MethodError{Type: typ, Description: desc}
 	}
 	return nil
 }
@@ -219,7 +245,12 @@ func (c *InternalClient) Dispatch(
 			c.proxy.logger.Printf("jmap internal client transport error shard=%s err=%v", base, err)
 			continue
 		}
-		respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, internalClientMaxResponseBytes))
+		// Read one byte past the cap so an over-limit response is
+		// detectable rather than silently truncated. json.Unmarshal
+		// below would usually reject truncated JSON, but relying on
+		// that is incidental; fail explicitly and consistently with
+		// DownloadBlob instead.
+		respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, c.maxResponseBytes+1))
 		_ = resp.Body.Close()
 		if readErr != nil {
 			lastErr = fmt.Errorf("jmap dispatch %s: read body: %w", base, readErr)
@@ -236,6 +267,9 @@ func (c *InternalClient) Dispatch(
 			// 4xx. Surface immediately so the caller can map to
 			// the corresponding handler response.
 			return nil, fmt.Errorf("jmap dispatch %s: upstream %d: %s", base, resp.StatusCode, truncate(respBody, 512))
+		}
+		if int64(len(respBody)) > c.maxResponseBytes {
+			return nil, fmt.Errorf("jmap dispatch %s: response exceeds %d byte limit", base, c.maxResponseBytes)
 		}
 		var out JmapResponse
 		if err := json.Unmarshal(respBody, &out); err != nil {
@@ -329,7 +363,12 @@ func (c *InternalClient) DownloadBlob(
 			c.proxy.logger.Printf("jmap internal client download transport error shard=%s err=%v", base, err)
 			continue
 		}
-		body, readErr := io.ReadAll(io.LimitReader(resp.Body, internalClientMaxBlobBytes))
+		// Read one byte past the cap so a blob that exactly fills
+		// the limit is distinguishable from a truncated one: if we
+		// got more than internalClientMaxBlobBytes back, the body
+		// was oversized and returning it would silently corrupt the
+		// export artifact. Surface it as an error instead.
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, c.maxBlobBytes+1))
 		_ = resp.Body.Close()
 		if readErr != nil {
 			lastErr = fmt.Errorf("jmap download %s: read body: %w", base, readErr)
@@ -342,6 +381,9 @@ func (c *InternalClient) DownloadBlob(
 		}
 		if resp.StatusCode >= 400 {
 			return nil, fmt.Errorf("jmap download %s: upstream %d: %s", base, resp.StatusCode, truncate(body, 512))
+		}
+		if int64(len(body)) > c.maxBlobBytes {
+			return nil, fmt.Errorf("jmap download %s: blob exceeds %d byte limit", base, c.maxBlobBytes)
 		}
 		return body, nil
 	}

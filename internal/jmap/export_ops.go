@@ -117,6 +117,13 @@ var exportBodyProperties = []string{
 	"partId", "blobId", "type", "name", "size", "disposition",
 }
 
+// emailGetBatchSize chunks the per-account `ids` array of an
+// Email/get so a single call stays under the server's
+// `maxObjectsInGet` (RFC 8620 §5.1; Stalwart's default is 500).
+// Mirrors DestroyEmails' destroyBatchSize so a caller passing more
+// ids than the limit for one account can't trip `requestTooLarge`.
+const emailGetBatchSize = 500
+
 // FetchFullMessages implements EmailExporter.
 func (e *StalwartEmailExporter) FetchFullMessages(ctx context.Context, tenantID string, messageIDs []string) ([]ExportedMessage, error) {
 	if strings.TrimSpace(tenantID) == "" {
@@ -160,30 +167,35 @@ func (e *StalwartEmailExporter) FetchFullMessages(ctx context.Context, tenantID 
 		}
 		emailIDs := byAccount[acct]
 
-		emailGet := map[string]any{
-			"accountId":      acct,
-			"ids":            emailIDs,
-			"properties":     emailGetProperties,
-			"bodyProperties": exportBodyProperties,
-		}
-		req := JmapRequest{
-			Using:       []string{jmapCoreCapability, jmapMailCapability},
-			MethodCalls: [][]any{{"Email/get", emailGet, "g0"}},
-		}
-		resp, err := e.client.Dispatch(ctx, tenantID, kchatUserID, req)
-		if err != nil {
-			return nil, fmt.Errorf("Email/get account %s: %w", acct, err)
-		}
-		list, err := parseEmailGetList(resp, "g0")
-		if err != nil {
-			return nil, fmt.Errorf("parse Email/get account %s: %w", acct, err)
-		}
-		for _, em := range list {
-			msg, err := e.hydrateMessage(ctx, tenantID, kchatUserID, acct, em)
-			if err != nil {
-				return nil, err
+		for start := 0; start < len(emailIDs); start += emailGetBatchSize {
+			end := min(start+emailGetBatchSize, len(emailIDs))
+			batch := emailIDs[start:end]
+
+			emailGet := map[string]any{
+				"accountId":      acct,
+				"ids":            batch,
+				"properties":     emailGetProperties,
+				"bodyProperties": exportBodyProperties,
 			}
-			hydrated[msg.ID] = msg
+			req := JmapRequest{
+				Using:       []string{jmapCoreCapability, jmapMailCapability},
+				MethodCalls: [][]any{{"Email/get", emailGet, "g0"}},
+			}
+			resp, err := e.client.Dispatch(ctx, tenantID, kchatUserID, req)
+			if err != nil {
+				return nil, fmt.Errorf("Email/get account %s: %w", acct, err)
+			}
+			list, err := parseEmailGetList(resp, "g0")
+			if err != nil {
+				return nil, fmt.Errorf("parse Email/get account %s: %w", acct, err)
+			}
+			for _, em := range list {
+				msg, err := e.hydrateMessage(ctx, tenantID, kchatUserID, acct, em)
+				if err != nil {
+					return nil, err
+				}
+				hydrated[msg.ID] = msg
+			}
 		}
 	}
 

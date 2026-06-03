@@ -30,6 +30,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 	"time"
 
@@ -217,6 +218,20 @@ func (o *StalwartEmailOperator) QueryEmailsByDate(ctx context.Context, tenantID,
 		}
 		resp, err := o.client.Dispatch(ctx, tenantID, a.kchatUserID, req)
 		if err != nil {
+			// JMAP mailbox ids are per-account (RFC 8621 §2), so a
+			// single `mailboxID` from the caller may not exist in
+			// every account. Stalwart rejects an `inMailbox` naming
+			// an unknown mailbox with `invalidArguments` (RFC 8621
+			// §5.5); that just means this account has nothing under
+			// the target mailbox, so skip it rather than failing the
+			// whole tenant sweep. Without a mailbox filter there's no
+			// such per-account ambiguity, so the error still
+			// propagates.
+			var me *MethodError
+			if mailboxID != "" && errors.As(err, &me) && me.Type == "invalidArguments" {
+				o.logger.Printf("jmap QueryEmailsByDate: account %s has no mailbox %q, skipping (%v)", a.accountID, mailboxID, me)
+				continue
+			}
 			return nil, fmt.Errorf("Email/query account %s: %w", a.accountID, err)
 		}
 		ids, err := parseEmailQueryIDs(resp, "q0")
@@ -333,8 +348,17 @@ func checkEmailSetDestroy(resp *JmapResponse, callID string) error {
 		return fmt.Errorf("unexpected response method for %s: %q", callID, name)
 	}
 	notDestroyed, _ := args["notDestroyed"].(map[string]any)
-	for id, v := range notDestroyed {
-		setErr, _ := v.(map[string]any)
+	// Iterate in sorted id order: Go map iteration is randomized, so
+	// when a batch has several hard failures of different types the
+	// surfaced one would otherwise be non-deterministic, making
+	// logs/metrics irreproducible.
+	ids := make([]string, 0, len(notDestroyed))
+	for id := range notDestroyed {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		setErr, _ := notDestroyed[id].(map[string]any)
 		typ, _ := setErr["type"].(string)
 		if typ == "notFound" {
 			continue

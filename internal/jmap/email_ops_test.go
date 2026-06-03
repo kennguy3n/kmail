@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -145,6 +146,82 @@ func TestStalwartEmailOperator_QueryEmailsByDate_LimitStopsEarly(t *testing.T) {
 	}
 }
 
+func TestStalwartEmailOperator_QueryEmailsByDate_SkipsAccountMissingMailbox(t *testing.T) {
+	t.Parallel()
+
+	// JMAP mailbox ids are per-account: the caller's mailbox exists in
+	// acc-2 but not acc-1, where Stalwart rejects the inMailbox filter
+	// with invalidArguments. The sweep must skip acc-1 and still
+	// collect acc-2's matches rather than failing the whole tenant.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req map[string]any
+		_ = json.Unmarshal(body, &req)
+		calls, _ := req["methodCalls"].([]any)
+		call, _ := calls[0].([]any)
+		args, _ := call[1].(map[string]any)
+		accountID, _ := args["accountId"].(string)
+
+		var resp map[string]any
+		if accountID == "acc-1" {
+			resp = map[string]any{
+				"methodResponses": []any{
+					[]any{"error", map[string]any{"type": "invalidArguments", "description": "unknown mailbox"}, "q0"},
+				},
+			}
+		} else {
+			resp = map[string]any{
+				"methodResponses": []any{
+					[]any{"Email/query", map[string]any{"ids": []any{"e7"}}, "q0"},
+				},
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer srv.Close()
+
+	accts := []tenantAccount{{"u1", "acc-1"}, {"u2", "acc-2"}}
+	c := newOperatorTestProxy(t, srv, accts)
+	op, _ := NewStalwartEmailOperator(c, c.proxy.cfg.Pool, c.proxy.Logger())
+	op.accountsFn = func(_ context.Context, _ string) ([]tenantAccount, error) { return accts, nil }
+
+	got, err := op.QueryEmailsByDate(context.Background(), "t1", "mbx-9", time.Now(), 10)
+	if err != nil {
+		t.Fatalf("QueryEmailsByDate: %v", err)
+	}
+	if want := []string{"acc-2:e7"}; !equalStrings(got, want) {
+		t.Fatalf("ids = %v, want %v (acc-1 skipped)", got, want)
+	}
+}
+
+func TestStalwartEmailOperator_QueryEmailsByDate_OtherErrorPropagates(t *testing.T) {
+	t.Parallel()
+
+	// A non-invalidArguments method error is a real failure and must
+	// abort the sweep even when a mailbox filter is set — we only
+	// tolerate the specific "mailbox not in this account" signal.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := map[string]any{
+			"methodResponses": []any{
+				[]any{"error", map[string]any{"type": "serverFail", "description": "boom"}, "q0"},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer srv.Close()
+
+	accts := []tenantAccount{{"u1", "acc-1"}}
+	c := newOperatorTestProxy(t, srv, accts)
+	op, _ := NewStalwartEmailOperator(c, c.proxy.cfg.Pool, c.proxy.Logger())
+	op.accountsFn = func(_ context.Context, _ string) ([]tenantAccount, error) { return accts, nil }
+
+	if _, err := op.QueryEmailsByDate(context.Background(), "t1", "mbx-9", time.Now(), 10); err == nil {
+		t.Fatal("expected serverFail to propagate, not be skipped")
+	}
+}
+
 func TestStalwartEmailOperator_DestroyEmails(t *testing.T) {
 	t.Parallel()
 
@@ -226,6 +303,34 @@ func TestStalwartEmailOperator_DestroyEmails_HardErrorSurfaces(t *testing.T) {
 	err := op.DestroyEmails(context.Background(), "t1", []string{"acc-1:e1", "acc-1:e2"})
 	if err == nil {
 		t.Fatal("expected hard destroy error to surface")
+	}
+}
+
+func TestCheckEmailSetDestroy_DeterministicError(t *testing.T) {
+	t.Parallel()
+
+	// Two different hard failures in one batch. Map iteration is
+	// randomized, so without sorting the surfaced error would vary
+	// per run. Sorted id order means "e1" is always selected.
+	resp := &JmapResponse{
+		MethodResponses: [][]any{
+			{"Email/set", map[string]any{
+				"notDestroyed": map[string]any{
+					"e3": map[string]any{"type": "serverFail", "description": "boom"},
+					"e1": map[string]any{"type": "forbidden", "description": "no perms"},
+					"e2": map[string]any{"type": "notFound"},
+				},
+			}, "d0"},
+		},
+	}
+	for i := 0; i < 20; i++ {
+		err := checkEmailSetDestroy(resp, "d0")
+		if err == nil {
+			t.Fatal("expected a hard error to surface")
+		}
+		if !strings.Contains(err.Error(), "destroy e1 failed: forbidden") {
+			t.Fatalf("iteration %d: err = %v, want deterministic e1/forbidden", i, err)
+		}
 	}
 }
 
