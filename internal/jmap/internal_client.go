@@ -256,6 +256,108 @@ func (c *InternalClient) Dispatch(
 	return nil, lastErr
 }
 
+// DownloadBlob fetches a JMAP blob from Stalwart and returns its
+// raw bytes. It is the binary counterpart to Dispatch: where
+// Dispatch posts a JSON method batch to `/jmap/api`, DownloadBlob
+// GETs Stalwart's blob-download endpoint
+// (`/jmap/download/{accountId}/{blobId}/{name}`, RFC 8620 §6.2)
+// so a colocated caller (the eDiscovery export runner) can pull a
+// full RFC 5322 message or an attachment part by blobId.
+//
+// `accountID` is supplied by the caller rather than re-resolved
+// from `(tenant, user)` because the export path already holds the
+// account id (it qualified the email id with it). `kchatUserID`
+// still stamps the `X-KMail-Kchat-User-Id` identity header so
+// Stalwart authorises the download against the same principal the
+// proxy would. `name` is a cosmetic filename segment Stalwart
+// echoes into the Content-Disposition; pass "" to default to
+// "blob".
+//
+// Shard failover mirrors Dispatch: primary first, then each
+// secondary on transport error / 5xx. A 4xx is not retried (every
+// shard returns the same) and surfaces immediately.
+func (c *InternalClient) DownloadBlob(
+	ctx context.Context,
+	tenantID, kchatUserID, accountID, blobID, name string,
+) ([]byte, error) {
+	if strings.TrimSpace(tenantID) == "" {
+		return nil, errors.New("jmap.InternalClient.DownloadBlob: tenantID is required")
+	}
+	if strings.TrimSpace(kchatUserID) == "" {
+		return nil, errors.New("jmap.InternalClient.DownloadBlob: kchatUserID is required")
+	}
+	if strings.TrimSpace(accountID) == "" {
+		return nil, errors.New("jmap.InternalClient.DownloadBlob: accountID is required")
+	}
+	if strings.TrimSpace(blobID) == "" {
+		return nil, errors.New("jmap.InternalClient.DownloadBlob: blobID is required")
+	}
+	if name == "" {
+		name = "blob"
+	}
+
+	urls := c.proxy.ResolveShardURLs(ctx, tenantID)
+	if len(urls) == 0 {
+		urls = []string{c.proxy.Target().String()}
+	}
+
+	relPath := "/jmap/download/" +
+		url.PathEscape(accountID) + "/" +
+		url.PathEscape(blobID) + "/" +
+		url.PathEscape(name)
+
+	var lastErr error
+	for _, base := range urls {
+		endpoint, err := joinPath(base, relPath)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		httpReq.Header.Set("Accept", "application/octet-stream")
+		httpReq.Header.Set("X-KMail-Tenant-Id", tenantID)
+		httpReq.Header.Set("X-KMail-Kchat-User-Id", kchatUserID)
+		httpReq.Header.Set("X-KMail-Stalwart-Account-Id", accountID)
+
+		resp, err := c.httpc.Do(httpReq)
+		if err != nil {
+			lastErr = fmt.Errorf("jmap download %s: %w", base, err)
+			c.proxy.logger.Printf("jmap internal client download transport error shard=%s err=%v", base, err)
+			continue
+		}
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, internalClientMaxBlobBytes))
+		_ = resp.Body.Close()
+		if readErr != nil {
+			lastErr = fmt.Errorf("jmap download %s: read body: %w", base, readErr)
+			continue
+		}
+		if resp.StatusCode >= 500 {
+			lastErr = fmt.Errorf("jmap download %s: upstream %d", base, resp.StatusCode)
+			c.proxy.logger.Printf("jmap internal client download 5xx shard=%s status=%d", base, resp.StatusCode)
+			continue
+		}
+		if resp.StatusCode >= 400 {
+			return nil, fmt.Errorf("jmap download %s: upstream %d: %s", base, resp.StatusCode, truncate(body, 512))
+		}
+		return body, nil
+	}
+	if lastErr == nil {
+		lastErr = errors.New("jmap download: no shard URL configured")
+	}
+	return nil, lastErr
+}
+
+// internalClientMaxBlobBytes bounds a single blob download. A full
+// RFC 5322 message with inline attachments can be large; 64 MiB
+// matches the typical hard ceiling on message size in the
+// deliverability path and keeps a hostile / misconfigured Stalwart
+// from wedging the BFF on `io.ReadAll`.
+const internalClientMaxBlobBytes = 64 << 20
+
 // internalClientMaxResponseBytes bounds the response body the
 // internal client will accept from Stalwart. JMAP responses are
 // bounded by the request's `maxObjectsInGet` plus per-object
