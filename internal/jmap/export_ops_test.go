@@ -218,6 +218,67 @@ func TestStalwartEmailExporter_FetchFullMessages_BatchesPerAccount(t *testing.T)
 	}
 }
 
+func TestStalwartEmailExporter_FetchFullMessages_DedupsInput(t *testing.T) {
+	t.Parallel()
+
+	// Duplicate input IDs must be coalesced: fetched once (the
+	// server should never see a repeated id in the Email/get set)
+	// and emitted once, in first-seen order.
+	var sawIDs atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/jmap/download/") {
+			_, _ = w.Write([]byte("Subject: x\r\n\r\nbody"))
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		var req map[string]any
+		_ = json.Unmarshal(body, &req)
+		calls, _ := req["methodCalls"].([]any)
+		call, _ := calls[0].([]any)
+		args, _ := call[1].(map[string]any)
+		ids, _ := args["ids"].([]any)
+		sawIDs.Add(int64(len(ids)))
+		list := make([]any, 0, len(ids))
+		for _, idv := range ids {
+			id, _ := idv.(string)
+			list = append(list, map[string]any{
+				"id":            id,
+				"blobId":        "blob-" + id,
+				"bodyStructure": map[string]any{"type": "text/plain", "partId": "1"},
+			})
+		}
+		resp := map[string]any{
+			"methodResponses": []any{
+				[]any{"Email/get", map[string]any{"list": list}, "g0"},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer srv.Close()
+
+	accts := []tenantAccount{{"u1", "acc-1"}}
+	c := newOperatorTestProxy(t, srv, accts)
+	ex, _ := NewStalwartEmailExporter(c, c.proxy.cfg.Pool, c.proxy.Logger())
+	ex.accountsFn = func(_ context.Context, _ string) ([]tenantAccount, error) { return accts, nil }
+
+	// e1 appears three times, e2 twice — two distinct ids.
+	got, err := ex.FetchFullMessages(context.Background(), "t1",
+		[]string{"acc-1:e1", "acc-1:e2", "acc-1:e1", "acc-1:e2", "acc-1:e1"})
+	if err != nil {
+		t.Fatalf("FetchFullMessages: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("len = %d, want 2 distinct", len(got))
+	}
+	if got[0].ID != "acc-1:e1" || got[1].ID != "acc-1:e2" {
+		t.Errorf("order = [%s, %s], want [acc-1:e1, acc-1:e2]", got[0].ID, got[1].ID)
+	}
+	if n := sawIDs.Load(); n != 2 {
+		t.Errorf("server saw %d ids, want 2 (deduped before Email/get)", n)
+	}
+}
+
 func TestStalwartEmailExporter_FetchFullMessages_MalformedID(t *testing.T) {
 	t.Parallel()
 	ex := &StalwartEmailExporter{}

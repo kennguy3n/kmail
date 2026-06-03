@@ -138,17 +138,22 @@ func NewStalwartEmailOperator(client *InternalClient, pool *pgxpool.Pool, logger
 		logger = log.Default()
 	}
 	op := &StalwartEmailOperator{client: client, pool: pool, logger: logger}
-	op.accountsFn = op.queryTenantAccounts
+	op.accountsFn = func(ctx context.Context, tenantID string) ([]tenantAccount, error) {
+		return queryTenantAccounts(ctx, op.pool, tenantID)
+	}
 	return op, nil
 }
 
 // queryTenantAccounts loads the active user / shared-inbox accounts
 // for a tenant inside an RLS-scoped transaction (matching the
 // proxy's account-resolution path). `service` accounts are excluded
-// — they hold no user mail subject to retention.
-func (o *StalwartEmailOperator) queryTenantAccounts(ctx context.Context, tenantID string) ([]tenantAccount, error) {
+// — they hold no user mail subject to retention. It takes the pool
+// directly (not a receiver) so both StalwartEmailOperator and
+// StalwartEmailExporter share one resolution path without either
+// fabricating the other.
+func queryTenantAccounts(ctx context.Context, pool *pgxpool.Pool, tenantID string) ([]tenantAccount, error) {
 	var accts []tenantAccount
-	err := pgx.BeginFunc(ctx, o.pool, func(tx pgx.Tx) error {
+	err := pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
 		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
 			return fmt.Errorf("set tenant GUC: %w", err)
 		}

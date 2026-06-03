@@ -59,11 +59,13 @@ type ExportedMessage struct {
 // EmailExporter fetches whole messages by account-qualified ID.
 // Implementations are safe for concurrent use.
 type EmailExporter interface {
-	// FetchFullMessages returns one ExportedMessage per resolvable
-	// input ID. IDs that no longer exist on the server are skipped
-	// (not an error) so a long-running export tolerates concurrent
-	// deletion; the caller compares counts. Results are returned in
-	// the input order, minus any skipped IDs.
+	// FetchFullMessages returns one ExportedMessage per distinct
+	// resolvable input ID. Duplicate input IDs are coalesced (JMAP
+	// Email/get treats `ids` as a set), and IDs that no longer exist
+	// on the server are skipped (not an error) so a long-running
+	// export tolerates concurrent deletion; the caller compares
+	// counts. Results are returned in first-seen input order, minus
+	// any skipped IDs.
 	FetchFullMessages(ctx context.Context, tenantID string, messageIDs []string) ([]ExportedMessage, error)
 }
 
@@ -95,10 +97,11 @@ func NewStalwartEmailExporter(client *InternalClient, pool *pgxpool.Pool, logger
 		logger = log.Default()
 	}
 	ex := &StalwartEmailExporter{client: client, pool: pool, logger: logger}
-	// Reuse the operator's account-enumeration query so both
+	// Share the operator's account-enumeration query so both
 	// abstractions resolve (account → kchat user) identically.
-	op := &StalwartEmailOperator{client: client, pool: pool, logger: logger}
-	ex.accountsFn = op.queryTenantAccounts
+	ex.accountsFn = func(ctx context.Context, tenantID string) ([]tenantAccount, error) {
+		return queryTenantAccounts(ctx, ex.pool, tenantID)
+	}
 	return ex, nil
 }
 
@@ -134,15 +137,24 @@ func (e *StalwartEmailExporter) FetchFullMessages(ctx context.Context, tenantID 
 	}
 
 	// Group qualified IDs by owning account, preserving first-seen
-	// account order; keep the input order to re-sort results.
+	// account order. Duplicate input IDs are coalesced here (and
+	// recorded in first-seen order) so a repeated id is fetched and
+	// emitted exactly once.
 	byAccount := make(map[string][]string)
 	accountOrder := make([]string, 0)
+	seen := make(map[string]bool, len(messageIDs))
+	uniqueIDs := make([]string, 0, len(messageIDs))
 	for _, q := range messageIDs {
 		acct, emailID, ok := SplitQualifiedEmailID(q)
 		if !ok {
 			return nil, fmt.Errorf("jmap.FetchFullMessages: malformed qualified id %q (want <accountID>:<emailID>)", q)
 		}
-		if _, seen := byAccount[acct]; !seen {
+		if seen[q] {
+			continue
+		}
+		seen[q] = true
+		uniqueIDs = append(uniqueIDs, q)
+		if _, ok := byAccount[acct]; !ok {
 			accountOrder = append(accountOrder, acct)
 		}
 		byAccount[acct] = append(byAccount[acct], emailID)
@@ -200,7 +212,7 @@ func (e *StalwartEmailExporter) FetchFullMessages(ctx context.Context, tenantID 
 	}
 
 	out := make([]ExportedMessage, 0, len(hydrated))
-	for _, q := range messageIDs {
+	for _, q := range uniqueIDs {
 		if msg, ok := hydrated[q]; ok {
 			out = append(out, msg)
 		}
