@@ -95,8 +95,9 @@ type StorageEventWorkerConfig struct {
 	Events *StorageEventService
 	// Interval between reconciliation sweeps. Defaults to 60s.
 	Interval time.Duration
-	// Audit, when set, records a system audit entry each time a
-	// tenant's snapshot is updated from the event stream.
+	// Audit, when set, records a system audit entry whenever a
+	// tenant's reconciled snapshot *changes* (not on every tick — see
+	// auditSnapshot).
 	Audit *audit.Service
 	// Metrics, when set, counts reconciliation runs / errors.
 	Metrics *StorageEventMetrics
@@ -111,6 +112,10 @@ type StorageEventWorkerConfig struct {
 // surfaces any discrepancy (`kmail_storage_event_drift_bytes`).
 type StorageEventWorker struct {
 	cfg StorageEventWorkerConfig
+	// lastTotal remembers the value last reconciled per tenant so the
+	// audit entry is emitted only when the snapshot actually changes.
+	// Accessed solely from the single Run goroutine, so no lock.
+	lastTotal map[string]int64
 }
 
 // NewStorageEventWorker builds a worker with sensible defaults.
@@ -121,7 +126,7 @@ func NewStorageEventWorker(cfg StorageEventWorkerConfig) *StorageEventWorker {
 	if cfg.Logger == nil {
 		cfg.Logger = log.Default()
 	}
-	return &StorageEventWorker{cfg: cfg}
+	return &StorageEventWorker{cfg: cfg, lastTotal: map[string]int64{}}
 }
 
 // Run loops until `ctx` is cancelled, reconciling on each tick.
@@ -183,7 +188,19 @@ func (w *StorageEventWorker) tick(ctx context.Context) error {
 	return nil
 }
 
+// auditSnapshot records an audit entry only when a tenant's reconciled
+// total differs from the value last written by this worker. Auditing
+// every 60s tick — including unchanged tenants — would flood the
+// tamper-evident audit_log hash chain; the per-tick snapshot is
+// already captured as a billing_events `storage_snapshot` row by
+// SetStorageUsage, so the audit_log entry is reserved for genuine
+// state transitions.
 func (w *StorageEventWorker) auditSnapshot(ctx context.Context, tenantID string, total int64) {
+	prev, seen := w.lastTotal[tenantID]
+	w.lastTotal[tenantID] = total
+	if seen && prev == total {
+		return
+	}
 	if w.cfg.Audit == nil {
 		return
 	}

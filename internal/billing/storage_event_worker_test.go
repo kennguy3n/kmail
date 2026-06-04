@@ -211,6 +211,53 @@ func TestStorageEventWorker_ClampsNegative(t *testing.T) {
 	}
 }
 
+// TestStorageEventWorker_AuditsOnlyOnChange verifies the reconcile
+// worker audits a tenant's snapshot when it first appears / changes
+// but stays silent on subsequent ticks where the total is unchanged,
+// so the tamper-evident audit_log is not flooded every 60s.
+func TestStorageEventWorker_AuditsOnlyOnChange(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	tenant := seedTenant(t, pool, "active")
+
+	events := NewStorageEventService(pool)
+	billingSvc := NewService(Config{Pool: pool})
+	mustRecord(t, events, tenant, EventObjectCreated, 100)
+
+	w := NewStorageEventWorker(StorageEventWorkerConfig{
+		Pool:    pool,
+		Billing: billingSvc,
+		Events:  events,
+		Audit:   newAuditService(pool),
+		Logger:  quietLogger(),
+	})
+
+	// First tick: total goes 0 → 100, one audit row expected.
+	if err := w.tick(ctx); err != nil {
+		t.Fatalf("tick 1: %v", err)
+	}
+	if n := countAudit(t, pool, tenant, "storage.usage_reconciled"); n != 1 {
+		t.Fatalf("audit rows after first change = %d, want 1", n)
+	}
+
+	// Second tick with no new events: total unchanged, no new audit.
+	if err := w.tick(ctx); err != nil {
+		t.Fatalf("tick 2: %v", err)
+	}
+	if n := countAudit(t, pool, tenant, "storage.usage_reconciled"); n != 1 {
+		t.Fatalf("audit rows after unchanged tick = %d, want 1 (no flood)", n)
+	}
+
+	// New event changes the total: a second audit row is expected.
+	mustRecord(t, events, tenant, EventObjectCreated, 50)
+	if err := w.tick(ctx); err != nil {
+		t.Fatalf("tick 3: %v", err)
+	}
+	if n := countAudit(t, pool, tenant, "storage.usage_reconciled"); n != 2 {
+		t.Fatalf("audit rows after second change = %d, want 2", n)
+	}
+}
+
 // TestStorageWebhook_IngestRecords drives a signed S3 notification
 // through the webhook and asserts it is reconciled end-to-end.
 func TestStorageWebhook_IngestRecords(t *testing.T) {
