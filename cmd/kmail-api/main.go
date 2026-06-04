@@ -1060,25 +1060,44 @@ func main() {
 		WithMLS(confidentialsend.NewHTTPKeyDeriver(cfg.KChatMLSEndpoint, cfg.KChatAPIToken))
 	confidentialsend.NewHandlers(confidentialSendSvc, valkeyClient, logger).Register(mux, authMW)
 
-	exportSvc := export.NewService(pool)
-	// Phase 5 closeout: wire the real JMAP / CalDAV / audit
-	// fan-out runner. Each dependency is best-effort so the BFF
-	// keeps booting in dev when one of the downstream services
-	// is unreachable.
+	exportSvc := export.NewService(pool).WithAuditLogger(auditSvc)
+	// Gap-closure Session 2: wire the real eDiscovery export
+	// fan-out. The runner pulls full RFC 5322 messages through the
+	// Session 0 jmap.EmailExporter, resolves scope via the
+	// EmailOperator scope query, packages mbox/eml/pst_stub +
+	// audit + calendar into a tar.gz, and streams it to the
+	// tenant's zk-object-fabric bucket. Calendar / audit are
+	// best-effort so the BFF keeps booting when a downstream
+	// service is unreachable.
 	exportAttachmentSvc := jmap.NewAttachmentService(jmap.AttachmentConfig{
 		Pool:      pool,
 		S3URL:     cfg.ZKFabric.S3URL,
 		AccessKey: cfg.ZKFabric.AccessKey,
 		SecretKey: cfg.ZKFabric.SecretKey,
 	})
-	exportSvc.WithRunner(export.NewRealRunner(export.RealRunnerConfig{
-		JMAP:     export.NewHTTPJMAPClient(cfg.StalwartURL, ""),
+	exportExporter, err := jmap.NewStalwartEmailExporter(internalJmap, pool, logger)
+	if err != nil {
+		logger.Fatalf("jmap.NewStalwartEmailExporter: %v", err)
+	}
+	exportQuerier, err := jmap.NewStalwartEmailOperator(internalJmap, pool, logger)
+	if err != nil {
+		logger.Fatalf("jmap.NewStalwartEmailOperator: %v", err)
+	}
+	exportRunner, err := export.NewJMAPExportRunner(export.JMAPExportRunnerConfig{
+		Exporter: exportExporter,
+		Querier:  exportQuerier,
+		Uploader: exportAttachmentSvc,
 		Calendar: calendarSvc,
 		Audit:    auditSvc,
-		Uploader: exportAttachmentSvc,
-	}))
+		Logger:   logger,
+	})
+	if err != nil {
+		logger.Fatalf("export.NewJMAPExportRunner: %v", err)
+	}
+	exportSvc.WithRunner(exportRunner)
 	export.NewHandlers(exportSvc).Register(mux, authMW)
-	go export.NewWorker(exportSvc, logger).Run(ctx)
+	exportMetrics := export.NewMetrics(metrics.Registry)
+	go export.NewWorker(exportSvc, logger).WithMetrics(exportMetrics).Run(ctx)
 
 	// Phase 5 closeout — SCIM 2.0 provisioning.
 	scimSvc := scim.NewService(pool, tenantSvc)

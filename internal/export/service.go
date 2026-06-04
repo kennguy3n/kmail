@@ -21,6 +21,9 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/kennguy3n/kmail/internal/audit"
+	"github.com/kennguy3n/kmail/internal/middleware"
 )
 
 // Job is the public export-job shape.
@@ -39,14 +42,43 @@ type Job struct {
 	CompletedAt  *time.Time `json:"completed_at,omitempty"`
 }
 
-// Runner is the per-job callback that produces the archive and
-// returns the download URL. Wired in main.go.
-type Runner func(ctx context.Context, job Job) (downloadURL string, err error)
+// Result is what a Runner returns after materialising an export
+// archive. The Service persists these fields onto the export_jobs
+// row (artifact columns + download_url) and records MessageIDs in
+// the export_job_messages join table.
+type Result struct {
+	// DownloadURL is a short-lived presigned GET for the archive.
+	DownloadURL string
+	// ArtifactURL is the canonical, stable reference to the stored
+	// archive (re-presignable by the admin UI).
+	ArtifactURL string
+	// ArtifactSizeBytes is the size of the packaged archive.
+	ArtifactSizeBytes int64
+	// ArtifactChecksum is the lowercase hex SHA-256 of the archive.
+	ArtifactChecksum string
+	// MessageIDs are the account-qualified IDs included in the
+	// archive, recorded for audit / legal-hold reproducibility.
+	MessageIDs []string
+}
+
+// Runner materialises the archive for one job and returns its
+// Result. Wired in main.go; tests inject a fake.
+type Runner interface {
+	Run(ctx context.Context, job Job) (Result, error)
+}
+
+// AuditLogger is the subset of *audit.Service the export service
+// writes to when a job changes state. Optional (nil disables audit
+// emission).
+type AuditLogger interface {
+	Log(ctx context.Context, e audit.Entry) (*audit.Entry, error)
+}
 
 // Service manages export jobs.
 type Service struct {
 	pool   *pgxpool.Pool
 	runner Runner
+	audit  AuditLogger
 }
 
 // NewService returns a Service.
@@ -57,6 +89,12 @@ func NewService(pool *pgxpool.Pool) *Service {
 // WithRunner sets the runner that materializes archives.
 func (s *Service) WithRunner(r Runner) *Service {
 	s.runner = r
+	return s
+}
+
+// WithAuditLogger wires the audit-log writer. Pass nil to disable.
+func (s *Service) WithAuditLogger(a AuditLogger) *Service {
+	s.audit = a
 	return s
 }
 
@@ -171,32 +209,115 @@ func (s *Service) claimNextJob(ctx context.Context) (*Job, error) {
 	return &j, nil
 }
 
-// markComplete records the runner result.
-func (s *Service) markComplete(ctx context.Context, id string, downloadURL string) error {
-	_, err := s.pool.Exec(ctx, `
-		UPDATE export_jobs SET status = 'completed', download_url = $2, completed_at = now()
-		WHERE id = $1::uuid
-	`, id, downloadURL)
-	return err
-}
-
-func (s *Service) markFailed(ctx context.Context, id string, runErr error) error {
-	_, err := s.pool.Exec(ctx, `
-		UPDATE export_jobs SET status = 'failed', error_message = $2, completed_at = now()
-		WHERE id = $1::uuid
-	`, id, runErr.Error())
-	return err
-}
-
-// RunExport executes the runner for a job. Useful for tests / for
-// the worker tick.
-func (s *Service) RunExport(ctx context.Context, job Job) error {
-	if s.runner == nil {
-		return s.markFailed(ctx, job.ID, fmt.Errorf("no runner registered"))
-	}
-	url, err := s.runner(ctx, job)
+// markComplete records the runner result: the artifact columns +
+// download_url on the export_jobs row and one export_job_messages
+// row per included message. All writes happen in a single
+// tenant-scoped transaction so the RLS policies on both tables
+// (which require app.tenant_id) are satisfied and the job + its
+// message manifest commit atomically.
+func (s *Service) markComplete(ctx context.Context, job Job, res Result) error {
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := middleware.SetTenantGUC(ctx, tx, job.TenantID); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `
+			UPDATE export_jobs
+			SET status = 'completed', download_url = $2, completed_at = now(),
+			    artifact_url = $3, artifact_size_bytes = $4, artifact_checksum = $5
+			WHERE id = $1::uuid AND tenant_id = $6::uuid
+		`, job.ID, res.DownloadURL, res.ArtifactURL, res.ArtifactSizeBytes, res.ArtifactChecksum, job.TenantID)
+		if err != nil {
+			return fmt.Errorf("update export_jobs: %w", err)
+		}
+		for _, mid := range res.MessageIDs {
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO export_job_messages (job_id, tenant_id, message_id)
+				VALUES ($1::uuid, $2::uuid, $3)
+				ON CONFLICT (job_id, message_id) DO NOTHING
+			`, job.ID, job.TenantID, mid); err != nil {
+				return fmt.Errorf("insert export_job_messages: %w", err)
+			}
+		}
+		return nil
+	})
 	if err != nil {
-		return s.markFailed(ctx, job.ID, err)
+		return err
 	}
-	return s.markComplete(ctx, job.ID, url)
+	s.logAudit(ctx, job, "export.completed", map[string]any{
+		"format":              job.Format,
+		"scope":               job.Scope,
+		"artifact_size_bytes": res.ArtifactSizeBytes,
+		"artifact_checksum":   res.ArtifactChecksum,
+		"message_count":       len(res.MessageIDs),
+	})
+	return nil
+}
+
+func (s *Service) markFailed(ctx context.Context, job Job, runErr error) error {
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := middleware.SetTenantGUC(ctx, tx, job.TenantID); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `
+			UPDATE export_jobs SET status = 'failed', error_message = $2, completed_at = now()
+			WHERE id = $1::uuid AND tenant_id = $3::uuid
+		`, job.ID, runErr.Error(), job.TenantID)
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	s.logAudit(ctx, job, "export.failed", map[string]any{
+		"format": job.Format,
+		"scope":  job.Scope,
+		"error":  runErr.Error(),
+	})
+	return nil
+}
+
+// logAudit appends a tenant-scoped audit entry for an export state
+// change. Best-effort: a logging failure must not fail the export,
+// so the error is swallowed (the audit chain is tamper-evident, not
+// transactional with the job).
+func (s *Service) logAudit(ctx context.Context, job Job, action string, meta map[string]any) {
+	if s.audit == nil || job.TenantID == "" {
+		return
+	}
+	actorID := job.RequesterID
+	if actorID == "" {
+		actorID = "export-worker"
+	}
+	_, _ = s.audit.Log(ctx, audit.Entry{
+		TenantID:     job.TenantID,
+		ActorID:      actorID,
+		ActorType:    audit.ActorSystem,
+		Action:       action,
+		ResourceType: "export_job",
+		ResourceID:   job.ID,
+		Metadata:     meta,
+	})
+}
+
+// RunExport executes the runner for a job and persists the outcome.
+// It returns the Result (zero on failure) plus any error so the
+// worker can update metrics and logs.
+func (s *Service) RunExport(ctx context.Context, job Job) (Result, error) {
+	if s.runner == nil {
+		err := errors.New("export: no runner registered")
+		if mErr := s.markFailed(ctx, job, err); mErr != nil {
+			return Result{}, fmt.Errorf("%w (and mark-failed: %v)", err, mErr)
+		}
+		return Result{}, err
+	}
+	res, err := s.runner.Run(ctx, job)
+	if err != nil {
+		if mErr := s.markFailed(ctx, job, err); mErr != nil {
+			return Result{}, fmt.Errorf("%w (and mark-failed: %v)", err, mErr)
+		}
+		return Result{}, err
+	}
+	if err := s.markComplete(ctx, job, res); err != nil {
+		return Result{}, err
+	}
+	return res, nil
 }
