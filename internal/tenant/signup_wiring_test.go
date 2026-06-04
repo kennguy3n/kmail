@@ -2,12 +2,65 @@ package tenant
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log"
 	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgconn"
+
 	"github.com/kennguy3n/kmail/internal/jmap"
 )
+
+// TestClassifyCreateTenantResult locks in the ordering of the error
+// translation in signupProvisioner.CreateTenant: a non-nil tenant (the
+// INSERT succeeded) must always be classified as a partial-provisioning
+// failure, even when the accompanying error is a Postgres unique violation
+// raised by a post-insert hook — otherwise the valid tenant pointer is
+// discarded and a freshly-created tenant is misreported as a replay.
+func TestClassifyCreateTenantResult(t *testing.T) {
+	uniq := fmt.Errorf("billing.OnTenantCreated: %w", &pgconn.PgError{Code: "23505"})
+	tenant := &Tenant{ID: "tenant-1", Slug: "acme"}
+
+	t.Run("success passes tenant through", func(t *testing.T) {
+		got, err := classifyCreateTenantResult(tenant, nil)
+		if err != nil || got != tenant {
+			t.Fatalf("got (%v, %v), want (tenant, nil)", got, err)
+		}
+	})
+
+	t.Run("inserted tenant + hook unique violation is partial provisioning", func(t *testing.T) {
+		got, err := classifyCreateTenantResult(tenant, uniq)
+		if got != tenant {
+			t.Fatalf("tenant = %v, want preserved pointer %v", got, tenant)
+		}
+		if !errors.Is(err, ErrTenantProvisionIncomplete) {
+			t.Fatalf("err = %v, want ErrTenantProvisionIncomplete", err)
+		}
+		if errors.Is(err, ErrTenantExists) {
+			t.Fatal("must not classify an inserted tenant as ErrTenantExists")
+		}
+	})
+
+	t.Run("failed insert unique violation is tenant exists", func(t *testing.T) {
+		got, err := classifyCreateTenantResult(nil, uniq)
+		if got != nil {
+			t.Fatalf("tenant = %v, want nil", got)
+		}
+		if !errors.Is(err, ErrTenantExists) {
+			t.Fatalf("err = %v, want ErrTenantExists", err)
+		}
+	})
+
+	t.Run("failed insert other error passes through", func(t *testing.T) {
+		boom := errors.New("connection refused")
+		got, err := classifyCreateTenantResult(nil, boom)
+		if got != nil || !errors.Is(err, boom) {
+			t.Fatalf("got (%v, %v), want (nil, boom)", got, err)
+		}
+	})
+}
 
 // fakeJMAPSubmitter records dispatched requests and returns canned
 // responses keyed by the first method-call name, so we can assert how

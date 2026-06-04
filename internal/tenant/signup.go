@@ -398,6 +398,15 @@ func (s *SignupService) InitiateSignup(ctx context.Context, email, orgName, plan
 	if s.stripe == nil {
 		return nil, ErrCheckoutUnavailable
 	}
+	// Stripe's Checkout Session API requires absolute success_url /
+	// cancel_url. Without a configured public base URL those would be
+	// built as relative paths ("/signup?..."), which Stripe rejects with
+	// a 400. Fail fast with a clear configuration error before persisting
+	// a signup_requests row, rather than minting a doomed checkout and
+	// leaving an orphaned `failed` row behind.
+	if s.baseURL == "" {
+		return nil, fmt.Errorf("%w: public base URL is not configured", ErrCheckoutUnavailable)
+	}
 	priceID := s.planPrices[plan]
 	if priceID == "" {
 		return nil, fmt.Errorf("%w: no Stripe price configured for plan %q", ErrCheckoutUnavailable, plan)

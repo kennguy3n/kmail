@@ -137,23 +137,39 @@ func NewSignupProvisioner(svc *Service, pool *pgxpool.Pool) TenantProvisioner {
 }
 
 func (p *signupProvisioner) CreateTenant(ctx context.Context, in CreateTenantInput) (*Tenant, error) {
-	t, err := p.svc.CreateTenant(ctx, in)
-	if err != nil {
-		if isUniqueViolation(err) {
-			return nil, ErrTenantExists
-		}
-		// Service.CreateTenant returns a non-nil tenant alongside the
-		// error when the row was inserted but a post-insert provisioning
-		// hook failed (see internal/tenant/service.go). Preserve that
-		// tenant and signal the partial state so CompleteSignup re-drives
-		// the idempotent hooks instead of discarding the pointer and
-		// permanently failing the signup over a half-provisioned tenant.
-		if t != nil {
-			return t, fmt.Errorf("%w: %v", ErrTenantProvisionIncomplete, err)
-		}
-		return nil, err
+	return classifyCreateTenantResult(p.svc.CreateTenant(ctx, in))
+}
+
+// classifyCreateTenantResult translates the (tenant, error) pair returned
+// by Service.CreateTenant into the signup-flow sentinels.
+//
+// The order of checks matters. Service.CreateTenant returns a nil tenant
+// only when the INSERT itself failed (see internal/tenant/service.go); a
+// slug collision there is the genuine "tenant already exists" signal
+// (ErrTenantExists). Once the INSERT succeeds it returns a non-nil tenant
+// alongside any post-insert hook error — and that hook error can itself be
+// a Postgres unique violation (e.g. a billing upsert hitting 23505). So the
+// t != nil (partial-provisioning) branch must be evaluated BEFORE the
+// isUniqueViolation branch; otherwise a freshly-created tenant whose hook
+// raised a 23505 would be misclassified as a pre-existing tenant and its
+// valid pointer discarded.
+func classifyCreateTenantResult(t *Tenant, err error) (*Tenant, error) {
+	if err == nil {
+		return t, nil
 	}
-	return t, nil
+	// INSERT succeeded but a post-insert provisioning hook failed.
+	// Preserve the tenant and signal the partial state so CompleteSignup
+	// re-drives the idempotent hooks instead of discarding the pointer and
+	// permanently failing the signup over a half-provisioned tenant.
+	if t != nil {
+		return t, fmt.Errorf("%w: %v", ErrTenantProvisionIncomplete, err)
+	}
+	// INSERT failed. A unique violation here is a slug collision —
+	// the idempotent "tenant already exists" replay signal.
+	if isUniqueViolation(err) {
+		return nil, ErrTenantExists
+	}
+	return nil, err
 }
 
 // EnsureProvisioned re-runs the idempotent post-insert provisioning

@@ -351,6 +351,30 @@ func TestInitiateSignup_NoPriceForPlan(t *testing.T) {
 	}
 }
 
+func TestInitiateSignup_MissingPublicBaseURL(t *testing.T) {
+	// Without a public base URL the success/cancel URLs would be relative
+	// paths Stripe rejects. InitiateSignup must fail fast before persisting
+	// a row or calling Stripe.
+	repo := newFakeSignupRepo()
+	stripe := &fakeStripe{}
+	svc := newTestService(repo, newFakeProvisioner(), stripe, func(c *SignupConfig) {
+		c.PublicBaseURL = ""
+	})
+
+	_, err := svc.InitiateSignup(context.Background(), "a@acme.com", "Acme", "core")
+	if !errors.Is(err, ErrCheckoutUnavailable) {
+		t.Fatalf("err = %v, want ErrCheckoutUnavailable", err)
+	}
+	if stripe.calls != 0 {
+		t.Fatalf("stripe calls = %d, want 0 (must fail before minting checkout)", stripe.calls)
+	}
+	repo.mu.Lock()
+	defer repo.mu.Unlock()
+	if len(repo.byID) != 0 {
+		t.Fatalf("persisted %d signup rows, want 0 (must fail before persisting)", len(repo.byID))
+	}
+}
+
 func TestInitiateSignup_CheckoutErrorMarksFailed(t *testing.T) {
 	repo := newFakeSignupRepo()
 	stripe := &fakeStripe{err: errors.New("stripe down")}
