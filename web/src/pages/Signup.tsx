@@ -214,6 +214,10 @@ function SignupProcessing({
         if (doneRef.current) {
           return;
         }
+        // A poll succeeded — clear any soft error left over from a
+        // previous transient failure so the amber message doesn't linger
+        // once status checks have recovered.
+        setError(null);
         switch (req.status) {
           case "active":
             doneRef.current = true;

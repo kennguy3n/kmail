@@ -397,6 +397,26 @@ func (m *JMAPWelcomeMailer) SendWelcome(ctx context.Context, msg WelcomeMessage)
 		"textBody": []map[string]string{{"partId": "body", "type": "text/plain"}},
 	}
 
+	// RFC 8621 §7 makes identityId a required property on
+	// EmailSubmission creation. When an operator hasn't pinned one via
+	// KMAIL_SIGNUP_WELCOME_IDENTITY, resolve the sender's real identity
+	// (preferring the one matching the from address) rather than omitting
+	// the property — a strictly-conformant Stalwart config would reject a
+	// submission with no identityId, silently dropping the welcome email.
+	identityID := m.identityID
+	if identityID == "" {
+		resolved, rErr := m.resolveIdentityID(ctx, accountID)
+		if rErr != nil {
+			// Best-effort: the account may have no identity provisioned
+			// yet. Fall back to omitting identityId and let the server
+			// auto-select, preserving prior behavior instead of failing
+			// the (best-effort) welcome email outright.
+			m.logger.Printf("welcome mailer: resolve identity (account=%s): %v; submitting without identityId", accountID, rErr)
+		} else {
+			identityID = resolved
+		}
+	}
+
 	submissionCreate := map[string]any{
 		"emailId": "#welcome",
 		"envelope": map[string]any{
@@ -404,8 +424,8 @@ func (m *JMAPWelcomeMailer) SendWelcome(ctx context.Context, msg WelcomeMessage)
 			"rcptTo":   []map[string]string{{"email": msg.To}},
 		},
 	}
-	if m.identityID != "" {
-		submissionCreate["identityId"] = m.identityID
+	if identityID != "" {
+		submissionCreate["identityId"] = identityID
 	}
 
 	req := jmap.JmapRequest{
@@ -501,6 +521,59 @@ func (m *JMAPWelcomeMailer) resolveDraftsMailbox(ctx context.Context, accountID 
 		return fallback, nil
 	}
 	return "", fmt.Errorf("mailbox/get: account %s has no mailboxes", accountID)
+}
+
+// resolveIdentityID returns a valid JMAP Identity id for the sender,
+// preferring the identity whose email matches the configured from
+// address and falling back to the first identity. RFC 8621 §7 requires
+// identityId on EmailSubmission creation; this is used only when no
+// identity id is configured so strictly-conformant servers still accept
+// the submission.
+func (m *JMAPWelcomeMailer) resolveIdentityID(ctx context.Context, accountID string) (string, error) {
+	req := jmap.JmapRequest{
+		Using: []string{
+			"urn:ietf:params:jmap:core",
+			"urn:ietf:params:jmap:submission",
+		},
+		MethodCalls: [][]any{
+			{"Identity/get", map[string]any{
+				"accountId":  accountID,
+				"ids":        nil,
+				"properties": []string{"id", "email"},
+			}, "i0"},
+		},
+	}
+	resp, err := m.submitter.Dispatch(ctx, m.senderTenantID, m.senderKChatUserID, req)
+	if err != nil {
+		return "", err
+	}
+	if err := resp.FirstCallError(); err != nil {
+		return "", err
+	}
+	_, args, ok := resp.CallByID("i0")
+	if !ok {
+		return "", fmt.Errorf("identity/get: response missing i0 call")
+	}
+	list, _ := args["list"].([]any)
+	var fallback string
+	for _, item := range list {
+		idn, _ := item.(map[string]any)
+		id, _ := idn["id"].(string)
+		if id == "" {
+			continue
+		}
+		email, _ := idn["email"].(string)
+		if strings.EqualFold(email, m.fromAddress) {
+			return id, nil
+		}
+		if fallback == "" {
+			fallback = id
+		}
+	}
+	if fallback != "" {
+		return fallback, nil
+	}
+	return "", fmt.Errorf("identity/get: account %s has no identities", accountID)
 }
 
 // firstSetError returns a descriptive error for the first rejected

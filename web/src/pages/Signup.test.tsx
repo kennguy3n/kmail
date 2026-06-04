@@ -144,6 +144,45 @@ describe("Signup processing", () => {
     expect(signupApi.getSignupStatus).toHaveBeenCalledWith("req-1");
   });
 
+  it("clears the transient error message once polling recovers", async () => {
+    vi.mocked(signupApi.getSignupStatus)
+      // First poll fails transiently → soft amber message appears.
+      .mockRejectedValueOnce(
+        new signupApi.SignupApiError("/api/v1/signup/req-1/status", 503, "upstream unavailable"),
+      )
+      // Recovery: a successful poll (still pending) must clear the error.
+      .mockResolvedValueOnce({
+        id: "req-1",
+        email: "a@acme.com",
+        org_name: "Acme",
+        plan: "pro",
+        status: "pending",
+        created_at: "2024-01-01T00:00:00Z",
+      })
+      .mockResolvedValueOnce({
+        id: "req-1",
+        email: "a@acme.com",
+        org_name: "Acme",
+        plan: "pro",
+        status: "active",
+        created_at: "2024-01-01T00:00:00Z",
+      });
+
+    renderAt("/signup?status=success&id=req-1");
+
+    // The soft error surfaces after the first (failed) poll.
+    expect(await screen.findByText(/still working .*retrying/i)).toBeInTheDocument();
+
+    // Once a poll succeeds the amber message must disappear, and the
+    // flow continues to the DNS wizard on active.
+    await waitFor(() => {
+      expect(screen.queryByText(/still working .*retrying/i)).not.toBeInTheDocument();
+    });
+    await waitFor(() => {
+      expect(screen.getByText("DNS WIZARD")).toBeInTheDocument();
+    });
+  });
+
   it("shows a failure message when the signup failed", async () => {
     vi.mocked(signupApi.getSignupStatus).mockResolvedValueOnce({
       id: "req-1",
