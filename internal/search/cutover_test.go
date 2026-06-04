@@ -3,6 +3,7 @@ package search
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"sync"
@@ -123,6 +124,11 @@ func (s *inMemoryCutoverStore) ListCandidates(_ context.Context, f CandidateFilt
 		r, ok := s.rows[memRowKey{tenantID: id, targetBackend: f.TargetBackend}]
 		switch {
 		case !ok:
+			ids = append(ids, id)
+		case r.state == CutoverPending:
+			// Mirrors the production SQL's `OR cutover_state =
+			// 'pending'`: an operator-initiated row that never
+			// executed is still a candidate.
 			ids = append(ids, id)
 		case r.state == CutoverFailed && r.failureCount < f.MaxFailures && r.updatedAt.Before(f.RetryAfterBefore):
 			ids = append(ids, id)
@@ -485,6 +491,68 @@ func TestCutoverWorker_AboveThresholdFullCutover(t *testing.T) {
 	}
 	if store.tenantBackends["tenant-a"] != BackendOpenSearch {
 		t.Fatalf("tenant backend = %q, want opensearch", store.tenantBackends["tenant-a"])
+	}
+}
+
+// TestCutoverWorker_PendingCandidateIsClaimed proves the worker
+// recovers an operator-initiated `pending` row whose synchronous
+// ExecuteCutover never ran (e.g. the HTTP request was cancelled
+// between InitiateCutover's UpsertPending and the Claim). Before the
+// fix, ListCandidates matched only NULL or `failed` rows, so the
+// lingering pending row both failed to be picked up AND masked the
+// bare-NULL auto-promotion the tenant would otherwise have gotten —
+// wedging it in pending forever. ListCandidates now includes pending
+// rows, so the next tick claims and completes it.
+func TestCutoverWorker_PendingCandidateIsClaimed(t *testing.T) {
+	store := newInMemoryStore([]string{"tenant-a"})
+	flipper := newFakeFlipper(store)
+	now := time.Unix(1_700_000_000, 0)
+	// Simulate InitiateCutover whose ExecuteCutover never ran.
+	if _, err := store.UpsertPending(context.Background(), "tenant-a", BackendOpenSearch, 200_000, 100_000, now); err != nil {
+		t.Fatalf("seed pending row: %v", err)
+	}
+	if r := store.rowFor("tenant-a", BackendOpenSearch); r == nil || r.state != CutoverPending {
+		t.Fatalf("precondition: want a pending row, got %+v", r)
+	}
+	sizer := MailboxSizerFunc(func(context.Context, string) (int64, error) { return 200_000, nil })
+	source := MessageSourceFunc(func(context.Context, string) ([]Message, error) {
+		return []Message{{TenantID: "tenant-a", MessageID: "m1"}}, nil
+	})
+	w := buildWorker(t, store, flipper, sizer, source, 100_000, func() time.Time { return now })
+	w.Tick(context.Background())
+
+	if r := store.rowFor("tenant-a", BackendOpenSearch); r == nil || r.state != CutoverCompleted {
+		t.Fatalf("orphaned pending row not recovered: state = %+v, want CutoverCompleted", r)
+	}
+	if store.tenantBackends["tenant-a"] != BackendOpenSearch {
+		t.Fatalf("tenant backend = %q, want opensearch (flip must happen)", store.tenantBackends["tenant-a"])
+	}
+}
+
+// TestCutoverWorker_BelowThresholdPendingNotAutoPromoted pins the
+// other half of the contract: a pending row IS a candidate, but the
+// worker's size-threshold gate still applies, so a below-threshold
+// manual initiation is left untouched for the operator to re-trigger
+// (via ExecuteCutover) rather than silently auto-promoted.
+func TestCutoverWorker_BelowThresholdPendingNotAutoPromoted(t *testing.T) {
+	store := newInMemoryStore([]string{"tenant-a"})
+	flipper := newFakeFlipper(store)
+	now := time.Unix(1_700_000_000, 0)
+	if _, err := store.UpsertPending(context.Background(), "tenant-a", BackendOpenSearch, 1_000, 100_000, now); err != nil {
+		t.Fatalf("seed pending row: %v", err)
+	}
+	sizer := MailboxSizerFunc(func(context.Context, string) (int64, error) { return 1_000, nil }) // below threshold
+	source := MessageSourceFunc(func(context.Context, string) ([]Message, error) {
+		return []Message{{TenantID: "tenant-a", MessageID: "m1"}}, nil
+	})
+	w := buildWorker(t, store, flipper, sizer, source, 100_000, func() time.Time { return now })
+	w.Tick(context.Background())
+
+	if r := store.rowFor("tenant-a", BackendOpenSearch); r == nil || r.state != CutoverPending {
+		t.Fatalf("below-threshold pending row = %+v, want left as CutoverPending (no auto-promote)", r)
+	}
+	if store.tenantBackends["tenant-a"] != BackendMeilisearch {
+		t.Fatalf("tenant backend = %q, want meilisearch (below-threshold must not flip)", store.tenantBackends["tenant-a"])
 	}
 }
 
@@ -1802,5 +1870,55 @@ func TestServiceValidate_FailsWhenNeverVisible(t *testing.T) {
 	}
 	if backend.calls != cutoverValidationAttempts {
 		t.Fatalf("SearchMessages called %d times, want %d (full budget then give up)", backend.calls, cutoverValidationAttempts)
+	}
+}
+
+// saturatedBackend simulates a destination whose probe term (a
+// common subject) matches at least `cutoverValidationLimit` docs,
+// none of which is the sampled target message. Mirrors a real index:
+// the index IS populated + queryable, the target is just ranked
+// beyond the result window.
+type saturatedBackend struct {
+	name  string
+	calls int
+}
+
+func (b *saturatedBackend) Name() string                                { return b.name }
+func (b *saturatedBackend) IndexMessage(context.Context, Message) error { return nil }
+func (b *saturatedBackend) SearchMessages(_ context.Context, _, _ string, limit int) ([]SearchHit, error) {
+	b.calls++
+	hits := make([]SearchHit, limit)
+	for i := range hits {
+		hits[i] = SearchHit{MessageID: fmt.Sprintf("other-%d", i)}
+	}
+	return hits, nil
+}
+func (b *saturatedBackend) DeleteIndex(context.Context, string) error             { return nil }
+func (b *saturatedBackend) MigrateIndex(context.Context, string, []Message) error { return nil }
+func (b *saturatedBackend) ExportMessages(context.Context, string) ([]Message, error) {
+	return nil, nil
+}
+
+// TestServiceValidate_SaturatedResultPasses proves the ranking
+// false-negative the reviewer flagged is gone: a tenant with many
+// messages sharing a common subject can push the sampled target doc
+// past the result window, but a SATURATED result set (== limit hits)
+// proves the index is populated + queryable, so validation must NOT
+// abort the cutover on that ranking artefact. The probe runs once —
+// saturation is a definitive (non-retryable) accept.
+func TestServiceValidate_SaturatedResultPasses(t *testing.T) {
+	orig := validationRetrySleep
+	validationRetrySleep = func(time.Duration) {}
+	defer func() { validationRetrySleep = orig }()
+
+	backend := &saturatedBackend{name: BackendOpenSearch}
+	svc := NewService(Config{Backends: []SearchBackend{backend}})
+	msgs := []Message{{TenantID: "tenant-a", MessageID: "m1", Subject: "Re: thanks"}}
+
+	if err := svc.Validate(context.Background(), "tenant-a", BackendOpenSearch, msgs); err != nil {
+		t.Fatalf("Validate returned %v, want nil (saturated window must not be a false negative)", err)
+	}
+	if backend.calls != 1 {
+		t.Fatalf("SearchMessages called %d times, want 1 (saturation is a definitive accept, no retry)", backend.calls)
 	}
 }

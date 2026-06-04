@@ -282,9 +282,21 @@ func NewPostgresCutoverStore(pool *pgxpool.Pool) *PostgresCutoverStore {
 // target is still eligible. Filter SQL:
 //
 //   - tenant currently on f.SourceBackend, AND
-//   - no job row for f.TargetBackend, OR the only row for
-//     f.TargetBackend is a recoverable `failed` (failure_count
-//     and back-off window predicates apply).
+//   - no job row for f.TargetBackend, OR the row for
+//     f.TargetBackend is `pending` (operator-initiated intent that
+//     hasn't executed yet), OR it is a recoverable `failed`
+//     (failure_count and back-off window predicates apply).
+//
+// `pending` rows are candidates so InitiateCutover's documented
+// contract holds: an operator-initiated cutover whose synchronous
+// ExecuteCutover never ran (e.g. the HTTP request was cancelled
+// between the UpsertPending and the Claim) is still discovered by
+// the worker and driven to completion instead of wedging the tenant
+// in `pending` forever (and suppressing the auto-promotion that the
+// bare-NULL branch would otherwise have triggered). The worker's own
+// size-threshold gate still applies, so a below-threshold manual
+// initiation is left for the operator to re-trigger rather than
+// auto-promoted.
 //
 // `in_progress` rows are NOT candidates — they're either being
 // actively driven by another worker (the Claim race-loser path)
@@ -299,6 +311,7 @@ func (s *PostgresCutoverStore) ListCandidates(ctx context.Context, f CandidateFi
 		WHERE t.search_backend = $1
 		  AND (
 		      j.tenant_id IS NULL
+		      OR j.cutover_state = 'pending'
 		      OR (j.cutover_state = 'failed'
 		          AND j.failure_count < $3
 		          AND j.updated_at < $4)
@@ -851,6 +864,13 @@ func (d migrationDeps) recordAudit(ctx context.Context, tenantID, sourceBackend,
 // turning validation into a second full scan.
 const cutoverValidationSampleSize = 10
 
+// cutoverValidationLimit is the page size of the per-message search
+// probe. It also doubles as the saturation threshold in
+// validateSearchable: a result set this full means the term matches
+// at least this many docs, so a missing target is "ranked beyond the
+// window" rather than "absent". See validateSearchable.
+const cutoverValidationLimit = 50
+
 // cutoverValidationAttempts / cutoverValidationRetryDelay bound the
 // per-message retry loop that absorbs the destination index's
 // write-visibility latency (OpenSearch refresh interval, async
@@ -924,6 +944,22 @@ func (s *Service) Validate(ctx context.Context, tenantID, backend string, msgs [
 // exhausted. The budget is small and bounded, so a real failure
 // adds at most cutoverValidationAttempts*cutoverValidationRetryDelay
 // (~1s) before returning.
+//
+// The probe is a free-text query on the message's own subject (or
+// sender), since the backend's multi_match indexes those fields but
+// NOT the message_id. That means a tenant with many messages sharing
+// a common subject ("Re: thanks", a newsletter) can push the target
+// doc past the `cutoverValidationLimit`-sized result window even
+// though it is correctly indexed. We must not treat that as a
+// failure: when the result set is SATURATED (== limit hits) the term
+// demonstrably matches at least `limit` docs, so the index is
+// populated + queryable for it and the target is merely ranked
+// lower — inconclusive for this message, not the empty/broken-index
+// failure mode Validate guards against. Only a NON-saturated result
+// (< limit hits) that still lacks the target is a real miss: the
+// doc's own subject is the query, so if fewer than `limit` docs
+// matched, every match was returned and the target is genuinely
+// absent — which is retried (write-visibility) and ultimately fails.
 func (s *Service) validateSearchable(ctx context.Context, b SearchBackend, tenantID, backend string, m Message) error {
 	var lastErr error
 	for attempt := 0; attempt < cutoverValidationAttempts; attempt++ {
@@ -933,12 +969,18 @@ func (s *Service) validateSearchable(ctx context.Context, b SearchBackend, tenan
 				return ctx.Err()
 			}
 		}
-		hits, err := b.SearchMessages(ctx, tenantID, validationQuery(m), 50)
+		hits, err := b.SearchMessages(ctx, tenantID, validationQuery(m), cutoverValidationLimit)
 		if err != nil {
 			lastErr = fmt.Errorf("validate: search in %q: %w", backend, err)
 			continue
 		}
 		if containsMessageID(hits, m.MessageID) {
+			return nil
+		}
+		if len(hits) >= cutoverValidationLimit {
+			// Saturated window: index is populated + queryable for
+			// this term, the target is just ranked beyond it. Don't
+			// fail the cutover on a ranking artefact.
 			return nil
 		}
 		lastErr = fmt.Errorf("validate: message %q not searchable in %q after reindex", m.MessageID, backend)
@@ -1076,9 +1118,11 @@ func NewCutoverService(cfg CutoverServiceConfig) (*CutoverService, error) {
 // any prior failed/completed row's back-off) so the tenant becomes
 // immediately claimable. It does NOT run the migration — call
 // ExecuteCutover to drive it synchronously, or let the auto-worker
-// pick the pending row up on its next tick. Returns the resulting
-// job. Rejects an unknown backend value and a no-op cutover (the
-// tenant is already on the target).
+// pick the pending row up on its next tick (ListCandidates includes
+// `pending` rows, so a never-executed initiation is recovered rather
+// than wedged — subject to the worker's size threshold). Returns the
+// resulting job. Rejects an unknown backend value and a no-op
+// cutover (the tenant is already on the target).
 func (c *CutoverService) InitiateCutover(ctx context.Context, tenantID, targetBackend string) (*CutoverJob, error) {
 	if tenantID == "" || targetBackend == "" {
 		return nil, fmt.Errorf("%w: tenantID and targetBackend required", ErrInvalidInput)
