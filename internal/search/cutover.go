@@ -848,6 +848,12 @@ const (
 // validationRetrySleep is the sleep used between validation retries.
 // A package var (not a direct time.Sleep call) so tests can swap in
 // a no-op and exercise the retry path without real delays.
+//
+// It MUST only be mutated from tests (set-then-defer-restore) and the
+// tests that swap it MUST NOT run with t.Parallel(): production never
+// writes it, but it is process-global, so a parallel swap would race.
+// If the cutover validation knobs ever move onto Service, fold this in
+// as a Service field instead.
 var validationRetrySleep = time.Sleep
 
 // Validate implements BackendFlipper.Validate. After a reindex it
