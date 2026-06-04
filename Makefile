@@ -112,3 +112,36 @@ chaos:
 # manages the Vite lifecycle and verifies the expected output.
 screenshots:
 	./scripts/capture-screenshots-with-mock.sh
+
+# scale-test runs the multi-tenant scale load-test harness from
+# scripts/loadtest/: it seeds a synthetic tenant fleet, drives the
+# weighted workload through ramp-up/steady/cool-down, and renders a
+# Markdown SLO report. Override TENANTS / USERS / DURATION (steady-
+# state duration) and the SCALE_* knobs as needed. Set SCALE_DRY=1
+# to exercise the full pipeline (seed -> load -> report) offline
+# without touching the BFF — used by the build self-check.
+#
+#   make scale-test TENANTS=100 USERS=10 DURATION=10m
+#   make scale-test SCALE_DRY=1                 # offline dry run
+.PHONY: scale-test
+TENANTS        ?= 100
+USERS          ?= 20
+DURATION       ?= 10m
+SCALE_WORKERS  ?= 64
+SCALE_RAMPUP   ?= 1m
+SCALE_COOLDOWN ?= 1m
+SCALE_MESSAGES ?= 10000
+SCALE_OUT      ?= ./loadtest-out
+SCALE_DRY      ?=
+SCALE_DRY_FLAG := $(if $(SCALE_DRY),--dry-run,)
+scale-test:
+	@mkdir -p $(SCALE_OUT)
+	$(GO) run ./scripts/loadtest/seed-tenants.go \
+	  --tenants $(TENANTS) --users $(USERS) --messages $(SCALE_MESSAGES) $(SCALE_DRY_FLAG)
+	$(GO) run ./scripts/loadtest/scale-5k.go \
+	  --tenants $(TENANTS) --workers $(SCALE_WORKERS) \
+	  --rampup $(SCALE_RAMPUP) --steady $(DURATION) --cooldown $(SCALE_COOLDOWN) \
+	  --json-out $(SCALE_OUT)/scale-report.json $(SCALE_DRY_FLAG)
+	$(GO) run ./scripts/loadtest/report.go \
+	  --in $(SCALE_OUT)/scale-report.json --out $(SCALE_OUT)/scale-report.md \
+	  --fail-on-violation=$(if $(SCALE_DRY),false,true)
