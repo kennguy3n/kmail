@@ -87,6 +87,21 @@ spec:
             # whatever this value says (`:8080` by default).
             - name: KMAIL_API_ADDR
               value: ":{{ .Values.kmailApi.service.targetPort }}"
+            # Pin the in-process workers OFF here, mirroring the
+            # defensive pin in worker-deployment.yaml. The binary's
+            # in-source default is already `true`, but `env:` wins
+            # over the shared ConfigMap carried in `envFrom` above, so
+            # this makes the intent explicit and immune to ConfigMap
+            # drift: if an operator ever adds `KMAIL_DISABLE_WORKERS:
+            # "false"` to the chart's ConfigMap (e.g. to flip the
+            # binary into single-binary dev mode), the dedicated
+            # kmail-worker Deployment would otherwise start running the
+            # same workers as the API, double-processing every job.
+            # This per-pod pin keeps the API worker-free regardless of
+            # ConfigMap contents; single-binary mode is opted into by
+            # NOT deploying the worker and setting the flag elsewhere.
+            - name: KMAIL_DISABLE_WORKERS
+              value: "true"
             {{- if .Values.mtls.enabled }}
             # When mTLS is enabled the BFF MUST speak HTTPS on
             # Stalwart's `jmap-tls` listener (port 8443), and the
