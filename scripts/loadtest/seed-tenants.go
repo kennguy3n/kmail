@@ -175,18 +175,23 @@ func main() {
 		}()
 	}
 
+	// progressDone stops the progress reporter as soon as the run finishes,
+	// rather than relying on process exit to reap the goroutine.
+	progressDone := make(chan struct{})
 	go func() {
-		var done int64
+		var last int64
 		t := time.NewTicker(5 * time.Second)
 		defer t.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
+			case <-progressDone:
+				return
 			case <-t.C:
 				cur := atomic.LoadInt64(&st.tenantsCreated) + atomic.LoadInt64(&st.tenantsReused)
-				if cur != done {
-					done = cur
+				if cur != last {
+					last = cur
 					fmt.Printf("seed-tenants: %d/%d tenants reconciled (%d msgs)\n",
 						cur, cfg.tenants, atomic.LoadInt64(&st.messages))
 				}
@@ -204,6 +209,7 @@ loop:
 	}
 	close(jobs)
 	wg.Wait()
+	close(progressDone)
 
 	printSummary(cfg, &st, time.Since(start))
 	if atomic.LoadInt64(&st.tenantErrors) > 0 {

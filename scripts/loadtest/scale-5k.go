@@ -39,12 +39,13 @@ package main
 
 import (
 	"bytes"
+	"container/heap"
 	"context"
-	"crypto/rand"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	mrand "math/rand"
 	"mime/multipart"
 	"net/http"
@@ -274,14 +275,21 @@ type opCollector struct {
 
 func (o *opCollector) record(latency time.Duration, isErr bool, cap int, rng *mrand.Rand) {
 	o.n++
+	if isErr {
+		o.errors++
+		return
+	}
+	// Latency stats (mean, max, percentiles) describe *served* requests
+	// only. Errors are accounted for separately via the error rate; a
+	// failed request's wall-clock time (e.g. a 30s timeout) is not a
+	// latency the system delivered, so folding it into sumMs/maxMs would
+	// inflate those figures and make them inconsistent with the
+	// error-excluding percentiles. Hence we accumulate after the error
+	// check.
 	ms := float64(latency.Microseconds()) / 1000.0
 	o.sumMs += ms
 	if ms > o.maxMs {
 		o.maxMs = ms
-	}
-	if isErr {
-		o.errors++
-		return
 	}
 	// Reservoir sampling keeps memory bounded for multi-million
 	// request runs while preserving an unbiased latency sample.
@@ -296,42 +304,101 @@ func (o *opCollector) record(latency time.Duration, isErr bool, cap int, rng *mr
 	}
 }
 
-func (o *opCollector) merge(other *opCollector, cap int, rng *mrand.Rand) {
-	o.n += other.n
-	o.errors += other.errors
-	o.sumMs += other.sumMs
-	if other.maxMs > o.maxMs {
-		o.maxMs = other.maxMs
-	}
-	for _, s := range other.samples {
-		o.seen++
-		if len(o.samples) < cap {
-			o.samples = append(o.samples, s)
-			continue
-		}
-		j := rng.Int63n(o.seen)
-		if j < int64(cap) {
-			o.samples[j] = s
+// finalizeMerged aggregates exact counts across all per-worker collectors
+// for one operation and estimates percentiles from a population-weighted
+// merge of their latency reservoirs.
+func finalizeMerged(name string, weight int, cols []*opCollector, capN int, rng *mrand.Rand) opStat {
+	var n, errs int64
+	var sumMs, maxMs float64
+	for _, c := range cols {
+		n += c.n
+		errs += c.errors
+		sumMs += c.sumMs
+		if c.maxMs > maxMs {
+			maxMs = c.maxMs
 		}
 	}
-}
-
-func (o *opCollector) finalize(name string, weight int) opStat {
-	st := opStat{Op: name, Weight: weight, N: o.n, Errors: o.errors, MaxMs: round1(o.maxMs)}
-	succ := o.n - o.errors
-	if o.n > 0 {
-		st.ErrorRate = round2(100.0 * float64(o.errors) / float64(o.n))
+	st := opStat{Op: name, Weight: weight, N: n, Errors: errs, MaxMs: round1(maxMs)}
+	succ := n - errs
+	if n > 0 {
+		st.ErrorRate = round2(100.0 * float64(errs) / float64(n))
 	}
 	if succ > 0 {
-		st.MeanMs = round1(o.sumMs / float64(succ))
+		st.MeanMs = round1(sumMs / float64(succ))
 	}
-	if len(o.samples) > 0 {
-		sort.Float64s(o.samples)
-		st.P50ms = round1(percentile(o.samples, 50))
-		st.P95ms = round1(percentile(o.samples, 95))
-		st.P99ms = round1(percentile(o.samples, 99))
+	samples := mergeReservoirs(cols, capN, rng)
+	if len(samples) > 0 {
+		sort.Float64s(samples)
+		st.P50ms = round1(percentile(samples, 50))
+		st.P95ms = round1(percentile(samples, 95))
+		st.P99ms = round1(percentile(samples, 99))
 	}
 	return st
+}
+
+// mergeReservoirs combines the per-worker latency reservoirs into a single
+// bounded sample (size capN) suitable for percentile estimation.
+//
+// Each worker reservoir is itself a uniform sample of that worker's `seen`
+// successful observations, so a surviving sample represents seen/len(samples)
+// population items. A naive concatenation-then-resample would treat every
+// surviving sample as a single observation and therefore under-weight workers
+// that saw more traffic than their reservoir could hold. To stay unbiased we
+// weight each sample by the population it stands in for and apply
+// Efraimidis–Spirakis weighted reservoir sampling (A-Res): draw key = u^(1/w)
+// per item and keep the capN largest keys via a min-heap. Equal weights reduce
+// to ordinary uniform sampling, so small runs are exact.
+func mergeReservoirs(cols []*opCollector, capN int, rng *mrand.Rand) []float64 {
+	if capN < 1 {
+		return nil
+	}
+	h := make(keyHeap, 0, capN)
+	for _, c := range cols {
+		m := len(c.samples)
+		if m == 0 {
+			continue
+		}
+		w := 1.0
+		if c.seen > int64(m) {
+			w = float64(c.seen) / float64(m)
+		}
+		for _, s := range c.samples {
+			u := rng.Float64()
+			if u <= 0 {
+				u = math.SmallestNonzeroFloat64
+			}
+			key := math.Pow(u, 1.0/w)
+			if h.Len() < capN {
+				heap.Push(&h, keyed{key: key, val: s})
+			} else if key > h[0].key {
+				h[0] = keyed{key: key, val: s}
+				heap.Fix(&h, 0)
+			}
+		}
+	}
+	out := make([]float64, h.Len())
+	for i, k := range h {
+		out[i] = k.val
+	}
+	return out
+}
+
+// keyed is a latency sample tagged with its Efraimidis–Spirakis selection key.
+type keyed struct{ key, val float64 }
+
+// keyHeap is a min-heap on key, so the root is the weakest retained sample.
+type keyHeap []keyed
+
+func (h keyHeap) Len() int           { return len(h) }
+func (h keyHeap) Less(i, j int) bool { return h[i].key < h[j].key }
+func (h keyHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *keyHeap) Push(x any)        { *h = append(*h, x.(keyed)) }
+func (h *keyHeap) Pop() any {
+	old := *h
+	n := len(old)
+	it := old[n-1]
+	*h = old[:n-1]
+	return it
 }
 
 func percentile(sorted []float64, p int) float64 {
@@ -387,6 +454,9 @@ func main() {
 		http:    &http.Client{Timeout: cfg.httpTimeout},
 	}
 
+	// Generate the shared attachment payload once, before any worker runs.
+	initAttachmentPayload(cfg.attachmentSize)
+
 	targets, err := discoverTargets(ctx, cl, cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "scale-5k: target discovery failed: %v\n", err)
@@ -396,7 +466,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "scale-5k: no seeded tenants matching slug prefix %q — run `make scale-test` seeding first\n", cfg.slugPrefix)
 		os.Exit(1)
 	}
-	fmt.Printf("scale-5k: discovered %d targets across %d tenants\n", len(targets), len(targets))
+	fmt.Printf("scale-5k: discovered %d targets across %d requested tenants\n", len(targets), cfg.tenants)
 
 	s := run(ctx, cl, cfg, targets)
 	if err := writeSummary(cfg.jsonOut, s); err != nil {
@@ -483,19 +553,17 @@ func run(ctx context.Context, cl *client, cfg config, targets []target) summary 
 	close(done)
 	finish := time.Now()
 
-	// Merge per-worker collectors.
-	merged := make([]opCollector, len(workload))
+	// Aggregate per-op counts and merge the per-worker latency reservoirs
+	// into a single population-weighted sample for percentile estimation.
 	mrng := mrand.New(mrand.NewSource(1))
-	for _, cols := range collectors {
-		for i := range cols {
-			merged[i].merge(&cols[i], cfg.maxSamples, mrng)
-		}
-	}
-
 	s := summary{Meta: metaFrom(cfg, start, finish, len(targets))}
 	var totalN, totalErr int64
 	for i, op := range workload {
-		st := merged[i].finalize(op.name, op.weight)
+		cols := make([]*opCollector, len(collectors))
+		for w := range collectors {
+			cols[w] = &collectors[w][i]
+		}
+		st := finalizeMerged(op.name, op.weight, cols, cfg.maxSamples, mrng)
 		s.Operations = append(s.Operations, st)
 		totalN += st.N
 		totalErr += st.Errors
@@ -787,14 +855,19 @@ func opAdminAPI(ctx context.Context, c *client, t target) error {
 }
 
 func opAttachmentUpload(ctx context.Context, c *client, t target) error {
-	size := attachmentSize
 	body := &bytes.Buffer{}
+	body.Grow(len(attachmentPayload) + 256)
 	mw := multipart.NewWriter(body)
 	fw, err := mw.CreateFormFile("file", "scale-5k-blob.bin")
 	if err != nil {
 		return err
 	}
-	if _, err := io.CopyN(fw, rand.Reader, size); err != nil {
+	// Stream from a single pre-generated payload (see initAttachmentPayload):
+	// the bytes need only be incompressible-ish to exercise the upload path,
+	// not cryptographically random. bytes.Reader is safe for concurrent reads
+	// since the backing array is never mutated, so all workers share it
+	// instead of each allocating + crypto/rand-filling MiBs per request.
+	if _, err := io.Copy(fw, bytes.NewReader(attachmentPayload)); err != nil {
 		return err
 	}
 	if err := mw.Close(); err != nil {
@@ -823,6 +896,25 @@ func opAttachmentUpload(ctx context.Context, c *client, t target) error {
 // attachmentSize is set from config before the run starts so the
 // op closures (which take no config) can read it.
 var attachmentSize int64
+
+// attachmentPayload is the shared, immutable body uploaded by
+// opAttachmentUpload. It is generated once (initAttachmentPayload) with a
+// cheap PRNG — the content only needs to be non-trivially compressible to
+// exercise the upload path realistically, so paying crypto/rand + a fresh
+// multi-MiB allocation on every request would only make the load generator
+// itself the bottleneck.
+var attachmentPayload []byte
+
+func initAttachmentPayload(size int64) {
+	if size < 0 {
+		size = 0
+	}
+	attachmentPayload = make([]byte, size)
+	r := mrand.New(mrand.NewSource(0x5ca1e5))
+	for i := range attachmentPayload {
+		attachmentPayload[i] = byte(r.Intn(256))
+	}
+}
 
 // mrandShared is a process-wide RNG for non-latency-critical random
 // choices (search terms). Guarded for concurrency.
