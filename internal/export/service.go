@@ -21,6 +21,9 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/kennguy3n/kmail/internal/audit"
+	"github.com/kennguy3n/kmail/internal/middleware"
 )
 
 // Job is the public export-job shape.
@@ -39,14 +42,52 @@ type Job struct {
 	CompletedAt  *time.Time `json:"completed_at,omitempty"`
 }
 
-// Runner is the per-job callback that produces the archive and
-// returns the download URL. Wired in main.go.
-type Runner func(ctx context.Context, job Job) (downloadURL string, err error)
+// Result is what a Runner returns after materialising an export
+// archive. The Service persists these fields onto the export_jobs
+// row (artifact columns + download_url) and records MessageIDs in
+// the export_job_messages join table.
+type Result struct {
+	// DownloadURL is a short-lived presigned GET for the archive.
+	DownloadURL string
+	// ArtifactURL is the canonical, stable reference to the stored
+	// archive (re-presignable by the admin UI).
+	ArtifactURL string
+	// ArtifactSizeBytes is the size of the packaged archive.
+	ArtifactSizeBytes int64
+	// ArtifactChecksum is the lowercase hex SHA-256 of the archive.
+	ArtifactChecksum string
+	// MessageIDs are the account-qualified IDs included in the
+	// archive, recorded for audit / legal-hold reproducibility.
+	MessageIDs []string
+}
+
+// Runner materialises the archive for one job and returns its
+// Result. Wired in main.go; tests inject a fake.
+type Runner interface {
+	Run(ctx context.Context, job Job) (Result, error)
+}
+
+// errJobNotCurrent reports that a terminal-state write (markComplete /
+// markFailed) matched no row because the job is no longer the running
+// instance this goroutine claimed: RequeueStaleJobs reset it to
+// 'pending' (and another worker may have re-claimed it) while this run
+// was still in flight. The run's outcome is therefore abandoned — the
+// caller must not count it or treat it as the job's result, since the
+// authoritative run is the re-claimed one.
+var errJobNotCurrent = errors.New("export: job no longer in the claimed running state; terminal update skipped")
+
+// AuditLogger is the subset of *audit.Service the export service
+// writes to when a job changes state. Optional (nil disables audit
+// emission).
+type AuditLogger interface {
+	Log(ctx context.Context, e audit.Entry) (*audit.Entry, error)
+}
 
 // Service manages export jobs.
 type Service struct {
 	pool   *pgxpool.Pool
 	runner Runner
+	audit  AuditLogger
 }
 
 // NewService returns a Service.
@@ -57,6 +98,12 @@ func NewService(pool *pgxpool.Pool) *Service {
 // WithRunner sets the runner that materializes archives.
 func (s *Service) WithRunner(r Runner) *Service {
 	s.runner = r
+	return s
+}
+
+// WithAuditLogger wires the audit-log writer. Pass nil to disable.
+func (s *Service) WithAuditLogger(a AuditLogger) *Service {
+	s.audit = a
 	return s
 }
 
@@ -171,32 +218,192 @@ func (s *Service) claimNextJob(ctx context.Context) (*Job, error) {
 	return &j, nil
 }
 
-// markComplete records the runner result.
-func (s *Service) markComplete(ctx context.Context, id string, downloadURL string) error {
-	_, err := s.pool.Exec(ctx, `
-		UPDATE export_jobs SET status = 'completed', download_url = $2, completed_at = now()
-		WHERE id = $1::uuid
-	`, id, downloadURL)
-	return err
-}
-
-func (s *Service) markFailed(ctx context.Context, id string, runErr error) error {
-	_, err := s.pool.Exec(ctx, `
-		UPDATE export_jobs SET status = 'failed', error_message = $2, completed_at = now()
-		WHERE id = $1::uuid
-	`, id, runErr.Error())
-	return err
-}
-
-// RunExport executes the runner for a job. Useful for tests / for
-// the worker tick.
-func (s *Service) RunExport(ctx context.Context, job Job) error {
-	if s.runner == nil {
-		return s.markFailed(ctx, job.ID, fmt.Errorf("no runner registered"))
+// RequeueStaleJobs resets export jobs stuck in 'running' longer than
+// olderThan back to 'pending' so a later worker tick retries them. A
+// job goes stale when the process that claimed it died, or a
+// transient DB error stopped markComplete/markFailed from recording a
+// terminal state — claimNextJob only ever picks up 'pending' rows, so
+// without this backstop such a job would hang in 'running' forever.
+//
+// olderThan must comfortably exceed the longest expected job runtime
+// so a still-running export is never requeued and run a second time.
+// Returns the number of jobs requeued.
+//
+// Like claimNextJob this runs on the worker's (RLS-bypassing) pool
+// connection without a tenant GUC: it is a cross-tenant maintenance
+// sweep scoped by status + age rather than by tenant.
+func (s *Service) RequeueStaleJobs(ctx context.Context, olderThan time.Duration) (int64, error) {
+	if s.pool == nil {
+		return 0, nil
 	}
-	url, err := s.runner(ctx, job)
+	cutoff := time.Now().Add(-olderThan)
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE export_jobs
+		SET status = 'pending', started_at = NULL, error_message = ''
+		WHERE status = 'running' AND started_at IS NOT NULL AND started_at < $1
+	`, cutoff)
 	if err != nil {
-		return s.markFailed(ctx, job.ID, err)
+		return 0, fmt.Errorf("requeue stale jobs: %w", err)
 	}
-	return s.markComplete(ctx, job.ID, url)
+	return tag.RowsAffected(), nil
+}
+
+// markComplete records the runner result: the artifact columns +
+// download_url on the export_jobs row and one export_job_messages
+// row per included message. All writes happen in a single
+// tenant-scoped transaction so the RLS policies on both tables
+// (which require app.tenant_id) are satisfied and the job + its
+// message manifest commit atomically.
+func (s *Service) markComplete(ctx context.Context, job Job, res Result) error {
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := middleware.SetTenantGUC(ctx, tx, job.TenantID); err != nil {
+			return err
+		}
+		// Fence the write to the exact run we claimed: only update a row
+		// that is still 'running' with the same started_at this goroutine
+		// saw at claim time. If RequeueStaleJobs reset the job to 'pending'
+		// (started_at NULL) or another worker re-claimed it (a new
+		// started_at) while we ran, this matches zero rows so we neither
+		// clobber the re-claimed run's state nor resurrect a 'pending' job
+		// into 'completed' with a stale artifact.
+		tag, err := tx.Exec(ctx, `
+			UPDATE export_jobs
+			SET status = 'completed', download_url = $2, completed_at = now(),
+			    artifact_url = $3, artifact_size_bytes = $4, artifact_checksum = $5
+			WHERE id = $1::uuid AND tenant_id = $6::uuid
+			  AND status = 'running' AND started_at = $7
+		`, job.ID, res.DownloadURL, res.ArtifactURL, res.ArtifactSizeBytes, res.ArtifactChecksum, job.TenantID, job.StartedAt)
+		if err != nil {
+			return fmt.Errorf("update export_jobs: %w", err)
+		}
+		if tag.RowsAffected() == 0 {
+			// Job was requeued/re-claimed mid-run: skip the manifest
+			// insert and signal the abandoned run to the caller.
+			return errJobNotCurrent
+		}
+		// Insert the whole manifest in one round-trip by unnesting the
+		// id array, rather than issuing one INSERT per message. A large
+		// export can include up to defaultMaxMessages (100k) ids;
+		// 100k sequential round-trips inside this transaction would
+		// hold row locks for a long time and risk a statement/transaction
+		// timeout, widening the window in which a crash leaves the job
+		// stuck in 'running'. ON CONFLICT DO NOTHING keeps the insert
+		// idempotent so a RequeueStaleJobs retry of markComplete is safe.
+		if len(res.MessageIDs) > 0 {
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO export_job_messages (job_id, tenant_id, message_id)
+				SELECT $1::uuid, $2::uuid, m
+				FROM unnest($3::text[]) AS m
+				ON CONFLICT (job_id, message_id) DO NOTHING
+			`, job.ID, job.TenantID, res.MessageIDs); err != nil {
+				return fmt.Errorf("insert export_job_messages: %w", err)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	// Only emit the audit entry for a run that actually recorded the
+	// terminal state (gated on the UPDATE above taking effect).
+	s.logAudit(ctx, job, "export.completed", map[string]any{
+		"format":              job.Format,
+		"scope":               job.Scope,
+		"artifact_size_bytes": res.ArtifactSizeBytes,
+		"artifact_checksum":   res.ArtifactChecksum,
+		"message_count":       len(res.MessageIDs),
+	})
+	return nil
+}
+
+func (s *Service) markFailed(ctx context.Context, job Job, runErr error) error {
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := middleware.SetTenantGUC(ctx, tx, job.TenantID); err != nil {
+			return err
+		}
+		// Same run-fencing as markComplete: never mark a job 'failed' once
+		// it has been requeued/re-claimed, otherwise a slow run that
+		// errored out after the stale-timeout would permanently fail a job
+		// that is already being retried, defeating RequeueStaleJobs.
+		tag, err := tx.Exec(ctx, `
+			UPDATE export_jobs SET status = 'failed', error_message = $2, completed_at = now()
+			WHERE id = $1::uuid AND tenant_id = $3::uuid
+			  AND status = 'running' AND started_at = $4
+		`, job.ID, runErr.Error(), job.TenantID, job.StartedAt)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return errJobNotCurrent
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	s.logAudit(ctx, job, "export.failed", map[string]any{
+		"format": job.Format,
+		"scope":  job.Scope,
+		"error":  runErr.Error(),
+	})
+	return nil
+}
+
+// logAudit appends a tenant-scoped audit entry for an export state
+// change. Best-effort: a logging failure must not fail the export,
+// so the error is swallowed (the audit chain is tamper-evident, not
+// transactional with the job).
+func (s *Service) logAudit(ctx context.Context, job Job, action string, meta map[string]any) {
+	if s.audit == nil || job.TenantID == "" {
+		return
+	}
+	actorID := job.RequesterID
+	if actorID == "" {
+		actorID = "export-worker"
+	}
+	_, _ = s.audit.Log(ctx, audit.Entry{
+		TenantID:     job.TenantID,
+		ActorID:      actorID,
+		ActorType:    audit.ActorSystem,
+		Action:       action,
+		ResourceType: "export_job",
+		ResourceID:   job.ID,
+		Metadata:     meta,
+	})
+}
+
+// RunExport executes the runner for a job and persists the outcome.
+// It returns the Result (zero on failure) plus any error so the
+// worker can update metrics and logs.
+func (s *Service) RunExport(ctx context.Context, job Job) (Result, error) {
+	if s.runner == nil {
+		err := errors.New("export: no runner registered")
+		if mErr := s.markFailed(ctx, job, err); mErr != nil {
+			// If the job was requeued/re-claimed mid-run the failure
+			// write is a no-op; surface that abandonment verbatim so the
+			// worker neither double-counts nor masks it with the run err.
+			if errors.Is(mErr, errJobNotCurrent) {
+				return Result{}, mErr
+			}
+			return Result{}, fmt.Errorf("%w (and mark-failed: %v)", err, mErr)
+		}
+		return Result{}, err
+	}
+	res, err := s.runner.Run(ctx, job)
+	if err != nil {
+		if mErr := s.markFailed(ctx, job, err); mErr != nil {
+			if errors.Is(mErr, errJobNotCurrent) {
+				return Result{}, mErr
+			}
+			return Result{}, fmt.Errorf("%w (and mark-failed: %v)", err, mErr)
+		}
+		return Result{}, err
+	}
+	if err := s.markComplete(ctx, job, res); err != nil {
+		// errJobNotCurrent propagates here too: the artifact was built
+		// and uploaded but the job was requeued, so the result is
+		// discarded and the retry will produce the authoritative one.
+		return Result{}, err
+	}
+	return res, nil
 }
