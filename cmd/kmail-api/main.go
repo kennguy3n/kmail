@@ -1135,8 +1135,14 @@ func main() {
 	}
 	exportSvc.WithRunner(exportRunner)
 	export.NewHandlers(exportSvc).Register(mux, authMW)
+	// Register the export collectors unconditionally (matching the
+	// retention worker above) so the API's /metrics surface stays
+	// stable regardless of KMAIL_DISABLE_WORKERS — only the worker's
+	// Run loop is gated. This avoids silently dropping kmail_export_*
+	// from the API scrape target when workers run in the kmail-worker
+	// process instead.
+	exportMetrics := export.NewMetrics(metrics.Registry)
 	if !disableWorkers {
-		exportMetrics := export.NewMetrics(metrics.Registry)
 		go export.NewWorker(exportSvc, logger).WithMetrics(exportMetrics).Run(ctx)
 	}
 
