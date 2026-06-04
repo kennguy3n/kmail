@@ -92,10 +92,11 @@ func (h *CutoverHandlers) initiate(w http.ResponseWriter, r *http.Request) {
 	actorID := middleware.KChatUserIDFrom(r.Context())
 	if err := h.svc.ExecuteCutover(r.Context(), tenantID, req.TargetBackend, actorID); err != nil {
 		// A validation/reindex failure is a real, expected
-		// operator-facing outcome: the job row is now `failed`
-		// and the tenant is still safely on source. Surface the
-		// terminal row alongside the error so the UI can render
-		// it without a second round-trip.
+		// operator-facing outcome: the job row is now `failed` and
+		// the tenant is still safely on source. We return just the
+		// error status here; the admin UI refreshes the history table
+		// (a GET) from its catch handler to pick up the now-`failed`
+		// row, so the failed terminal state is never lost.
 		status := statusFor(err)
 		if errors.Is(err, ErrCutoverInProgress) {
 			status = http.StatusConflict

@@ -177,6 +177,55 @@ describe("<SearchAdmin /> cutover", () => {
     expect(screen.getByRole("button", { name: "Start cutover" })).toBeDisabled();
   });
 
+  it("clears the prior tenant's cutover history (no stale flash) on switch", async () => {
+    // Tenant-1 has a completed cutover; tenant-2's history GET is held
+    // open so we can observe the window between the switch and the new
+    // response. Without resetting `cutoverJobs` to null in `reload`,
+    // tenant-1's row would stay visible under tenant-2 during that gap.
+    const tenant2 = { ...tenant, id: "tenant-2", name: "Beta", slug: "beta" };
+    listTenants.mockResolvedValueOnce([tenant, tenant2]);
+    getSearchBackend.mockResolvedValue({ backend: "shared_meilisearch" });
+    listAvailableSearchBackends.mockResolvedValue([
+      "shared_meilisearch",
+      "shared_opensearch",
+    ]);
+    let releaseTenant2Jobs!: (jobs: { jobs: CutoverJob[] }) => void;
+    const tenant2Jobs = new Promise<{ jobs: CutoverJob[] }>((resolve) => {
+      releaseTenant2Jobs = resolve;
+    });
+    requestJSON.mockImplementation((url: string, init?: RequestInit) => {
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (method === "GET" && url.includes("tenant-2")) {
+        return tenant2Jobs;
+      }
+      if (method === "GET") {
+        return Promise.resolve({ jobs: [completedJob] });
+      }
+      return Promise.reject(new Error(`unexpected request: ${method} ${url}`));
+    });
+    render(<SearchAdmin />);
+    await screen.findByRole("heading", { name: "Cutover", level: 3 });
+    // Tenant-1's completed row is on screen.
+    expect(await screen.findByRole("cell", { name: "Completed" })).toBeInTheDocument();
+
+    fireEvent.change(screen.getByRole("combobox", { name: /tenant/i }), {
+      target: { value: "tenant-2" },
+    });
+
+    await waitFor(() => {
+      expect(getSearchBackend).toHaveBeenCalledWith("tenant-2");
+    });
+    // While tenant-2's history is still loading, tenant-1's row must be
+    // gone and the loading affordance shown — not a stale cross-tenant flash.
+    expect(screen.queryByRole("cell", { name: "Completed" })).toBeNull();
+    expect(screen.getByText("Loading…")).toBeInTheDocument();
+
+    releaseTenant2Jobs({ jobs: [] });
+    expect(
+      await screen.findByText("No cutovers have run for this tenant."),
+    ).toBeInTheDocument();
+  });
+
   it("surfaces a failed cutover and keeps the tenant readable", async () => {
     const { AdminApiError } =
       await vi.importActual<typeof import("../../api/admin")>("../../api/admin");

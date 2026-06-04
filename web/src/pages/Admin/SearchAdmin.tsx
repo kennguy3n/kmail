@@ -154,7 +154,10 @@ export default function SearchAdmin() {
       // tenant across a tenant switch: the stale option is filtered
       // out of the <select> but the controlled value survives, so
       // the "Start cutover" button stays enabled and would submit a
-      // target meant for a different tenant.
+      // target meant for a different tenant. (Tenant-switch-only
+      // state — `info` and `cutoverJobs` — is cleared in the
+      // selectedTenantId effect, not here, so a same-tenant refresh
+      // after a cutover keeps its success line.)
       setCutoverTarget("");
       getSearchBackend(tid)
         .then(setConfig)
@@ -165,7 +168,17 @@ export default function SearchAdmin() {
   );
 
   useEffect(() => {
-    if (selectedTenantId) reload(selectedTenantId);
+    if (!selectedTenantId) return;
+    // A new tenant was selected: drop the previous tenant's transient
+    // view state before the refetch lands so nothing bleeds across the
+    // switch. `cutoverJobs -> null` falls the history table back to its
+    // "Loading…" affordance instead of briefly showing tenant A's rows
+    // under tenant B; `info` clears a "Cutover to X completed." line so
+    // it can't linger under a different tenant. (Same-tenant refreshes
+    // call `reload` directly and intentionally preserve these.)
+    setInfo(null);
+    setCutoverJobs(null);
+    reload(selectedTenantId);
   }, [selectedTenantId, reload]);
 
   // Fetch the wired-backend list once per mount. The endpoint is
