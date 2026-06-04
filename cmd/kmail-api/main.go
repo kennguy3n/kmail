@@ -379,11 +379,15 @@ func main() {
 		billingLifecycleEarly.WithStripe(stripeClient, planPrices)
 	}
 	billing.NewHandlers(billingSvc, logger).WithLifecycle(billingLifecycleEarly).Register(mux, authMW)
-	billing.NewWebhookHandler(billing.WebhookConfig{
+	// Captured so the self-service signup completer can be injected
+	// later (the signup service depends on the tenant service, built
+	// further down). See the signup wiring block near onboarding.
+	stripeWebhook := billing.NewWebhookHandler(billing.WebhookConfig{
 		Lifecycle:           billingLifecycleEarly,
 		StripeWebhookSecret: os.Getenv("KMAIL_STRIPE_WEBHOOK_SECRET"),
 		Logger:              logger,
-	}).Register(mux)
+	})
+	stripeWebhook.Register(mux)
 
 	// kmail-secrets envelope. KMAIL_SECRETS_KEY is the single
 	// master key from which every BFF-side at-rest encryption key
@@ -1196,6 +1200,58 @@ func main() {
 	// Phase 6: auto-complete onboarding steps from internal events.
 	autoTriggerSvc := onboarding.NewAutoTriggerService(pool)
 	webhookSvc.AddListener(autoTriggerSvc)
+
+	// --- Self-service tenant signup (gap-closure Session 3) ---
+	// Public signup funnel: POST /api/v1/signup mints a Stripe
+	// Checkout Session; the checkout.session.completed webhook drives
+	// CompleteSignup to provision the tenant idempotently. Wired here
+	// because it composes the tenant, onboarding, audit, DNS, and
+	// JMAP services assembled above.
+	signupMetrics := tenant.NewSignupMetrics(metrics.Registry)
+	signupPlanPrices := map[string]string{
+		"core":    os.Getenv("KMAIL_STRIPE_PRICE_CORE"),
+		"pro":     os.Getenv("KMAIL_STRIPE_PRICE_PRO"),
+		"privacy": os.Getenv("KMAIL_STRIPE_PRICE_PRIVACY"),
+	}
+	var signupCheckout tenant.StripeCheckoutClient
+	if k := os.Getenv("KMAIL_STRIPE_SECRET_KEY"); k != "" {
+		signupCheckout = &tenant.StripeCheckoutHTTP{
+			APIKey:  k,
+			BaseURL: os.Getenv("KMAIL_STRIPE_API_BASE"),
+			HTTP:    http.DefaultClient,
+		}
+	}
+	signupWelcomeMailer := tenant.NewJMAPWelcomeMailer(
+		internalJmap,
+		os.Getenv("KMAIL_SIGNUP_WELCOME_TENANT"),
+		os.Getenv("KMAIL_SIGNUP_WELCOME_USER"),
+		os.Getenv("KMAIL_SIGNUP_WELCOME_FROM"),
+		os.Getenv("KMAIL_SIGNUP_WELCOME_IDENTITY"),
+		logger,
+	)
+	signupSvc := tenant.NewSignupService(tenant.SignupConfig{
+		Repo:        tenant.NewSignupRepository(pool),
+		Provisioner: tenant.NewSignupProvisioner(tenantSvc, pool),
+		Stripe:      signupCheckout,
+		Checklist: tenant.NewChecklistAdapter(func(ctx context.Context, tid string) error {
+			_, err := onboardingSvc.GetChecklist(ctx, tid)
+			return err
+		}),
+		Audit:         auditSvc,
+		Mailer:        signupWelcomeMailer,
+		DNS:           dnsSvc,
+		Metrics:       signupMetrics,
+		PlanPrices:    signupPlanPrices,
+		PublicBaseURL: os.Getenv("KMAIL_PUBLIC_BASE_URL"),
+		Logger:        logger,
+	})
+	tenant.NewSignupHandlers(tenant.SignupHandlersConfig{
+		Service: signupSvc,
+		Limiter: limiterStore,
+		Metrics: signupMetrics,
+		Logger:  logger,
+	}).Register(mux)
+	stripeWebhook.SetSignupCompleter(signupSvc)
 
 	// Wire metrics and tracing into the outer handler chain.
 	handler := http.Handler(mux)

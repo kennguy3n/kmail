@@ -40,6 +40,7 @@ import DkimAdmin from "./pages/Admin/DkimAdmin";
 import SieveAdmin from "./pages/Admin/SieveAdmin";
 import SecuritySettings from "./pages/Admin/SecuritySettings";
 import ContactsView from "./pages/Mail/ContactsView";
+import Signup from "./pages/Signup";
 
 /**
  * App is the KMail React entrypoint.
@@ -56,6 +57,10 @@ export default function App() {
           the recipient is unauthenticated and should not see the
           KMail nav or admin chrome. */}
       <Route path="secure/:token" element={<SecurePortal />} />
+
+      {/* Self-service signup funnel — public, pre-auth, outside the
+          Layout shell (no tenant/session exists yet). */}
+      <Route path="signup" element={<Signup />} />
 
       <Route element={<Layout />}>
         <Route index element={<Navigate to="/mail" replace />} />

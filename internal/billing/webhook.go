@@ -17,6 +17,7 @@
 package billing
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -40,11 +41,28 @@ import (
 // Stripe's own SDKs default to 5 minutes (300s).
 const stripeReplayWindow = 5 * time.Minute
 
+// SignupCompleter provisions a tenant for a completed Stripe Checkout
+// Session. Implemented by *tenant.SignupService. It is declared here
+// as a narrow interface (rather than importing the tenant package) so
+// billing stays free of a tenant import — tenant's signup flow does
+// not import billing, and keeping the dependency one-directional
+// avoids an import cycle.
+type SignupCompleter interface {
+	CompleteCheckoutSignup(ctx context.Context, stripeCheckoutSessionID string) error
+}
+
 // WebhookConfig wires the Stripe webhook handler.
 type WebhookConfig struct {
 	Lifecycle           *Lifecycle
 	StripeWebhookSecret string
 	Logger              *log.Logger
+	// SignupCompleter handles checkout.session.completed by
+	// provisioning the self-service tenant. Optional; when nil that
+	// event type is accepted and ignored. Usually wired after
+	// construction via SetSignupCompleter because the signup service
+	// depends on the tenant service, which is built later than the
+	// webhook handler at the composition root.
+	SignupCompleter SignupCompleter
 	// Now overrides time.Now for deterministic tests.
 	Now func() time.Time
 }
@@ -69,6 +87,15 @@ func NewWebhookHandler(cfg WebhookConfig) *WebhookHandler {
 // unauthenticated — Stripe webhooks are signed, not bearer-authed.
 func (h *WebhookHandler) Register(mux *http.ServeMux) {
 	mux.Handle("POST /api/v1/billing/webhooks/stripe", http.HandlerFunc(h.serve))
+}
+
+// SetSignupCompleter wires the self-service signup completer after
+// construction. The signup service depends on the tenant service,
+// which is assembled later than this webhook handler, so the
+// composition root captures the handler and injects the completer
+// once the tenant service exists.
+func (h *WebhookHandler) SetSignupCompleter(c SignupCompleter) {
+	h.cfg.SignupCompleter = c
 }
 
 type stripeEvent struct {
@@ -104,6 +131,13 @@ func (h *WebhookHandler) serve(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *WebhookHandler) dispatch(r *http.Request, ev stripeEvent) error {
+	// checkout.session.completed is the self-service signup
+	// completion trigger. It is handled before the Lifecycle nil
+	// guard because signup provisioning is independent of the
+	// billing Lifecycle and may be wired without it.
+	if ev.Type == "checkout.session.completed" {
+		return h.completeSignup(r, ev)
+	}
 	if h.cfg.Lifecycle == nil {
 		return nil
 	}
@@ -123,6 +157,32 @@ func (h *WebhookHandler) dispatch(r *http.Request, ev stripeEvent) error {
 
 type paymentObject struct {
 	Metadata map[string]string `json:"metadata"`
+}
+
+// checkoutSessionObject is the slice of a Stripe Checkout Session we
+// need from a checkout.session.completed event: the session id, which
+// is the idempotency key the signup flow stored on the
+// signup_requests row.
+type checkoutSessionObject struct {
+	ID string `json:"id"`
+}
+
+// completeSignup provisions the self-service tenant for a completed
+// Checkout Session. Idempotent: SignupCompleter maps a replayed
+// session id back to the same tenant, so Stripe's at-least-once
+// delivery is safe.
+func (h *WebhookHandler) completeSignup(r *http.Request, ev stripeEvent) error {
+	if h.cfg.SignupCompleter == nil {
+		return nil
+	}
+	var obj checkoutSessionObject
+	if err := json.Unmarshal(ev.Data.Object, &obj); err != nil {
+		return fmt.Errorf("decode checkout session: %w", err)
+	}
+	if obj.ID == "" {
+		return nil
+	}
+	return h.cfg.SignupCompleter.CompleteCheckoutSignup(r.Context(), obj.ID)
 }
 
 func tenantIDFromObject(raw json.RawMessage) string {
