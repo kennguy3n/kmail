@@ -198,6 +198,120 @@ func TestInternalClient_Dispatch_4xxDoesNotFailOver(t *testing.T) {
 	}
 }
 
+func TestInternalClient_DownloadBlob_HappyPath(t *testing.T) {
+	t.Parallel()
+
+	var gotPath string
+	var gotHeaders http.Header
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotHeaders = r.Header.Clone()
+		_, _ = w.Write([]byte("RAW-RFC5322-BYTES"))
+	}))
+	defer srv.Close()
+
+	p := newTestProxy(t)
+	p.target.Scheme = "http"
+	p.target.Host = srv.Listener.Addr().String()
+	c, _ := NewInternalClient(p)
+
+	body, err := c.DownloadBlob(context.Background(), "t1", "u1", "acc-1", "blob-9", "message.eml")
+	if err != nil {
+		t.Fatalf("DownloadBlob: %v", err)
+	}
+	if string(body) != "RAW-RFC5322-BYTES" {
+		t.Errorf("body = %q", body)
+	}
+	if gotPath != "/jmap/download/acc-1/blob-9/message.eml" {
+		t.Errorf("path = %q", gotPath)
+	}
+	if gotHeaders.Get("X-KMail-Stalwart-Account-Id") != "acc-1" {
+		t.Errorf("account header = %q", gotHeaders.Get("X-KMail-Stalwart-Account-Id"))
+	}
+}
+
+func TestInternalClient_DownloadBlob_OversizeErrors(t *testing.T) {
+	t.Parallel()
+
+	// Server returns more bytes than the (test-shrunk) cap. The
+	// client must report an error rather than silently returning the
+	// truncated prefix — a truncated export artifact is corrupt data.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("0123456789ABCDEF")) // 16 bytes
+	}))
+	defer srv.Close()
+
+	p := newTestProxy(t)
+	p.target.Scheme = "http"
+	p.target.Host = srv.Listener.Addr().String()
+	c, _ := NewInternalClient(p)
+	c.maxBlobBytes = 8
+
+	body, err := c.DownloadBlob(context.Background(), "t1", "u1", "acc-1", "blob-9", "big.bin")
+	if err == nil {
+		t.Fatalf("expected oversize error, got body len=%d", len(body))
+	}
+	if body != nil {
+		t.Errorf("oversize must not return truncated bytes; got %q", body)
+	}
+	if !strings.Contains(err.Error(), "exceeds") {
+		t.Errorf("err = %v, want it to mention the byte limit", err)
+	}
+}
+
+func TestInternalClient_DownloadBlob_ExactLimitOK(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("01234567")) // exactly 8 bytes
+	}))
+	defer srv.Close()
+
+	p := newTestProxy(t)
+	p.target.Scheme = "http"
+	p.target.Host = srv.Listener.Addr().String()
+	c, _ := NewInternalClient(p)
+	c.maxBlobBytes = 8
+
+	body, err := c.DownloadBlob(context.Background(), "t1", "u1", "acc-1", "blob-9", "exact.bin")
+	if err != nil {
+		t.Fatalf("a blob exactly at the limit must succeed: %v", err)
+	}
+	if string(body) != "01234567" {
+		t.Errorf("body = %q", body)
+	}
+}
+
+func TestInternalClient_Dispatch_OversizeErrors(t *testing.T) {
+	t.Parallel()
+
+	// A valid-but-oversized JSON envelope must fail explicitly rather
+	// than relying on json.Unmarshal to incidentally catch a truncated
+	// body.
+	big := `{"methodResponses":[["Mailbox/get",{"x":"` + strings.Repeat("a", 64) + `"},"c0"]]}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(big))
+	}))
+	defer srv.Close()
+
+	p := newTestProxy(t)
+	p.target.Scheme = "http"
+	p.target.Host = srv.Listener.Addr().String()
+	p.PrimeAccountCache("t1", "u1", "acc-1")
+	c, _ := NewInternalClient(p)
+	c.maxResponseBytes = 16
+
+	_, err := c.Dispatch(context.Background(), "t1", "u1", JmapRequest{
+		MethodCalls: [][]any{{"Mailbox/get", map[string]any{}, "c0"}},
+	})
+	if err == nil {
+		t.Fatal("expected oversize response error")
+	}
+	if !strings.Contains(err.Error(), "exceeds") {
+		t.Errorf("err = %v, want it to mention the byte limit", err)
+	}
+}
+
 func TestInternalClient_RequiresProxy(t *testing.T) {
 	t.Parallel()
 	if _, err := NewInternalClient(nil); err == nil {

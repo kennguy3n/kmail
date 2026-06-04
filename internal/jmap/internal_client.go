@@ -42,6 +42,13 @@ type InternalClient struct {
 	proxy   *Proxy
 	httpc   *http.Client
 	timeout time.Duration
+
+	// Byte caps on bodies read from Stalwart. Default to the
+	// package consts in NewInternalClient; held as fields so the
+	// oversize-guard tests can exercise the truncation path without
+	// allocating tens of MiB.
+	maxBlobBytes     int64
+	maxResponseBytes int64
 }
 
 // internalClientDefaultTimeout bounds the BFF→Stalwart request.
@@ -65,9 +72,11 @@ func NewInternalClient(proxy *Proxy) (*InternalClient, error) {
 		return nil, errors.New("jmap.NewInternalClient: proxy has no transport (uninitialised?)")
 	}
 	return &InternalClient{
-		proxy:   proxy,
-		httpc:   &http.Client{Transport: tr, Timeout: internalClientDefaultTimeout},
-		timeout: internalClientDefaultTimeout,
+		proxy:            proxy,
+		httpc:            &http.Client{Transport: tr, Timeout: internalClientDefaultTimeout},
+		timeout:          internalClientDefaultTimeout,
+		maxBlobBytes:     internalClientMaxBlobBytes,
+		maxResponseBytes: internalClientMaxResponseBytes,
 	}, nil
 }
 
@@ -131,12 +140,32 @@ func (r *JmapResponse) CallByID(id string) (string, map[string]any, bool) {
 	return "", nil, false
 }
 
+// MethodError is a JMAP method-level error (`["error", {...}, "cN"]`,
+// RFC 8620 §3.5.1) surfaced as a typed Go error so callers can
+// branch on the JMAP error `Type` rather than string-matching the
+// message. For example the retention sweep tolerates a per-account
+// `invalidArguments` raised by an `inMailbox` filter that names a
+// mailbox absent from that account (JMAP mailbox ids are
+// per-account, RFC 8621 §2).
+type MethodError struct {
+	Type        string
+	Description string
+}
+
+func (e *MethodError) Error() string {
+	if e.Description != "" {
+		return fmt.Sprintf("jmap method error: %s: %s", e.Type, e.Description)
+	}
+	return fmt.Sprintf("jmap method error: %s", e.Type)
+}
+
 // FirstCallError extracts the first JMAP method-level error from
 // the response, if any. The JMAP envelope itself is HTTP 200 even
 // when individual method calls fail (`["error", {...}, "c0"]` is
 // the canonical shape per RFC 8620 §3.5.1), so the bootstrap
 // handler must surface those to the SDK as a 502/5xx rather than
-// returning a partially-empty response.
+// returning a partially-empty response. The returned error is a
+// *MethodError so callers can inspect the JMAP error type.
 func (r *JmapResponse) FirstCallError() error {
 	for _, entry := range r.MethodResponses {
 		if len(entry) != 3 {
@@ -149,10 +178,7 @@ func (r *JmapResponse) FirstCallError() error {
 		args, _ := entry[1].(map[string]any)
 		typ, _ := args["type"].(string)
 		desc, _ := args["description"].(string)
-		if desc != "" {
-			return fmt.Errorf("jmap method error: %s: %s", typ, desc)
-		}
-		return fmt.Errorf("jmap method error: %s", typ)
+		return &MethodError{Type: typ, Description: desc}
 	}
 	return nil
 }
@@ -219,7 +245,12 @@ func (c *InternalClient) Dispatch(
 			c.proxy.logger.Printf("jmap internal client transport error shard=%s err=%v", base, err)
 			continue
 		}
-		respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, internalClientMaxResponseBytes))
+		// Read one byte past the cap so an over-limit response is
+		// detectable rather than silently truncated. json.Unmarshal
+		// below would usually reject truncated JSON, but relying on
+		// that is incidental; fail explicitly and consistently with
+		// DownloadBlob instead.
+		respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, c.maxResponseBytes+1))
 		_ = resp.Body.Close()
 		if readErr != nil {
 			lastErr = fmt.Errorf("jmap dispatch %s: read body: %w", base, readErr)
@@ -236,6 +267,9 @@ func (c *InternalClient) Dispatch(
 			// 4xx. Surface immediately so the caller can map to
 			// the corresponding handler response.
 			return nil, fmt.Errorf("jmap dispatch %s: upstream %d: %s", base, resp.StatusCode, truncate(respBody, 512))
+		}
+		if int64(len(respBody)) > c.maxResponseBytes {
+			return nil, fmt.Errorf("jmap dispatch %s: response exceeds %d byte limit", base, c.maxResponseBytes)
 		}
 		var out JmapResponse
 		if err := json.Unmarshal(respBody, &out); err != nil {
@@ -255,6 +289,116 @@ func (c *InternalClient) Dispatch(
 	}
 	return nil, lastErr
 }
+
+// DownloadBlob fetches a JMAP blob from Stalwart and returns its
+// raw bytes. It is the binary counterpart to Dispatch: where
+// Dispatch posts a JSON method batch to `/jmap/api`, DownloadBlob
+// GETs Stalwart's blob-download endpoint
+// (`/jmap/download/{accountId}/{blobId}/{name}`, RFC 8620 §6.2)
+// so a colocated caller (the eDiscovery export runner) can pull a
+// full RFC 5322 message or an attachment part by blobId.
+//
+// `accountID` is supplied by the caller rather than re-resolved
+// from `(tenant, user)` because the export path already holds the
+// account id (it qualified the email id with it). `kchatUserID`
+// still stamps the `X-KMail-Kchat-User-Id` identity header so
+// Stalwart authorises the download against the same principal the
+// proxy would. `name` is a cosmetic filename segment Stalwart
+// echoes into the Content-Disposition; pass "" to default to
+// "blob".
+//
+// Shard failover mirrors Dispatch: primary first, then each
+// secondary on transport error / 5xx. A 4xx is not retried (every
+// shard returns the same) and surfaces immediately.
+func (c *InternalClient) DownloadBlob(
+	ctx context.Context,
+	tenantID, kchatUserID, accountID, blobID, name string,
+) ([]byte, error) {
+	if strings.TrimSpace(tenantID) == "" {
+		return nil, errors.New("jmap.InternalClient.DownloadBlob: tenantID is required")
+	}
+	if strings.TrimSpace(kchatUserID) == "" {
+		return nil, errors.New("jmap.InternalClient.DownloadBlob: kchatUserID is required")
+	}
+	if strings.TrimSpace(accountID) == "" {
+		return nil, errors.New("jmap.InternalClient.DownloadBlob: accountID is required")
+	}
+	if strings.TrimSpace(blobID) == "" {
+		return nil, errors.New("jmap.InternalClient.DownloadBlob: blobID is required")
+	}
+	if name == "" {
+		name = "blob"
+	}
+
+	urls := c.proxy.ResolveShardURLs(ctx, tenantID)
+	if len(urls) == 0 {
+		urls = []string{c.proxy.Target().String()}
+	}
+
+	relPath := "/jmap/download/" +
+		url.PathEscape(accountID) + "/" +
+		url.PathEscape(blobID) + "/" +
+		url.PathEscape(name)
+
+	var lastErr error
+	for _, base := range urls {
+		endpoint, err := joinPath(base, relPath)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		httpReq.Header.Set("Accept", "application/octet-stream")
+		httpReq.Header.Set("X-KMail-Tenant-Id", tenantID)
+		httpReq.Header.Set("X-KMail-Kchat-User-Id", kchatUserID)
+		httpReq.Header.Set("X-KMail-Stalwart-Account-Id", accountID)
+
+		resp, err := c.httpc.Do(httpReq)
+		if err != nil {
+			lastErr = fmt.Errorf("jmap download %s: %w", base, err)
+			c.proxy.logger.Printf("jmap internal client download transport error shard=%s err=%v", base, err)
+			continue
+		}
+		// Read one byte past the cap so a blob that exactly fills
+		// the limit is distinguishable from a truncated one: if we
+		// got more than internalClientMaxBlobBytes back, the body
+		// was oversized and returning it would silently corrupt the
+		// export artifact. Surface it as an error instead.
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, c.maxBlobBytes+1))
+		_ = resp.Body.Close()
+		if readErr != nil {
+			lastErr = fmt.Errorf("jmap download %s: read body: %w", base, readErr)
+			continue
+		}
+		if resp.StatusCode >= 500 {
+			lastErr = fmt.Errorf("jmap download %s: upstream %d", base, resp.StatusCode)
+			c.proxy.logger.Printf("jmap internal client download 5xx shard=%s status=%d", base, resp.StatusCode)
+			continue
+		}
+		if resp.StatusCode >= 400 {
+			return nil, fmt.Errorf("jmap download %s: upstream %d: %s", base, resp.StatusCode, truncate(body, 512))
+		}
+		if int64(len(body)) > c.maxBlobBytes {
+			return nil, fmt.Errorf("jmap download %s: blob exceeds %d byte limit", base, c.maxBlobBytes)
+		}
+		return body, nil
+	}
+	if lastErr == nil {
+		lastErr = errors.New("jmap download: no shard URL configured")
+	}
+	return nil, lastErr
+}
+
+// internalClientMaxBlobBytes bounds a single blob download. A full
+// RFC 5322 message with inline attachments can be large; 64 MiB
+// matches the typical hard ceiling on message size in the
+// deliverability path and keeps a hostile / misconfigured Stalwart
+// from wedging the BFF on `io.ReadAll`.
+const internalClientMaxBlobBytes = 64 << 20
 
 // internalClientMaxResponseBytes bounds the response body the
 // internal client will accept from Stalwart. JMAP responses are
