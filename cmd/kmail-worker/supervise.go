@@ -64,10 +64,24 @@ type supervisor struct {
 	// as a field (rather than a constant) so tests can drive the
 	// restart path without real-time sleeps.
 	baseBackoff time.Duration
+	// healthyResetAfter is the minimum uptime a single Run loop must
+	// accumulate before its eventual return is treated as a fresh
+	// failure rather than a continuation of a flapping streak. A run
+	// that lasted at least this long resets the backoff to
+	// baseBackoff, so a worker that was healthy for hours and then
+	// exits once restarts promptly instead of at the capped delay;
+	// only *consecutive rapid* exits escalate the backoff. Exposed
+	// as a field so tests can shrink it without real-time waits.
+	healthyResetAfter time.Duration
 }
 
 func newSupervisor(metrics *workerMetrics, logger *log.Logger) *supervisor {
-	return &supervisor{metrics: metrics, logger: logger, baseBackoff: time.Second}
+	return &supervisor{
+		metrics:           metrics,
+		logger:            logger,
+		baseBackoff:       time.Second,
+		healthyResetAfter: supervisorMaxBackoff,
+	}
 }
 
 // start launches reg under supervision. It returns immediately; the
@@ -82,14 +96,20 @@ func (s *supervisor) run(ctx context.Context, reg workerRegistration) {
 	s.metrics.up.WithLabelValues(reg.name).Set(1)
 	defer s.metrics.up.WithLabelValues(reg.name).Set(0)
 
-	backoff := s.baseBackoff
-	if backoff <= 0 {
-		backoff = time.Second
+	baseBackoff := s.baseBackoff
+	if baseBackoff <= 0 {
+		baseBackoff = time.Second
 	}
+	healthyResetAfter := s.healthyResetAfter
+	if healthyResetAfter <= 0 {
+		healthyResetAfter = supervisorMaxBackoff
+	}
+	backoff := baseBackoff
 	for {
 		if ctx.Err() != nil {
 			return
 		}
+		start := time.Now()
 		s.runOnce(ctx, reg)
 		if ctx.Err() != nil {
 			// Context cancelled: this is a normal shutdown, not a
@@ -98,19 +118,46 @@ func (s *supervisor) run(ctx context.Context, reg workerRegistration) {
 		}
 		// Unexpected early return (or a recovered panic): restart
 		// after a capped backoff so a flapping downstream doesn't
-		// turn into a hot loop.
+		// turn into a hot loop. A run that stayed up for a sustained
+		// healthy period resets the streak (see advanceBackoff).
 		s.metrics.restarts.WithLabelValues(reg.name).Inc()
-		s.logger.Printf("worker %q returned before shutdown; restarting in %s", reg.name, backoff)
+		delay, next := advanceBackoff(backoff, baseBackoff, time.Since(start), healthyResetAfter)
+		backoff = next
+		s.logger.Printf("worker %q returned before shutdown; restarting in %s", reg.name, delay)
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(backoff):
-		}
-		backoff *= 2
-		if backoff > supervisorMaxBackoff {
-			backoff = supervisorMaxBackoff
+		case <-time.After(delay):
 		}
 	}
+}
+
+// advanceBackoff computes the delay to wait before the next restart
+// and the backoff to carry into the following iteration, given the
+// previously-carried backoff (prev), the floor (base), how long the
+// just-finished run lasted (ranFor), and the healthy-run threshold.
+//
+// If the run lasted at least healthyResetAfter it is not part of a
+// flapping streak, so the delay drops back to base; otherwise the
+// escalated prev applies. The carried backoff is the applied delay
+// doubled, capped at supervisorMaxBackoff. Pure (no clock/IO) so the
+// escalation/reset behaviour is unit-testable without real sleeps.
+func advanceBackoff(prev, base, ranFor, healthyResetAfter time.Duration) (delay, next time.Duration) {
+	if base <= 0 {
+		base = time.Second
+	}
+	delay = prev
+	if delay < base {
+		delay = base
+	}
+	if ranFor >= healthyResetAfter {
+		delay = base
+	}
+	next = delay * 2
+	if next > supervisorMaxBackoff {
+		next = supervisorMaxBackoff
+	}
+	return delay, next
 }
 
 // runOnce executes a single invocation of the worker's Run loop with

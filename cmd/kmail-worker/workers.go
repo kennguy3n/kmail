@@ -425,8 +425,8 @@ func buildCutoverWorker(
 	}
 	openURL := os.Getenv("KMAIL_OPENSEARCH_URL")
 	if openURL != "" {
-		openUser := os.Getenv("KMAIL_OPENSEARCH_USERNAME")
-		openPass := os.Getenv("KMAIL_OPENSEARCH_PASSWORD")
+		openUser := os.Getenv("KMAIL_OPENSEARCH_USER")
+		openPass := os.Getenv("KMAIL_OPENSEARCH_PASS")
 		backends = append(backends, search.NewOpenSearchBackend(openURL, openUser, openPass))
 		sharedOpen, err := search.NewSharedOpenSearchBackend(openURL, openUser, openPass, shardResolver)
 		if err != nil {

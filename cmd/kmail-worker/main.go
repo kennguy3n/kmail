@@ -52,10 +52,14 @@ func main() {
 	}
 	logger.Printf("starting with %s", cfg)
 
-	// startupCtx is used for one-shot construction-time probes
-	// (e.g. the Valkey ping that selects the circuit-breaker impl).
-	// It is cancelled as soon as construction finishes; the workers
-	// themselves run under the separate workerCtx below.
+	// startupCtx bounds one-shot construction-time probes (e.g. the
+	// Valkey ping that selects the circuit-breaker impl, and the
+	// pool's initial connection). It is cancelled explicitly as soon
+	// as construction finishes (see startupCancel() after
+	// buildWorkers) — the long-lived workers run under the separate
+	// workerCtx below, and pgxpool only uses this context for the
+	// initial connect, not the pool's lifetime. The deferred cancel
+	// is an idempotent safety net for the early-return (Fatalf) paths.
 	startupCtx, startupCancel := context.WithCancel(context.Background())
 	defer startupCancel()
 
@@ -107,6 +111,11 @@ func main() {
 	}
 	wm.registered.Set(float64(len(regs)))
 	logger.Printf("kmail-worker: %d background workers registered", len(regs))
+
+	// Construction is done: release the startup context now (rather
+	// than waiting for the deferred cancel at process exit) so no
+	// construction-time probe lingers while the workers run.
+	startupCancel()
 
 	// workerCtx drives the worker lifecycle. It is cancelled first on
 	// shutdown so workers drain before the HTTP server and pools go.

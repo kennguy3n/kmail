@@ -303,6 +303,45 @@ func TestBuildWorkersOptionalGatesEnabled(t *testing.T) {
 	}
 }
 
+func TestAdvanceBackoff(t *testing.T) {
+	const base = time.Second
+	const healthy = supervisorMaxBackoff
+
+	// Consecutive rapid (unhealthy) exits escalate the delay,
+	// doubling each time and capping at supervisorMaxBackoff.
+	var prev time.Duration // first iteration carries base
+	wantSeq := []time.Duration{1, 2, 4, 8, 16, 30, 30}
+	for i, want := range wantSeq {
+		delay, next := advanceBackoff(prev, base, 0 /* ran <0.1ms: unhealthy */, healthy)
+		if delay != want*time.Second {
+			t.Fatalf("iter %d: delay = %s, want %s", i, delay, want*time.Second)
+		}
+		prev = next
+	}
+
+	// A run that lasted at least healthyResetAfter resets the streak:
+	// even after a long escalated backoff, the next delay drops to base.
+	delay, next := advanceBackoff(supervisorMaxBackoff, base, healthy, healthy)
+	if delay != base {
+		t.Fatalf("healthy run: delay = %s, want %s (reset to base)", delay, base)
+	}
+	if next != 2*base {
+		t.Fatalf("healthy run: next = %s, want %s", next, 2*base)
+	}
+
+	// A run just under the threshold does NOT reset.
+	delay, _ = advanceBackoff(8*time.Second, base, healthy-time.Nanosecond, healthy)
+	if delay != 8*time.Second {
+		t.Fatalf("sub-threshold run: delay = %s, want 8s (no reset)", delay)
+	}
+
+	// Defensive: a non-positive base falls back to one second.
+	delay, _ = advanceBackoff(0, 0, 0, healthy)
+	if delay != time.Second {
+		t.Fatalf("zero base: delay = %s, want 1s", delay)
+	}
+}
+
 func TestGetenvHelpers(t *testing.T) {
 	t.Setenv("KMAIL_WORKER_TEST_DUR", "45s")
 	if got := getenvDuration("KMAIL_WORKER_TEST_DUR", time.Hour); got != 45*time.Second {
