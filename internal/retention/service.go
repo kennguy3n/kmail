@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -58,8 +59,11 @@ type Policy struct {
 // Service manages retention policies and drives enforcement
 // through an optional Enforcer.
 type Service struct {
-	pool     *pgxpool.Pool
-	enforcer *Enforcer
+	pool *pgxpool.Pool
+	// enforcer is registered by the worker goroutine (engineFor)
+	// while EvaluateRetention may read it from another goroutine, so
+	// it is stored atomically to keep the two paths race-free.
+	enforcer atomic.Pointer[Enforcer]
 }
 
 // NewService returns a Service.
@@ -72,7 +76,7 @@ func NewService(pool *pgxpool.Pool) *Service {
 // its options are known and registers it here so both the worker
 // loop and any direct EvaluateRetention caller share one engine.
 func (s *Service) WithEnforcer(e *Enforcer) *Service {
-	s.enforcer = e
+	s.enforcer.Store(e)
 	return s
 }
 
@@ -165,7 +169,8 @@ func (s *Service) EvaluateRetention(ctx context.Context, tenantID string) (int, 
 	if err != nil {
 		return 0, err
 	}
-	if s.enforcer == nil {
+	enforcer := s.enforcer.Load()
+	if enforcer == nil {
 		enabled := 0
 		for _, p := range policies {
 			if p.Enabled {
@@ -180,7 +185,7 @@ func (s *Service) EvaluateRetention(ctx context.Context, tenantID string) (int, 
 		if !p.Enabled {
 			continue
 		}
-		if _, err := s.enforcer.EnforcePolicy(ctx, tenantID, p); err != nil {
+		if _, err := enforcer.EnforcePolicy(ctx, tenantID, p); err != nil {
 			errs = append(errs, fmt.Errorf("policy %s: %w", p.ID, err))
 			continue
 		}

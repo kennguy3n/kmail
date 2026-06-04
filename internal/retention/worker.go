@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -185,6 +186,12 @@ func (w *Worker) Run(ctx context.Context) {
 // and registers it on the Service so direct EvaluateRetention
 // callers reuse the same instance. Returns nil when no operator has
 // been wired (the worker then logs and skips enforcement).
+//
+// The sync.Once snapshots the worker's configuration (op, dryRun,
+// metrics) at the first tick: this is startup-only config, so every
+// With* option must be set before Run starts. There is intentionally
+// no runtime reconfiguration path — a config change requires a new
+// worker.
 func (w *Worker) engineFor() *Enforcer {
 	w.engineOnce.Do(func() {
 		if w.op == nil {
@@ -403,6 +410,69 @@ func (e *JMAPEnforcer) DestroyEmails(ctx context.Context, tenantID string, ids [
 		if err := e.jmap(ctx, url, body, &resp); err != nil {
 			return err
 		}
+		// HTTP success does not imply JMAP success: Stalwart reports
+		// per-message failures in `notDestroyed`. Surface any hard
+		// failure (forbidden/serverFail/...) so the run is recorded as
+		// failed instead of silently under-deleting while counting the
+		// batch as removed.
+		if err := checkJMAPDestroy(resp.MethodResponses, "c1"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// checkJMAPDestroy inspects an `Email/set` destroy response and
+// returns an error only for hard failures. A `notFound` SetError
+// means the message was already gone (idempotent destroy) and is
+// ignored, mirroring jmap.StalwartEmailOperator. IDs are visited in
+// sorted order so the surfaced error is deterministic when a batch
+// has several distinct hard failures.
+func checkJMAPDestroy(methodResponses [][]json.RawMessage, callID string) error {
+	if len(methodResponses) == 0 || len(methodResponses[0]) < 2 {
+		return fmt.Errorf("retention: missing Email/set response (%s)", callID)
+	}
+	var name string
+	if err := json.Unmarshal(methodResponses[0][0], &name); err != nil {
+		return fmt.Errorf("retention: decode Email/set response method: %w", err)
+	}
+	if name == "error" {
+		var je struct {
+			Type        string `json:"type"`
+			Description string `json:"description"`
+		}
+		_ = json.Unmarshal(methodResponses[0][1], &je)
+		if je.Description != "" {
+			return fmt.Errorf("retention: Email/set destroy failed: %s: %s", je.Type, je.Description)
+		}
+		return fmt.Errorf("retention: Email/set destroy failed: %s", je.Type)
+	}
+	if name != "Email/set" {
+		return fmt.Errorf("retention: unexpected response method for %s: %q", callID, name)
+	}
+	var args struct {
+		NotDestroyed map[string]struct {
+			Type        string `json:"type"`
+			Description string `json:"description"`
+		} `json:"notDestroyed"`
+	}
+	if err := json.Unmarshal(methodResponses[0][1], &args); err != nil {
+		return fmt.Errorf("retention: decode Email/set args: %w", err)
+	}
+	ids := make([]string, 0, len(args.NotDestroyed))
+	for id := range args.NotDestroyed {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		setErr := args.NotDestroyed[id]
+		if setErr.Type == "notFound" {
+			continue
+		}
+		if setErr.Description != "" {
+			return fmt.Errorf("retention: destroy %s failed: %s: %s", id, setErr.Type, setErr.Description)
+		}
+		return fmt.Errorf("retention: destroy %s failed: %s", id, setErr.Type)
 	}
 	return nil
 }
