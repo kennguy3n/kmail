@@ -3,11 +3,16 @@ package search
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
+	"github.com/kennguy3n/kmail/internal/audit"
 )
 
 // inMemoryCutoverStore exercises the worker's state machine
@@ -120,6 +125,11 @@ func (s *inMemoryCutoverStore) ListCandidates(_ context.Context, f CandidateFilt
 		switch {
 		case !ok:
 			ids = append(ids, id)
+		case r.state == CutoverPending:
+			// Mirrors the production SQL's `OR cutover_state =
+			// 'pending'`: an operator-initiated row that never
+			// executed is still a candidate.
+			ids = append(ids, id)
 		case r.state == CutoverFailed && r.failureCount < f.MaxFailures && r.updatedAt.Before(f.RetryAfterBefore):
 			ids = append(ids, id)
 		}
@@ -142,6 +152,10 @@ func (s *inMemoryCutoverStore) Claim(_ context.Context, tenantID, targetBackend 
 	r.state = CutoverInProgress
 	r.mailboxSize = size
 	r.startedAt = &now
+	// A fresh attempt clears any prior completion timestamp so a
+	// later MarkFailed can't leave a failed row advertising an old
+	// "Completed" date. Mirrors PostgresCutoverStore.Claim.
+	r.completedAt = nil
 	r.updatedAt = now
 	return true, nil
 }
@@ -241,6 +255,88 @@ func (s *inMemoryCutoverStore) ReconcileStale(_ context.Context, sourceBackend, 
 	return n, nil
 }
 
+// toJob projects a memRow into the CutoverJob shape the store's
+// Get / List / UpsertPending readers return, synthesising the
+// created_at the in-memory model doesn't track separately.
+func (r *memRow) toJob(tenantID, targetBackend string) CutoverJob {
+	return CutoverJob{
+		TenantID:      tenantID,
+		TargetBackend: targetBackend,
+		State:         r.state,
+		MailboxSize:   r.mailboxSize,
+		Threshold:     r.threshold,
+		StartedAt:     r.startedAt,
+		CompletedAt:   r.completedAt,
+		FailureCount:  r.failureCount,
+		LastError:     r.lastError,
+		CreatedAt:     r.updatedAt,
+		UpdatedAt:     r.updatedAt,
+	}
+}
+
+// UpsertPending mirrors the Postgres impl: leave an in_progress
+// row entirely untouched (including updatedAt, so ReconcileStale's
+// crash-recovery clock keeps running); otherwise (re)set the row to
+// pending with refreshed size/threshold and a cleared back-off so
+// the manual trigger overrides the failure / completed guards.
+func (s *inMemoryCutoverStore) UpsertPending(_ context.Context, tenantID, targetBackend string, size, threshold int64, now time.Time) (*CutoverJob, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k := memRowKey{tenantID: tenantID, targetBackend: targetBackend}
+	r, ok := s.rows[k]
+	if !ok {
+		r = &memRow{state: CutoverPending, mailboxSize: size, threshold: threshold, updatedAt: now}
+		s.rows[k] = r
+		j := r.toJob(tenantID, targetBackend)
+		return &j, nil
+	}
+	if r.state == CutoverInProgress {
+		j := r.toJob(tenantID, targetBackend)
+		return &j, nil
+	}
+	r.state = CutoverPending
+	r.failureCount = 0
+	r.lastError = ""
+	r.mailboxSize = size
+	r.threshold = threshold
+	// Re-initiating a completed row must not carry its old
+	// completion timestamp into the new lifecycle. Mirrors
+	// PostgresCutoverStore.UpsertPending.
+	r.completedAt = nil
+	r.updatedAt = now
+	j := r.toJob(tenantID, targetBackend)
+	return &j, nil
+}
+
+// Get mirrors the Postgres impl, returning ErrNotFound for a
+// missing (tenant, target) row.
+func (s *inMemoryCutoverStore) Get(_ context.Context, tenantID, targetBackend string) (*CutoverJob, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r, ok := s.rows[memRowKey{tenantID: tenantID, targetBackend: targetBackend}]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	j := r.toJob(tenantID, targetBackend)
+	return &j, nil
+}
+
+// List returns every row for a tenant. Order is unspecified in the
+// in-memory model (map iteration); callers that assert ordering
+// should use the Postgres impl.
+func (s *inMemoryCutoverStore) List(_ context.Context, tenantID string) ([]CutoverJob, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var jobs []CutoverJob
+	for k, r := range s.rows {
+		if k.tenantID != tenantID {
+			continue
+		}
+		jobs = append(jobs, r.toJob(k.tenantID, k.targetBackend))
+	}
+	return jobs, nil
+}
+
 // fakeFlipper records ReindexTo / SetBackend invocations so tests
 // can assert what the worker drove and inject per-tenant failures.
 // SetBackend writes back to the linked inMemoryCutoverStore so the
@@ -254,6 +350,14 @@ type fakeFlipper struct {
 	reindexCall    map[string]reindexCallRecord
 	setBackendErr  map[string]error
 	reindexErr     map[string]error
+	// validateErr injects a per-tenant validation failure so
+	// tests can assert a reindex that "succeeded" but produced an
+	// unsearchable index leaves the tenant on the source backend.
+	validateErr map[string]error
+	// validateCall records the (backend, count) Validate saw so
+	// tests can confirm validation ran AFTER reindex and BEFORE
+	// the backend flip.
+	validateCall map[string]reindexCallRecord
 }
 
 type reindexCallRecord struct {
@@ -268,7 +372,23 @@ func newFakeFlipper(store *inMemoryCutoverStore) *fakeFlipper {
 		reindexCall:    map[string]reindexCallRecord{},
 		setBackendErr:  map[string]error{},
 		reindexErr:     map[string]error{},
+		validateErr:    map[string]error{},
+		validateCall:   map[string]reindexCallRecord{},
 	}
+}
+
+// Validate records the call and returns any injected per-tenant
+// error. It does NOT write back to the store, so a validation
+// failure leaves `tenantBackends` (the source backend) untouched —
+// exactly the safety property the cutover guarantees.
+func (f *fakeFlipper) Validate(_ context.Context, tenantID, backend string, msgs []Message) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.validateErr[tenantID]; err != nil {
+		return err
+	}
+	f.validateCall[tenantID] = reindexCallRecord{backend: backend, count: len(msgs)}
+	return nil
 }
 
 func (f *fakeFlipper) SetBackend(_ context.Context, tenantID, backend string) error {
@@ -371,6 +491,68 @@ func TestCutoverWorker_AboveThresholdFullCutover(t *testing.T) {
 	}
 	if store.tenantBackends["tenant-a"] != BackendOpenSearch {
 		t.Fatalf("tenant backend = %q, want opensearch", store.tenantBackends["tenant-a"])
+	}
+}
+
+// TestCutoverWorker_PendingCandidateIsClaimed proves the worker
+// recovers an operator-initiated `pending` row whose synchronous
+// ExecuteCutover never ran (e.g. the HTTP request was cancelled
+// between InitiateCutover's UpsertPending and the Claim). Before the
+// fix, ListCandidates matched only NULL or `failed` rows, so the
+// lingering pending row both failed to be picked up AND masked the
+// bare-NULL auto-promotion the tenant would otherwise have gotten —
+// wedging it in pending forever. ListCandidates now includes pending
+// rows, so the next tick claims and completes it.
+func TestCutoverWorker_PendingCandidateIsClaimed(t *testing.T) {
+	store := newInMemoryStore([]string{"tenant-a"})
+	flipper := newFakeFlipper(store)
+	now := time.Unix(1_700_000_000, 0)
+	// Simulate InitiateCutover whose ExecuteCutover never ran.
+	if _, err := store.UpsertPending(context.Background(), "tenant-a", BackendOpenSearch, 200_000, 100_000, now); err != nil {
+		t.Fatalf("seed pending row: %v", err)
+	}
+	if r := store.rowFor("tenant-a", BackendOpenSearch); r == nil || r.state != CutoverPending {
+		t.Fatalf("precondition: want a pending row, got %+v", r)
+	}
+	sizer := MailboxSizerFunc(func(context.Context, string) (int64, error) { return 200_000, nil })
+	source := MessageSourceFunc(func(context.Context, string) ([]Message, error) {
+		return []Message{{TenantID: "tenant-a", MessageID: "m1"}}, nil
+	})
+	w := buildWorker(t, store, flipper, sizer, source, 100_000, func() time.Time { return now })
+	w.Tick(context.Background())
+
+	if r := store.rowFor("tenant-a", BackendOpenSearch); r == nil || r.state != CutoverCompleted {
+		t.Fatalf("orphaned pending row not recovered: state = %+v, want CutoverCompleted", r)
+	}
+	if store.tenantBackends["tenant-a"] != BackendOpenSearch {
+		t.Fatalf("tenant backend = %q, want opensearch (flip must happen)", store.tenantBackends["tenant-a"])
+	}
+}
+
+// TestCutoverWorker_BelowThresholdPendingNotAutoPromoted pins the
+// other half of the contract: a pending row IS a candidate, but the
+// worker's size-threshold gate still applies, so a below-threshold
+// manual initiation is left untouched for the operator to re-trigger
+// (via ExecuteCutover) rather than silently auto-promoted.
+func TestCutoverWorker_BelowThresholdPendingNotAutoPromoted(t *testing.T) {
+	store := newInMemoryStore([]string{"tenant-a"})
+	flipper := newFakeFlipper(store)
+	now := time.Unix(1_700_000_000, 0)
+	if _, err := store.UpsertPending(context.Background(), "tenant-a", BackendOpenSearch, 1_000, 100_000, now); err != nil {
+		t.Fatalf("seed pending row: %v", err)
+	}
+	sizer := MailboxSizerFunc(func(context.Context, string) (int64, error) { return 1_000, nil }) // below threshold
+	source := MessageSourceFunc(func(context.Context, string) ([]Message, error) {
+		return []Message{{TenantID: "tenant-a", MessageID: "m1"}}, nil
+	})
+	w := buildWorker(t, store, flipper, sizer, source, 100_000, func() time.Time { return now })
+	w.Tick(context.Background())
+
+	if r := store.rowFor("tenant-a", BackendOpenSearch); r == nil || r.state != CutoverPending {
+		t.Fatalf("below-threshold pending row = %+v, want left as CutoverPending (no auto-promote)", r)
+	}
+	if store.tenantBackends["tenant-a"] != BackendMeilisearch {
+		t.Fatalf("tenant backend = %q, want meilisearch (below-threshold must not flip)", store.tenantBackends["tenant-a"])
 	}
 }
 
@@ -490,6 +672,10 @@ type gatedFlipper struct {
 
 func (g *gatedFlipper) SetBackend(ctx context.Context, tenantID, backend string) error {
 	return g.inner.SetBackend(ctx, tenantID, backend)
+}
+
+func (g *gatedFlipper) Validate(ctx context.Context, tenantID, backend string, msgs []Message) error {
+	return g.inner.Validate(ctx, tenantID, backend, msgs)
 }
 
 func (g *gatedFlipper) ReindexTo(ctx context.Context, tenantID, backend string, msgs []Message) error {
@@ -705,6 +891,8 @@ func TestCutoverWorker_MarkCompletedPersistentFailureReconcilesNextTick(t *testi
 	// tick we'll clear the flake so reconciliation can run
 	// cleanly.
 	wrapped := &flakeyMarkCompleted{CutoverStore: store, failuresLeft: 999}
+	metrics := NewCutoverMetrics(nil)
+	rec := &recordingAudit{}
 	sizer := MailboxSizerFunc(func(context.Context, string) (int64, error) { return 200_000, nil })
 	source := MessageSourceFunc(func(context.Context, string) ([]Message, error) {
 		return []Message{{TenantID: "tenant-a"}}, nil
@@ -715,6 +903,8 @@ func TestCutoverWorker_MarkCompletedPersistentFailureReconcilesNextTick(t *testi
 		Sizer:                sizer,
 		Source:               source,
 		Logger:               silentLogger(),
+		Metrics:              metrics,
+		Audit:                rec,
 		Threshold:            100_000,
 		Interval:             time.Hour,
 		MaxFailures:          5,
@@ -735,6 +925,20 @@ func TestCutoverWorker_MarkCompletedPersistentFailureReconcilesNextTick(t *testi
 	if store.tenantBackends["tenant-a"] != BackendOpenSearch {
 		t.Fatalf("tenant backend = %q, want opensearch (SetBackend ran)", store.tenantBackends["tenant-a"])
 	}
+	// SetBackend committed, so the cutover succeeded even though the
+	// MarkCompleted bookkeeping is still exhausted: the completion
+	// metric + audit entry must already be recorded. ReconcileCompleted
+	// only repairs the store row, never the counter or audit trail, so
+	// recording these lazily would permanently undercount.
+	if got := testutil.ToFloat64(metrics.Completed); got != 1 {
+		t.Fatalf("completed counter = %v, want 1 (recorded at SetBackend, not at MarkCompleted)", got)
+	}
+	if got := testutil.ToFloat64(metrics.InProgress); got != 0 {
+		t.Fatalf("in-progress gauge = %v, want 0 after tick settles", got)
+	}
+	if _, ok := rec.find("search_cutover_completed"); !ok {
+		t.Fatal("no search_cutover_completed audit entry despite successful SetBackend")
+	}
 
 	// Drop the flake so the reconciler can stick.
 	wrapped.failuresLeft = 0
@@ -745,6 +949,11 @@ func TestCutoverWorker_MarkCompletedPersistentFailureReconcilesNextTick(t *testi
 	w.Tick(context.Background())
 	if r := store.rowByTenant("tenant-a"); r == nil || r.state != CutoverCompleted {
 		t.Fatalf("after reconcile tick, row = %+v, want completed", r)
+	}
+	// ReconcileCompleted repaired the row but must NOT re-count the
+	// completion — the counter stays at exactly 1.
+	if got := testutil.ToFloat64(metrics.Completed); got != 1 {
+		t.Fatalf("completed counter = %v after reconcile, want 1 (no double count)", got)
 	}
 }
 
@@ -1046,3 +1255,670 @@ func TestCutoverWorker_SameTenantBothTransitionsKeyedIndependently(t *testing.T)
 // helper. Used by the multi-transition test above so we can
 // inject a pre-existing job row with a populated `completedAt`.
 func ptrTime(t time.Time) *time.Time { return &t }
+
+// fakeGetter reports a tenant's current backend by reading the
+// linked in-memory store's tenantBackends map, so it reflects a
+// SetBackend flip immediately (mirroring production's GetBackend
+// reading `tenants.search_backend`).
+type fakeGetter struct{ store *inMemoryCutoverStore }
+
+func (g fakeGetter) GetBackend(_ context.Context, tenantID string) (string, error) {
+	g.store.mu.Lock()
+	defer g.store.mu.Unlock()
+	b, ok := g.store.tenantBackends[tenantID]
+	if !ok {
+		return "", ErrNotFound
+	}
+	return b, nil
+}
+
+// recordingAudit captures every audit.Entry the cutover paths emit
+// so tests can assert action / actor / metadata wiring.
+type recordingAudit struct {
+	mu      sync.Mutex
+	entries []audit.Entry
+}
+
+func (a *recordingAudit) Log(_ context.Context, e audit.Entry) (*audit.Entry, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.entries = append(a.entries, e)
+	return &e, nil
+}
+
+func (a *recordingAudit) find(action string) (audit.Entry, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, e := range a.entries {
+		if e.Action == action {
+			return e, true
+		}
+	}
+	return audit.Entry{}, false
+}
+
+// TestCutoverWorker_ValidationFailureLeavesTenantOnSource is the
+// headline safety test: a reindex that "succeeds" but produces an
+// index the validation step can't query must NOT flip the backend
+// — the tenant stays readable on the source and the row is failed.
+func TestCutoverWorker_ValidationFailureLeavesTenantOnSource(t *testing.T) {
+	store := newInMemoryStore([]string{"tenant-a"})
+	flipper := newFakeFlipper(store)
+	flipper.validateErr["tenant-a"] = errors.New("0 of 2 sample messages searchable")
+	now := time.Unix(1_700_000_000, 0)
+	sizer := MailboxSizerFunc(func(context.Context, string) (int64, error) { return 200_000, nil })
+	source := MessageSourceFunc(func(context.Context, string) ([]Message, error) {
+		return []Message{{TenantID: "tenant-a", MessageID: "m1"}}, nil
+	})
+	w := buildWorker(t, store, flipper, sizer, source, 100_000, func() time.Time { return now })
+	w.Tick(context.Background())
+
+	// Reindex ran (validation is downstream of it)...
+	if rec := flipper.reindexCall["tenant-a"]; rec.backend != BackendOpenSearch {
+		t.Fatalf("expected ReindexTo to run before validation, got %+v", rec)
+	}
+	// ...but the backend was NOT flipped.
+	if got := flipper.setBackendCall["tenant-a"]; got != "" {
+		t.Fatalf("SetBackend ran despite validation failure: %q", got)
+	}
+	if store.tenantBackends["tenant-a"] != BackendMeilisearch {
+		t.Fatalf("tenant moved off source on validation failure: %q", store.tenantBackends["tenant-a"])
+	}
+	r := store.rowByTenant("tenant-a")
+	if r == nil || r.state != CutoverFailed || r.failureCount != 1 {
+		t.Fatalf("row = %+v, want failed/1", r)
+	}
+	if want := "validate: "; len(r.lastError) < len(want) || r.lastError[:len(want)] != want {
+		t.Fatalf("last_error = %q, want a 'validate: ...' reason", r.lastError)
+	}
+}
+
+// TestCutoverWorker_ValidationRunsBetweenReindexAndSetBackend pins
+// the call ordering: validation sees the reindexed batch and runs
+// before the backend flip on the happy path.
+func TestCutoverWorker_ValidationRunsBetweenReindexAndSetBackend(t *testing.T) {
+	store := newInMemoryStore([]string{"tenant-a"})
+	flipper := newFakeFlipper(store)
+	now := time.Unix(1_700_000_000, 0)
+	msgs := []Message{{TenantID: "tenant-a", MessageID: "m1"}, {TenantID: "tenant-a", MessageID: "m2"}}
+	sizer := MailboxSizerFunc(func(context.Context, string) (int64, error) { return 200_000, nil })
+	source := MessageSourceFunc(func(context.Context, string) ([]Message, error) { return msgs, nil })
+	w := buildWorker(t, store, flipper, sizer, source, 100_000, func() time.Time { return now })
+	w.Tick(context.Background())
+
+	vc, ok := flipper.validateCall["tenant-a"]
+	if !ok {
+		t.Fatal("Validate was never called on the happy path")
+	}
+	if vc.backend != BackendOpenSearch || vc.count != 2 {
+		t.Fatalf("Validate saw %+v, want {opensearch, 2}", vc)
+	}
+	if flipper.setBackendCall["tenant-a"] != BackendOpenSearch {
+		t.Fatal("SetBackend did not run after successful validation")
+	}
+}
+
+// barrierFlipper blocks every ReindexTo at a barrier so a test can
+// observe exactly how many cutovers the worker runs in parallel.
+type barrierFlipper struct {
+	inner   *fakeFlipper
+	entered chan string
+	release chan struct{}
+}
+
+func (b *barrierFlipper) ReindexTo(ctx context.Context, tenantID, backend string, msgs []Message) error {
+	b.entered <- tenantID
+	<-b.release
+	return b.inner.ReindexTo(ctx, tenantID, backend, msgs)
+}
+
+func (b *barrierFlipper) SetBackend(ctx context.Context, tenantID, backend string) error {
+	return b.inner.SetBackend(ctx, tenantID, backend)
+}
+
+func (b *barrierFlipper) Validate(ctx context.Context, tenantID, backend string, msgs []Message) error {
+	return b.inner.Validate(ctx, tenantID, backend, msgs)
+}
+
+// TestCutoverWorker_ConcurrencyCapBoundsInFlight proves the worker
+// never runs more than Concurrency cutovers at once. With a cap of
+// 2 and 5 oversized tenants, exactly 2 reach ReindexTo while the
+// rest wait; releasing the barrier lets the remaining tenants
+// migrate.
+func TestCutoverWorker_ConcurrencyCapBoundsInFlight(t *testing.T) {
+	tenants := []string{"t1", "t2", "t3", "t4", "t5"}
+	store := newInMemoryStore(tenants)
+	flipper := newFakeFlipper(store)
+	barrier := &barrierFlipper{
+		inner:   flipper,
+		entered: make(chan string, len(tenants)),
+		release: make(chan struct{}),
+	}
+	now := time.Unix(1_700_000_000, 0)
+	sizer := MailboxSizerFunc(func(context.Context, string) (int64, error) { return 200_000, nil })
+	source := MessageSourceFunc(func(_ context.Context, id string) ([]Message, error) {
+		return []Message{{TenantID: id, MessageID: id + "-m1"}}, nil
+	})
+	w, err := NewCutoverWorker(CutoverConfig{
+		Store:       store,
+		Service:     barrier,
+		Sizer:       sizer,
+		Source:      source,
+		Logger:      silentLogger(),
+		Threshold:   100_000,
+		Interval:    time.Hour,
+		MaxFailures: 5,
+		MaxRetryGap: time.Hour,
+		Concurrency: 2,
+		Now:         func() time.Time { return now },
+		Sleep:       func(time.Duration) {},
+	})
+	if err != nil {
+		t.Fatalf("NewCutoverWorker: %v", err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		w.Tick(context.Background())
+		close(done)
+	}()
+
+	// Exactly Concurrency (2) cutovers should reach the barrier.
+	for i := 0; i < 2; i++ {
+		select {
+		case <-barrier.entered:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("only %d cutovers started, want 2 in parallel", i)
+		}
+	}
+	// A 3rd must NOT start while the first two hold their slots.
+	select {
+	case id := <-barrier.entered:
+		t.Fatalf("concurrency cap exceeded: tenant %q started a 3rd parallel cutover", id)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	// Release the barrier; every tenant should now migrate.
+	close(barrier.release)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not finish after releasing the barrier")
+	}
+	for _, id := range tenants {
+		if r := store.rowByTenant(id); r == nil || r.state != CutoverCompleted {
+			t.Fatalf("tenant %s row = %+v, want completed", id, r)
+		}
+	}
+}
+
+// TestCutoverMetrics_TrackCompletedAndFailed verifies the
+// Prometheus counters move on the success and failure paths and
+// the in-flight gauge settles back to zero.
+func TestCutoverMetrics_TrackCompletedAndFailed(t *testing.T) {
+	store := newInMemoryStore([]string{"ok-tenant", "bad-tenant"})
+	flipper := newFakeFlipper(store)
+	flipper.reindexErr["bad-tenant"] = errors.New("opensearch down")
+	metrics := NewCutoverMetrics(nil)
+	now := time.Unix(1_700_000_000, 0)
+	sizer := MailboxSizerFunc(func(context.Context, string) (int64, error) { return 200_000, nil })
+	source := MessageSourceFunc(func(_ context.Context, id string) ([]Message, error) {
+		return []Message{{TenantID: id, MessageID: id + "-m1"}}, nil
+	})
+	w, err := NewCutoverWorker(CutoverConfig{
+		Store:       store,
+		Service:     flipper,
+		Sizer:       sizer,
+		Source:      source,
+		Logger:      silentLogger(),
+		Metrics:     metrics,
+		Threshold:   100_000,
+		Interval:    time.Hour,
+		MaxFailures: 5,
+		MaxRetryGap: time.Hour,
+		Now:         func() time.Time { return now },
+		Sleep:       func(time.Duration) {},
+	})
+	if err != nil {
+		t.Fatalf("NewCutoverWorker: %v", err)
+	}
+	w.Tick(context.Background())
+
+	if got := testutil.ToFloat64(metrics.Completed); got != 1 {
+		t.Fatalf("completed counter = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(metrics.Failed); got != 1 {
+		t.Fatalf("failed counter = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(metrics.InProgress); got != 0 {
+		t.Fatalf("in-progress gauge = %v, want 0 after tick settles", got)
+	}
+}
+
+// TestCutoverWorker_AuditsCompletedAndFailed verifies the worker
+// emits system-actor audit entries for both terminal outcomes with
+// the source/target backends recorded in the metadata.
+func TestCutoverWorker_AuditsCompletedAndFailed(t *testing.T) {
+	store := newInMemoryStore([]string{"ok-tenant", "bad-tenant"})
+	flipper := newFakeFlipper(store)
+	flipper.reindexErr["bad-tenant"] = errors.New("opensearch down")
+	rec := &recordingAudit{}
+	now := time.Unix(1_700_000_000, 0)
+	sizer := MailboxSizerFunc(func(context.Context, string) (int64, error) { return 200_000, nil })
+	source := MessageSourceFunc(func(_ context.Context, id string) ([]Message, error) {
+		return []Message{{TenantID: id, MessageID: id + "-m1"}}, nil
+	})
+	w, err := NewCutoverWorker(CutoverConfig{
+		Store:       store,
+		Service:     flipper,
+		Sizer:       sizer,
+		Source:      source,
+		Audit:       rec,
+		Logger:      silentLogger(),
+		Threshold:   100_000,
+		Interval:    time.Hour,
+		MaxFailures: 5,
+		MaxRetryGap: time.Hour,
+		Now:         func() time.Time { return now },
+		Sleep:       func(time.Duration) {},
+	})
+	if err != nil {
+		t.Fatalf("NewCutoverWorker: %v", err)
+	}
+	w.Tick(context.Background())
+
+	done, ok := rec.find("search_cutover_completed")
+	if !ok {
+		t.Fatal("no search_cutover_completed audit entry")
+	}
+	if done.ActorType != audit.ActorSystem {
+		t.Fatalf("completed actorType = %q, want system", done.ActorType)
+	}
+	if done.Metadata["target_backend"] != BackendOpenSearch || done.Metadata["source_backend"] != BackendMeilisearch {
+		t.Fatalf("completed metadata = %+v, want source meili / target opensearch", done.Metadata)
+	}
+	failed, ok := rec.find("search_cutover_failed")
+	if !ok {
+		t.Fatal("no search_cutover_failed audit entry")
+	}
+	if failed.ActorType != audit.ActorSystem {
+		t.Fatalf("failed actorType = %q, want system", failed.ActorType)
+	}
+	if _, hasErr := failed.Metadata["error"]; !hasErr {
+		t.Fatalf("failed metadata missing error: %+v", failed.Metadata)
+	}
+}
+
+// buildCutoverService wires a CutoverService over the in-memory
+// store + fake flipper used by the manual-path tests.
+func buildCutoverService(t *testing.T, store *inMemoryCutoverStore, flipper BackendFlipper, source MessageSource, aud AuditLogger) *CutoverService {
+	t.Helper()
+	svc, err := NewCutoverService(CutoverServiceConfig{
+		Store:     store,
+		Flipper:   flipper,
+		Source:    source,
+		Sizer:     MailboxSizerFunc(func(context.Context, string) (int64, error) { return 200_000, nil }),
+		Getter:    fakeGetter{store: store},
+		Audit:     aud,
+		Logger:    silentLogger(),
+		Threshold: 100_000,
+		Now:       func() time.Time { return time.Unix(1_700_000_000, 0) },
+		Sleep:     func(time.Duration) {},
+	})
+	if err != nil {
+		t.Fatalf("NewCutoverService: %v", err)
+	}
+	return svc
+}
+
+// TestCutoverService_InitiateExecuteList walks the full manual
+// path: initiate creates a pending row, execute migrates + flips +
+// audits as the operator, and list reflects the completed job.
+func TestCutoverService_InitiateExecuteList(t *testing.T) {
+	store := newInMemoryStore([]string{"tenant-a"})
+	flipper := newFakeFlipper(store)
+	rec := &recordingAudit{}
+	source := MessageSourceFunc(func(_ context.Context, id string) ([]Message, error) {
+		return []Message{{TenantID: id, MessageID: "m1"}}, nil
+	})
+	svc := buildCutoverService(t, store, flipper, source, rec)
+	ctx := context.Background()
+
+	job, err := svc.InitiateCutover(ctx, "tenant-a", BackendOpenSearch)
+	if err != nil {
+		t.Fatalf("InitiateCutover: %v", err)
+	}
+	if job.State != CutoverPending {
+		t.Fatalf("initiated job state = %q, want pending", job.State)
+	}
+
+	if err := svc.ExecuteCutover(ctx, "tenant-a", BackendOpenSearch, "admin-1"); err != nil {
+		t.Fatalf("ExecuteCutover: %v", err)
+	}
+	if store.tenantBackends["tenant-a"] != BackendOpenSearch {
+		t.Fatalf("backend not flipped: %q", store.tenantBackends["tenant-a"])
+	}
+
+	jobs, err := svc.ListCutoverJobs(ctx, "tenant-a")
+	if err != nil {
+		t.Fatalf("ListCutoverJobs: %v", err)
+	}
+	if len(jobs) != 1 || jobs[0].State != CutoverCompleted {
+		t.Fatalf("jobs = %+v, want one completed", jobs)
+	}
+
+	entry, ok := rec.find("search_cutover_completed")
+	if !ok {
+		t.Fatal("no completed audit entry for manual cutover")
+	}
+	if entry.ActorType != audit.ActorAdmin || entry.ActorID != "admin-1" {
+		t.Fatalf("manual audit actor = %q/%q, want admin/admin-1", entry.ActorType, entry.ActorID)
+	}
+
+	// Initiating again now that the tenant is already on the
+	// target must be rejected as a no-op.
+	if _, err := svc.InitiateCutover(ctx, "tenant-a", BackendOpenSearch); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("re-initiate on current backend err = %v, want ErrInvalidInput", err)
+	}
+}
+
+// TestCutoverService_ValidationFailureKeepsSource confirms the
+// manual path shares the worker's safety guarantee: a validation
+// failure aborts the cutover and leaves the tenant on source.
+func TestCutoverService_ValidationFailureKeepsSource(t *testing.T) {
+	store := newInMemoryStore([]string{"tenant-a"})
+	flipper := newFakeFlipper(store)
+	flipper.validateErr["tenant-a"] = errors.New("not searchable")
+	rec := &recordingAudit{}
+	source := MessageSourceFunc(func(_ context.Context, id string) ([]Message, error) {
+		return []Message{{TenantID: id, MessageID: "m1"}}, nil
+	})
+	svc := buildCutoverService(t, store, flipper, source, rec)
+	ctx := context.Background()
+
+	if _, err := svc.InitiateCutover(ctx, "tenant-a", BackendOpenSearch); err != nil {
+		t.Fatalf("InitiateCutover: %v", err)
+	}
+	err := svc.ExecuteCutover(ctx, "tenant-a", BackendOpenSearch, "admin-1")
+	if err == nil {
+		t.Fatal("ExecuteCutover succeeded despite validation failure")
+	}
+	if store.tenantBackends["tenant-a"] != BackendMeilisearch {
+		t.Fatalf("tenant moved off source: %q", store.tenantBackends["tenant-a"])
+	}
+	if r := store.rowByTenant("tenant-a"); r == nil || r.state != CutoverFailed {
+		t.Fatalf("row = %+v, want failed", r)
+	}
+	if _, ok := rec.find("search_cutover_failed"); !ok {
+		t.Fatal("no failed audit entry for manual cutover")
+	}
+}
+
+// TestCutoverService_ReInitiateAfterCompletionClearsCompletedAt
+// guards the store contract that a non-completed row never carries a
+// stale `completed_at`. The bug: re-initiating a previously-completed
+// (tenant, target) row reset it to pending but kept the old
+// completion timestamp; Claim then flipped it to in_progress still
+// carrying that timestamp, so a subsequent validation failure left a
+// `failed` row that the admin UI rendered with a "Completed" date.
+// The fix nulls completed_at on both the UpsertPending reset and the
+// Claim transition — this test drives the full re-run-then-fail path
+// through CutoverService and asserts the terminal failed row (and the
+// public ListCutoverJobs projection the UI consumes) reports no
+// completion time.
+func TestCutoverService_ReInitiateAfterCompletionClearsCompletedAt(t *testing.T) {
+	store := newInMemoryStore([]string{"tenant-a"})
+	flipper := newFakeFlipper(store)
+	source := MessageSourceFunc(func(_ context.Context, id string) ([]Message, error) {
+		return []Message{{TenantID: id, MessageID: "m1", Subject: "hello"}}, nil
+	})
+	svc := buildCutoverService(t, store, flipper, source, &recordingAudit{})
+	ctx := context.Background()
+
+	// 1) A first cutover meilisearch -> opensearch succeeds, so the
+	//    (tenant-a, opensearch) row is `completed` with a populated
+	//    completed_at.
+	if _, err := svc.InitiateCutover(ctx, "tenant-a", BackendOpenSearch); err != nil {
+		t.Fatalf("InitiateCutover #1: %v", err)
+	}
+	if err := svc.ExecuteCutover(ctx, "tenant-a", BackendOpenSearch, "admin-1"); err != nil {
+		t.Fatalf("ExecuteCutover #1: %v", err)
+	}
+	if r := store.rowFor("tenant-a", BackendOpenSearch); r == nil || r.completedAt == nil {
+		t.Fatalf("precondition: completed row should have completed_at, got %+v", r)
+	}
+
+	// 2) The tenant later moves back off opensearch (e.g. an
+	//    operator-driven flip), so the historical opensearch row is
+	//    re-runnable while its completed_at lingers.
+	store.flipBackend("tenant-a", BackendMeilisearch)
+
+	// 3) Re-initiate opensearch, but this time validation fails.
+	flipper.validateErr["tenant-a"] = errors.New("not searchable")
+	if _, err := svc.InitiateCutover(ctx, "tenant-a", BackendOpenSearch); err != nil {
+		t.Fatalf("InitiateCutover #2: %v", err)
+	}
+	if err := svc.ExecuteCutover(ctx, "tenant-a", BackendOpenSearch, "admin-1"); err == nil {
+		t.Fatal("ExecuteCutover #2 succeeded despite validation failure")
+	}
+
+	// The terminal row is `failed` and must NOT carry the old
+	// completion timestamp.
+	r := store.rowFor("tenant-a", BackendOpenSearch)
+	if r == nil || r.state != CutoverFailed {
+		t.Fatalf("row = %+v, want failed", r)
+	}
+	if r.completedAt != nil {
+		t.Fatalf("failed row still carries completed_at = %v, want nil", r.completedAt)
+	}
+
+	// And the public projection the admin UI reads agrees.
+	jobs, err := svc.ListCutoverJobs(ctx, "tenant-a")
+	if err != nil {
+		t.Fatalf("ListCutoverJobs: %v", err)
+	}
+	for _, j := range jobs {
+		if j.TargetBackend == BackendOpenSearch && j.State == CutoverFailed && j.CompletedAt != nil {
+			t.Fatalf("failed opensearch job exposes CompletedAt = %v, want nil", j.CompletedAt)
+		}
+	}
+}
+
+// TestCutoverService_ExecuteInProgressReturnsErr proves a manual
+// execute won't double-run a cutover another actor already claimed.
+func TestCutoverService_ExecuteInProgressReturnsErr(t *testing.T) {
+	store := newInMemoryStore([]string{"tenant-a"})
+	flipper := newFakeFlipper(store)
+	source := MessageSourceFunc(func(_ context.Context, id string) ([]Message, error) {
+		return []Message{{TenantID: id, MessageID: "m1"}}, nil
+	})
+	svc := buildCutoverService(t, store, flipper, source, nil)
+	ctx := context.Background()
+
+	// Simulate the auto-worker already holding the claim.
+	if _, err := store.Claim(ctx, "tenant-a", BackendOpenSearch, 200_000, 100_000, time.Unix(1_700_000_000, 0)); err != nil {
+		t.Fatalf("seed claim: %v", err)
+	}
+	if err := svc.ExecuteCutover(ctx, "tenant-a", BackendOpenSearch, "admin-1"); !errors.Is(err, ErrCutoverInProgress) {
+		t.Fatalf("ExecuteCutover err = %v, want ErrCutoverInProgress", err)
+	}
+}
+
+// TestCutoverService_ReInitiateInProgressPreservesStaleClock proves a
+// manual re-initiate against an already-running cutover leaves the
+// in_progress row entirely untouched — in particular it must NOT bump
+// updated_at. Bumping it would reset ReconcileStale's crash-recovery
+// window on every retry, indefinitely postponing demotion of a
+// genuinely crashed migration. Regression test for the UpsertPending
+// unconditional `updated_at = $5`.
+func TestCutoverService_ReInitiateInProgressPreservesStaleClock(t *testing.T) {
+	store := newInMemoryStore([]string{"tenant-a"})
+	flipper := newFakeFlipper(store)
+	source := MessageSourceFunc(func(_ context.Context, id string) ([]Message, error) {
+		return []Message{{TenantID: id, MessageID: "m1"}}, nil
+	})
+	svc := buildCutoverService(t, store, flipper, source, nil)
+	ctx := context.Background()
+
+	// Claim the row well in the past; buildCutoverService's clock is
+	// ~100M seconds later, so any bump would obviously reset the clock.
+	claimedAt := time.Unix(1_600_000_000, 0)
+	if ok, err := store.Claim(ctx, "tenant-a", BackendOpenSearch, 200_000, 100_000, claimedAt); err != nil || !ok {
+		t.Fatalf("seed claim: ok=%v err=%v", ok, err)
+	}
+
+	job, err := svc.InitiateCutover(ctx, "tenant-a", BackendOpenSearch)
+	if err != nil {
+		t.Fatalf("InitiateCutover: %v", err)
+	}
+	if job.State != CutoverInProgress {
+		t.Fatalf("re-initiate state = %q, want in_progress (row left untouched)", job.State)
+	}
+	if r := store.rowByTenant("tenant-a"); r == nil || !r.updatedAt.Equal(claimedAt) {
+		t.Fatalf("updatedAt = %v, want unchanged %v (manual re-initiate must not reset the stale clock)", r, claimedAt)
+	}
+
+	// Because updated_at survived the re-initiate, the crash-recovery
+	// sweep still sees the row as stale and demotes it to failed.
+	before := claimedAt.Add(time.Hour)
+	n, err := store.ReconcileStale(ctx, BackendMeilisearch, BackendOpenSearch, before, time.Unix(1_700_000_000, 0))
+	if err != nil {
+		t.Fatalf("ReconcileStale: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("ReconcileStale demoted %d rows, want 1 (stale clock must survive re-initiate)", n)
+	}
+}
+
+// visibilityDelayBackend is a SearchBackend whose SearchMessages
+// returns no hits for the first `missesBeforeVisible` calls and then
+// starts returning the doc — simulating a destination index whose
+// writes only become searchable after a refresh (OpenSearch ~1s) or
+// async indexing (Meilisearch). Only the methods Service.Validate
+// touches do anything; the rest are no-ops.
+type visibilityDelayBackend struct {
+	name                string
+	visibleID           string
+	missesBeforeVisible int
+	calls               int
+}
+
+func (b *visibilityDelayBackend) Name() string                                { return b.name }
+func (b *visibilityDelayBackend) IndexMessage(context.Context, Message) error { return nil }
+func (b *visibilityDelayBackend) SearchMessages(_ context.Context, _, _ string, _ int) ([]SearchHit, error) {
+	b.calls++
+	if b.calls <= b.missesBeforeVisible {
+		return nil, nil
+	}
+	return []SearchHit{{MessageID: b.visibleID}}, nil
+}
+func (b *visibilityDelayBackend) DeleteIndex(context.Context, string) error             { return nil }
+func (b *visibilityDelayBackend) MigrateIndex(context.Context, string, []Message) error { return nil }
+func (b *visibilityDelayBackend) ExportMessages(context.Context, string) ([]Message, error) {
+	return nil, nil
+}
+
+// TestServiceValidate_RetriesUntilDocVisible proves validation
+// tolerates the destination index's write-visibility latency: a
+// just-reindexed doc that isn't searchable on the first query (the
+// OpenSearch _bulk refresh race the reviewer flagged) is retried
+// within the bounded budget rather than failing the cutover.
+func TestServiceValidate_RetriesUntilDocVisible(t *testing.T) {
+	orig := validationRetrySleep
+	validationRetrySleep = func(time.Duration) {}
+	defer func() { validationRetrySleep = orig }()
+
+	// Invisible for the first cutoverValidationAttempts-1 searches,
+	// visible on the final allowed attempt.
+	backend := &visibilityDelayBackend{
+		name:                BackendOpenSearch,
+		visibleID:           "m1",
+		missesBeforeVisible: cutoverValidationAttempts - 1,
+	}
+	svc := NewService(Config{Backends: []SearchBackend{backend}})
+	msgs := []Message{{TenantID: "tenant-a", MessageID: "m1", Subject: "hello world"}}
+
+	if err := svc.Validate(context.Background(), "tenant-a", BackendOpenSearch, msgs); err != nil {
+		t.Fatalf("Validate returned %v, want nil (must retry until the doc is visible)", err)
+	}
+	if backend.calls != cutoverValidationAttempts {
+		t.Fatalf("SearchMessages called %d times, want %d (one per attempt until visible)", backend.calls, cutoverValidationAttempts)
+	}
+}
+
+// TestServiceValidate_FailsWhenNeverVisible proves the retry budget
+// is bounded: a genuinely empty / broken destination index (doc
+// never becomes searchable) still fails validation after exhausting
+// the attempts, so the cutover is correctly aborted and the tenant
+// stays on source.
+func TestServiceValidate_FailsWhenNeverVisible(t *testing.T) {
+	orig := validationRetrySleep
+	validationRetrySleep = func(time.Duration) {}
+	defer func() { validationRetrySleep = orig }()
+
+	backend := &visibilityDelayBackend{
+		name:                BackendOpenSearch,
+		visibleID:           "m1",
+		missesBeforeVisible: cutoverValidationAttempts + 5, // never within budget
+	}
+	svc := NewService(Config{Backends: []SearchBackend{backend}})
+	msgs := []Message{{TenantID: "tenant-a", MessageID: "m1", Subject: "hello world"}}
+
+	err := svc.Validate(context.Background(), "tenant-a", BackendOpenSearch, msgs)
+	if err == nil {
+		t.Fatal("Validate succeeded, want failure when doc never becomes searchable")
+	}
+	if backend.calls != cutoverValidationAttempts {
+		t.Fatalf("SearchMessages called %d times, want %d (full budget then give up)", backend.calls, cutoverValidationAttempts)
+	}
+}
+
+// saturatedBackend simulates a destination whose probe term (a
+// common subject) matches at least `cutoverValidationLimit` docs,
+// none of which is the sampled target message. Mirrors a real index:
+// the index IS populated + queryable, the target is just ranked
+// beyond the result window.
+type saturatedBackend struct {
+	name  string
+	calls int
+}
+
+func (b *saturatedBackend) Name() string                                { return b.name }
+func (b *saturatedBackend) IndexMessage(context.Context, Message) error { return nil }
+func (b *saturatedBackend) SearchMessages(_ context.Context, _, _ string, limit int) ([]SearchHit, error) {
+	b.calls++
+	hits := make([]SearchHit, limit)
+	for i := range hits {
+		hits[i] = SearchHit{MessageID: fmt.Sprintf("other-%d", i)}
+	}
+	return hits, nil
+}
+func (b *saturatedBackend) DeleteIndex(context.Context, string) error             { return nil }
+func (b *saturatedBackend) MigrateIndex(context.Context, string, []Message) error { return nil }
+func (b *saturatedBackend) ExportMessages(context.Context, string) ([]Message, error) {
+	return nil, nil
+}
+
+// TestServiceValidate_SaturatedResultPasses proves the ranking
+// false-negative the reviewer flagged is gone: a tenant with many
+// messages sharing a common subject can push the sampled target doc
+// past the result window, but a SATURATED result set (== limit hits)
+// proves the index is populated + queryable, so validation must NOT
+// abort the cutover on that ranking artefact. The probe runs once —
+// saturation is a definitive (non-retryable) accept.
+func TestServiceValidate_SaturatedResultPasses(t *testing.T) {
+	orig := validationRetrySleep
+	validationRetrySleep = func(time.Duration) {}
+	defer func() { validationRetrySleep = orig }()
+
+	backend := &saturatedBackend{name: BackendOpenSearch}
+	svc := NewService(Config{Backends: []SearchBackend{backend}})
+	msgs := []Message{{TenantID: "tenant-a", MessageID: "m1", Subject: "Re: thanks"}}
+
+	if err := svc.Validate(context.Background(), "tenant-a", BackendOpenSearch, msgs); err != nil {
+		t.Fatalf("Validate returned %v, want nil (saturated window must not be a false negative)", err)
+	}
+	if backend.calls != 1 {
+		t.Fatalf("SearchMessages called %d times, want 1 (saturation is a definitive accept, no retry)", backend.calls)
+	}
+}
