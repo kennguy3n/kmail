@@ -155,6 +155,16 @@ func (e *Enforcer) EnforcePolicy(ctx context.Context, tenantID string, policy Po
 	if err != nil {
 		return e.complete(ctx, tenantID, policy, run, err)
 	}
+	// Defense-in-depth for a destructive operation: the CRUD layer
+	// rejects RetentionDays <= 0, but a directly-tampered row would
+	// yield cutoff == now() (RetentionDays == 0) or a future cutoff
+	// (negative), matching the tenant's entire mailbox. Refuse to act
+	// on such a policy and record the run as failed rather than trust
+	// the upstream validation.
+	if policy.RetentionDays <= 0 {
+		return e.complete(ctx, tenantID, policy, run,
+			fmt.Errorf("retention: refusing to enforce policy %s: non-positive retention_days=%d", policy.ID, policy.RetentionDays))
+	}
 	cutoff := e.now().Add(-time.Duration(policy.RetentionDays) * 24 * time.Hour)
 
 	var prev []string

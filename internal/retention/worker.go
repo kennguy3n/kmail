@@ -137,6 +137,11 @@ func (w *Worker) DryRun() bool { return w.dryRun }
 // Snapshot returns the most-recent enforcement totals seen by the
 // worker. Counters are cumulative (not per-tick) so the admin UI
 // can render "X emails deleted since boot".
+//
+// These totals reflect worker-driven enforcement only. Enforcement
+// triggered directly through Service.EvaluateRetention still updates
+// the Prometheus volume counters but not this snapshot, so the admin
+// card tracks the scheduled sweep rather than ad-hoc invocations.
 func (w *Worker) Snapshot() WorkerSnapshot {
 	snap := WorkerSnapshot{
 		DryRun:         w.dryRun,

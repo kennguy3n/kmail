@@ -329,6 +329,29 @@ func TestEnforcePolicy_MailboxMissingTargetRef(t *testing.T) {
 	}
 }
 
+func TestEnforcePolicy_NonPositiveRetentionDaysRefused(t *testing.T) {
+	t.Parallel()
+	// A tampered/zero RetentionDays would make cutoff == now() (or a
+	// future cutoff for negatives), matching the whole mailbox. The
+	// enforcer must refuse and never touch mail.
+	for _, days := range []int{0, -7} {
+		op := &fakeOperator{remaining: genIDs(1000)}
+		enf := NewEnforcer(op, nil, nil)
+		policy := Policy{ID: "77777777-7777-7777-7777-777777777777", PolicyType: "delete", RetentionDays: days, AppliesTo: "mailbox", TargetRef: "mbox-1"}
+
+		run, err := enf.EnforcePolicy(context.Background(), "tenant-a", policy)
+		if err == nil || !strings.Contains(err.Error(), "non-positive retention_days") {
+			t.Fatalf("days=%d: expected refusal, got %v", days, err)
+		}
+		if op.queryCalls != 0 || op.destroyCalls != 0 {
+			t.Fatalf("days=%d: enforcer touched mail: queries=%d destroys=%d", days, op.queryCalls, op.destroyCalls)
+		}
+		if run == nil || run.EmailsProcessed != 0 || run.EmailsDeleted != 0 {
+			t.Fatalf("days=%d: run recorded work: %+v", days, run)
+		}
+	}
+}
+
 func TestEnforcePolicy_QueryErrorPropagates(t *testing.T) {
 	t.Parallel()
 	sentinel := errors.New("shard offline")
