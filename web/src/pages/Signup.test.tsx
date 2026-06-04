@@ -33,11 +33,20 @@ vi.mock("../api/signup", async () => {
   };
 });
 
-function renderAt(path: string, onRedirect = vi.fn()) {
+function renderAt(path: string, onRedirect = vi.fn(), pollTimeoutMs?: number) {
   return render(
     <MemoryRouter initialEntries={[path]}>
       <Routes>
-        <Route path="/signup" element={<Signup pollIntervalMs={10} onRedirect={onRedirect} />} />
+        <Route
+          path="/signup"
+          element={
+            <Signup
+              pollIntervalMs={10}
+              pollTimeoutMs={pollTimeoutMs}
+              onRedirect={onRedirect}
+            />
+          }
+        />
         <Route path="/admin/dns-wizard" element={<div>DNS WIZARD</div>} />
       </Routes>
     </MemoryRouter>,
@@ -188,6 +197,31 @@ describe("Signup processing", () => {
     expect(
       await screen.findByText(/payment didn.t go through/i),
     ).toBeInTheDocument();
+  });
+
+  it("stops polling and shows a timeout state when provisioning never completes", async () => {
+    // Status never reaches a terminal state — simulates a webhook that
+    // never fires.
+    vi.mocked(signupApi.getSignupStatus).mockResolvedValue({
+      id: "req-1",
+      plan: "pro",
+      status: "pending",
+      created_at: "2024-01-01T00:00:00Z",
+    });
+
+    // Zero budget: after the first (pending) poll the loop must give up
+    // and surface the timeout state instead of scheduling another poll
+    // forever.
+    renderAt("/signup?status=success&id=req-1", vi.fn(), 0);
+
+    expect(
+      await screen.findByText(/taking longer than expected/i),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("link", { name: /contact support/i }),
+    ).toBeInTheDocument();
+    // It must NOT have navigated onward.
+    expect(screen.queryByText("DNS WIZARD")).not.toBeInTheDocument();
   });
 });
 

@@ -609,6 +609,30 @@ func TestCompleteSignup_UnknownSession(t *testing.T) {
 	}
 }
 
+// TestCompleteCheckoutSignup_UnknownSessionIsNoop guards the webhook
+// adapter: a checkout.session.completed for a session this funnel never
+// minted must NOT surface an error (which the billing webhook would turn
+// into a 500, triggering Stripe to retry the delivery indefinitely). It
+// is a no-op, while genuine session ids still provision normally.
+func TestCompleteCheckoutSignup_UnknownSessionIsNoop(t *testing.T) {
+	repo := newFakeSignupRepo()
+	svc := newTestService(repo, newFakeProvisioner(), &fakeStripe{})
+
+	if err := svc.CompleteCheckoutSignup(context.Background(), "cs_not_ours"); err != nil {
+		t.Fatalf("unknown session: got err %v, want nil (no-op)", err)
+	}
+
+	// A real signup session still completes through the same adapter.
+	sess := seedPending(t, svc, repo, "founder@acme.com", "Acme Inc", "pro")
+	if err := svc.CompleteCheckoutSignup(context.Background(), sess); err != nil {
+		t.Fatalf("known session: CompleteCheckoutSignup: %v", err)
+	}
+	got, _ := repo.GetByCheckoutSession(context.Background(), sess)
+	if got.Status != "active" {
+		t.Fatalf("status = %q, want active", got.Status)
+	}
+}
+
 func TestDeterministicSlug_StableAndUnique(t *testing.T) {
 	a1 := deterministicSlug("Acme Inc", "req-1")
 	a2 := deterministicSlug("Acme Inc", "req-1")

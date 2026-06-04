@@ -32,9 +32,18 @@ import {
 /** Where a provisioned tenant is sent to finish setup. */
 const POST_SIGNUP_PATH = "/admin/dns-wizard";
 
+/** Default overall budget for the processing-step poll loop (10 min).
+ * After this elapses without the webhook flipping the row to a terminal
+ * status, we stop polling and surface a "taking longer than expected"
+ * state instead of spinning forever. */
+const DEFAULT_POLL_TIMEOUT_MS = 10 * 60 * 1000;
+
 export interface SignupProps {
   /** Poll cadence for the processing step. Overridable for tests. */
   pollIntervalMs?: number;
+  /** Overall budget for the processing-step poll loop before giving up
+   * and showing the timeout state. Overridable for tests. */
+  pollTimeoutMs?: number;
   /** Browser redirect to Stripe Checkout. Overridable for tests.
    * Defaults to a full navigation so the Stripe-hosted page replaces
    * the SPA. */
@@ -43,6 +52,7 @@ export interface SignupProps {
 
 export default function Signup({
   pollIntervalMs = 2000,
+  pollTimeoutMs = DEFAULT_POLL_TIMEOUT_MS,
   onRedirect = (url) => window.location.assign(url),
 }: SignupProps) {
   const [params] = useSearchParams();
@@ -51,7 +61,11 @@ export default function Signup({
 
   if (status === "success" && idParam) {
     return (
-      <SignupProcessing id={idParam} pollIntervalMs={pollIntervalMs} />
+      <SignupProcessing
+        id={idParam}
+        pollIntervalMs={pollIntervalMs}
+        pollTimeoutMs={pollTimeoutMs}
+      />
     );
   }
   if (status === "cancelled") {
@@ -189,14 +203,16 @@ function SignupForm({ onRedirect }: { onRedirect: (url: string) => void }) {
 function SignupProcessing({
   id,
   pollIntervalMs,
+  pollTimeoutMs,
 }: {
   id: string;
   pollIntervalMs: number;
+  pollTimeoutMs: number;
 }) {
   const navigate = useNavigate();
-  const [phase, setPhase] = useState<"working" | "failed" | "expired">(
-    "working",
-  );
+  const [phase, setPhase] = useState<
+    "working" | "failed" | "expired" | "timeout"
+  >("working");
   const [error, setError] = useState<string | null>(null);
   // Guard against a late poll resolving after we've navigated away.
   const doneRef = useRef(false);
@@ -204,6 +220,23 @@ function SignupProcessing({
   useEffect(() => {
     doneRef.current = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    // Absolute budget for the whole loop. The webhook may never land
+    // (misconfigured Stripe endpoint, dropped delivery); without this
+    // the user would stare at "Setting up your workspace…" forever and
+    // the transient-error path would retry indefinitely. Captured once
+    // per effect run so it spans every poll, pending or errored.
+    const deadline = Date.now() + pollTimeoutMs;
+
+    // scheduleNext queues the next poll unless we've blown the overall
+    // budget, in which case it stops and surfaces the timeout state.
+    const scheduleNext = () => {
+      if (Date.now() >= deadline) {
+        doneRef.current = true;
+        setPhase("timeout");
+        return;
+      }
+      timer = setTimeout(poll, pollIntervalMs);
+    };
 
     const poll = async () => {
       if (doneRef.current) {
@@ -232,8 +265,8 @@ function SignupProcessing({
             setPhase("expired");
             return;
           default:
-            // still pending — schedule the next poll.
-            timer = setTimeout(poll, pollIntervalMs);
+            // still pending — schedule the next poll (or time out).
+            scheduleNext();
         }
       } catch (err) {
         if (doneRef.current) {
@@ -241,11 +274,11 @@ function SignupProcessing({
         }
         // Transient fetch/5xx errors shouldn't abort polling — the
         // webhook may not have landed yet. Surface a soft message and
-        // keep trying.
+        // keep trying until the overall deadline.
         setError(
           err instanceof Error ? err.message : "Temporary error while checking status.",
         );
-        timer = setTimeout(poll, pollIntervalMs);
+        scheduleNext();
       }
     };
 
@@ -256,7 +289,7 @@ function SignupProcessing({
         clearTimeout(timer);
       }
     };
-  }, [id, pollIntervalMs, navigate]);
+  }, [id, pollIntervalMs, pollTimeoutMs, navigate]);
 
   return (
     <main style={styles.page}>
@@ -299,6 +332,20 @@ function SignupProcessing({
             </p>
             <a href="/signup" style={styles.linkButton}>
               Start over
+            </a>
+          </>
+        )}
+        {phase === "timeout" && (
+          <>
+            <h1 style={styles.h1}>This is taking longer than expected</h1>
+            <p style={styles.subtitle}>
+              Your payment went through, but provisioning hasn&apos;t finished
+              yet. It may still complete on its own — try refreshing in a few
+              minutes. If the problem persists, please contact support and
+              we&apos;ll finish setting up your workspace.
+            </p>
+            <a href="mailto:support@kmail.example" style={styles.linkButton}>
+              Contact support
             </a>
           </>
         )}

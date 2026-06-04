@@ -490,8 +490,21 @@ func (s *SignupService) GetStatus(ctx context.Context, id string) (*SignupStatus
 
 // CompleteCheckoutSignup adapts CompleteSignup to the error-only shape
 // the billing webhook's SignupCompleter interface expects.
+//
+// A checkout.session.completed event is delivered for EVERY Stripe
+// Checkout Session on the account, not just ones this signup funnel
+// minted. When the session id resolves no signup_requests row,
+// CompleteSignup returns ErrSignupNotFound — that simply means the
+// checkout belongs to some other flow, so it is a no-op here rather than
+// an error. Swallowing it (using the sentinel directly, which only this
+// package can reach) keeps the webhook from returning 500 and triggering
+// Stripe's retry storm for events that were never ours to handle. Any
+// other error is a genuine failure and propagates so Stripe redelivers.
 func (s *SignupService) CompleteCheckoutSignup(ctx context.Context, stripeCheckoutSessionID string) error {
 	_, err := s.CompleteSignup(ctx, stripeCheckoutSessionID)
+	if errors.Is(err, ErrSignupNotFound) {
+		return nil
+	}
 	return err
 }
 
