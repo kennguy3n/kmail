@@ -1,8 +1,11 @@
 # KMail — multi-stage Go build.
 #
-# Builds every cmd/* binary and copies them into a minimal runtime
-# image. The concrete service to run is selected by the container
-# command (e.g., `kmail-api`, `kmail-tenant`).
+# Builds every cmd/* binary (kmail-api, kmail-worker, kmail-tenant,
+# …) and copies them into a minimal runtime image. The concrete
+# service to run is selected by the container command — the default
+# ENTRYPOINT is `kmail-api`; the worker Deployment overrides it with
+# `command: ["/usr/local/bin/kmail-worker"]` to run the background
+# workers split out in the Session 6 service decomposition.
 
 # ---------------------------------------------------------------
 # Stage 1: build

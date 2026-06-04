@@ -1,0 +1,126 @@
+{{- /*
+  kmail-worker — the background-worker process split out of kmail-api
+  (Session 6 service decomposition). It runs every background worker
+  (calendar reminders, undo/scheduled/snooze dispatch, billing quota
+  scan, search cutover, deliverability alert evaluation, shard-health
+  probing, retention enforcement, export fan-out, admin-proxy grant
+  expiry, webhook delivery) and exposes ONLY /healthz, /readyz, and
+  /metrics on `kmailWorker.metricsPort`.
+
+  It serves no tenant traffic, so unlike kmail-api it has NO Service,
+  NO Ingress, and NO HPA — it is an internal, single-replica
+  Deployment. It reuses the SAME ConfigMap and Secret as the API so
+  the two processes always read identical config, and the SAME
+  Stalwart client mTLS keypair because the dispatch workers submit
+  to Stalwart over the internal JMAP path.
+*/ -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "kmail.fullname" . }}-worker
+  labels:
+    {{- include "kmail.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  replicas: {{ .Values.kmailWorker.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "kmail.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: worker
+  template:
+    metadata:
+      labels:
+        {{- include "kmail.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: worker
+      {{- if .Values.mtls.enabled }}
+      annotations:
+        # Restart the worker when cert-manager rotates the Stalwart
+        # client keypair so the dispatch workers pick up the new
+        # cert. No-op when the Reloader controller is not installed.
+        reloader.stakater.com/auto: "true"
+        secret.reloader.stakater.com/reload: "{{ include "kmail.fullname" . }}-stalwart-client-tls"
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "kmail.serviceAccountName" . }}
+      containers:
+        - name: kmail-worker
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # Select the worker entrypoint from the shared image
+          # (the Dockerfile builds every cmd/* binary into
+          # /usr/local/bin and defaults its ENTRYPOINT to kmail-api).
+          command: ["/usr/local/bin/kmail-worker"]
+          ports:
+            - name: metrics
+              # Single source of truth for the worker's health/metrics
+              # listen port: the container port, KMAIL_WORKER_ADDR, and
+              # both probes below are all driven by this one value.
+              containerPort: {{ .Values.kmailWorker.metricsPort }}
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: {{ include "kmail.fullname" . }}-config
+            - secretRef:
+                name: {{ include "kmail.secretName" . }}
+          {{- /*
+            The worker does NOT start workers conditionally on
+            KMAIL_DISABLE_WORKERS — that flag only gates the
+            in-process workers in kmail-api. The dedicated
+            kmail-worker binary always runs the full set. We DO
+            pin KMAIL_DISABLE_WORKERS=true here defensively so that
+            if the image's default command is ever overridden back
+            to kmail-api in this pod, it won't double-run the
+            workers that this Deployment already owns.
+
+            The mTLS block mirrors deployment-api.yaml because the
+            dispatch workers submit to Stalwart over the same
+            internal JMAP path the API uses, so they need the same
+            HTTPS-on-8443 + client-cert posture. As in the API
+            template, all entries MUST share ONE `env:` mapping.
+          */}}
+          env:
+            - name: KMAIL_WORKER_ADDR
+              value: ":{{ .Values.kmailWorker.metricsPort }}"
+            - name: KMAIL_DISABLE_WORKERS
+              value: "true"
+            {{- if .Values.mtls.enabled }}
+            - name: KMAIL_STALWART_URL
+              value: {{ printf "https://%s-stalwart-0.%s.%s.svc.cluster.local:8443" (include "kmail.fullname" .) .Values.stalwart.service.headlessName .Release.Namespace | quote }}
+            - name: KMAIL_STALWART_TLS_CERT
+              value: /etc/kmail/tls/stalwart-client/tls.crt
+            - name: KMAIL_STALWART_TLS_KEY
+              value: /etc/kmail/tls/stalwart-client/tls.key
+            - name: KMAIL_STALWART_TLS_CA
+              value: /etc/kmail/tls/stalwart-client/ca.crt
+            {{- with .Values.mtls.serverName }}
+            - name: KMAIL_STALWART_TLS_SERVER_NAME
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
+          {{- if .Values.mtls.enabled }}
+          volumeMounts:
+            - name: stalwart-client-tls
+              mountPath: /etc/kmail/tls/stalwart-client
+              readOnly: true
+          {{- end }}
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            {{- toYaml .Values.kmailWorker.resources | nindent 12 }}
+      {{- if .Values.mtls.enabled }}
+      volumes:
+        - name: stalwart-client-tls
+          secret:
+            secretName: {{ include "kmail.fullname" . }}-stalwart-client-tls
+            defaultMode: 0400
+      {{- end }}
