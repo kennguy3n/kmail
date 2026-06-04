@@ -265,9 +265,10 @@ func (r *memRow) toJob(tenantID, targetBackend string) CutoverJob {
 }
 
 // UpsertPending mirrors the Postgres impl: leave an in_progress
-// row untouched; otherwise (re)set the row to pending with a
-// cleared back-off so the manual trigger overrides the failure /
-// completed guards.
+// row entirely untouched (including updatedAt, so ReconcileStale's
+// crash-recovery clock keeps running); otherwise (re)set the row to
+// pending with refreshed size/threshold and a cleared back-off so
+// the manual trigger overrides the failure / completed guards.
 func (s *inMemoryCutoverStore) UpsertPending(_ context.Context, tenantID, targetBackend string, size, threshold int64, now time.Time) (*CutoverJob, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -279,11 +280,13 @@ func (s *inMemoryCutoverStore) UpsertPending(_ context.Context, tenantID, target
 		j := r.toJob(tenantID, targetBackend)
 		return &j, nil
 	}
-	if r.state != CutoverInProgress {
-		r.state = CutoverPending
-		r.failureCount = 0
-		r.lastError = ""
+	if r.state == CutoverInProgress {
+		j := r.toJob(tenantID, targetBackend)
+		return &j, nil
 	}
+	r.state = CutoverPending
+	r.failureCount = 0
+	r.lastError = ""
 	r.mailboxSize = size
 	r.threshold = threshold
 	r.updatedAt = now
@@ -1569,5 +1572,51 @@ func TestCutoverService_ExecuteInProgressReturnsErr(t *testing.T) {
 	}
 	if err := svc.ExecuteCutover(ctx, "tenant-a", BackendOpenSearch, "admin-1"); !errors.Is(err, ErrCutoverInProgress) {
 		t.Fatalf("ExecuteCutover err = %v, want ErrCutoverInProgress", err)
+	}
+}
+
+// TestCutoverService_ReInitiateInProgressPreservesStaleClock proves a
+// manual re-initiate against an already-running cutover leaves the
+// in_progress row entirely untouched — in particular it must NOT bump
+// updated_at. Bumping it would reset ReconcileStale's crash-recovery
+// window on every retry, indefinitely postponing demotion of a
+// genuinely crashed migration. Regression test for the UpsertPending
+// unconditional `updated_at = $5`.
+func TestCutoverService_ReInitiateInProgressPreservesStaleClock(t *testing.T) {
+	store := newInMemoryStore([]string{"tenant-a"})
+	flipper := newFakeFlipper(store)
+	source := MessageSourceFunc(func(_ context.Context, id string) ([]Message, error) {
+		return []Message{{TenantID: id, MessageID: "m1"}}, nil
+	})
+	svc := buildCutoverService(t, store, flipper, source, nil)
+	ctx := context.Background()
+
+	// Claim the row well in the past; buildCutoverService's clock is
+	// ~100M seconds later, so any bump would obviously reset the clock.
+	claimedAt := time.Unix(1_600_000_000, 0)
+	if ok, err := store.Claim(ctx, "tenant-a", BackendOpenSearch, 200_000, 100_000, claimedAt); err != nil || !ok {
+		t.Fatalf("seed claim: ok=%v err=%v", ok, err)
+	}
+
+	job, err := svc.InitiateCutover(ctx, "tenant-a", BackendOpenSearch)
+	if err != nil {
+		t.Fatalf("InitiateCutover: %v", err)
+	}
+	if job.State != CutoverInProgress {
+		t.Fatalf("re-initiate state = %q, want in_progress (row left untouched)", job.State)
+	}
+	if r := store.rowByTenant("tenant-a"); r == nil || !r.updatedAt.Equal(claimedAt) {
+		t.Fatalf("updatedAt = %v, want unchanged %v (manual re-initiate must not reset the stale clock)", r, claimedAt)
+	}
+
+	// Because updated_at survived the re-initiate, the crash-recovery
+	// sweep still sees the row as stale and demotes it to failed.
+	before := claimedAt.Add(time.Hour)
+	n, err := store.ReconcileStale(ctx, BackendMeilisearch, BackendOpenSearch, before, time.Unix(1_700_000_000, 0))
+	if err != nil {
+		t.Fatalf("ReconcileStale: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("ReconcileStale demoted %d rows, want 1 (stale clock must survive re-initiate)", n)
 	}
 }

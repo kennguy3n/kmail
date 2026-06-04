@@ -519,10 +519,14 @@ func scanCutoverJob(row rowScanner) (*CutoverJob, error) {
 // — unlike the worker's cross-tenant scans, the manual path is
 // always operating on a single known tenant.
 //
-// An existing `in_progress` row is returned UNCHANGED so a manual
-// re-initiate can't trample a cutover the worker (or a prior
-// request) is actively running. Any other state (`pending`,
-// `failed`, `completed`) is reset to `pending` with a cleared
+// An existing `in_progress` row is returned UNCHANGED — including
+// its `updated_at` — so a manual re-initiate can't trample a cutover
+// the worker (or a prior request) is actively running. Crucially,
+// leaving `updated_at` alone keeps ReconcileStale's crash-recovery
+// clock running: bumping it here would push the stale-detection
+// window out by another ReconcileAfter on every manual re-initiate.
+// Any other state (`pending`, `failed`, `completed`) is reset to
+// `pending` with a refreshed mailbox_size / threshold and a cleared
 // failure_count / last_error so the operator's explicit trigger
 // overrides the failure back-off and the completed-row guard,
 // making the tenant immediately claimable again.
@@ -539,13 +543,16 @@ func (s *PostgresCutoverStore) UpsertPending(ctx context.Context, tenantID, targ
 			ON CONFLICT (tenant_id, target_backend) DO UPDATE
 			   SET cutover_state = CASE WHEN search_cutover_jobs.cutover_state = 'in_progress'
 			                            THEN search_cutover_jobs.cutover_state ELSE 'pending' END,
-			       mailbox_size  = EXCLUDED.mailbox_size,
-			       threshold     = EXCLUDED.threshold,
+			       mailbox_size  = CASE WHEN search_cutover_jobs.cutover_state = 'in_progress'
+			                            THEN search_cutover_jobs.mailbox_size ELSE EXCLUDED.mailbox_size END,
+			       threshold     = CASE WHEN search_cutover_jobs.cutover_state = 'in_progress'
+			                            THEN search_cutover_jobs.threshold ELSE EXCLUDED.threshold END,
 			       failure_count = CASE WHEN search_cutover_jobs.cutover_state = 'in_progress'
 			                            THEN search_cutover_jobs.failure_count ELSE 0 END,
 			       last_error    = CASE WHEN search_cutover_jobs.cutover_state = 'in_progress'
 			                            THEN search_cutover_jobs.last_error ELSE '' END,
-			       updated_at    = $5
+			       updated_at    = CASE WHEN search_cutover_jobs.cutover_state = 'in_progress'
+			                            THEN search_cutover_jobs.updated_at ELSE $5 END
 			RETURNING `+cutoverJobColumns,
 			tenantID, targetBackend, size, threshold, now.UTC())
 		j, err := scanCutoverJob(row)

@@ -75,8 +75,18 @@ func (h *CutoverHandlers) initiate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	if _, err := h.svc.InitiateCutover(r.Context(), tenantID, req.TargetBackend); err != nil {
+	job, err := h.svc.InitiateCutover(r.Context(), tenantID, req.TargetBackend)
+	if err != nil {
 		writeError(w, statusFor(err), err)
+		return
+	}
+	// If a cutover is already running for this (tenant, target),
+	// UpsertPending leaves the in_progress row untouched. Short-
+	// circuit with 409 instead of attempting a Claim that's
+	// guaranteed to lose the race — and avoid the confusing
+	// "started then immediately conflicted" UX.
+	if job.State == CutoverInProgress {
+		writeError(w, http.StatusConflict, ErrCutoverInProgress)
 		return
 	}
 	actorID := middleware.KChatUserIDFrom(r.Context())
@@ -93,7 +103,7 @@ func (h *CutoverHandlers) initiate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, status, err)
 		return
 	}
-	job, err := h.svc.GetCutoverJob(r.Context(), tenantID, req.TargetBackend)
+	job, err = h.svc.GetCutoverJob(r.Context(), tenantID, req.TargetBackend)
 	if err != nil {
 		writeError(w, statusFor(err), err)
 		return
