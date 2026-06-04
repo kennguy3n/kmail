@@ -77,6 +77,22 @@ export interface SignupRequest {
   completed_at?: string;
 }
 
+/**
+ * SignupStatusView mirrors the minimal projection returned by the
+ * public GET /signup/{id}/status polling endpoint. The server
+ * deliberately omits the PII (email, org_name) and the Stripe checkout
+ * session id from this unauthenticated, UUID-gated route — the polling
+ * UI only branches on `status`. See `SignupStatusView` in
+ * `internal/tenant/signup.go`.
+ */
+export interface SignupStatusView {
+  id: string;
+  plan: SignupPlan;
+  status: SignupStatus;
+  created_at: string;
+  completed_at?: string;
+}
+
 /** SignupApiError carries the URL, HTTP status, and parsed server
  * message for a failed signup request. */
 export class SignupApiError extends Error {
@@ -127,13 +143,14 @@ export async function initiateSignup(
 
 /**
  * getSignupStatus polls the status of a signup request by id. Returns
- * the full request so callers can branch on `status`.
+ * the minimal public status view (no PII) so callers can branch on
+ * `status`.
  */
-export async function getSignupStatus(id: string): Promise<SignupRequest> {
+export async function getSignupStatus(id: string): Promise<SignupStatusView> {
   const url = `${BASE}/signup/${encodeURIComponent(id)}/status`;
   const res = await fetch(url);
   if (!res.ok) {
     throw await parseError(url, res);
   }
-  return (await res.json()) as SignupRequest;
+  return (await res.json()) as SignupStatusView;
 }

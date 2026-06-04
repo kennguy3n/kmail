@@ -90,10 +90,10 @@ describe("getSignupStatus", () => {
     const fetchMock = vi
       .spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(
+        // The status endpoint returns the minimal public projection
+        // (no email / org_name / stripe session id).
         jsonResponse({
           id: "req-1",
-          email: "a@acme.com",
-          org_name: "Acme",
           plan: "core",
           status: "active",
           created_at: "2024-01-01T00:00:00Z",

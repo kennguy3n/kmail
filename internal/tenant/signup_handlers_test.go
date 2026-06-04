@@ -251,12 +251,26 @@ func TestSignupHandler_Status(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", rr.Code, rr.Body.String())
 	}
-	var got SignupRequest
+	var got SignupStatusView
 	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if got.ID != req.ID || got.Status != "pending" {
-		t.Fatalf("got %+v, want id=%s status=pending", got, req.ID)
+	if got.ID != req.ID || got.Status != "pending" || got.Plan != "core" {
+		t.Fatalf("got %+v, want id=%s status=pending plan=core", got, req.ID)
+	}
+
+	// The status route is public and gated only by the unguessable id,
+	// so it must not leak the collected PII or the Stripe session id.
+	// Assert on the raw JSON keys: a struct decode would silently drop
+	// extra fields and hide a regression.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(rr.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("decode raw: %v", err)
+	}
+	for _, leaked := range []string{"email", "org_name", "stripe_checkout_session_id"} {
+		if _, ok := raw[leaked]; ok {
+			t.Fatalf("public status response leaks %q: body=%s", leaked, rr.Body.String())
+		}
 	}
 }
 

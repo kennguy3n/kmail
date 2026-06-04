@@ -152,6 +152,24 @@ type SignupRequest struct {
 	CheckoutURL string `json:"checkout_url,omitempty"`
 }
 
+// SignupStatusView is the minimal, public projection of a signup
+// request returned by the unauthenticated GET /signup/{id}/status
+// polling endpoint.
+//
+// That route is gated only by the unguessability of the UUID id, so it
+// must not leak anything an attacker who guessed (or was handed) the id
+// shouldn't see. It therefore deliberately omits the PII the funnel
+// collected (Email, OrgName) and the StripeCheckoutSessionID — the
+// polling UI only branches on Status. The remaining fields (plan and
+// timestamps) are non-identifying funnel metadata safe to expose.
+type SignupStatusView struct {
+	ID          string     `json:"id"`
+	Plan        string     `json:"plan"`
+	Status      string     `json:"status"`
+	CreatedAt   time.Time  `json:"created_at"`
+	CompletedAt *time.Time `json:"completed_at,omitempty"`
+}
+
 // SignupRepository persists the pre-tenant `signup_requests` table.
 // The table carries no tenant_id and no RLS policy (access is gated
 // at the handler layer), so the concrete implementation talks to the
@@ -448,13 +466,26 @@ func (s *SignupService) InitiateSignup(ctx context.Context, email, orgName, plan
 	return req, nil
 }
 
-// GetStatus returns the public status view for a signup request.
-func (s *SignupService) GetStatus(ctx context.Context, id string) (*SignupRequest, error) {
+// GetStatus returns the minimal public status view for a signup
+// request. It projects the persisted row down to SignupStatusView so
+// the unauthenticated polling endpoint never serves the collected PII
+// (email, org_name) or the Stripe checkout session id.
+func (s *SignupService) GetStatus(ctx context.Context, id string) (*SignupStatusView, error) {
 	id = strings.TrimSpace(id)
 	if id == "" {
 		return nil, fmt.Errorf("%w: id is required", ErrInvalidInput)
 	}
-	return s.repo.GetByID(ctx, id)
+	req, err := s.repo.GetByID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	return &SignupStatusView{
+		ID:          req.ID,
+		Plan:        req.Plan,
+		Status:      req.Status,
+		CreatedAt:   req.CreatedAt,
+		CompletedAt: req.CompletedAt,
+	}, nil
 }
 
 // CompleteCheckoutSignup adapts CompleteSignup to the error-only shape

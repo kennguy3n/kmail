@@ -117,16 +117,12 @@ describe("Signup processing", () => {
     vi.mocked(signupApi.getSignupStatus)
       .mockResolvedValueOnce({
         id: "req-1",
-        email: "a@acme.com",
-        org_name: "Acme",
         plan: "pro",
         status: "pending",
         created_at: "2024-01-01T00:00:00Z",
       })
       .mockResolvedValueOnce({
         id: "req-1",
-        email: "a@acme.com",
-        org_name: "Acme",
         plan: "pro",
         status: "active",
         created_at: "2024-01-01T00:00:00Z",
@@ -153,16 +149,12 @@ describe("Signup processing", () => {
       // Recovery: a successful poll (still pending) must clear the error.
       .mockResolvedValueOnce({
         id: "req-1",
-        email: "a@acme.com",
-        org_name: "Acme",
         plan: "pro",
         status: "pending",
         created_at: "2024-01-01T00:00:00Z",
       })
       .mockResolvedValueOnce({
         id: "req-1",
-        email: "a@acme.com",
-        org_name: "Acme",
         plan: "pro",
         status: "active",
         created_at: "2024-01-01T00:00:00Z",
@@ -186,8 +178,6 @@ describe("Signup processing", () => {
   it("shows a failure message when the signup failed", async () => {
     vi.mocked(signupApi.getSignupStatus).mockResolvedValueOnce({
       id: "req-1",
-      email: "a@acme.com",
-      org_name: "Acme",
       plan: "pro",
       status: "failed",
       created_at: "2024-01-01T00:00:00Z",
