@@ -74,11 +74,23 @@ func (f *fakeUploader) UploadLargeAttachment(_ context.Context, _, filename, _ s
 type fakeAuditQuerier struct {
 	entries []audit.Entry
 	gotF    audit.QueryFilters
+	calls   int
 }
 
+// Query honours Offset/Limit so the runner's pagination loop is
+// exercised exactly as it would be against the real audit service.
 func (f *fakeAuditQuerier) Query(_ context.Context, _ string, ff audit.QueryFilters) ([]audit.Entry, error) {
 	f.gotF = ff
-	return f.entries, nil
+	f.calls++
+	start := ff.Offset
+	if start > len(f.entries) {
+		start = len(f.entries)
+	}
+	end := len(f.entries)
+	if ff.Limit > 0 && start+ff.Limit < end {
+		end = start + ff.Limit
+	}
+	return append([]audit.Entry(nil), f.entries[start:end]...), nil
 }
 
 // --- helpers ---------------------------------------------------------------
@@ -353,6 +365,71 @@ func TestRun_AppendsAuditJSON(t *testing.T) {
 	}
 	if len(entries) != 1 || entries[0].Action != "mail.read" {
 		t.Errorf("audit entries wrong: %+v", entries)
+	}
+}
+
+func TestRun_EMLDedupesCollidingNames(t *testing.T) {
+	t.Parallel()
+	// "acct:a b" and "acct:a/b" both sanitise to "acct:a_b": the
+	// archive must keep both messages under distinct entry paths
+	// rather than silently overwriting one with the other.
+	now := time.Now()
+	q := &fakeQuerier{ids: []string{"acct:a b", "acct:a/b"}}
+	ex := &fakeExporter{byID: map[string]jmap.ExportedMessage{
+		"acct:a b": msg("acct:a b", "a@x", "S", now, "raw-space"),
+		"acct:a/b": msg("acct:a/b", "a@x", "S", now, "raw-slash"),
+	}}
+	up := &fakeUploader{}
+	r := newRunner(t, JMAPExportRunnerConfig{Exporter: ex, Querier: q, Uploader: up})
+
+	res, err := r.Run(context.Background(), Job{ID: "j", TenantID: "t", Format: FormatEML, Scope: ScopeAll})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(res.MessageIDs) != 2 {
+		t.Fatalf("expected both messages included, got %v", res.MessageIDs)
+	}
+	files := untar(t, up.gotBody)
+	first, ok1 := files["mail/acct:a_b.eml"]
+	second, ok2 := files["mail/acct:a_b-2.eml"]
+	if !ok1 || !ok2 {
+		t.Fatalf("expected two distinct eml entries, got %v", keys(files))
+	}
+	// Both payloads must survive — neither clobbered the other.
+	got := string(first) + "|" + string(second)
+	if !strings.Contains(got, "raw-space") || !strings.Contains(got, "raw-slash") {
+		t.Errorf("colliding entries lost a payload: %q", got)
+	}
+}
+
+func TestRun_AuditPaginatesBeyondPageSize(t *testing.T) {
+	t.Parallel()
+	// A trail larger than the per-call cap (auditPageSize) must be
+	// fully exported, not silently truncated at the first page.
+	const total = auditPageSize*2 + 500
+	entries := make([]audit.Entry, total)
+	for i := range entries {
+		entries[i] = audit.Entry{Action: fmt.Sprintf("a%d", i), ResourceType: "email"}
+	}
+	q := &fakeQuerier{ids: []string{"acct:1"}}
+	ex := &fakeExporter{byID: map[string]jmap.ExportedMessage{"acct:1": msg("acct:1", "a@x", "s", time.Now(), "raw")}}
+	up := &fakeUploader{}
+	aud := &fakeAuditQuerier{entries: entries}
+	r := newRunner(t, JMAPExportRunnerConfig{Exporter: ex, Querier: q, Uploader: up, Audit: aud})
+
+	if _, err := r.Run(context.Background(), Job{ID: "j", TenantID: "t", Format: FormatEML, Scope: ScopeAll}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	files := untar(t, up.gotBody)
+	var got []audit.Entry
+	if err := json.Unmarshal(files["audit.json"], &got); err != nil {
+		t.Fatalf("audit json: %v", err)
+	}
+	if len(got) != total {
+		t.Errorf("exported %d audit entries, want %d (silent truncation?)", len(got), total)
+	}
+	if aud.calls != 3 {
+		t.Errorf("expected 3 paged queries, got %d", aud.calls)
 	}
 }
 

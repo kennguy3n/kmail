@@ -35,6 +35,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"strings"
 	"time"
 
@@ -174,8 +175,23 @@ func (r *JMAPExportRunner) Run(ctx context.Context, job Job) (Result, error) {
 		return Result{}, err
 	}
 
-	buf := &bytes.Buffer{}
-	gz := gzip.NewWriter(buf)
+	// Materialise the archive to a temp file rather than buffering
+	// it entirely in memory: a large eDiscovery export (up to
+	// maxMessages fully-hydrated RFC 5322 messages, each potentially
+	// several MB) would otherwise pin multiple GB of heap. The
+	// SHA-256 is computed on the fly with a MultiWriter tee so the
+	// archive never has to be re-read to be hashed.
+	tmp, err := os.CreateTemp("", "kmail-export-*.tar.gz")
+	if err != nil {
+		return Result{}, fmt.Errorf("create temp archive: %w", err)
+	}
+	defer func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmp.Name())
+	}()
+
+	hasher := sha256.New()
+	gz := gzip.NewWriter(io.MultiWriter(tmp, hasher))
 	tw := tar.NewWriter(gz)
 
 	included, err := r.writeMail(ctx, tw, job, format, ids, after, before)
@@ -200,11 +216,18 @@ func (r *JMAPExportRunner) Run(ctx context.Context, job Job) (Result, error) {
 		return Result{}, fmt.Errorf("close gzip: %w", err)
 	}
 
-	archive := buf.Bytes()
-	sum := sha256.Sum256(archive)
+	fi, err := tmp.Stat()
+	if err != nil {
+		return Result{}, fmt.Errorf("stat temp archive: %w", err)
+	}
+	size := fi.Size()
+	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+		return Result{}, fmt.Errorf("rewind temp archive: %w", err)
+	}
+
 	res := Result{
-		ArtifactSizeBytes: int64(len(archive)),
-		ArtifactChecksum:  hex.EncodeToString(sum[:]),
+		ArtifactSizeBytes: size,
+		ArtifactChecksum:  hex.EncodeToString(hasher.Sum(nil)),
 		MessageIDs:        included,
 	}
 
@@ -212,11 +235,11 @@ func (r *JMAPExportRunner) Run(ctx context.Context, job Job) (Result, error) {
 	if r.uploader == nil {
 		// Dev fallback: no object store wired. Surface size + name
 		// so the job still completes with a meaningful, inert URL.
-		res.DownloadURL = fmt.Sprintf("data:application/gzip;size=%d;name=%s", len(archive), filename)
+		res.DownloadURL = fmt.Sprintf("data:application/gzip;size=%d;name=%s", size, filename)
 		res.ArtifactURL = res.DownloadURL
 		return res, nil
 	}
-	signed, err := r.uploader.UploadLargeAttachment(ctx, job.TenantID, filename, "application/gzip", bytes.NewReader(archive), int64(len(archive)))
+	signed, err := r.uploader.UploadLargeAttachment(ctx, job.TenantID, filename, "application/gzip", tmp, size)
 	if err != nil {
 		return Result{}, fmt.Errorf("upload archive: %w", err)
 	}
@@ -272,10 +295,11 @@ func (r *JMAPExportRunner) resolveScope(ctx context.Context, job Job) (ids []str
 // any date_range lower-bound filtering).
 func (r *JMAPExportRunner) writeMail(ctx context.Context, tw *tar.Writer, job Job, format string, ids []string, after, before time.Time) ([]string, error) {
 	var (
-		mbox     bytes.Buffer
-		mw       = NewMboxWriter(&mbox)
-		manifest []manifestEntry
-		included = make([]string, 0, len(ids))
+		mbox      bytes.Buffer
+		mw        = NewMboxWriter(&mbox)
+		manifest  []manifestEntry
+		included  = make([]string, 0, len(ids))
+		usedNames = map[string]int{}
 	)
 
 	for start := 0; start < len(ids); start += fetchBatchSize {
@@ -297,7 +321,11 @@ func (r *JMAPExportRunner) writeMail(ctx context.Context, tw *tar.Writer, job Jo
 					return nil, fmt.Errorf("write mbox message %s: %w", msg.ID, err)
 				}
 			case FormatEML:
-				if err := writeTarFile(tw, "mail/"+sanitize(msg.ID)+".eml", msg.Raw); err != nil {
+				// Guard against two distinct ids sanitising to the
+				// same path: a duplicate tar entry would be silently
+				// dropped by most extractors, losing a message.
+				name := "mail/" + uniqueName(usedNames, sanitize(msg.ID)) + ".eml"
+				if err := writeTarFile(tw, name, msg.Raw); err != nil {
 					return nil, err
 				}
 			case FormatPSTStub:
@@ -401,19 +429,33 @@ func (r *JMAPExportRunner) writeCalendars(ctx context.Context, tw *tar.Writer, j
 }
 
 func (r *JMAPExportRunner) writeAudit(ctx context.Context, tw *tar.Writer, job Job, after, before time.Time) error {
-	f := audit.QueryFilters{Limit: 1000}
+	base := audit.QueryFilters{Limit: auditPageSize}
 	if !after.IsZero() {
-		f.Since = after
+		base.Since = after
 	}
 	if !before.IsZero() {
-		f.Until = before
+		base.Until = before
 	}
-	entries, err := r.audit.Query(ctx, job.TenantID, f)
-	if err != nil {
-		return err
+	// audit.Service.Query hard-caps Limit at 1000 per call, so a
+	// single query would silently truncate a busy tenant's trail —
+	// unacceptable for an eDiscovery export. Page through with
+	// Offset until the trail is exhausted so audit.json is complete.
+	entries := make([]audit.Entry, 0)
+	for offset := 0; offset < auditMaxEntries; offset += auditPageSize {
+		f := base
+		f.Offset = offset
+		page, err := r.audit.Query(ctx, job.TenantID, f)
+		if err != nil {
+			return err
+		}
+		entries = append(entries, page...)
+		if len(page) < auditPageSize {
+			break
+		}
 	}
-	if entries == nil {
-		entries = []audit.Entry{}
+	if len(entries) >= auditMaxEntries {
+		// Never silent: if we hit the safety ceiling, say so loudly.
+		r.logger.Printf("export: job %s audit trail hit the %d-entry export cap; archive may omit the oldest entries", job.ID, auditMaxEntries)
 	}
 	body, err := json.MarshalIndent(entries, "", "  ")
 	if err != nil {
@@ -492,6 +534,28 @@ func extractVEvent(ical string) string {
 		return ""
 	}
 	return ical[start : end+len("END:VEVENT")]
+}
+
+// auditPageSize is the per-call page size for the audit export. It
+// matches the hard Limit cap enforced by audit.Service.Query.
+const auditPageSize = 1000
+
+// auditMaxEntries bounds the total audit entries pulled into one
+// archive so a pathological trail cannot exhaust memory. Hitting it
+// is logged loudly (never a silent truncation).
+const auditMaxEntries = 100000
+
+// uniqueName returns base the first time it is seen and base-N for
+// the N-th repeat, so callers can guarantee distinct archive entry
+// paths even when two source ids collapse to the same sanitised
+// string. The supplied map tracks occurrence counts across calls.
+func uniqueName(used map[string]int, base string) string {
+	n := used[base]
+	used[base] = n + 1
+	if n == 0 {
+		return base
+	}
+	return fmt.Sprintf("%s-%d", base, n+1)
 }
 
 // sanitize makes an arbitrary id safe to use as a tar entry path

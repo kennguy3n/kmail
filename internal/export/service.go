@@ -209,6 +209,36 @@ func (s *Service) claimNextJob(ctx context.Context) (*Job, error) {
 	return &j, nil
 }
 
+// RequeueStaleJobs resets export jobs stuck in 'running' longer than
+// olderThan back to 'pending' so a later worker tick retries them. A
+// job goes stale when the process that claimed it died, or a
+// transient DB error stopped markComplete/markFailed from recording a
+// terminal state — claimNextJob only ever picks up 'pending' rows, so
+// without this backstop such a job would hang in 'running' forever.
+//
+// olderThan must comfortably exceed the longest expected job runtime
+// so a still-running export is never requeued and run a second time.
+// Returns the number of jobs requeued.
+//
+// Like claimNextJob this runs on the worker's (RLS-bypassing) pool
+// connection without a tenant GUC: it is a cross-tenant maintenance
+// sweep scoped by status + age rather than by tenant.
+func (s *Service) RequeueStaleJobs(ctx context.Context, olderThan time.Duration) (int64, error) {
+	if s.pool == nil {
+		return 0, nil
+	}
+	cutoff := time.Now().Add(-olderThan)
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE export_jobs
+		SET status = 'pending', started_at = NULL, error_message = ''
+		WHERE status = 'running' AND started_at IS NOT NULL AND started_at < $1
+	`, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("requeue stale jobs: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
 // markComplete records the runner result: the artifact columns +
 // download_url on the export_jobs row and one export_job_messages
 // row per included message. All writes happen in a single
