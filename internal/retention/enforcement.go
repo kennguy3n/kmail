@@ -57,6 +57,17 @@ var errNoProgress = errors.New("retention: enforcement made no progress (destroy
 // message IDs to a cold tier (zk-object-fabric placement move) ahead
 // of an archive-policy destroy. Returns the number of objects moved.
 // Implementations batch internally as needed.
+//
+// MoveToCold MUST be idempotent for already-cold objects. The archive
+// path is a non-atomic two-phase mutation (move-to-cold, then destroy
+// the Stalwart-side index entry): if the destroy fails after a
+// successful move, the message stays in the cutoff window and the
+// next sweep re-issues MoveToCold for the same IDs before retrying
+// the destroy. Re-moving an already-cold object must therefore be a
+// safe no-op rather than an error. The zk-object-fabric
+// `/placements/move` endpoint sets the target tier declaratively
+// (desired-state), so moving a cold object to cold is naturally
+// idempotent; alternative implementations must preserve that.
 type ColdMover interface {
 	MoveToCold(ctx context.Context, tenantID string, messageIDs []string) (int, error)
 }
@@ -182,8 +193,13 @@ func (e *Enforcer) EnforcePolicy(ctx context.Context, tenantID string, policy Po
 		// Live sweeps page by re-querying: destroyed messages drop
 		// out of the cutoff window so the next call returns the next
 		// batch. If the identical batch comes back, destroy isn't
-		// actually removing anything — bail rather than loop.
-		if !e.dryRun && equalStrings(ids, prev) {
+		// actually removing anything — bail rather than loop. The
+		// comparison is order-independent (set membership): the JMAP
+		// query sorts by receivedAt, but ties on equal timestamps have
+		// unspecified ordering, so a re-queried identical *set* may come
+		// back in a different order. Comparing as a set still catches
+		// the no-progress condition rather than waiting for maxPages.
+		if !e.dryRun && sameIDSet(ids, prev) {
 			return e.complete(ctx, tenantID, policy, run, errNoProgress)
 		}
 		prev = ids
@@ -393,12 +409,24 @@ func scopeMailbox(p Policy) (string, error) {
 	}
 }
 
-func equalStrings(a, b []string) bool {
+// sameIDSet reports whether a and b contain exactly the same IDs,
+// independent of order. Message IDs are unique within a query page,
+// so set membership is the right equality for the no-progress guard:
+// it does not depend on the JMAP server's tie-breaking order for
+// messages sharing a receivedAt timestamp.
+func sameIDSet(a, b []string) bool {
 	if len(a) != len(b) {
 		return false
 	}
-	for i := range a {
-		if a[i] != b[i] {
+	if len(a) == 0 {
+		return true
+	}
+	seen := make(map[string]struct{}, len(a))
+	for _, id := range a {
+		seen[id] = struct{}{}
+	}
+	for _, id := range b {
+		if _, ok := seen[id]; !ok {
 			return false
 		}
 	}

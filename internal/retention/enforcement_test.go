@@ -400,6 +400,66 @@ func TestEnforcePolicy_NoProgressGuard(t *testing.T) {
 	}
 }
 
+// reorderingOperator returns the same set of IDs on every query but
+// in a different (reversed) order each call, and its destroy removes
+// nothing — modelling a JMAP server whose tie-breaking on equal
+// receivedAt is unspecified. The no-progress guard must still fire.
+type reorderingOperator struct {
+	ids   []string
+	calls int
+}
+
+func (o *reorderingOperator) QueryEmailsByDate(_ context.Context, _, _ string, _ time.Time, _ int) ([]string, error) {
+	o.calls++
+	out := append([]string(nil), o.ids...)
+	if o.calls%2 == 0 { // alternate the order on re-query
+		for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+			out[i], out[j] = out[j], out[i]
+		}
+	}
+	return out, nil
+}
+
+func (o *reorderingOperator) DestroyEmails(_ context.Context, _ string, _ []string) error {
+	return nil // success, but removes nothing
+}
+
+func TestEnforcePolicy_NoProgressGuardIsOrderIndependent(t *testing.T) {
+	t.Parallel()
+	op := &reorderingOperator{ids: genIDs(4)}
+	enf := NewEnforcer(op, nil, nil)
+
+	_, err := enf.EnforcePolicy(context.Background(), "tenant-a", deletePolicy())
+	if !errors.Is(err, errNoProgress) {
+		t.Fatalf("error = %v, want %v", err, errNoProgress)
+	}
+	// Must bail on the second query (identical set, reordered), not
+	// spin toward maxPages.
+	if op.calls > 2 {
+		t.Fatalf("guard did not fire on reordered set: %d queries", op.calls)
+	}
+}
+
+func TestSameIDSet(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		a, b []string
+		want bool
+	}{
+		{"equal same order", []string{"a", "b"}, []string{"a", "b"}, true},
+		{"equal reordered", []string{"a", "b", "c"}, []string{"c", "a", "b"}, true},
+		{"both empty", nil, nil, true},
+		{"different length", []string{"a"}, []string{"a", "b"}, false},
+		{"same length different members", []string{"a", "b"}, []string{"a", "c"}, false},
+	}
+	for _, tc := range cases {
+		if got := sameIDSet(tc.a, tc.b); got != tc.want {
+			t.Errorf("%s: sameIDSet=%v want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
 func TestEnforcePolicy_WritesAudit(t *testing.T) {
 	t.Parallel()
 	op := &fakeOperator{remaining: genIDs(40)}
