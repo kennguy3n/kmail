@@ -149,6 +149,13 @@ export default function SearchAdmin() {
   const reload = useCallback(
     (tid: string) => {
       setError(null);
+      // Reset the manual-cutover target on every (re)load. Without
+      // this the picker keeps the value chosen for the PREVIOUS
+      // tenant across a tenant switch: the stale option is filtered
+      // out of the <select> but the controlled value survives, so
+      // the "Start cutover" button stays enabled and would submit a
+      // target meant for a different tenant.
+      setCutoverTarget("");
       getSearchBackend(tid)
         .then(setConfig)
         .catch((e: unknown) => setError(String(e)));

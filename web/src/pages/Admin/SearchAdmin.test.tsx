@@ -140,6 +140,43 @@ describe("<SearchAdmin /> cutover", () => {
     ).toBeInTheDocument();
   });
 
+  it("resets the manual-cutover target when the tenant is switched", async () => {
+    // Two tenants so we can drive the picker. Both sit on
+    // shared_meilisearch, so shared_opensearch is a valid target for
+    // either — meaning a stale selection would NOT be filtered out of
+    // the <select> and would keep the trigger enabled if it survived
+    // the switch.
+    const tenant2 = { ...tenant, id: "tenant-2", name: "Beta", slug: "beta" };
+    listTenants.mockResolvedValueOnce([tenant, tenant2]);
+    getSearchBackend.mockResolvedValue({ backend: "shared_meilisearch" });
+    listAvailableSearchBackends.mockResolvedValue([
+      "shared_meilisearch",
+      "shared_opensearch",
+    ]);
+    routeRequestJSON(undefined, []);
+    render(<SearchAdmin />);
+    await screen.findByRole("heading", { name: "Cutover", level: 3 });
+
+    const target = await screen.findByRole("combobox", { name: /target backend/i });
+    fireEvent.change(target, { target: { value: "shared_opensearch" } });
+    expect((target as HTMLSelectElement).value).toBe("shared_opensearch");
+    expect(screen.getByRole("button", { name: "Start cutover" })).toBeEnabled();
+
+    // Switch tenants via the picker.
+    fireEvent.change(screen.getByRole("combobox", { name: /tenant/i }), {
+      target: { value: "tenant-2" },
+    });
+
+    await waitFor(() => {
+      expect(getSearchBackend).toHaveBeenCalledWith("tenant-2");
+    });
+    // The stale target must not carry over: select resets to "" and
+    // the trigger is disabled until the operator picks a target for
+    // the new tenant.
+    expect((target as HTMLSelectElement).value).toBe("");
+    expect(screen.getByRole("button", { name: "Start cutover" })).toBeDisabled();
+  });
+
   it("surfaces a failed cutover and keeps the tenant readable", async () => {
     const { AdminApiError } =
       await vi.importActual<typeof import("../../api/admin")>("../../api/admin");
