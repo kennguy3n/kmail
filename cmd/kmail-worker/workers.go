@@ -250,7 +250,12 @@ func buildWorkers(ctx context.Context, d workerDeps) ([]workerRegistration, erro
 	// the same internal JMAP client the dispatch workers use, so the
 	// worker process applies identical mTLS + breaker posture.
 	auditSvc := audit.NewService(pool)
-	exportSvc := export.NewService(pool)
+	// WithAuditLogger mirrors cmd/kmail-api: the worker is now the
+	// dedicated process that runs export jobs, so the Service must
+	// own the audit logger to emit export.completed / export.failed
+	// entries (eDiscovery compliance). Without it Service.logAudit
+	// silently no-ops on the nil audit field.
+	exportSvc := export.NewService(pool).WithAuditLogger(auditSvc)
 	exportAttachmentSvc := jmap.NewAttachmentService(jmap.AttachmentConfig{
 		Pool:      pool,
 		S3URL:     cfg.ZKFabric.S3URL,
