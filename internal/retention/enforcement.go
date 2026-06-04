@@ -409,24 +409,30 @@ func scopeMailbox(p Policy) (string, error) {
 	}
 }
 
-// sameIDSet reports whether a and b contain exactly the same IDs,
-// independent of order. Message IDs are unique within a query page,
-// so set membership is the right equality for the no-progress guard:
-// it does not depend on the JMAP server's tie-breaking order for
-// messages sharing a receivedAt timestamp.
+// sameIDSet reports whether a and b contain the same set of distinct
+// IDs, independent of order. This is the right equality for the
+// no-progress guard: it does not depend on the JMAP server's
+// tie-breaking order for messages sharing a receivedAt timestamp.
+//
+// It compares distinct sets rather than relying on equal slice lengths,
+// so it stays correct even if a caller's input ever contained duplicate
+// IDs (a JMAP query page never does). Comparing the two sets in both
+// directions avoids the false-equal that a one-directional membership
+// check would give for e.g. (["x","y"], ["x","x"]).
 func sameIDSet(a, b []string) bool {
-	if len(a) != len(b) {
+	sa := make(map[string]struct{}, len(a))
+	for _, id := range a {
+		sa[id] = struct{}{}
+	}
+	sb := make(map[string]struct{}, len(b))
+	for _, id := range b {
+		sb[id] = struct{}{}
+	}
+	if len(sa) != len(sb) {
 		return false
 	}
-	if len(a) == 0 {
-		return true
-	}
-	seen := make(map[string]struct{}, len(a))
-	for _, id := range a {
-		seen[id] = struct{}{}
-	}
-	for _, id := range b {
-		if _, ok := seen[id]; !ok {
+	for id := range sa {
+		if _, ok := sb[id]; !ok {
 			return false
 		}
 	}

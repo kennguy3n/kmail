@@ -452,6 +452,8 @@ func TestSameIDSet(t *testing.T) {
 		{"both empty", nil, nil, true},
 		{"different length", []string{"a"}, []string{"a", "b"}, false},
 		{"same length different members", []string{"a", "b"}, []string{"a", "c"}, false},
+		{"duplicate in b not equal", []string{"a", "b"}, []string{"a", "a"}, false},
+		{"duplicates collapse to same set", []string{"a", "a", "b"}, []string{"a", "b"}, true},
 	}
 	for _, tc := range cases {
 		if got := sameIDSet(tc.a, tc.b); got != tc.want {
