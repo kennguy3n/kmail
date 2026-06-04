@@ -55,14 +55,25 @@ type Policy struct {
 	UpdatedAt     time.Time `json:"updated_at"`
 }
 
-// Service manages retention policies.
+// Service manages retention policies and drives enforcement
+// through an optional Enforcer.
 type Service struct {
-	pool *pgxpool.Pool
+	pool     *pgxpool.Pool
+	enforcer *Enforcer
 }
 
 // NewService returns a Service.
 func NewService(pool *pgxpool.Pool) *Service {
 	return &Service{pool: pool}
+}
+
+// WithEnforcer wires the enforcement engine used by
+// EvaluateRetention. The retention worker builds the Enforcer once
+// its options are known and registers it here so both the worker
+// loop and any direct EvaluateRetention caller share one engine.
+func (s *Service) WithEnforcer(e *Enforcer) *Service {
+	s.enforcer = e
+	return s
 }
 
 // CreatePolicy inserts a new policy.
@@ -141,23 +152,41 @@ func (s *Service) ListPolicies(ctx context.Context, tenantID string) ([]Policy, 
 	return out, rows.Err()
 }
 
-// EvaluateRetention walks the enabled policies for a tenant and
-// emits an audit-style summary. The actual `Email/set destroy` /
-// placement-update for the archive tier lives in the Phase 5
-// follow-up worker (see package doc).
+// EvaluateRetention enforces every enabled policy for a tenant via
+// the configured Enforcer and returns the number of policies that
+// completed without error. Per-policy failures are collected and
+// returned joined so one bad policy does not abort the rest.
+//
+// When no Enforcer is configured it degrades to counting enabled
+// policies (a no-op evaluation) so callers wired before the worker
+// builds its engine still get a sane answer instead of a panic.
 func (s *Service) EvaluateRetention(ctx context.Context, tenantID string) (int, error) {
 	policies, err := s.ListPolicies(ctx, tenantID)
 	if err != nil {
 		return 0, err
 	}
-	enabled := 0
+	if s.enforcer == nil {
+		enabled := 0
+		for _, p := range policies {
+			if p.Enabled {
+				enabled++
+			}
+		}
+		return enabled, nil
+	}
+	enforced := 0
+	var errs []error
 	for _, p := range policies {
 		if !p.Enabled {
 			continue
 		}
-		enabled++
+		if _, err := s.enforcer.EnforcePolicy(ctx, tenantID, p); err != nil {
+			errs = append(errs, fmt.Errorf("policy %s: %w", p.ID, err))
+			continue
+		}
+		enforced++
 	}
-	return enabled, nil
+	return enforced, errors.Join(errs...)
 }
 
 // ListActiveTenants returns the active tenants the worker should

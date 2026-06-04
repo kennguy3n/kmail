@@ -10,13 +10,13 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/kennguy3n/kmail/internal/middleware"
+	"github.com/kennguy3n/kmail/internal/jmap"
 )
 
 // Metrics is the Prometheus metric set for the retention worker.
@@ -56,25 +56,6 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 	return m
 }
 
-// EmailEnforcer is the abstraction over Stalwart JMAP that the
-// worker calls to enumerate + destroy / archive emails. The
-// production wiring uses `jmapHTTPEnforcer` (defined below); tests
-// supply a fake.
-type EmailEnforcer interface {
-	// QueryOlderThan returns the IDs of emails for `tenantID`
-	// older than `before`. `appliesTo` and `targetRef` mirror the
-	// retention policy fields so the enforcer can scope to a
-	// mailbox / label.
-	QueryOlderThan(ctx context.Context, tenantID, appliesTo, targetRef string, before time.Time) ([]string, error)
-	// Destroy removes the listed email IDs. Implementations
-	// batch internally.
-	Destroy(ctx context.Context, tenantID string, ids []string) (int, error)
-	// Archive moves the listed email IDs to a cold-storage tier
-	// via the zk-object-fabric placement API. Returns how many
-	// blobs were moved.
-	Archive(ctx context.Context, tenantID string, ids []string) (int, error)
-}
-
 // ShardResolver is the subset of `tenant.ShardService` the worker
 // needs to talk to a tenant's Stalwart shard. Kept narrow so the
 // retention package does not pull the tenant package as a
@@ -90,16 +71,23 @@ type Worker struct {
 	svc      *Service
 	logger   *log.Logger
 	interval time.Duration
-	enforcer EmailEnforcer
+	op       jmap.EmailOperator
 	dryRun   bool
 	metrics  *Metrics
 
+	// engine is the shared Enforcer, built lazily from the wired
+	// options on the first tick and registered on the Service so
+	// the worker loop and Service.EvaluateRetention drive the same
+	// instance.
+	engineOnce sync.Once
+	engine     *Enforcer
+
 	// Last enforcement snapshot for the admin UI status card.
 	// Read-only outside the worker; updated atomically each tick.
-	lastEvaluatedAt  atomic.Int64
-	lastDeletedTotal atomic.Int64
+	lastEvaluatedAt   atomic.Int64
+	lastDeletedTotal  atomic.Int64
 	lastArchivedTotal atomic.Int64
-	lastErrorsTotal  atomic.Int64
+	lastErrorsTotal   atomic.Int64
 }
 
 // NewWorker constructs a Worker. Defaults to dry-run; production
@@ -117,9 +105,11 @@ func (w *Worker) WithInterval(d time.Duration) *Worker {
 	return w
 }
 
-// WithEnforcer wires the JMAP / fabric enforcer.
-func (w *Worker) WithEnforcer(e EmailEnforcer) *Worker {
-	w.enforcer = e
+// WithEnforcer wires the email operator the enforcement engine
+// drives. Production passes a *JMAPEnforcer (which also implements
+// ColdMover for archive policies); tests supply a fake operator.
+func (w *Worker) WithEnforcer(op jmap.EmailOperator) *Worker {
+	w.op = op
 	return w
 }
 
@@ -191,78 +181,80 @@ func (w *Worker) Run(ctx context.Context) {
 	}
 }
 
+// engineFor builds the shared Enforcer once from the wired options
+// and registers it on the Service so direct EvaluateRetention
+// callers reuse the same instance. Returns nil when no operator has
+// been wired (the worker then logs and skips enforcement).
+func (w *Worker) engineFor() *Enforcer {
+	w.engineOnce.Do(func() {
+		if w.op == nil {
+			return
+		}
+		e := NewEnforcer(w.op, w.svc.pool, w.logger).
+			WithDryRun(w.dryRun).
+			WithMetrics(w.metrics)
+		// The production *JMAPEnforcer is both the operator and the
+		// cold-tier mover; wire the archive path when available.
+		if cm, ok := w.op.(ColdMover); ok {
+			e = e.WithColdMover(cm)
+		}
+		w.engine = e
+		w.svc.WithEnforcer(e)
+	})
+	return w.engine
+}
+
 func (w *Worker) tick(ctx context.Context) error {
+	engine := w.engineFor()
+	if engine == nil {
+		w.logger.Printf("retention.worker: no email operator wired; skipping tick")
+		return nil
+	}
 	tenants, err := w.svc.ListActiveTenants(ctx)
 	if err != nil {
 		return err
 	}
 	for _, id := range tenants {
-		policies, err := w.svc.ListPolicies(ctx, id)
-		if err != nil {
-			w.logger.Printf("retention.worker: tenant %s list: %v", id, err)
-			continue
-		}
-		for _, p := range policies {
-			if !p.Enabled {
-				continue
-			}
-			if err := w.enforcePolicy(ctx, id, p); err != nil {
-				w.logger.Printf("retention.worker: tenant %s policy %s: %v", id, p.ID, err)
-			}
+		// Per-tenant isolation: one tenant's failure (shard down,
+		// RLS error, ...) must not abort the sweep for the rest.
+		if err := w.evaluateTenant(ctx, engine, id); err != nil {
+			w.logger.Printf("retention.worker: tenant %s: %v", id, err)
 		}
 	}
 	return nil
 }
 
-func (w *Worker) enforcePolicy(ctx context.Context, tenantID string, p Policy) error {
-	logID, err := w.startLog(ctx, tenantID, p.ID, w.dryRun)
+func (w *Worker) evaluateTenant(ctx context.Context, engine *Enforcer, tenantID string) error {
+	policies, err := w.svc.ListPolicies(ctx, tenantID)
 	if err != nil {
-		w.logger.Printf("retention.worker: startLog: %v", err)
+		w.incErrors()
+		return fmt.Errorf("list policies: %w", err)
 	}
 	w.lastEvaluatedAt.Store(time.Now().Unix())
-	w.incEvaluations()
-	before := time.Now().AddDate(0, 0, -p.RetentionDays)
 
-	if w.enforcer == nil {
-		// No enforcer wired (early dev / tests). Record a
-		// placeholder log entry so admins can confirm the worker
-		// is alive.
-		_ = w.completeLog(ctx, logID, 0, 0, 0, "", noopNote(w.dryRun))
-		return nil
+	var errs []error
+	for _, p := range policies {
+		if !p.Enabled {
+			continue
+		}
+		w.incEvaluations()
+		run, err := engine.EnforcePolicy(ctx, tenantID, p)
+		// Account whatever progress the run made even on a partial
+		// failure so the admin snapshot stays accurate.
+		if run != nil {
+			if run.EmailsDeleted > 0 {
+				w.lastDeletedTotal.Add(int64(run.EmailsDeleted))
+			}
+			if run.EmailsArchived > 0 {
+				w.lastArchivedTotal.Add(int64(run.EmailsArchived))
+			}
+		}
+		if err != nil {
+			w.incErrors()
+			errs = append(errs, fmt.Errorf("policy %s: %w", p.ID, err))
+		}
 	}
-
-	ids, err := w.enforcer.QueryOlderThan(ctx, tenantID, p.AppliesTo, p.TargetRef, before)
-	if err != nil {
-		w.incErrors()
-		_ = w.completeLog(ctx, logID, 0, 0, 0, err.Error(), "")
-		return err
-	}
-
-	processed := len(ids)
-	if w.dryRun {
-		_ = w.completeLog(ctx, logID, processed, 0, 0, "", "dry_run=true")
-		w.logger.Printf("retention.worker: tenant %s policy %s dry-run matched %d emails", tenantID, p.ID, processed)
-		return nil
-	}
-
-	deleted, archived := 0, 0
-	switch p.PolicyType {
-	case "delete":
-		deleted, err = w.enforcer.Destroy(ctx, tenantID, ids)
-	case "archive":
-		archived, err = w.enforcer.Archive(ctx, tenantID, ids)
-	default:
-		err = fmt.Errorf("retention: unsupported policy_type %q", p.PolicyType)
-	}
-	if err != nil {
-		w.incErrors()
-		_ = w.completeLog(ctx, logID, processed, deleted, archived, err.Error(), "")
-		return err
-	}
-	w.incDeleted(deleted)
-	w.incArchived(archived)
-	_ = w.completeLog(ctx, logID, processed, deleted, archived, "", "")
-	return nil
+	return errors.Join(errs...)
 }
 
 func (w *Worker) incEvaluations() {
@@ -278,76 +270,23 @@ func (w *Worker) incErrors() {
 	}
 }
 
-func (w *Worker) incDeleted(n int) {
-	if n <= 0 {
-		return
-	}
-	w.lastDeletedTotal.Add(int64(n))
-	if w.metrics != nil {
-		w.metrics.EmailsDeleted.Add(float64(n))
-	}
-}
-
-func (w *Worker) incArchived(n int) {
-	if n <= 0 {
-		return
-	}
-	w.lastArchivedTotal.Add(int64(n))
-	if w.metrics != nil {
-		w.metrics.EmailsArchived.Add(float64(n))
-	}
-}
-
-func noopNote(dryRun bool) string {
-	if dryRun {
-		return "dry_run=true,enforcer=noop"
-	}
-	return "enforcer=noop"
-}
-
-func (w *Worker) startLog(ctx context.Context, tenantID, policyID string, dryRun bool) (string, error) {
-	if w.svc.pool == nil {
-		return "", nil
-	}
-	var id string
-	err := pgx.BeginFunc(ctx, w.svc.pool, func(tx pgx.Tx) error {
-		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
-			return err
-		}
-		notes := ""
-		if dryRun {
-			notes = "dry_run=true"
-		}
-		return tx.QueryRow(ctx, `
-			INSERT INTO retention_enforcement_log (tenant_id, policy_id, notes)
-			VALUES ($1::uuid, $2::uuid, $3)
-			RETURNING id::text
-		`, tenantID, policyID, notes).Scan(&id)
-	})
-	return id, err
-}
-
-func (w *Worker) completeLog(ctx context.Context, logID string, processed, deleted, archived int, errMsg, notes string) error {
-	if w.svc.pool == nil || logID == "" {
-		return nil
-	}
-	_, err := w.svc.pool.Exec(ctx, `
-		UPDATE retention_enforcement_log
-		SET emails_processed = $2, emails_deleted = $3, emails_archived = $4,
-		    completed_at = now(), error = COALESCE($5, ''), notes = COALESCE(NULLIF($6, ''), notes)
-		WHERE id = $1::uuid
-	`, logID, processed, deleted, archived, errMsg, notes)
-	return err
-}
-
 // ---------------------------------------------------------------
 // JMAP-backed enforcer
 // ---------------------------------------------------------------
 
-// JMAPEnforcer is the production EmailEnforcer. It speaks JMAP to
-// the tenant's Stalwart shard for delete operations; archive ops
-// post to the zk-object-fabric placement API to flip the storage
-// tier of matched blobs.
+// JMAPEnforcer is the production email operator. It speaks JMAP to
+// the tenant's Stalwart shard for query / destroy, and posts to the
+// zk-object-fabric placement API to move blobs to the cold tier for
+// archive policies. It implements both jmap.EmailOperator and
+// ColdMover so the Enforcer can drive delete and archive policies
+// through one wired object.
+//
+// Note: this operator addresses the shard with a single
+// tenant-level accountId and treats the IDs it returns as opaque
+// round-trip tokens (its own QueryEmailsByDate output feeds straight
+// back into DestroyEmails). It does not emit the account-qualified
+// IDs that *jmap.StalwartEmailOperator does; the two must not be
+// mixed across a query/destroy boundary.
 type JMAPEnforcer struct {
 	Shards     ShardResolver
 	HTTP       *http.Client
@@ -356,6 +295,11 @@ type JMAPEnforcer struct {
 	FabricAuth string
 	Logger     *log.Logger
 }
+
+var (
+	_ jmap.EmailOperator = (*JMAPEnforcer)(nil)
+	_ ColdMover          = (*JMAPEnforcer)(nil)
+)
 
 // NewJMAPEnforcer returns a JMAPEnforcer with sensible defaults.
 func NewJMAPEnforcer(shards ShardResolver, httpClient *http.Client, auth, fabricURL, fabricAuth string, logger *log.Logger) *JMAPEnforcer {
@@ -375,17 +319,27 @@ func NewJMAPEnforcer(shards ShardResolver, httpClient *http.Client, auth, fabric
 	}
 }
 
-// QueryOlderThan asks Stalwart for email IDs older than `before`.
-func (e *JMAPEnforcer) QueryOlderThan(ctx context.Context, tenantID, appliesTo, targetRef string, before time.Time) ([]string, error) {
+// QueryEmailsByDate implements jmap.EmailOperator: it asks Stalwart
+// for up to `limit` email IDs received before `olderThan`, oldest
+// first, optionally scoped to `mailboxID`.
+func (e *JMAPEnforcer) QueryEmailsByDate(ctx context.Context, tenantID, mailboxID string, olderThan time.Time, limit int) ([]string, error) {
+	if strings.TrimSpace(tenantID) == "" {
+		return nil, errors.New("retention: tenantID is required")
+	}
+	if limit <= 0 {
+		limit = queryPageSize
+	}
 	url, err := e.shardURL(ctx, tenantID)
 	if err != nil {
 		return nil, err
 	}
 	filter := map[string]any{
-		"before": before.UTC().Format(time.RFC3339),
+		// JMAP UTCDate: RFC 3339 in UTC, "Z" suffix, no fractional
+		// seconds (RFC 8620 §1.4).
+		"before": olderThan.UTC().Format("2006-01-02T15:04:05Z"),
 	}
-	if appliesTo == "mailbox" && targetRef != "" {
-		filter["inMailbox"] = targetRef
+	if mailboxID != "" {
+		filter["inMailbox"] = mailboxID
 	}
 	body := map[string]any{
 		"using": []string{"urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"},
@@ -393,7 +347,10 @@ func (e *JMAPEnforcer) QueryOlderThan(ctx context.Context, tenantID, appliesTo, 
 			{"Email/query", map[string]any{
 				"accountId": tenantID,
 				"filter":    filter,
-				"limit":     1000,
+				"sort": []map[string]any{
+					{"property": "receivedAt", "isAscending": true},
+				},
+				"limit": limit,
 			}, "c1"},
 		},
 	}
@@ -415,18 +372,21 @@ func (e *JMAPEnforcer) QueryOlderThan(ctx context.Context, tenantID, appliesTo, 
 	return args.IDs, nil
 }
 
-// Destroy issues `Email/set` with `destroy` in batches of 100.
-func (e *JMAPEnforcer) Destroy(ctx context.Context, tenantID string, ids []string) (int, error) {
+// DestroyEmails implements jmap.EmailOperator: it issues
+// `Email/set` with `destroy` in batches of 100.
+func (e *JMAPEnforcer) DestroyEmails(ctx context.Context, tenantID string, ids []string) error {
+	if strings.TrimSpace(tenantID) == "" {
+		return errors.New("retention: tenantID is required")
+	}
+	if len(ids) == 0 {
+		return nil
+	}
 	url, err := e.shardURL(ctx, tenantID)
 	if err != nil {
-		return 0, err
+		return err
 	}
-	count := 0
-	for i := 0; i < len(ids); i += 100 {
-		end := i + 100
-		if end > len(ids) {
-			end = len(ids)
-		}
+	for i := 0; i < len(ids); i += destroyChunk {
+		end := min(i+destroyChunk, len(ids))
 		batch := ids[i:end]
 		body := map[string]any{
 			"using": []string{"urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"},
@@ -441,31 +401,27 @@ func (e *JMAPEnforcer) Destroy(ctx context.Context, tenantID string, ids []strin
 			MethodResponses [][]json.RawMessage `json:"methodResponses"`
 		}
 		if err := e.jmap(ctx, url, body, &resp); err != nil {
-			return count, err
+			return err
 		}
-		count += len(batch)
 	}
-	return count, nil
+	return nil
 }
 
-// Archive flips the storage tier of matching blobs to cold via the
-// zk-object-fabric placement API.
-func (e *JMAPEnforcer) Archive(ctx context.Context, tenantID string, ids []string) (int, error) {
+// MoveToCold implements ColdMover: it flips the storage tier of the
+// matching blobs to cold via the zk-object-fabric placement API.
+func (e *JMAPEnforcer) MoveToCold(ctx context.Context, tenantID string, ids []string) (int, error) {
 	if e.FabricURL == "" {
 		return 0, errors.New("retention: fabric url not configured")
 	}
 	count := 0
-	for i := 0; i < len(ids); i += 100 {
-		end := i + 100
-		if end > len(ids) {
-			end = len(ids)
-		}
+	for i := 0; i < len(ids); i += destroyChunk {
+		end := min(i+destroyChunk, len(ids))
 		batch := ids[i:end]
 		body := map[string]any{
-			"tenant_id":    tenantID,
-			"object_ids":   batch,
-			"target_tier":  "cold",
-			"reason":       "retention_archive",
+			"tenant_id":   tenantID,
+			"object_ids":  batch,
+			"target_tier": "cold",
+			"reason":      "retention_archive",
 		}
 		buf, _ := json.Marshal(body)
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost,
