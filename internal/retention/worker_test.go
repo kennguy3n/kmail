@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // fakeShards is a ShardResolver that always points at one URL.
@@ -79,6 +80,54 @@ func TestJMAPDestroyEmails_AllDestroyedSucceeds(t *testing.T) {
 	e := NewJMAPEnforcer(fakeShards{url: srv.URL}, srv.Client(), "", "", "", nil)
 	if err := e.DestroyEmails(context.Background(), "t1", []string{"m1", "m2"}); err != nil {
 		t.Fatalf("clean destroy should succeed, got %v", err)
+	}
+}
+
+func TestJMAPQueryEmailsByDate_MethodErrorSurfaces(t *testing.T) {
+	// HTTP 200 carrying a JMAP method-level error must NOT be read as
+	// an empty (sweep-complete) result, or the enforcer records a
+	// false success while mail remains.
+	srv := jmapSetServer(t, `{"methodResponses":[["error",{"type":"accountNotFound","description":"no such account"},"c1"]]}`)
+	defer srv.Close()
+
+	e := NewJMAPEnforcer(fakeShards{url: srv.URL}, srv.Client(), "", "", "", nil)
+	ids, err := e.QueryEmailsByDate(context.Background(), "t1", "", time.Now(), 500)
+	if err == nil {
+		t.Fatal("expected error for JMAP method-level error response, got nil")
+	}
+	if !strings.Contains(err.Error(), "accountNotFound") {
+		t.Fatalf("error should name the failure type, got %v", err)
+	}
+	if ids != nil {
+		t.Fatalf("expected nil ids on error, got %v", ids)
+	}
+}
+
+func TestJMAPQueryEmailsByDate_EmptyResultIsNotAnError(t *testing.T) {
+	srv := jmapSetServer(t, `{"methodResponses":[["Email/query",{"ids":[]},"c1"]]}`)
+	defer srv.Close()
+
+	e := NewJMAPEnforcer(fakeShards{url: srv.URL}, srv.Client(), "", "", "", nil)
+	ids, err := e.QueryEmailsByDate(context.Background(), "t1", "", time.Now(), 500)
+	if err != nil {
+		t.Fatalf("a genuinely empty result must not error, got %v", err)
+	}
+	if len(ids) != 0 {
+		t.Fatalf("expected no ids, got %v", ids)
+	}
+}
+
+func TestJMAPQueryEmailsByDate_ReturnsIDs(t *testing.T) {
+	srv := jmapSetServer(t, `{"methodResponses":[["Email/query",{"ids":["m1","m2"]},"c1"]]}`)
+	defer srv.Close()
+
+	e := NewJMAPEnforcer(fakeShards{url: srv.URL}, srv.Client(), "", "", "", nil)
+	ids, err := e.QueryEmailsByDate(context.Background(), "t1", "", time.Now(), 500)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(ids) != 2 || ids[0] != "m1" || ids[1] != "m2" {
+		t.Fatalf("expected [m1 m2], got %v", ids)
 	}
 }
 

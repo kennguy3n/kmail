@@ -367,16 +367,51 @@ func (e *JMAPEnforcer) QueryEmailsByDate(ctx context.Context, tenantID, mailboxI
 	if err := e.jmap(ctx, url, body, &resp); err != nil {
 		return nil, err
 	}
-	if len(resp.MethodResponses) == 0 || len(resp.MethodResponses[0]) < 2 {
-		return nil, nil
+	// A JMAP method-level error (e.g. ["error",{"type":"accountNotFound"}])
+	// must surface as an error: unmarshalling it into the ids struct
+	// would yield nil IDs, which the Enforcer paging loop would read as
+	// "sweep complete" and record a false success while mail remains.
+	rawArgs, err := jmapMethodArgs(resp.MethodResponses, "Email/query", "c1")
+	if err != nil {
+		return nil, err
 	}
 	var args struct {
 		IDs []string `json:"ids"`
 	}
-	if err := json.Unmarshal(resp.MethodResponses[0][1], &args); err != nil {
-		return nil, err
+	if err := json.Unmarshal(rawArgs, &args); err != nil {
+		return nil, fmt.Errorf("retention: decode Email/query args: %w", err)
 	}
 	return args.IDs, nil
+}
+
+// jmapMethodArgs extracts the args object of the first method
+// response, returning an error when the response is missing, is a
+// JMAP method-level `error`, or is not the expected method. This is
+// the single place query/destroy guard against an HTTP-200 JMAP
+// failure being mistaken for a valid (empty) result.
+func jmapMethodArgs(methodResponses [][]json.RawMessage, expected, callID string) (json.RawMessage, error) {
+	if len(methodResponses) == 0 || len(methodResponses[0]) < 2 {
+		return nil, fmt.Errorf("retention: missing %s response (%s)", expected, callID)
+	}
+	var name string
+	if err := json.Unmarshal(methodResponses[0][0], &name); err != nil {
+		return nil, fmt.Errorf("retention: decode %s response method: %w", expected, err)
+	}
+	if name == "error" {
+		var je struct {
+			Type        string `json:"type"`
+			Description string `json:"description"`
+		}
+		_ = json.Unmarshal(methodResponses[0][1], &je)
+		if je.Description != "" {
+			return nil, fmt.Errorf("retention: %s failed: %s: %s", expected, je.Type, je.Description)
+		}
+		return nil, fmt.Errorf("retention: %s failed: %s", expected, je.Type)
+	}
+	if name != expected {
+		return nil, fmt.Errorf("retention: unexpected response method for %s: %q", callID, name)
+	}
+	return methodResponses[0][1], nil
 }
 
 // DestroyEmails implements jmap.EmailOperator: it issues
@@ -429,26 +464,9 @@ func (e *JMAPEnforcer) DestroyEmails(ctx context.Context, tenantID string, ids [
 // sorted order so the surfaced error is deterministic when a batch
 // has several distinct hard failures.
 func checkJMAPDestroy(methodResponses [][]json.RawMessage, callID string) error {
-	if len(methodResponses) == 0 || len(methodResponses[0]) < 2 {
-		return fmt.Errorf("retention: missing Email/set response (%s)", callID)
-	}
-	var name string
-	if err := json.Unmarshal(methodResponses[0][0], &name); err != nil {
-		return fmt.Errorf("retention: decode Email/set response method: %w", err)
-	}
-	if name == "error" {
-		var je struct {
-			Type        string `json:"type"`
-			Description string `json:"description"`
-		}
-		_ = json.Unmarshal(methodResponses[0][1], &je)
-		if je.Description != "" {
-			return fmt.Errorf("retention: Email/set destroy failed: %s: %s", je.Type, je.Description)
-		}
-		return fmt.Errorf("retention: Email/set destroy failed: %s", je.Type)
-	}
-	if name != "Email/set" {
-		return fmt.Errorf("retention: unexpected response method for %s: %q", callID, name)
+	rawArgs, err := jmapMethodArgs(methodResponses, "Email/set", callID)
+	if err != nil {
+		return err
 	}
 	var args struct {
 		NotDestroyed map[string]struct {
@@ -456,7 +474,7 @@ func checkJMAPDestroy(methodResponses [][]json.RawMessage, callID string) error 
 			Description string `json:"description"`
 		} `json:"notDestroyed"`
 	}
-	if err := json.Unmarshal(methodResponses[0][1], &args); err != nil {
+	if err := json.Unmarshal(rawArgs, &args); err != nil {
 		return fmt.Errorf("retention: decode Email/set args: %w", err)
 	}
 	ids := make([]string, 0, len(args.NotDestroyed))

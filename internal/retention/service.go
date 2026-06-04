@@ -1,19 +1,20 @@
-// Package retention — Phase 5 retention / archive lifecycle.
+// Package retention — retention / archive lifecycle.
 //
 // Tenant admins declare retention policies that auto-archive or
-// auto-delete email older than N days. The Phase 5 implementation
-// is intentionally narrow:
+// auto-delete email older than N days:
 //
-//   * Policy CRUD against `retention_policies` (admin UI surface).
-//   * `EvaluateRetention` is a no-op stub that walks the policies
-//     list and emits an audit event recording how many policies
-//     would have run; the actual JMAP-side `Email/set destroy` plus
-//     the zk-object-fabric placement-update for the archive tier
-//     lands as a Phase 5 follow-up once the retention worker has
-//     been validated against staging traffic.
+//   - Policy CRUD against `retention_policies` (admin UI surface).
+//   - `EvaluateRetention` drives real enforcement: for every enabled
+//     policy it invokes the configured `Enforcer`, which pages the
+//     tenant's mail older than the cutoff and issues batched JMAP
+//     `Email/set destroy` (delete) or zk-object-fabric cold-tier
+//     moves followed by destroy (archive). When no Enforcer is wired
+//     it degrades to counting enabled policies so callers wired
+//     before the worker builds its engine still get a sane answer.
 //
-// The retention worker (worker.go) ticks daily and calls
-// `EvaluateRetention` for every active tenant.
+// The retention worker (worker.go) ticks daily, builds the shared
+// Enforcer once, registers it on the Service, and evaluates every
+// active tenant with per-tenant error isolation.
 package retention
 
 import (
