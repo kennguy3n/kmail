@@ -327,6 +327,16 @@ func (s *PostgresCutoverStore) ListCandidates(ctx context.Context, f CandidateFi
 // (tenant, target) pair land on a single winner. The composite
 // `(tenant_id, target_backend)` PK lets the same tenant carry
 // multiple rows (one per target) simultaneously.
+//
+// The in_progress transition nulls `completed_at`: every claim
+// starts a FRESH attempt, so any timestamp left over from a prior
+// completion (a re-claimed `failed` row, or a `pending` row that a
+// completed cutover was reset to) must not survive onto the new
+// attempt — otherwise a subsequent MarkFailed would leave a `failed`
+// row still advertising the old "Completed" date. Claim is the
+// single chokepoint every fresh attempt (manual and worker) passes
+// through, so clearing it here keeps the invariant "a non-completed
+// row never carries a completed_at" intact.
 func (s *PostgresCutoverStore) Claim(ctx context.Context, tenantID, targetBackend string, size, threshold int64, now time.Time) (bool, error) {
 	var claimed bool
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
@@ -343,6 +353,7 @@ func (s *PostgresCutoverStore) Claim(ctx context.Context, tenantID, targetBacken
 			   SET cutover_state = 'in_progress',
 			       mailbox_size  = $3,
 			       started_at    = $4,
+			       completed_at  = NULL,
 			       updated_at    = $4
 			 WHERE tenant_id      = $1
 			   AND target_backend = $2
@@ -529,7 +540,11 @@ func scanCutoverJob(row rowScanner) (*CutoverJob, error) {
 // `pending` with a refreshed mailbox_size / threshold and a cleared
 // failure_count / last_error so the operator's explicit trigger
 // overrides the failure back-off and the completed-row guard,
-// making the tenant immediately claimable again.
+// making the tenant immediately claimable again. `completed_at` is
+// also nulled on reset: re-initiating a previously-`completed` row
+// must not carry its old completion timestamp into the new
+// lifecycle, or a subsequent failure would render a `failed` row
+// that still shows a "Completed" date.
 func (s *PostgresCutoverStore) UpsertPending(ctx context.Context, tenantID, targetBackend string, size, threshold int64, now time.Time) (*CutoverJob, error) {
 	var job *CutoverJob
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
@@ -551,6 +566,8 @@ func (s *PostgresCutoverStore) UpsertPending(ctx context.Context, tenantID, targ
 			                            THEN search_cutover_jobs.failure_count ELSE 0 END,
 			       last_error    = CASE WHEN search_cutover_jobs.cutover_state = 'in_progress'
 			                            THEN search_cutover_jobs.last_error ELSE '' END,
+			       completed_at  = CASE WHEN search_cutover_jobs.cutover_state = 'in_progress'
+			                            THEN search_cutover_jobs.completed_at ELSE NULL END,
 			       updated_at    = CASE WHEN search_cutover_jobs.cutover_state = 'in_progress'
 			                            THEN search_cutover_jobs.updated_at ELSE $5 END
 			RETURNING `+cutoverJobColumns,
@@ -982,7 +999,6 @@ type CutoverService struct {
 	store     CutoverStore
 	sizer     MailboxSizer
 	getter    BackendGetter
-	audit     AuditLogger
 	logger    *log.Logger
 	exec      migrationDeps
 	threshold int64
@@ -1038,7 +1054,6 @@ func NewCutoverService(cfg CutoverServiceConfig) (*CutoverService, error) {
 		store:     cfg.Store,
 		sizer:     cfg.Sizer,
 		getter:    cfg.Getter,
-		audit:     cfg.Audit,
 		logger:    cfg.Logger,
 		threshold: cfg.Threshold,
 		now:       cfg.Now,

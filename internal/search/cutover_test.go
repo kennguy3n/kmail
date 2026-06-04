@@ -146,6 +146,10 @@ func (s *inMemoryCutoverStore) Claim(_ context.Context, tenantID, targetBackend 
 	r.state = CutoverInProgress
 	r.mailboxSize = size
 	r.startedAt = &now
+	// A fresh attempt clears any prior completion timestamp so a
+	// later MarkFailed can't leave a failed row advertising an old
+	// "Completed" date. Mirrors PostgresCutoverStore.Claim.
+	r.completedAt = nil
 	r.updatedAt = now
 	return true, nil
 }
@@ -289,6 +293,10 @@ func (s *inMemoryCutoverStore) UpsertPending(_ context.Context, tenantID, target
 	r.lastError = ""
 	r.mailboxSize = size
 	r.threshold = threshold
+	// Re-initiating a completed row must not carry its old
+	// completion timestamp into the new lifecycle. Mirrors
+	// PostgresCutoverStore.UpsertPending.
+	r.completedAt = nil
 	r.updatedAt = now
 	j := r.toJob(tenantID, targetBackend)
 	return &j, nil
@@ -1575,6 +1583,76 @@ func TestCutoverService_ValidationFailureKeepsSource(t *testing.T) {
 	}
 	if _, ok := rec.find("search_cutover_failed"); !ok {
 		t.Fatal("no failed audit entry for manual cutover")
+	}
+}
+
+// TestCutoverService_ReInitiateAfterCompletionClearsCompletedAt
+// guards the store contract that a non-completed row never carries a
+// stale `completed_at`. The bug: re-initiating a previously-completed
+// (tenant, target) row reset it to pending but kept the old
+// completion timestamp; Claim then flipped it to in_progress still
+// carrying that timestamp, so a subsequent validation failure left a
+// `failed` row that the admin UI rendered with a "Completed" date.
+// The fix nulls completed_at on both the UpsertPending reset and the
+// Claim transition — this test drives the full re-run-then-fail path
+// through CutoverService and asserts the terminal failed row (and the
+// public ListCutoverJobs projection the UI consumes) reports no
+// completion time.
+func TestCutoverService_ReInitiateAfterCompletionClearsCompletedAt(t *testing.T) {
+	store := newInMemoryStore([]string{"tenant-a"})
+	flipper := newFakeFlipper(store)
+	source := MessageSourceFunc(func(_ context.Context, id string) ([]Message, error) {
+		return []Message{{TenantID: id, MessageID: "m1", Subject: "hello"}}, nil
+	})
+	svc := buildCutoverService(t, store, flipper, source, &recordingAudit{})
+	ctx := context.Background()
+
+	// 1) A first cutover meilisearch -> opensearch succeeds, so the
+	//    (tenant-a, opensearch) row is `completed` with a populated
+	//    completed_at.
+	if _, err := svc.InitiateCutover(ctx, "tenant-a", BackendOpenSearch); err != nil {
+		t.Fatalf("InitiateCutover #1: %v", err)
+	}
+	if err := svc.ExecuteCutover(ctx, "tenant-a", BackendOpenSearch, "admin-1"); err != nil {
+		t.Fatalf("ExecuteCutover #1: %v", err)
+	}
+	if r := store.rowFor("tenant-a", BackendOpenSearch); r == nil || r.completedAt == nil {
+		t.Fatalf("precondition: completed row should have completed_at, got %+v", r)
+	}
+
+	// 2) The tenant later moves back off opensearch (e.g. an
+	//    operator-driven flip), so the historical opensearch row is
+	//    re-runnable while its completed_at lingers.
+	store.flipBackend("tenant-a", BackendMeilisearch)
+
+	// 3) Re-initiate opensearch, but this time validation fails.
+	flipper.validateErr["tenant-a"] = errors.New("not searchable")
+	if _, err := svc.InitiateCutover(ctx, "tenant-a", BackendOpenSearch); err != nil {
+		t.Fatalf("InitiateCutover #2: %v", err)
+	}
+	if err := svc.ExecuteCutover(ctx, "tenant-a", BackendOpenSearch, "admin-1"); err == nil {
+		t.Fatal("ExecuteCutover #2 succeeded despite validation failure")
+	}
+
+	// The terminal row is `failed` and must NOT carry the old
+	// completion timestamp.
+	r := store.rowFor("tenant-a", BackendOpenSearch)
+	if r == nil || r.state != CutoverFailed {
+		t.Fatalf("row = %+v, want failed", r)
+	}
+	if r.completedAt != nil {
+		t.Fatalf("failed row still carries completed_at = %v, want nil", r.completedAt)
+	}
+
+	// And the public projection the admin UI reads agrees.
+	jobs, err := svc.ListCutoverJobs(ctx, "tenant-a")
+	if err != nil {
+		t.Fatalf("ListCutoverJobs: %v", err)
+	}
+	for _, j := range jobs {
+		if j.TargetBackend == BackendOpenSearch && j.State == CutoverFailed && j.CompletedAt != nil {
+			t.Fatalf("failed opensearch job exposes CompletedAt = %v, want nil", j.CompletedAt)
+		}
 	}
 }
 
