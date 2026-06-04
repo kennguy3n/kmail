@@ -246,6 +246,9 @@ func buildWorkers(ctx context.Context, d workerDeps) ([]workerRegistration, erro
 	regs = append(regs, workerRegistration{name: "retention", run: retentionWorker.Run})
 
 	// --- export fan-out (calendar + audit reuse) ---
+	// Mirrors cmd/kmail-api: the runner exports/queries Stalwart over
+	// the same internal JMAP client the dispatch workers use, so the
+	// worker process applies identical mTLS + breaker posture.
 	auditSvc := audit.NewService(pool)
 	exportSvc := export.NewService(pool)
 	exportAttachmentSvc := jmap.NewAttachmentService(jmap.AttachmentConfig{
@@ -254,13 +257,27 @@ func buildWorkers(ctx context.Context, d workerDeps) ([]workerRegistration, erro
 		AccessKey: cfg.ZKFabric.AccessKey,
 		SecretKey: cfg.ZKFabric.SecretKey,
 	})
-	exportSvc.WithRunner(export.NewRealRunner(export.RealRunnerConfig{
-		JMAP:     export.NewHTTPJMAPClient(cfg.StalwartURL, ""),
+	exportExporter, err := jmap.NewStalwartEmailExporter(internalJmap, pool, logger)
+	if err != nil {
+		return nil, fmt.Errorf("jmap.NewStalwartEmailExporter: %w", err)
+	}
+	exportQuerier, err := jmap.NewStalwartEmailOperator(internalJmap, pool, logger)
+	if err != nil {
+		return nil, fmt.Errorf("jmap.NewStalwartEmailOperator: %w", err)
+	}
+	exportRunner, err := export.NewJMAPExportRunner(export.JMAPExportRunnerConfig{
+		Exporter: exportExporter,
+		Querier:  exportQuerier,
+		Uploader: exportAttachmentSvc,
 		Calendar: calendarSvc,
 		Audit:    auditSvc,
-		Uploader: exportAttachmentSvc,
-	}))
-	exportWorker := export.NewWorker(exportSvc, logger)
+		Logger:   logger,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("export.NewJMAPExportRunner: %w", err)
+	}
+	exportSvc.WithRunner(exportRunner)
+	exportWorker := export.NewWorker(exportSvc, logger).WithMetrics(export.NewMetrics(d.reg))
 	regs = append(regs, workerRegistration{name: "export", run: exportWorker.Run})
 
 	// --- admin-proxy grant expiry ---

@@ -1,25 +1,27 @@
-// Package retention — Phase 5 retention / archive lifecycle.
+// Package retention — retention / archive lifecycle.
 //
 // Tenant admins declare retention policies that auto-archive or
-// auto-delete email older than N days. The Phase 5 implementation
-// is intentionally narrow:
+// auto-delete email older than N days:
 //
-//   * Policy CRUD against `retention_policies` (admin UI surface).
-//   * `EvaluateRetention` is a no-op stub that walks the policies
-//     list and emits an audit event recording how many policies
-//     would have run; the actual JMAP-side `Email/set destroy` plus
-//     the zk-object-fabric placement-update for the archive tier
-//     lands as a Phase 5 follow-up once the retention worker has
-//     been validated against staging traffic.
+//   - Policy CRUD against `retention_policies` (admin UI surface).
+//   - `EvaluateRetention` drives real enforcement: for every enabled
+//     policy it invokes the configured `Enforcer`, which pages the
+//     tenant's mail older than the cutoff and issues batched JMAP
+//     `Email/set destroy` (delete) or zk-object-fabric cold-tier
+//     moves followed by destroy (archive). When no Enforcer is wired
+//     it degrades to counting enabled policies so callers wired
+//     before the worker builds its engine still get a sane answer.
 //
-// The retention worker (worker.go) ticks daily and calls
-// `EvaluateRetention` for every active tenant.
+// The retention worker (worker.go) ticks daily, builds the shared
+// Enforcer once, registers it on the Service, and evaluates every
+// active tenant with per-tenant error isolation.
 package retention
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -55,14 +57,28 @@ type Policy struct {
 	UpdatedAt     time.Time `json:"updated_at"`
 }
 
-// Service manages retention policies.
+// Service manages retention policies and drives enforcement
+// through an optional Enforcer.
 type Service struct {
 	pool *pgxpool.Pool
+	// enforcer is registered by the worker goroutine (engineFor)
+	// while EvaluateRetention may read it from another goroutine, so
+	// it is stored atomically to keep the two paths race-free.
+	enforcer atomic.Pointer[Enforcer]
 }
 
 // NewService returns a Service.
 func NewService(pool *pgxpool.Pool) *Service {
 	return &Service{pool: pool}
+}
+
+// WithEnforcer wires the enforcement engine used by
+// EvaluateRetention. The retention worker builds the Enforcer once
+// its options are known and registers it here so both the worker
+// loop and any direct EvaluateRetention caller share one engine.
+func (s *Service) WithEnforcer(e *Enforcer) *Service {
+	s.enforcer.Store(e)
+	return s
 }
 
 // CreatePolicy inserts a new policy.
@@ -141,23 +157,42 @@ func (s *Service) ListPolicies(ctx context.Context, tenantID string) ([]Policy, 
 	return out, rows.Err()
 }
 
-// EvaluateRetention walks the enabled policies for a tenant and
-// emits an audit-style summary. The actual `Email/set destroy` /
-// placement-update for the archive tier lives in the Phase 5
-// follow-up worker (see package doc).
+// EvaluateRetention enforces every enabled policy for a tenant via
+// the configured Enforcer and returns the number of policies that
+// completed without error. Per-policy failures are collected and
+// returned joined so one bad policy does not abort the rest.
+//
+// When no Enforcer is configured it degrades to counting enabled
+// policies (a no-op evaluation) so callers wired before the worker
+// builds its engine still get a sane answer instead of a panic.
 func (s *Service) EvaluateRetention(ctx context.Context, tenantID string) (int, error) {
 	policies, err := s.ListPolicies(ctx, tenantID)
 	if err != nil {
 		return 0, err
 	}
-	enabled := 0
+	enforcer := s.enforcer.Load()
+	if enforcer == nil {
+		enabled := 0
+		for _, p := range policies {
+			if p.Enabled {
+				enabled++
+			}
+		}
+		return enabled, nil
+	}
+	enforced := 0
+	var errs []error
 	for _, p := range policies {
 		if !p.Enabled {
 			continue
 		}
-		enabled++
+		if _, err := enforcer.EnforcePolicy(ctx, tenantID, p); err != nil {
+			errs = append(errs, fmt.Errorf("policy %s: %w", p.ID, err))
+			continue
+		}
+		enforced++
 	}
-	return enabled, nil
+	return enforced, errors.Join(errs...)
 }
 
 // ListActiveTenants returns the active tenants the worker should
