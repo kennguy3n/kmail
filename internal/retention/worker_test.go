@@ -131,6 +131,37 @@ func TestJMAPQueryEmailsByDate_ReturnsIDs(t *testing.T) {
 	}
 }
 
+func TestJMAPMethodArgs_MatchesByCallID(t *testing.T) {
+	// A response carrying multiple method results (out of order) must
+	// be resolved by callID, not by position.
+	responses := [][]json.RawMessage{
+		{json.RawMessage(`"Core/echo"`), json.RawMessage(`{}`), json.RawMessage(`"c0"`)},
+		{json.RawMessage(`"Email/query"`), json.RawMessage(`{"ids":["x"]}`), json.RawMessage(`"c1"`)},
+	}
+	raw, err := jmapMethodArgs(responses, "Email/query", "c1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var args struct {
+		IDs []string `json:"ids"`
+	}
+	if err := json.Unmarshal(raw, &args); err != nil {
+		t.Fatalf("decode args: %v", err)
+	}
+	if len(args.IDs) != 1 || args.IDs[0] != "x" {
+		t.Fatalf("matched the wrong response by callID: %v", args.IDs)
+	}
+}
+
+func TestJMAPMethodArgs_MissingCallIDErrors(t *testing.T) {
+	responses := [][]json.RawMessage{
+		{json.RawMessage(`"Email/query"`), json.RawMessage(`{"ids":[]}`), json.RawMessage(`"c0"`)},
+	}
+	if _, err := jmapMethodArgs(responses, "Email/query", "c1"); err == nil {
+		t.Fatal("expected error when no response carries the requested callID")
+	}
+}
+
 // TestService_EnforcerRegistrationIsRaceFree exercises the atomic
 // enforcer pointer: the worker goroutine registers the engine while a
 // caller drives EvaluateRetention. Run under -race this would flag an
