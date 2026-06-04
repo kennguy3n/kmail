@@ -70,6 +70,21 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// KMAIL_DISABLE_WORKERS decouples the background workers from
+	// the API process. The workers now run in their own
+	// `cmd/kmail-worker` binary (Session 6 decomposition), so the
+	// default is `true` — kmail-api serves HTTP only and does NOT
+	// start any background goroutine. Set it to `false` to restore
+	// the single-binary dev mode where the API also runs every
+	// worker in-process (handy for `go run ./cmd/kmail-api` against
+	// a bare docker-compose stack without a separate worker pod).
+	disableWorkers := config.GetenvBool("KMAIL_DISABLE_WORKERS", true)
+	if disableWorkers {
+		logger.Printf("background workers disabled in kmail-api (run cmd/kmail-worker); set KMAIL_DISABLE_WORKERS=false for single-binary dev mode")
+	} else {
+		logger.Printf("background workers ENABLED in kmail-api (KMAIL_DISABLE_WORKERS=false) — single-binary dev mode")
+	}
+
 	pool, err := pgxpool.New(ctx, cfg.DatabaseURL)
 	if err != nil {
 		logger.Fatalf("pgxpool.New: %v", err)
@@ -464,7 +479,9 @@ func main() {
 			// retries the ones that fail inline so a Stalwart
 			// outage eventually converges without operator
 			// intervention.
-			go tenant.NewAliasStalwartSyncWorker(pool, aliasSync, logger).Run(ctx)
+			if !disableWorkers {
+				go tenant.NewAliasStalwartSyncWorker(pool, aliasSync, logger).Run(ctx)
+			}
 		}
 	} else {
 		logger.Printf("stalwart alias sync disabled: KMAIL_STALWART_ADMIN_USER not set")
@@ -548,7 +565,9 @@ func main() {
 	// Background reminder worker: polls upcoming events every 60s
 	// and fires KChat reminders 15min / 5min before start.
 	reminderWorker := calendarbridge.NewReminderWorker(pool, calendarSvc, calendarNotifier, valkeyClient, logger)
-	go reminderWorker.Run(ctx)
+	if !disableWorkers {
+		go reminderWorker.Run(ctx)
+	}
 
 	auditSvc := audit.NewService(pool)
 	audit.NewHandlers(auditSvc, logger).Register(mux, authMW)
@@ -643,7 +662,9 @@ func main() {
 		if err != nil {
 			logger.Fatalf("undosend.NewDispatchWorker: %v", err)
 		}
-		go undoWorker.Run(ctx)
+		if !disableWorkers {
+			go undoWorker.Run(ctx)
+		}
 		logger.Printf("undosend: hold queue wired (delay=%s)", undoDelay)
 	} else {
 		logger.Printf("undosend: disabled (KMAIL_VALKEY_URL unset)")
@@ -683,7 +704,9 @@ func main() {
 	if err != nil {
 		logger.Fatalf("scheduledsend.NewDispatchWorker: %v", err)
 	}
-	go scheduledWorker.Run(ctx)
+	if !disableWorkers {
+		go scheduledWorker.Run(ctx)
+	}
 	logger.Printf("scheduledsend: worker wired (interval=%s)", scheduledInterval)
 
 	// Email Snooze (WS5). Hides an already-delivered email in a
@@ -711,7 +734,9 @@ func main() {
 	if err != nil {
 		logger.Fatalf("snooze.NewDispatchWorker: %v", err)
 	}
-	go snoozeWorker.Run(ctx)
+	if !disableWorkers {
+		go snoozeWorker.Run(ctx)
+	}
 	logger.Printf("snooze: worker wired (interval=%s)", snoozeInterval)
 
 	if chained := jmap.ChainSendInterceptors(sendInterceptors...); chained != nil {
@@ -914,7 +939,9 @@ func main() {
 		if cutErr != nil {
 			logger.Fatalf("search.NewCutoverWorker: %v", cutErr)
 		}
-		go cutover.Run(ctx)
+		if !disableWorkers {
+			go cutover.Run(ctx)
+		}
 		logger.Printf("search: auto-cutover worker started (poll=%s)", getenvDuration("KMAIL_SEARCH_CUTOVER_INTERVAL", time.Hour))
 	} else {
 		logger.Printf("search: auto-cutover worker disabled (need both Meilisearch and OpenSearch configured)")
@@ -1024,7 +1051,9 @@ func main() {
 			Interval: cfg.Billing.QuotaWorkerInterval,
 			Logger:   logger,
 		})
-		go worker.Run(ctx)
+		if !disableWorkers {
+			go worker.Run(ctx)
+		}
 	}
 
 	// Deliverability alert evaluator: walks every tenant every
@@ -1035,7 +1064,9 @@ func main() {
 		Interval: getenvDuration("KMAIL_ALERT_EVAL_INTERVAL", 15*time.Minute),
 		Logger:   logger,
 	}
-	go alertEvaluator.Run(ctx)
+	if !disableWorkers {
+		go alertEvaluator.Run(ctx)
+	}
 
 	// Shard health worker: probes every registered Stalwart
 	// shard every 60s and flips offline shards out of rotation.
@@ -1044,7 +1075,9 @@ func main() {
 		Interval: getenvDuration("KMAIL_SHARD_HEALTH_INTERVAL", 60*time.Second),
 		Logger:   logger,
 	}
-	go shardHealth.Run(ctx)
+	if !disableWorkers {
+		go shardHealth.Run(ctx)
+	}
 
 	// Phase 5 admin surfaces.
 	placementSvc := tenant.NewPlacementService(pool, cfg.ZKFabric.ConsoleURL)
@@ -1063,7 +1096,9 @@ func main() {
 		WithDryRun(retentionDryRun).
 		WithMetrics(retentionMetrics)
 	retention.NewHandlers(retentionSvc, logger).WithWorker(retentionWorker).Register(mux, authMW)
-	go retentionWorker.Run(ctx)
+	if !disableWorkers {
+		go retentionWorker.Run(ctx)
+	}
 
 	approvalSvc := approval.NewService(pool)
 	approval.NewHandlers(approvalSvc).Register(mux, authMW)
@@ -1132,8 +1167,16 @@ func main() {
 	}
 	exportSvc.WithRunner(exportRunner)
 	export.NewHandlers(exportSvc).Register(mux, authMW)
+	// Register the export collectors unconditionally (matching the
+	// retention worker above) so the API's /metrics surface stays
+	// stable regardless of KMAIL_DISABLE_WORKERS — only the worker's
+	// Run loop is gated. This avoids silently dropping kmail_export_*
+	// from the API scrape target when workers run in the kmail-worker
+	// process instead.
 	exportMetrics := export.NewMetrics(metrics.Registry)
-	go export.NewWorker(exportSvc, logger).WithMetrics(exportMetrics).Run(ctx)
+	if !disableWorkers {
+		go export.NewWorker(exportSvc, logger).WithMetrics(exportMetrics).Run(ctx)
+	}
 
 	// Phase 5 closeout — SCIM 2.0 provisioning.
 	scimSvc := scim.NewService(pool, tenantSvc)
@@ -1145,10 +1188,18 @@ func main() {
 	adminProxySvc := adminproxy.NewService(pool, approvalSvc, auditSvc, shardSvc)
 	adminproxy.NewHandlers(adminProxySvc, logger, cfg.StalwartURL).Register(mux, authMW)
 	// Phase 6: background watcher emits `session_expired` audit
-	// rows once `expires_at` passes.
-	go adminproxy.NewExpiryWorker(pool, auditSvc, logger).
-		WithMetric(metrics.Registry).
-		Run(ctx)
+	// rows once `expires_at` passes. Register the expiry collector
+	// unconditionally (matching the retention and export workers
+	// above) so the API's /metrics surface keeps exposing
+	// kmail_admin_sessions_expired_total regardless of
+	// KMAIL_DISABLE_WORKERS — only the worker's Run loop is gated.
+	// Otherwise the metric silently vanishes from the API scrape
+	// target when the expiry worker runs in the kmail-worker process.
+	expiryWorker := adminproxy.NewExpiryWorker(pool, auditSvc, logger).
+		WithMetric(metrics.Registry)
+	if !disableWorkers {
+		go expiryWorker.Run(ctx)
+	}
 
 	// Phase 5 closeout — CardDAV contact bridge.
 	contactSvc := contactbridge.NewService(contactbridge.Config{StalwartURL: cfg.StalwartURL})
@@ -1158,7 +1209,9 @@ func main() {
 	// Phase 5 closeout — Tenant webhook event system.
 	webhookSvc := webhooks.NewService(pool)
 	webhooks.NewHandlers(webhookSvc, logger).Register(mux, authMW)
-	go webhooks.NewWorker(webhookSvc, logger).Run(ctx)
+	if !disableWorkers {
+		go webhooks.NewWorker(webhookSvc, logger).Run(ctx)
+	}
 
 	// Phase E #14 — OAuth2 authorization server for third-party
 	// integrations. Mounted at /api/v1/oauth/* (so all four

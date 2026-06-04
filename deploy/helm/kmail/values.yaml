@@ -157,6 +157,41 @@ kmailApi:
     KMAIL_KCHAT_OIDC_AUDIENCE: ""
     KMAIL_LOKI_ENV: "prod"
 
+# kmail-worker — background-worker process (Session 6 decomposition).
+# Runs every background worker that kmail-api used to start in-process
+# (calendar reminders, undo/scheduled/snooze dispatch, billing quota
+# scan, search cutover, deliverability alerts, shard-health, retention,
+# export fan-out, admin-proxy expiry, webhooks). It exposes ONLY
+# /healthz, /readyz, and /metrics — no tenant traffic — so it has NO
+# Service, NO Ingress, and NO HPA. It reuses kmailApi's ConfigMap and
+# Secret so both processes read identical config.
+#
+# INVARIANT: every worker that can run in BOTH kmail-api (when
+# KMAIL_DISABLE_WORKERS=false) and kmail-worker MUST be safe under
+# concurrent execution — i.e. it claims its unit of work via a Postgres
+# advisory/row lock (FOR UPDATE SKIP LOCKED) or a Valkey lease. This is
+# what makes running both processes simultaneously, and scaling the
+# worker past one replica, safe. Do NOT register an unlocked worker in
+# cmd/kmail-worker/workers.go — it would double-execute.
+kmailWorker:
+  # Single replica by default. The workers coordinate via Postgres
+  # advisory/row locks and Valkey (see the INVARIANT above), so a second
+  # replica is safe but unnecessary for current throughput; scale up only
+  # if a worker's queue backs up (watch the kmail_worker_* metrics).
+  replicaCount: 1
+  # Health/metrics listen port. Drives the container port,
+  # KMAIL_WORKER_ADDR, and both probes in worker-deployment.yaml.
+  # Distinct from the API's 8080 so a single-binary dev pod could
+  # in principle run both without a port clash.
+  metricsPort: 8090
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+
 # Stalwart — mail core, deployed as a StatefulSet with stable
 # per-pod IPs via spec.subdomain. Mail nodes are explicitly NOT
 # autoscaled (see `do-not-do.md`); resize replicaCount manually.
