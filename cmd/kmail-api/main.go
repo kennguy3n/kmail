@@ -1188,11 +1188,17 @@ func main() {
 	adminProxySvc := adminproxy.NewService(pool, approvalSvc, auditSvc, shardSvc)
 	adminproxy.NewHandlers(adminProxySvc, logger, cfg.StalwartURL).Register(mux, authMW)
 	// Phase 6: background watcher emits `session_expired` audit
-	// rows once `expires_at` passes.
+	// rows once `expires_at` passes. Register the expiry collector
+	// unconditionally (matching the retention and export workers
+	// above) so the API's /metrics surface keeps exposing
+	// kmail_admin_sessions_expired_total regardless of
+	// KMAIL_DISABLE_WORKERS — only the worker's Run loop is gated.
+	// Otherwise the metric silently vanishes from the API scrape
+	// target when the expiry worker runs in the kmail-worker process.
+	expiryWorker := adminproxy.NewExpiryWorker(pool, auditSvc, logger).
+		WithMetric(metrics.Registry)
 	if !disableWorkers {
-		go adminproxy.NewExpiryWorker(pool, auditSvc, logger).
-			WithMetric(metrics.Registry).
-			Run(ctx)
+		go expiryWorker.Run(ctx)
 	}
 
 	// Phase 5 closeout — CardDAV contact bridge.
