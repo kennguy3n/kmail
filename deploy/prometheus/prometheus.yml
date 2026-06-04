@@ -23,3 +23,19 @@ scrape_configs:
     static_configs:
       - targets:
           - "host.docker.internal:8088"
+
+  # The background workers run out-of-process (cmd/kmail-worker) by
+  # default — kmail-api sets KMAIL_DISABLE_WORKERS=true — so the
+  # worker-side series (kmail_worker_* supervisor health, plus the
+  # job counters the workers own: kmail_export_*,
+  # kmail_search_cutover_*, kmail_admin_sessions_expired_total,
+  # retention runs, deliverability alerts) are exposed on the
+  # worker's own /metrics, NOT the BFF target above. Scrape it here.
+  # :8090 is KMAIL_WORKER_ADDR's default; reachable on the host
+  # whether the worker runs via `./bin/kmail-worker` or the compose
+  # `workers` profile (which publishes 8090:8090).
+  - job_name: "kmail-worker"
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - "host.docker.internal:8090"

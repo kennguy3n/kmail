@@ -177,6 +177,13 @@ func TestSupervisorWaitTimesOut(t *testing.T) {
 }
 
 func TestBuildWorkersBaselineRegistry(t *testing.T) {
+	// No live Postgres required: pgxpool.New is lazy and buildWorkers
+	// is construction-only (see the INVARIANT note on buildWorkers in
+	// workers.go). The DSN below is never dialed — this test asserts
+	// purely on the registered worker set. If buildWorkers ever gains
+	// a constructor that probes the pool at build time, that invariant
+	// breaks and this test would need a real DB or a stub pool.
+	//
 	// Clear the optional gates so the baseline (always-on) set is
 	// deterministic regardless of the host environment.
 	for _, k := range []string{

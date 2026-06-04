@@ -405,6 +405,63 @@ services:
       retries: 5
     restart: unless-stopped
 
+  # kmail-worker — background-worker process (Session 6 service
+  # decomposition). kmail-api now defaults KMAIL_DISABLE_WORKERS=true
+  # and serves HTTP only, so on its own it runs NONE of the background
+  # jobs (calendar reminders, undo/scheduled/snooze dispatch, billing
+  # quota scan, search cutover, deliverability alerts, shard-health,
+  # retention, export fan-out, admin-proxy expiry, webhooks). Bring
+  # this service up to run them against the dev stack, mirroring the
+  # dedicated worker Deployment the Helm chart ships in production:
+  #
+  #     docker compose --profile workers up
+  #
+  # Opt-in via the `workers` profile so the default `docker compose up`
+  # stays infra-only (the BFF itself is run on the host per the README
+  # "Run the Go BFF" step). The shared image builds every cmd/* binary;
+  # we override the default kmail-api ENTRYPOINT with the kmail-worker
+  # one. For single-binary local dev you can instead skip this service
+  # and run `KMAIL_DISABLE_WORKERS=false ./bin/kmail-api` on the host.
+  kmail-worker:
+    profiles: ["workers"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: kmail-worker
+    # NOTE: override the image ENTRYPOINT, not `command:`. The
+    # Dockerfile sets `ENTRYPOINT ["/usr/local/bin/kmail-api"]`, and
+    # Compose's `command:` maps to Docker CMD — i.e. *arguments* to
+    # that entrypoint — so it would still run kmail-api (with an
+    # ignored arg). The Helm worker Deployment uses `command:` because
+    # Kubernetes' `command` overrides the entrypoint; Compose differs.
+    entrypoint: ["/usr/local/bin/kmail-worker"]
+    environment:
+      # Reach the compose-network services by name (the host-run BFF
+      # uses the published localhost ports instead).
+      DATABASE_URL: "postgresql://kmail:kmail@postgres:5432/kmail?sslmode=disable"
+      KMAIL_VALKEY_URL: "redis://valkey:6379"
+      KMAIL_STALWART_URL: "http://stalwart:8080"
+      KMAIL_MEILISEARCH_URL: "http://meilisearch:7700"
+      KMAIL_MEILISEARCH_API_KEY: "kmail-dev"
+      # Health/metrics listener; published below for local scraping.
+      KMAIL_WORKER_ADDR: ":8090"
+    ports:
+      - "8090:8090"   # /healthz, /readyz, /metrics
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_started
+    # busybox wget ships in the alpine runtime image; /healthz is the
+    # process-liveness probe (readiness additionally pings Postgres).
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8090/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
 volumes:
   postgres_data:
   meilisearch_data:
