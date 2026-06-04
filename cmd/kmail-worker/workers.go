@@ -75,6 +75,14 @@ func buildWorkers(ctx context.Context, d workerDeps) ([]workerRegistration, erro
 	// worker, the shard-health worker, and the retention enforcer.
 	shardSvc := tenant.NewShardService(pool, logger)
 
+	// One audit logger shared by every worker that writes to the
+	// tamper-evident trail (search-cutover, export, adminproxy-expiry),
+	// mirroring cmd/kmail-api's single auditSvc. The worker is the
+	// process that actually runs these jobs when KMAIL_DISABLE_WORKERS
+	// is the default true, so each must own the audit logger or its
+	// system-actor entries silently drop.
+	auditSvc := audit.NewService(pool)
+
 	// JMAP proxy + internal client. The internal client is the wire
 	// path the undo / scheduled / snooze dispatch workers submit
 	// through, so it must carry the same mTLS + circuit-breaker
@@ -199,7 +207,7 @@ func buildWorkers(ctx context.Context, d workerDeps) ([]workerRegistration, erro
 	//   regs = append(regs, workerRegistration{name: "billing-storage-event", run: storageEventWorker.Run})
 
 	// --- search auto-cutover (requires both Meilisearch + OpenSearch) ---
-	if cutoverWorker, ok, cutErr := buildCutoverWorker(cfg, pool, shardSvc, billingSvc, logger); cutErr != nil {
+	if cutoverWorker, ok, cutErr := buildCutoverWorker(cfg, pool, shardSvc, billingSvc, auditSvc, d.reg, logger); cutErr != nil {
 		return nil, cutErr
 	} else if ok {
 		regs = append(regs, workerRegistration{name: "search-cutover", run: cutoverWorker.Run})
@@ -249,7 +257,6 @@ func buildWorkers(ctx context.Context, d workerDeps) ([]workerRegistration, erro
 	// Mirrors cmd/kmail-api: the runner exports/queries Stalwart over
 	// the same internal JMAP client the dispatch workers use, so the
 	// worker process applies identical mTLS + breaker posture.
-	auditSvc := audit.NewService(pool)
 	// WithAuditLogger mirrors cmd/kmail-api: the worker is now the
 	// dedicated process that runs export jobs, so the Service must
 	// own the audit logger to emit export.completed / export.failed
@@ -428,6 +435,8 @@ func buildCutoverWorker(
 	pool *pgxpool.Pool,
 	shardSvc *tenant.ShardService,
 	billingSvc *billing.Service,
+	auditLogger search.AuditLogger,
+	reg prometheus.Registerer,
 	logger *log.Logger,
 ) (*search.CutoverWorker, bool, error) {
 	shardResolver := search.ShardResolverFunc(func(ctx context.Context, tenantID string) (string, error) {
@@ -472,12 +481,24 @@ func buildCutoverWorker(
 	source := search.MessageSourceFunc(func(ctx context.Context, tenantID string) ([]search.Message, error) {
 		return searchSvc.Export(ctx, tenantID)
 	})
+	// Audit + Metrics mirror cmd/kmail-api's cutover wiring. The worker
+	// is the process that actually performs the migration when workers
+	// run out-of-process (the default), so it must (a) emit the
+	// system-actor completed/failed audit entries the API would have,
+	// and (b) export kmail_search_cutover_* on the worker's own
+	// registry — otherwise both the audit trail and the metrics for
+	// real cutovers silently vanish in the default deployment. Unlike
+	// the API (whose registry is built after the worker), the worker's
+	// registry already exists here, so NewCutoverMetrics(reg) registers
+	// directly.
 	cutover, err := search.NewCutoverWorker(search.CutoverConfig{
 		Pool:        pool,
 		Service:     searchSvc,
 		Sizer:       sizer,
 		Source:      source,
 		Logger:      logger,
+		Audit:       auditLogger,
+		Metrics:     search.NewCutoverMetrics(reg),
 		Threshold:   config.GetenvInt64("KMAIL_SEARCH_CUTOVER_THRESHOLD_BYTES", 0),
 		Interval:    getenvDuration("KMAIL_SEARCH_CUTOVER_INTERVAL", time.Hour),
 		MaxFailures: config.GetenvInt("KMAIL_SEARCH_CUTOVER_MAX_FAILURES", 5),
