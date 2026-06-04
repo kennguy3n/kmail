@@ -34,6 +34,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/kennguy3n/kmail/internal/config"
+	"github.com/kennguy3n/kmail/internal/middleware"
 	"github.com/kennguy3n/kmail/internal/valkeyurl"
 )
 
@@ -87,6 +88,35 @@ func main() {
 			}
 		}()
 	}
+
+	// OpenTelemetry tracing parity with cmd/kmail-api. The dispatch
+	// workers (undo / scheduled / snooze send, export) submit to
+	// Stalwart over the same instrumented internal JMAP path the API
+	// uses, so without a tracer provider in this process those
+	// worker→Stalwart spans — emitted in-process under the old
+	// single-binary mode — would silently vanish from distributed
+	// traces now that the workers run out-of-process (the default).
+	// Gated on the same KMAIL_TRACING_ENABLED flag as the API; the
+	// service name is "kmail-worker" so spans are attributable to this
+	// process. InitTracing installs the global tracer provider, so
+	// every otel.Tracer caller in the worker tree picks it up; it
+	// no-ops cleanly when OTEL_EXPORTER_OTLP_ENDPOINT is unset. The
+	// startupCtx is only used for exporter construction (the batch
+	// processor runs on its own context), mirroring the pool above.
+	tracingShutdown := func(context.Context) error { return nil }
+	if cfg.Observability.TracingEnabled {
+		sh, traceErr := middleware.InitTracing(startupCtx, "kmail-worker", cfg.Observability.OTLPEndpoint)
+		if traceErr != nil {
+			logger.Printf("tracing init: %v", traceErr)
+		} else {
+			tracingShutdown = sh
+		}
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = tracingShutdown(shutdownCtx)
+	}()
 
 	// Dedicated Prometheus registry: Go runtime + process collectors
 	// (valuable for a long-lived worker) plus the per-worker
