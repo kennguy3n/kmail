@@ -815,6 +815,8 @@ func TestCutoverWorker_MarkCompletedPersistentFailureReconcilesNextTick(t *testi
 	// tick we'll clear the flake so reconciliation can run
 	// cleanly.
 	wrapped := &flakeyMarkCompleted{CutoverStore: store, failuresLeft: 999}
+	metrics := NewCutoverMetrics(nil)
+	rec := &recordingAudit{}
 	sizer := MailboxSizerFunc(func(context.Context, string) (int64, error) { return 200_000, nil })
 	source := MessageSourceFunc(func(context.Context, string) ([]Message, error) {
 		return []Message{{TenantID: "tenant-a"}}, nil
@@ -825,6 +827,8 @@ func TestCutoverWorker_MarkCompletedPersistentFailureReconcilesNextTick(t *testi
 		Sizer:                sizer,
 		Source:               source,
 		Logger:               silentLogger(),
+		Metrics:              metrics,
+		Audit:                rec,
 		Threshold:            100_000,
 		Interval:             time.Hour,
 		MaxFailures:          5,
@@ -845,6 +849,20 @@ func TestCutoverWorker_MarkCompletedPersistentFailureReconcilesNextTick(t *testi
 	if store.tenantBackends["tenant-a"] != BackendOpenSearch {
 		t.Fatalf("tenant backend = %q, want opensearch (SetBackend ran)", store.tenantBackends["tenant-a"])
 	}
+	// SetBackend committed, so the cutover succeeded even though the
+	// MarkCompleted bookkeeping is still exhausted: the completion
+	// metric + audit entry must already be recorded. ReconcileCompleted
+	// only repairs the store row, never the counter or audit trail, so
+	// recording these lazily would permanently undercount.
+	if got := testutil.ToFloat64(metrics.Completed); got != 1 {
+		t.Fatalf("completed counter = %v, want 1 (recorded at SetBackend, not at MarkCompleted)", got)
+	}
+	if got := testutil.ToFloat64(metrics.InProgress); got != 0 {
+		t.Fatalf("in-progress gauge = %v, want 0 after tick settles", got)
+	}
+	if _, ok := rec.find("search_cutover_completed"); !ok {
+		t.Fatal("no search_cutover_completed audit entry despite successful SetBackend")
+	}
 
 	// Drop the flake so the reconciler can stick.
 	wrapped.failuresLeft = 0
@@ -855,6 +873,11 @@ func TestCutoverWorker_MarkCompletedPersistentFailureReconcilesNextTick(t *testi
 	w.Tick(context.Background())
 	if r := store.rowByTenant("tenant-a"); r == nil || r.state != CutoverCompleted {
 		t.Fatalf("after reconcile tick, row = %+v, want completed", r)
+	}
+	// ReconcileCompleted repaired the row but must NOT re-count the
+	// completion — the counter stays at exactly 1.
+	if got := testutil.ToFloat64(metrics.Completed); got != 1 {
+		t.Fatalf("completed counter = %v after reconcile, want 1 (no double count)", got)
 	}
 }
 
@@ -1618,5 +1641,88 @@ func TestCutoverService_ReInitiateInProgressPreservesStaleClock(t *testing.T) {
 	}
 	if n != 1 {
 		t.Fatalf("ReconcileStale demoted %d rows, want 1 (stale clock must survive re-initiate)", n)
+	}
+}
+
+// visibilityDelayBackend is a SearchBackend whose SearchMessages
+// returns no hits for the first `missesBeforeVisible` calls and then
+// starts returning the doc — simulating a destination index whose
+// writes only become searchable after a refresh (OpenSearch ~1s) or
+// async indexing (Meilisearch). Only the methods Service.Validate
+// touches do anything; the rest are no-ops.
+type visibilityDelayBackend struct {
+	name                string
+	visibleID           string
+	missesBeforeVisible int
+	calls               int
+}
+
+func (b *visibilityDelayBackend) Name() string                                { return b.name }
+func (b *visibilityDelayBackend) IndexMessage(context.Context, Message) error { return nil }
+func (b *visibilityDelayBackend) SearchMessages(_ context.Context, _, _ string, _ int) ([]SearchHit, error) {
+	b.calls++
+	if b.calls <= b.missesBeforeVisible {
+		return nil, nil
+	}
+	return []SearchHit{{MessageID: b.visibleID}}, nil
+}
+func (b *visibilityDelayBackend) DeleteIndex(context.Context, string) error             { return nil }
+func (b *visibilityDelayBackend) MigrateIndex(context.Context, string, []Message) error { return nil }
+func (b *visibilityDelayBackend) ExportMessages(context.Context, string) ([]Message, error) {
+	return nil, nil
+}
+
+// TestServiceValidate_RetriesUntilDocVisible proves validation
+// tolerates the destination index's write-visibility latency: a
+// just-reindexed doc that isn't searchable on the first query (the
+// OpenSearch _bulk refresh race the reviewer flagged) is retried
+// within the bounded budget rather than failing the cutover.
+func TestServiceValidate_RetriesUntilDocVisible(t *testing.T) {
+	orig := validationRetrySleep
+	validationRetrySleep = func(time.Duration) {}
+	defer func() { validationRetrySleep = orig }()
+
+	// Invisible for the first cutoverValidationAttempts-1 searches,
+	// visible on the final allowed attempt.
+	backend := &visibilityDelayBackend{
+		name:                BackendOpenSearch,
+		visibleID:           "m1",
+		missesBeforeVisible: cutoverValidationAttempts - 1,
+	}
+	svc := NewService(Config{Backends: []SearchBackend{backend}})
+	msgs := []Message{{TenantID: "tenant-a", MessageID: "m1", Subject: "hello world"}}
+
+	if err := svc.Validate(context.Background(), "tenant-a", BackendOpenSearch, msgs); err != nil {
+		t.Fatalf("Validate returned %v, want nil (must retry until the doc is visible)", err)
+	}
+	if backend.calls != cutoverValidationAttempts {
+		t.Fatalf("SearchMessages called %d times, want %d (one per attempt until visible)", backend.calls, cutoverValidationAttempts)
+	}
+}
+
+// TestServiceValidate_FailsWhenNeverVisible proves the retry budget
+// is bounded: a genuinely empty / broken destination index (doc
+// never becomes searchable) still fails validation after exhausting
+// the attempts, so the cutover is correctly aborted and the tenant
+// stays on source.
+func TestServiceValidate_FailsWhenNeverVisible(t *testing.T) {
+	orig := validationRetrySleep
+	validationRetrySleep = func(time.Duration) {}
+	defer func() { validationRetrySleep = orig }()
+
+	backend := &visibilityDelayBackend{
+		name:                BackendOpenSearch,
+		visibleID:           "m1",
+		missesBeforeVisible: cutoverValidationAttempts + 5, // never within budget
+	}
+	svc := NewService(Config{Backends: []SearchBackend{backend}})
+	msgs := []Message{{TenantID: "tenant-a", MessageID: "m1", Subject: "hello world"}}
+
+	err := svc.Validate(context.Background(), "tenant-a", BackendOpenSearch, msgs)
+	if err == nil {
+		t.Fatal("Validate succeeded, want failure when doc never becomes searchable")
+	}
+	if backend.calls != cutoverValidationAttempts {
+		t.Fatalf("SearchMessages called %d times, want %d (full budget then give up)", backend.calls, cutoverValidationAttempts)
 	}
 }

@@ -734,18 +734,26 @@ func runMigration(ctx context.Context, d migrationDeps, tenantID, sourceBackend,
 	if err := d.flipper.SetBackend(ctx, tenantID, targetBackend); err != nil {
 		return d.markFailed(ctx, tenantID, sourceBackend, targetBackend, "set backend", err)
 	}
-	// SetBackend committed; the tenant is live on the target.
+	// SetBackend committed — the tenant is now live on the target, so
+	// the cutover has *succeeded* regardless of what happens to the
+	// store bookkeeping below. Record the completion metric + audit
+	// entry HERE, before the MarkCompleted retry, so a persistent
+	// bookkeeping failure can't drop them: ReconcileCompleted only
+	// repairs the store row on a later tick, it never touches the
+	// counter or the audit trail, so deferring these until after a
+	// successful MarkCompleted would permanently undercount and
+	// leave a gap in the tamper-evident log.
+	d.metrics.Completed.Inc()
+	d.recordAudit(ctx, tenantID, sourceBackend, targetBackend, "search_cutover_completed", len(msgs), "")
+	d.logger.Printf("search.cutover[%s->%s]: tenant=%s migrated %d messages", sourceBackend, targetBackend, tenantID, len(msgs))
 	// MarkCompleted is bookkeeping — a transient failure here must
-	// not re-migrate, so retry with backoff and let the next
-	// tick's ReconcileCompleted pass promote the row if the budget
-	// is exhausted.
+	// not re-migrate, so retry with backoff and let the next tick's
+	// ReconcileCompleted pass promote the row if the budget is
+	// exhausted.
 	if err := d.markCompletedWithRetry(ctx, tenantID, targetBackend); err != nil {
 		d.logger.Printf("search.cutover[%s->%s]: tenant=%s SetBackend OK but MarkCompleted persistently failed; will be reconciled on next tick: %v", sourceBackend, targetBackend, tenantID, err)
 		return fmt.Errorf("mark completed: %w", err)
 	}
-	d.metrics.Completed.Inc()
-	d.recordAudit(ctx, tenantID, sourceBackend, targetBackend, "search_cutover_completed", len(msgs), "")
-	d.logger.Printf("search.cutover[%s->%s]: tenant=%s migrated %d messages", sourceBackend, targetBackend, tenantID, len(msgs))
 	return nil
 }
 
@@ -826,6 +834,22 @@ func (d migrationDeps) recordAudit(ctx context.Context, tenantID, sourceBackend,
 // turning validation into a second full scan.
 const cutoverValidationSampleSize = 10
 
+// cutoverValidationAttempts / cutoverValidationRetryDelay bound the
+// per-message retry loop that absorbs the destination index's
+// write-visibility latency (OpenSearch refresh interval, async
+// Meilisearch indexing). 5 attempts * 200ms ~= 1s, which comfortably
+// clears the default 1s OpenSearch refresh window while keeping the
+// worst-case delay on a genuine validation failure bounded.
+const (
+	cutoverValidationAttempts   = 5
+	cutoverValidationRetryDelay = 200 * time.Millisecond
+)
+
+// validationRetrySleep is the sleep used between validation retries.
+// A package var (not a direct time.Sleep call) so tests can swap in
+// a no-op and exercise the retry path without real delays.
+var validationRetrySleep = time.Sleep
+
 // Validate implements BackendFlipper.Validate. After a reindex it
 // samples up to cutoverValidationSampleSize of the just-migrated
 // messages and confirms each is searchable in `backend` by a
@@ -857,15 +881,46 @@ func (s *Service) Validate(ctx context.Context, tenantID, backend string, msgs [
 		return nil
 	}
 	for _, m := range sampleMessages(searchable, cutoverValidationSampleSize) {
-		hits, err := b.SearchMessages(ctx, tenantID, validationQuery(m), 50)
-		if err != nil {
-			return fmt.Errorf("validate: search in %q: %w", backend, err)
-		}
-		if !containsMessageID(hits, m.MessageID) {
-			return fmt.Errorf("validate: message %q not searchable in %q after reindex", m.MessageID, backend)
+		if err := s.validateSearchable(ctx, b, tenantID, backend, m); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+// validateSearchable confirms a single migrated message is findable
+// in `backend`, retrying with a short backoff to absorb the search
+// index's write-visibility latency. Reindex writes don't become
+// searchable synchronously — OpenSearch's `_bulk` only makes docs
+// queryable after the next refresh (default ~1s) and Meilisearch
+// indexes asynchronously — so a search fired immediately after
+// ReindexTo can legitimately miss a freshly-written doc. Retrying
+// turns that transient invisibility (and transient query errors)
+// into a wait rather than a spurious cutover failure, while a
+// genuinely empty / broken index still fails once the budget is
+// exhausted. The budget is small and bounded, so a real failure
+// adds at most cutoverValidationAttempts*cutoverValidationRetryDelay
+// (~1s) before returning.
+func (s *Service) validateSearchable(ctx context.Context, b SearchBackend, tenantID, backend string, m Message) error {
+	var lastErr error
+	for attempt := 0; attempt < cutoverValidationAttempts; attempt++ {
+		if attempt > 0 {
+			validationRetrySleep(cutoverValidationRetryDelay)
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+		}
+		hits, err := b.SearchMessages(ctx, tenantID, validationQuery(m), 50)
+		if err != nil {
+			lastErr = fmt.Errorf("validate: search in %q: %w", backend, err)
+			continue
+		}
+		if containsMessageID(hits, m.MessageID) {
+			return nil
+		}
+		lastErr = fmt.Errorf("validate: message %q not searchable in %q after reindex", m.MessageID, backend)
+	}
+	return lastErr
 }
 
 // validationQuery picks the free-text term used to look a message

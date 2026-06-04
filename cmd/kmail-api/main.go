@@ -714,7 +714,6 @@ func main() {
 		proxy.SetSendInterceptor(chained)
 	}
 
-
 	// DKIM rotation surface (Phase 7). Lives next to the DNS
 	// wizard so the wizard UI can show "rotation pending" rows
 	// when an admin has rolled a new selector but DNS hasn't
@@ -892,8 +891,10 @@ func main() {
 	if hasMeili && hasOpen {
 		// Reuse the cutover store/source/sizer/metrics built with
 		// the CutoverService above so the manual and automatic
-		// paths share one metric set and one mailbox-size source.
+		// paths share one store, one metric set, and one
+		// mailbox-size source.
 		cutover, cutErr := search.NewCutoverWorker(search.CutoverConfig{
+			Store:       cutoverStore,
 			Pool:        pool,
 			Service:     searchSvc,
 			Sizer:       cutoverSizer,
