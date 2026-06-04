@@ -173,6 +173,14 @@ kmailApi:
 # what makes running both processes simultaneously, and scaling the
 # worker past one replica, safe. Do NOT register an unlocked worker in
 # cmd/kmail-worker/workers.go — it would double-execute.
+#
+# ALERTING: the supervisor restarts a crashed/panicking worker forever
+# with capped (30s) backoff — there is no circuit breaker by design, so
+# a permanently-broken worker never crashes the pod. Alert on
+# rate(kmail_worker_restarts_total[5m]) and
+# rate(kmail_worker_panics_total[5m]) (scraped from this pod's :8090,
+# NOT the API target) to catch failures that would have been fatal in
+# the old single-binary model. See docs/ARCHITECTURE.md §9.
 kmailWorker:
   # Single replica by default. The workers coordinate via Postgres
   # advisory/row locks and Valkey (see the INVARIANT above), so a second

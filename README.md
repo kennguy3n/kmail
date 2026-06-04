@@ -44,6 +44,42 @@ make build
 ./bin/kmail-api
 ```
 
+### Run the background workers
+
+`kmail-api` defaults `KMAIL_DISABLE_WORKERS=true` and serves HTTP
+only — it runs **none** of the background jobs (calendar reminders,
+undo/scheduled/snooze send dispatch, billing-quota scan, search
+cutover, deliverability alerts, shard-health, retention, export
+fan-out, admin-proxy expiry, webhook delivery). Run those in the
+dedicated worker process (the production Helm chart deploys it as a
+separate Deployment):
+
+```bash
+./bin/kmail-worker            # runs all background workers; /metrics on :8090
+```
+
+Or, in Docker against the dev stack:
+
+```bash
+docker compose --profile workers up   # builds + runs kmail-worker
+```
+
+For single-binary local dev you can instead keep everything in
+`kmail-api`:
+
+```bash
+KMAIL_DISABLE_WORKERS=false ./bin/kmail-api
+```
+
+> **Upgrade note (non-Helm deployments):** before this split,
+> `kmail-api` ran the workers in-process. After upgrading, a bare
+> `kmail-api` no longer does. Deploy `kmail-worker` alongside it (the
+> Helm chart already does), or set `KMAIL_DISABLE_WORKERS=false` to
+> keep the old single-binary behaviour. Running both the dedicated
+> worker **and** `kmail-api` with workers enabled is safe — they
+> coordinate via Postgres advisory/row locks and Valkey leases — but
+> redundant.
+
 ### Run the React frontend
 
 ```bash

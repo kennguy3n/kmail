@@ -590,6 +590,23 @@ mismatch.
   events, retention runs, malware-scan outcomes). The
   `KMail Overview` dashboard renders the SLO targets from
   PROPOSAL.md against this scrape.
+- **Worker observability (out-of-process)**. Since the Session 6
+  decomposition, the background jobs run in `cmd/kmail-worker`
+  (kmail-api defaults `KMAIL_DISABLE_WORKERS=true`), exposing their
+  own `/metrics` on `:8090` — scraped by the `kmail-worker` job in
+  `deploy/prometheus/prometheus.yml`. The worker-owned series
+  (`kmail_export_*`, `kmail_search_cutover_*`,
+  `kmail_admin_sessions_expired_total`, retention/deliverability
+  counters) live on that target, not the BFF's. The supervisor
+  restarts a crashed/panicking worker forever with capped (30s)
+  backoff — there is **no circuit breaker by design** (permanently
+  giving up would silently disable a real subsystem). Persistent
+  breakage is therefore only visible as telemetry, so production
+  **must alert** on `rate(kmail_worker_restarts_total[5m])` and
+  `rate(kmail_worker_panics_total[5m])` — a worker that would have
+  been fatal in the old single-binary model now manifests as a
+  steady restart/panic rate plus a `kmail_worker_up{worker="…"}`
+  flap rather than a crashed pod.
 - **ClamAV malware scanning** ships behind the `clamav` compose
   profile (`docker compose --profile clamav up`). The
   `internal/malware` adapter speaks INSTREAM over TCP and is wired

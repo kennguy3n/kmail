@@ -405,6 +405,108 @@ services:
       retries: 5
     restart: unless-stopped
 
+  # kmail-worker — background-worker process (Session 6 service
+  # decomposition). kmail-api now defaults KMAIL_DISABLE_WORKERS=true
+  # and serves HTTP only, so on its own it runs NONE of the background
+  # jobs (calendar reminders, undo/scheduled/snooze dispatch, billing
+  # quota scan, search cutover, deliverability alerts, shard-health,
+  # retention, export fan-out, admin-proxy expiry, webhooks). Bring
+  # this service up to run them against the dev stack, mirroring the
+  # dedicated worker Deployment the Helm chart ships in production:
+  #
+  #     docker compose --profile workers up
+  #
+  # Opt-in via the `workers` profile so the default `docker compose up`
+  # stays infra-only (the BFF itself is run on the host per the README
+  # "Run the Go BFF" step). The shared image builds every cmd/* binary;
+  # we override the default kmail-api ENTRYPOINT with the kmail-worker
+  # one. For single-binary local dev you can instead skip this service
+  # and run `KMAIL_DISABLE_WORKERS=false ./bin/kmail-api` on the host.
+  kmail-worker:
+    profiles: ["workers"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: kmail-worker
+    # NOTE: override the image ENTRYPOINT, not `command:`. The
+    # Dockerfile sets `ENTRYPOINT ["/usr/local/bin/kmail-api"]`, and
+    # Compose's `command:` maps to Docker CMD — i.e. *arguments* to
+    # that entrypoint — so it would still run kmail-api (with an
+    # ignored arg). The Helm worker Deployment uses `command:` because
+    # Kubernetes' `command` overrides the entrypoint; Compose differs.
+    entrypoint: ["/usr/local/bin/kmail-worker"]
+    environment:
+      # Reach the compose-network services by name (the host-run BFF
+      # uses the published localhost ports instead). KMAIL_-prefixed
+      # to match the rest of this block and the Helm Secret
+      # (deploy/helm/kmail/values.yaml uses KMAIL_DATABASE_URL); the
+      # bare DATABASE_URL fallback in config.Load works too.
+      KMAIL_DATABASE_URL: "postgresql://kmail:kmail@postgres:5432/kmail?sslmode=disable"
+      KMAIL_VALKEY_URL: "redis://valkey:6379"
+      KMAIL_STALWART_URL: "http://stalwart:8080"
+      KMAIL_MEILISEARCH_URL: "http://meilisearch:7700"
+      KMAIL_MEILISEARCH_API_KEY: "kmail-dev"
+      # zk-object-fabric blob store, reached by compose service name on
+      # its container ports (8080 S3 / 8081 console; the host-published
+      # 9080/9081 are for the host-run BFF). The export worker builds an
+      # AttachmentService against the S3 URL and the retention enforcer
+      # uses the console URL — both default to localhost:9080/9081
+      # (config.go), unreachable in-container. Without these the export
+      # and retention ticks fail every cycle (logged, not fatal — the
+      # Run loops continue; see the depends_on note below), so the
+      # workers stay up but silently do no blob/retention work. Access/
+      # secret keys are left at their config defaults (kmail-access-key
+      # / kmail-secret-key), which match what zk-fabric-init and the
+      # stalwart service use.
+      KMAIL_ZK_FABRIC_S3_URL: "http://zk-fabric:8080"
+      KMAIL_ZK_FABRIC_CONSOLE_URL: "http://zk-fabric:8081"
+      # Dev stack: keep the worker out of production mTLS fail-closed
+      # posture (no TLS vars are set here, so this is only a clarity
+      # signal — Validate() returns nil for an all-empty TLS config
+      # either way).
+      KMAIL_ENV: "development"
+      # Health/metrics listener; published below for local scraping.
+      KMAIL_WORKER_ADDR: ":8090"
+    ports:
+      - "8090:8090"   # /healthz, /readyz, /metrics
+    depends_on:
+      # Only gate on the two backends the worker actually needs to be
+      # up to come up cleanly. We deliberately do NOT gate on
+      # stalwart-init (service_completed_successfully). Two reasons:
+      #
+      #  1. It isn't needed. Every worker Run loop logs-and-continues
+      #     on backend errors (e.g. undosend.DispatchWorker.Run only
+      #     returns on ctx.Done(); a JMAP/Stalwart failure is Printf'd,
+      #     not returned), so an unconfigured/unreachable Stalwart at
+      #     cold start produces log lines, NOT worker returns — the
+      #     supervisor only restarts on a return or panic, so there is
+      #     no cold-start restart-loop to prevent.
+      #  2. It would be fragile. stalwart-init is a one-shot whose
+      #     terminal (non-essential) spam-filter tuning hard-exits 1
+      #     under `set -eu` if the pinned Stalwart image rejects
+      #     `x:Setting/set`; gating on its success would then leave the
+      #     worker permanently `Created` and never started.
+      #
+      # The full mail stack still comes up: `docker compose
+      # --profile workers up` (no service arg) starts every
+      # profile-less service (stalwart, stalwart-init, zk-fabric, …)
+      # regardless of depends_on — depends_on only controls ordering,
+      # not whether a service starts. The worker simply tolerates the
+      # backend not being fully configured yet and proceeds once it is.
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_started
+    # busybox wget ships in the alpine runtime image; /healthz is the
+    # process-liveness probe (readiness additionally pings Postgres).
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8090/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
 volumes:
   postgres_data:
   meilisearch_data:

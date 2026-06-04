@@ -177,6 +177,16 @@ func TestSupervisorWaitTimesOut(t *testing.T) {
 }
 
 func TestBuildWorkersBaselineRegistry(t *testing.T) {
+	// No live backend required: pgxpool.New is lazy and buildWorkers
+	// is construction-only (see the INVARIANT note on buildWorkers in
+	// workers.go). The DSN below is never dialed, and passing
+	// valkey == nil (ValkeyURL: "" / workerDeps.valkey: nil) skips the
+	// one construction-time Valkey Ping in buildInternalJMAP — so this
+	// test asserts purely on the registered worker set with nothing
+	// listening. If buildWorkers ever gains a constructor that probes
+	// Postgres (or unconditionally probes Valkey) at build time, that
+	// invariant breaks and this test would need a real backend / stub.
+	//
 	// Clear the optional gates so the baseline (always-on) set is
 	// deterministic regardless of the host environment.
 	for _, k := range []string{
