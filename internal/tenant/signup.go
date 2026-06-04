@@ -63,6 +63,15 @@ var (
 	// admin user's (globally unique) email already has a row —
 	// the idempotent "admin already created" signal.
 	ErrUserExists = errors.New("signup: user already exists")
+
+	// ErrTenantProvisionIncomplete is returned by a TenantProvisioner's
+	// CreateTenant when the tenant row was inserted but a post-insert
+	// provisioning hook (zk-object-fabric bucket, billing lifecycle)
+	// failed. The tenant pointer is still returned alongside it so
+	// CompleteSignup can re-drive the idempotent hooks via
+	// EnsureProvisioned instead of permanently failing the signup and
+	// leaving a half-provisioned tenant behind.
+	ErrTenantProvisionIncomplete = errors.New("signup: tenant provisioning incomplete")
 )
 
 // PlanTier is a single self-service plan card surfaced on the public
@@ -175,6 +184,14 @@ type TenantProvisioner interface {
 	GetTenantBySlug(ctx context.Context, slug string) (*Tenant, error)
 	MarkSelfService(ctx context.Context, tenantID string) error
 	CreateAdminUser(ctx context.Context, tenantID, email, displayName string) (*User, error)
+	// EnsureProvisioned re-drives the idempotent post-insert
+	// provisioning hooks (zk-object-fabric bucket, billing lifecycle)
+	// for an existing tenant. CompleteSignup calls it whenever it did
+	// not freshly create the tenant in this attempt — i.e. on a
+	// replayed completion or after a prior attempt inserted the row but
+	// a hook failed — so a partially-provisioned tenant heals on the
+	// next webhook delivery instead of needing manual operator repair.
+	EnsureProvisioned(ctx context.Context, tenantID, plan string) error
 }
 
 // CheckoutSessionParams is the input to StripeCheckoutClient.
@@ -479,16 +496,38 @@ func (s *SignupService) CompleteSignup(ctx context.Context, stripeCheckoutSessio
 		Plan: req.Plan,
 	})
 	replay := false
-	if errors.Is(err, ErrTenantExists) {
+	healProvisioning := false
+	switch {
+	case errors.Is(err, ErrTenantExists):
 		// Concurrent / replayed completion — the tenant already
 		// exists for this signup. Resolve it and continue driving the
-		// remaining (idempotent) steps.
+		// remaining (idempotent) steps. Re-drive provisioning too, in
+		// case a prior attempt inserted the row but failed a hook.
 		replay = true
+		healProvisioning = true
 		tenant, err = s.prov.GetTenantBySlug(ctx, slug)
+	case errors.Is(err, ErrTenantProvisionIncomplete):
+		// The tenant row was inserted in THIS attempt but a post-insert
+		// provisioning hook failed. The tenant pointer is valid; clear
+		// the error and re-drive the idempotent hooks below so we don't
+		// mark the signup active over a half-provisioned tenant.
+		healProvisioning = true
+		err = nil
 	}
 	if err != nil {
 		s.failSignup(ctx, req.ID, "create tenant", err)
 		return nil, fmt.Errorf("signup: create tenant: %w", err)
+	}
+
+	if healProvisioning {
+		if err := s.prov.EnsureProvisioned(ctx, tenant.ID, tenant.Plan); err != nil {
+			// Provisioning is still incomplete. Keep the signup in a
+			// retryable state (return non-2xx → Stripe redelivers) so a
+			// later webhook heals it, rather than marking it active over
+			// a tenant whose zk-fabric bucket / billing record is missing.
+			s.failSignup(ctx, req.ID, "ensure provisioned", err)
+			return nil, fmt.Errorf("signup: ensure provisioned: %w", err)
+		}
 	}
 
 	if err := s.prov.MarkSelfService(ctx, tenant.ID); err != nil {

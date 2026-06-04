@@ -142,9 +142,38 @@ func (p *signupProvisioner) CreateTenant(ctx context.Context, in CreateTenantInp
 		if isUniqueViolation(err) {
 			return nil, ErrTenantExists
 		}
+		// Service.CreateTenant returns a non-nil tenant alongside the
+		// error when the row was inserted but a post-insert provisioning
+		// hook failed (see internal/tenant/service.go). Preserve that
+		// tenant and signal the partial state so CompleteSignup re-drives
+		// the idempotent hooks instead of discarding the pointer and
+		// permanently failing the signup over a half-provisioned tenant.
+		if t != nil {
+			return t, fmt.Errorf("%w: %v", ErrTenantProvisionIncomplete, err)
+		}
 		return nil, err
 	}
 	return t, nil
+}
+
+// EnsureProvisioned re-runs the idempotent post-insert provisioning
+// hooks (zk-object-fabric bucket, billing lifecycle) against an
+// existing tenant. It mirrors the hook sequence in Service.CreateTenant
+// and is safe to call repeatedly — CreateBucket / placement PUT and the
+// billing OnTenantCreated upsert all no-op when the resource already
+// exists for the tenant.
+func (p *signupProvisioner) EnsureProvisioned(ctx context.Context, tenantID, plan string) error {
+	if p.svc.provisioner != nil {
+		if _, err := p.svc.provisioner.Provision(ctx, tenantID, plan); err != nil {
+			return fmt.Errorf("zk-fabric provision: %w", err)
+		}
+	}
+	if p.svc.billing != nil {
+		if err := p.svc.billing.OnTenantCreated(ctx, tenantID, plan); err != nil {
+			return fmt.Errorf("billing.OnTenantCreated: %w", err)
+		}
+	}
+	return nil
 }
 
 func (p *signupProvisioner) GetTenantBySlug(ctx context.Context, slug string) (*Tenant, error) {
@@ -344,9 +373,20 @@ func (m *JMAPWelcomeMailer) SendWelcome(ctx context.Context, msg WelcomeMessage)
 		return fmt.Errorf("welcome mailer: resolve sender account: %w", err)
 	}
 
+	// Resolve the sender's real Drafts mailbox id. JMAP (RFC 8620 §5.1)
+	// reserves the `$`-prefix for *creation-id back-references* within a
+	// single request batch, not for well-known mailbox names — so a
+	// literal "$drafts" mailbox id makes the Email/set create land in
+	// `notCreated` and the whole welcome send silently no-ops. We must
+	// pass the account's actual Drafts mailbox id (RFC 8621 §2 `role`).
+	mailboxID, err := m.resolveDraftsMailbox(ctx, accountID)
+	if err != nil {
+		return fmt.Errorf("welcome mailer: resolve drafts mailbox: %w", err)
+	}
+
 	subject := fmt.Sprintf("Welcome to KMail, %s", msg.OrgName)
 	emailCreate := map[string]any{
-		"mailboxIds": map[string]bool{"$drafts": true},
+		"mailboxIds": map[string]bool{mailboxID: true},
 		"keywords":   map[string]bool{"$draft": true, "$seen": true},
 		"from":       []map[string]string{{"email": m.fromAddress}},
 		"to":         []map[string]string{{"email": msg.To}},
@@ -382,6 +422,9 @@ func (m *JMAPWelcomeMailer) SendWelcome(ctx context.Context, msg WelcomeMessage)
 			{"EmailSubmission/set", map[string]any{
 				"accountId": accountID,
 				"create":    map[string]any{"sub": submissionCreate},
+				// Don't leave the welcome message sitting in Drafts once
+				// Stalwart has handed it off — mirrors the undosend worker.
+				"onSuccessDestroyEmail": []any{"#welcome"},
 			}, "c1"},
 		},
 	}
@@ -392,6 +435,84 @@ func (m *JMAPWelcomeMailer) SendWelcome(ctx context.Context, msg WelcomeMessage)
 	}
 	if err := resp.FirstCallError(); err != nil {
 		return fmt.Errorf("welcome mailer: jmap error: %w", err)
+	}
+	// A JMAP set call returns HTTP 200 even when a create is rejected —
+	// the failure surfaces in `notCreated` / `notSent` (RFC 8620 §5.3),
+	// not as a method-level error — so inspect those explicitly.
+	if _, args, ok := resp.CallByID("c0"); ok {
+		if err := firstSetError("Email/set", args, "notCreated"); err != nil {
+			return fmt.Errorf("welcome mailer: %w", err)
+		}
+	}
+	if _, args, ok := resp.CallByID("c1"); ok {
+		if err := firstSetError("EmailSubmission/set", args, "notCreated"); err != nil {
+			return fmt.Errorf("welcome mailer: %w", err)
+		}
+	}
+	return nil
+}
+
+// resolveDraftsMailbox returns the account's Drafts mailbox id. It
+// prefers the mailbox whose JMAP `role` is "drafts" (RFC 8621 §2) and
+// falls back to the first mailbox so the transient welcome draft still
+// has a valid home (it is destroyed on successful submission anyway).
+func (m *JMAPWelcomeMailer) resolveDraftsMailbox(ctx context.Context, accountID string) (string, error) {
+	req := jmap.JmapRequest{
+		Using: []string{
+			"urn:ietf:params:jmap:core",
+			"urn:ietf:params:jmap:mail",
+		},
+		MethodCalls: [][]any{
+			{"Mailbox/get", map[string]any{
+				"accountId":  accountID,
+				"ids":        nil,
+				"properties": []string{"id", "role"},
+			}, "m0"},
+		},
+	}
+	resp, err := m.submitter.Dispatch(ctx, m.senderTenantID, m.senderKChatUserID, req)
+	if err != nil {
+		return "", err
+	}
+	if err := resp.FirstCallError(); err != nil {
+		return "", err
+	}
+	_, args, ok := resp.CallByID("m0")
+	if !ok {
+		return "", fmt.Errorf("mailbox/get: response missing m0 call")
+	}
+	list, _ := args["list"].([]any)
+	var fallback string
+	for _, item := range list {
+		mb, _ := item.(map[string]any)
+		id, _ := mb["id"].(string)
+		if id == "" {
+			continue
+		}
+		role, _ := mb["role"].(string)
+		if strings.EqualFold(role, "drafts") {
+			return id, nil
+		}
+		if fallback == "" {
+			fallback = id
+		}
+	}
+	if fallback != "" {
+		return fallback, nil
+	}
+	return "", fmt.Errorf("mailbox/get: account %s has no mailboxes", accountID)
+}
+
+// firstSetError returns a descriptive error for the first rejected
+// entry in a JMAP set response's `notCreated`/`notUpdated`/`notSent`
+// map, or nil when there are none.
+func firstSetError(method string, args map[string]any, key string) error {
+	rejected, _ := args[key].(map[string]any)
+	for id, v := range rejected {
+		entry, _ := v.(map[string]any)
+		typ, _ := entry["type"].(string)
+		desc, _ := entry["description"].(string)
+		return fmt.Errorf("%s %s[%s]: %s: %s", method, key, id, typ, desc)
 	}
 	return nil
 }

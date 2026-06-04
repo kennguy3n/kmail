@@ -36,6 +36,12 @@ type SignupHandlers struct {
 	// limit / window govern the per-IP rate limit on POST /signup.
 	limit  int64
 	window time.Duration
+	// trustedProxyDepth is the number of trusted reverse proxies
+	// (ingress / load balancers) in front of this server. It bounds how
+	// far from the right of the forwarded chain we read the client IP so
+	// a client-supplied X-Forwarded-For prefix can't spoof the rate-limit
+	// key. See clientIP.
+	trustedProxyDepth int
 }
 
 // SignupHandlersConfig wires SignupHandlers.
@@ -51,6 +57,14 @@ type SignupHandlersConfig struct {
 	// Defaults to 10. Window defaults to one minute.
 	Limit  int64
 	Window time.Duration
+	// TrustedProxyDepth is the number of trusted reverse proxies in
+	// front of this server (e.g. 1 for a single Kubernetes ingress).
+	// Only the rightmost TrustedProxyDepth hops of the forwarded chain
+	// are trusted, so a spoofed X-Forwarded-For prefix can't forge the
+	// rate-limit identity. Defaults to 1. Set to 0 when the server is
+	// directly internet-facing (trust only the transport peer and
+	// ignore X-Forwarded-For entirely).
+	TrustedProxyDepth int
 }
 
 // NewSignupHandlers constructs SignupHandlers with sensible defaults.
@@ -64,13 +78,24 @@ func NewSignupHandlers(cfg SignupHandlersConfig) *SignupHandlers {
 	if cfg.Window <= 0 {
 		cfg.Window = time.Minute
 	}
+	// Default an unset (zero) depth to a single ingress hop — the common
+	// Kubernetes deployment. A caller that is genuinely internet-facing
+	// passes a negative value, which we normalize to depth 0 (ignore
+	// X-Forwarded-For, trust only the transport peer).
+	switch {
+	case cfg.TrustedProxyDepth == 0:
+		cfg.TrustedProxyDepth = 1
+	case cfg.TrustedProxyDepth < 0:
+		cfg.TrustedProxyDepth = 0
+	}
 	return &SignupHandlers{
-		svc:     cfg.Service,
-		limiter: cfg.Limiter,
-		metrics: cfg.Metrics,
-		logger:  cfg.Logger,
-		limit:   cfg.Limit,
-		window:  cfg.Window,
+		svc:               cfg.Service,
+		limiter:           cfg.Limiter,
+		metrics:           cfg.Metrics,
+		logger:            cfg.Logger,
+		limit:             cfg.Limit,
+		window:            cfg.Window,
+		trustedProxyDepth: cfg.TrustedProxyDepth,
 	}
 }
 
@@ -133,7 +158,7 @@ func (h *SignupHandlers) allow(r *http.Request) bool {
 	if h.limiter == nil {
 		return true
 	}
-	ip := clientIP(r)
+	ip := clientIP(r, h.trustedProxyDepth)
 	bucket := time.Now().UTC().Truncate(h.window).Unix()
 	key := fmt.Sprintf("kmail:signup:rl:%s:%d", ip, bucket)
 	count, err := h.limiter.IncrWithTTL(r.Context(), key, h.window)
@@ -150,19 +175,55 @@ func (m *SignupMetrics) rateLimited() {
 	}
 }
 
-// clientIP extracts the originating client IP, honoring the first hop
-// in X-Forwarded-For (set by the ingress / load balancer) and falling
-// back to the transport RemoteAddr.
-func clientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		if first := strings.TrimSpace(strings.SplitN(xff, ",", 2)[0]); first != "" {
-			return first
+// clientIP extracts the rate-limit identity for r, resolving the real
+// client IP without trusting a spoofable X-Forwarded-For prefix.
+//
+// The forwarded chain as observed by this server is the X-Forwarded-For
+// entries (client-supplied first, then each proxy appends the peer it
+// saw) followed by the transport RemoteAddr (the immediate peer). The
+// rightmost trustedProxyDepth hops of that chain are our own trusted
+// infrastructure; the entry immediately to their left is the furthest
+// IP we can still attribute to the real client. Reading from the right
+// means a client that pre-seeds X-Forwarded-For with arbitrary IPs only
+// pads the (ignored) left of the chain and cannot forge its identity.
+//
+// With trustedProxyDepth == 0 the server is treated as directly
+// internet-facing: X-Forwarded-For is ignored entirely and only the
+// transport peer is used.
+func clientIP(r *http.Request, trustedProxyDepth int) string {
+	remote := r.RemoteAddr
+	if host, _, err := net.SplitHostPort(remote); err == nil {
+		remote = host
+	}
+	if trustedProxyDepth <= 0 {
+		return remote
+	}
+	chain := splitForwardedFor(r.Header.Get("X-Forwarded-For"))
+	chain = append(chain, remote)
+	idx := len(chain) - 1 - trustedProxyDepth
+	if idx < 0 {
+		// Fewer hops than trusted proxies (chain shorter than expected,
+		// e.g. a proxy didn't append): fall back to the leftmost known
+		// entry rather than indexing out of range.
+		idx = 0
+	}
+	return chain[idx]
+}
+
+// splitForwardedFor parses a comma-separated X-Forwarded-For header into
+// its non-empty, trimmed hops in left-to-right order.
+func splitForwardedFor(xff string) []string {
+	if strings.TrimSpace(xff) == "" {
+		return nil
+	}
+	parts := strings.Split(xff, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if v := strings.TrimSpace(p); v != "" {
+			out = append(out, v)
 		}
 	}
-	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		return host
-	}
-	return r.RemoteAddr
+	return out
 }
 
 // statusForSignupError maps signup service errors to HTTP statuses.

@@ -1250,6 +1250,11 @@ func main() {
 		Limiter: limiterStore,
 		Metrics: signupMetrics,
 		Logger:  logger,
+		// Number of trusted reverse proxies in front of the API so the
+		// signup rate limiter reads the real client IP without trusting
+		// a spoofable X-Forwarded-For prefix. Defaults to 1 (a single
+		// Kubernetes ingress); set negative to ignore X-Forwarded-For.
+		TrustedProxyDepth: config.GetenvInt("KMAIL_SIGNUP_TRUSTED_PROXY_DEPTH", 1),
 	}).Register(mux)
 	stripeWebhook.SetSignupCompleter(signupSvc)
 

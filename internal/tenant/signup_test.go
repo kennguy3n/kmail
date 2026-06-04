@@ -135,9 +135,20 @@ type fakeProvisioner struct {
 	bySlug          map[string]*Tenant
 	createCalls     int
 	userCalls       int
+	ensureCalls     int
 	seq             int
 	forceExistsOnce bool // first CreateTenant returns ErrTenantExists
 	usersByTenant   map[string]bool
+
+	// partialOnce makes the first CreateTenant insert the tenant row but
+	// return ErrTenantProvisionIncomplete (a non-nil tenant alongside the
+	// error), modelling Service.CreateTenant's partial-success return
+	// when a post-insert hook fails.
+	partialOnce bool
+	// ensureErrs is consumed one entry per EnsureProvisioned call; a
+	// non-nil entry makes that call fail (modelling a still-failing
+	// provisioning hook on retry).
+	ensureErrs []error
 }
 
 func newFakeProvisioner() *fakeProvisioner {
@@ -167,7 +178,26 @@ func (p *fakeProvisioner) CreateTenant(_ context.Context, in CreateTenantInput) 
 		Status: "active",
 	}
 	p.bySlug[in.Slug] = t
+	if p.partialOnce {
+		p.partialOnce = false
+		// Row inserted, but a post-insert hook failed: return the tenant
+		// AND the partial-provisioning signal, exactly like the
+		// production signupProvisioner.CreateTenant does.
+		return t, fmt.Errorf("%w: zk-fabric provision: boom", ErrTenantProvisionIncomplete)
+	}
 	return t, nil
+}
+
+func (p *fakeProvisioner) EnsureProvisioned(_ context.Context, _, _ string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.ensureCalls++
+	if len(p.ensureErrs) > 0 {
+		err := p.ensureErrs[0]
+		p.ensureErrs = p.ensureErrs[1:]
+		return err
+	}
+	return nil
 }
 
 func (p *fakeProvisioner) GetTenantBySlug(_ context.Context, slug string) (*Tenant, error) {
@@ -452,6 +482,98 @@ func TestCompleteSignup_ConcurrentCreate_ErrTenantExists(t *testing.T) {
 	}
 	if tn.ID != "tenant-existing" {
 		t.Fatalf("tenant id = %q, want tenant-existing (resolved by slug)", tn.ID)
+	}
+}
+
+// TestCompleteSignup_PartialProvision_HealsSameAttempt covers the case
+// where Service.CreateTenant inserts the tenant row but a post-insert
+// provisioning hook fails (CreateTenant returns a non-nil tenant with
+// ErrTenantProvisionIncomplete). CompleteSignup must NOT discard the
+// tenant; it must re-drive the idempotent hooks via EnsureProvisioned
+// and, on success, complete the signup.
+func TestCompleteSignup_PartialProvision_HealsSameAttempt(t *testing.T) {
+	repo := newFakeSignupRepo()
+	prov := newFakeProvisioner()
+	prov.partialOnce = true // first CreateTenant returns tenant + incomplete
+	mailer := &fakeMailer{}
+	svc := newTestService(repo, prov, &fakeStripe{}, func(c *SignupConfig) {
+		c.Mailer = mailer
+	})
+
+	sess := seedPending(t, svc, repo, "founder@acme.com", "Acme Inc", "core")
+	tn, err := svc.CompleteSignup(context.Background(), sess)
+	if err != nil {
+		t.Fatalf("CompleteSignup: %v", err)
+	}
+	if tn == nil || tn.ID == "" {
+		t.Fatal("expected a provisioned tenant, got nil/empty")
+	}
+	if prov.ensureCalls != 1 {
+		t.Fatalf("ensureCalls = %d, want 1 (must heal the partial provisioning)", prov.ensureCalls)
+	}
+	if prov.userCalls != 1 {
+		t.Fatalf("userCalls = %d, want 1 (admin user created after heal)", prov.userCalls)
+	}
+	req, _ := repo.GetByCheckoutSession(context.Background(), sess)
+	if req.Status != "active" {
+		t.Fatalf("signup status = %q, want active", req.Status)
+	}
+	if len(mailer.sent) != 1 {
+		t.Fatalf("welcome emails = %d, want 1", len(mailer.sent))
+	}
+}
+
+// TestCompleteSignup_PartialProvision_RetryHeals covers the webhook
+// redelivery path: the first attempt inserts the tenant row but the
+// provisioning heal still fails, so the signup is left retryable. The
+// second delivery hits the slug collision (ErrTenantExists), resolves
+// the tenant, re-drives the now-succeeding hooks, and completes —
+// without ever creating a duplicate tenant.
+func TestCompleteSignup_PartialProvision_RetryHeals(t *testing.T) {
+	repo := newFakeSignupRepo()
+	prov := newFakeProvisioner()
+	prov.partialOnce = true
+	prov.ensureErrs = []error{errors.New("zk-fabric still unavailable")}
+	mailer := &fakeMailer{}
+	svc := newTestService(repo, prov, &fakeStripe{}, func(c *SignupConfig) {
+		c.Mailer = mailer
+	})
+
+	sess := seedPending(t, svc, repo, "founder@acme.com", "Acme Inc", "core")
+
+	// First delivery: row inserted, heal fails -> signup not completed.
+	if _, err := svc.CompleteSignup(context.Background(), sess); err == nil {
+		t.Fatal("first CompleteSignup: expected error from failed provisioning heal")
+	}
+	req, _ := repo.GetByCheckoutSession(context.Background(), sess)
+	if req.Status == "active" {
+		t.Fatal("signup marked active despite incomplete provisioning")
+	}
+	if len(mailer.sent) != 0 {
+		t.Fatalf("welcome emails = %d, want 0 (signup not completed yet)", len(mailer.sent))
+	}
+
+	// Second delivery: slug collision -> resolve -> heal now succeeds.
+	tn, err := svc.CompleteSignup(context.Background(), sess)
+	if err != nil {
+		t.Fatalf("retry CompleteSignup: %v", err)
+	}
+	if prov.createCalls != 2 {
+		t.Fatalf("createCalls = %d, want 2", prov.createCalls)
+	}
+	if prov.ensureCalls != 2 {
+		t.Fatalf("ensureCalls = %d, want 2 (heal attempted on both deliveries)", prov.ensureCalls)
+	}
+	// Exactly one tenant ever inserted under the deterministic slug.
+	if len(prov.bySlug) != 1 {
+		t.Fatalf("provisioned tenants = %d, want 1 (no duplicate)", len(prov.bySlug))
+	}
+	if tn.Slug != deterministicSlug(req.OrgName, req.ID) {
+		t.Fatalf("tenant slug = %q, want deterministic slug", tn.Slug)
+	}
+	req, _ = repo.GetByCheckoutSession(context.Background(), sess)
+	if req.Status != "active" {
+		t.Fatalf("signup status = %q, want active after retry", req.Status)
 	}
 }
 

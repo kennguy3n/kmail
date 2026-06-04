@@ -147,23 +147,89 @@ func TestSignupHandler_RateLimiterFailsOpen(t *testing.T) {
 
 func TestSignupHandler_XForwardedFor(t *testing.T) {
 	limiter := newFakeRateLimiter()
-	h, _ := newTestHandlers(t, limiter)
+	h, _ := newTestHandlers(t, limiter) // default TrustedProxyDepth = 1
 	mux := http.NewServeMux()
 	h.Register(mux)
 
 	body := `{"email":"a@acme.com","org_name":"Acme","plan":"core"}`
-	// All requests share a RemoteAddr but carry distinct XFF client
-	// IPs; the limiter must key on the XFF first hop, so none are
-	// limited.
+	// Behind a single ingress (depth 1) the ingress appends the real
+	// client IP as the rightmost X-Forwarded-For hop. Distinct clients
+	// therefore key on distinct rightmost hops and none are limited,
+	// even though they share the same transport peer (the ingress).
 	for i := 0; i < 12; i++ {
 		req := httptest.NewRequest(http.MethodPost, "/api/v1/signup", strings.NewReader(body))
-		req.RemoteAddr = "10.0.0.1:9999"
-		req.Header.Set("X-Forwarded-For", "203.0.113."+strconv.Itoa(i)+", 10.0.0.1")
+		req.RemoteAddr = "10.0.0.1:9999" // ingress
+		req.Header.Set("X-Forwarded-For", "203.0.113."+strconv.Itoa(i))
 		rr := httptest.NewRecorder()
 		mux.ServeHTTP(rr, req)
 		if rr.Code == http.StatusTooManyRequests {
-			t.Fatalf("request %d limited despite distinct XFF IP", i)
+			t.Fatalf("request %d limited despite distinct client IP", i)
 		}
+	}
+}
+
+// TestSignupHandler_XForwardedFor_SpoofResistant verifies that a single
+// client behind the ingress cannot evade the per-IP limit by pre-seeding
+// X-Forwarded-For with arbitrary (spoofed) leftmost hops. With one
+// trusted proxy, the rate-limit identity is the hop the ingress
+// appended (the real client), not the attacker-controlled prefix.
+func TestSignupHandler_XForwardedFor_SpoofResistant(t *testing.T) {
+	limiter := newFakeRateLimiter()
+	h, _ := newTestHandlers(t, limiter) // default TrustedProxyDepth = 1
+	mux := http.NewServeMux()
+	h.Register(mux)
+
+	body := `{"email":"a@acme.com","org_name":"Acme","plan":"core"}`
+	// Attacker varies the spoofed leftmost hop every request; the ingress
+	// always appends the same real client IP (198.51.100.7) as the last
+	// hop. All 11 must share one bucket, so the 11th is rejected.
+	var limited bool
+	for i := 0; i < 11; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/signup", strings.NewReader(body))
+		req.RemoteAddr = "10.0.0.1:9999" // ingress
+		req.Header.Set("X-Forwarded-For", "203.0.113."+strconv.Itoa(i)+", 198.51.100.7")
+		rr := httptest.NewRecorder()
+		mux.ServeHTTP(rr, req)
+		if rr.Code == http.StatusTooManyRequests {
+			limited = true
+		}
+	}
+	if !limited {
+		t.Fatal("spoofed X-Forwarded-For prefix evaded the per-IP rate limit")
+	}
+}
+
+// TestSignupHandler_TrustedProxyDepthZero verifies that, configured as
+// directly internet-facing, the handler ignores X-Forwarded-For entirely
+// and keys on the transport peer.
+func TestSignupHandler_TrustedProxyDepthZero(t *testing.T) {
+	limiter := newFakeRateLimiter()
+	repo := newFakeSignupRepo()
+	svc := newTestService(repo, newFakeProvisioner(), &fakeStripe{})
+	h := NewSignupHandlers(SignupHandlersConfig{
+		Service:           svc,
+		Limiter:           limiter,
+		Metrics:           NewSignupMetrics(nil),
+		TrustedProxyDepth: -1, // ignore X-Forwarded-For
+	})
+	mux := http.NewServeMux()
+	h.Register(mux)
+
+	body := `{"email":"a@acme.com","org_name":"Acme","plan":"core"}`
+	// Same transport peer, spoofed-distinct XFF: must still be limited.
+	var limited bool
+	for i := 0; i < 11; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/signup", strings.NewReader(body))
+		req.RemoteAddr = "7.7.7.7:1234"
+		req.Header.Set("X-Forwarded-For", "203.0.113."+strconv.Itoa(i))
+		rr := httptest.NewRecorder()
+		mux.ServeHTTP(rr, req)
+		if rr.Code == http.StatusTooManyRequests {
+			limited = true
+		}
+	}
+	if !limited {
+		t.Fatal("depth 0 must key on transport peer and rate-limit it")
 	}
 }
 
