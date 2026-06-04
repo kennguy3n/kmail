@@ -259,12 +259,21 @@ func (s *Service) markComplete(ctx context.Context, job Job, res Result) error {
 		if err != nil {
 			return fmt.Errorf("update export_jobs: %w", err)
 		}
-		for _, mid := range res.MessageIDs {
+		// Insert the whole manifest in one round-trip by unnesting the
+		// id array, rather than issuing one INSERT per message. A large
+		// export can include up to defaultMaxMessages (100k) ids;
+		// 100k sequential round-trips inside this transaction would
+		// hold row locks for a long time and risk a statement/transaction
+		// timeout, widening the window in which a crash leaves the job
+		// stuck in 'running'. ON CONFLICT DO NOTHING keeps the insert
+		// idempotent so a RequeueStaleJobs retry of markComplete is safe.
+		if len(res.MessageIDs) > 0 {
 			if _, err := tx.Exec(ctx, `
 				INSERT INTO export_job_messages (job_id, tenant_id, message_id)
-				VALUES ($1::uuid, $2::uuid, $3)
+				SELECT $1::uuid, $2::uuid, m
+				FROM unnest($3::text[]) AS m
 				ON CONFLICT (job_id, message_id) DO NOTHING
-			`, job.ID, job.TenantID, mid); err != nil {
+			`, job.ID, job.TenantID, res.MessageIDs); err != nil {
 				return fmt.Errorf("insert export_job_messages: %w", err)
 			}
 		}

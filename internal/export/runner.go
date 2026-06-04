@@ -295,12 +295,34 @@ func (r *JMAPExportRunner) resolveScope(ctx context.Context, job Job) (ids []str
 // any date_range lower-bound filtering).
 func (r *JMAPExportRunner) writeMail(ctx context.Context, tw *tar.Writer, job Job, format string, ids []string, after, before time.Time) ([]string, error) {
 	var (
-		mbox      bytes.Buffer
-		mw        = NewMboxWriter(&mbox)
 		manifest  []manifestEntry
 		included  = make([]string, 0, len(ids))
-		usedNames = map[string]int{}
+		usedNames = map[string]struct{}{}
 	)
+
+	// For mbox we spill the concatenated stream to a temp file rather
+	// than a bytes.Buffer: tar needs an entry's size up front, but a
+	// 100k-message mailbox (each message potentially several MB) would
+	// pin multiple GB of heap if buffered. Streaming to disk and then
+	// copying the file into the tar entry with its known size keeps the
+	// mbox path's footprint bounded to one fetch batch — matching the
+	// archive-level temp file in Run and the per-file eml path.
+	var (
+		mboxFile *os.File
+		mw       *Writer
+	)
+	if format == FormatMbox {
+		f, err := os.CreateTemp("", "kmail-export-mbox-*.mbox")
+		if err != nil {
+			return nil, fmt.Errorf("create temp mbox: %w", err)
+		}
+		defer func() {
+			_ = f.Close()
+			_ = os.Remove(f.Name())
+		}()
+		mboxFile = f
+		mw = NewMboxWriter(f)
+	}
 
 	for start := 0; start < len(ids); start += fetchBatchSize {
 		end := min(start+fetchBatchSize, len(ids))
@@ -342,7 +364,14 @@ func (r *JMAPExportRunner) writeMail(ctx context.Context, tw *tar.Writer, job Jo
 
 	switch format {
 	case FormatMbox:
-		return included, writeTarFile(tw, "mailbox.mbox", mbox.Bytes())
+		fi, err := mboxFile.Stat()
+		if err != nil {
+			return nil, fmt.Errorf("stat temp mbox: %w", err)
+		}
+		if _, err := mboxFile.Seek(0, io.SeekStart); err != nil {
+			return nil, fmt.Errorf("rewind temp mbox: %w", err)
+		}
+		return included, writeTarStream(tw, "mailbox.mbox", fi.Size(), mboxFile)
 	case FormatPSTStub:
 		return included, writePSTStub(tw, job, manifest)
 	default: // eml entries already streamed
@@ -433,25 +462,39 @@ func (r *JMAPExportRunner) writeAudit(ctx context.Context, tw *tar.Writer, job J
 	if !after.IsZero() {
 		base.Since = after
 	}
-	if !before.IsZero() {
-		base.Until = before
+	// Pin the upper bound to a snapshot instant. OFFSET pagination over
+	// a created_at-DESC trail drifts if rows are inserted between pages
+	// (entries shift down, causing duplicates or skips). Bounding the
+	// window by Until freezes the result set: audit entries written
+	// after the export started fall outside the window and so cannot
+	// perturb the offsets of the rows we are paging through. A
+	// date_range export already has an explicit upper bound; otherwise
+	// we snapshot at "now".
+	until := before
+	if until.IsZero() {
+		until = time.Now().UTC()
 	}
-	// audit.Service.Query hard-caps Limit at 1000 per call, so a
-	// single query would silently truncate a busy tenant's trail —
-	// unacceptable for an eDiscovery export. Page through with
-	// Offset until the trail is exhausted so audit.json is complete.
+	base.Until = until
+	// audit.Service.Query hard-caps Limit per call, so a single query
+	// would silently truncate a busy tenant's trail — unacceptable for
+	// an eDiscovery export. Page until the trail is exhausted so
+	// audit.json is complete. Advance the offset by the number of rows
+	// actually returned (not the requested page size) so correctness
+	// does not depend on the service honouring auditPageSize exactly:
+	// if it clamps to a smaller effective page we simply make more
+	// round trips, never skipping or truncating.
 	entries := make([]audit.Entry, 0)
-	for offset := 0; offset < auditMaxEntries; offset += auditPageSize {
+	for len(entries) < auditMaxEntries {
 		f := base
-		f.Offset = offset
+		f.Offset = len(entries)
 		page, err := r.audit.Query(ctx, job.TenantID, f)
 		if err != nil {
 			return err
 		}
-		entries = append(entries, page...)
-		if len(page) < auditPageSize {
+		if len(page) == 0 {
 			break
 		}
+		entries = append(entries, page...)
 	}
 	if len(entries) >= auditMaxEntries {
 		// Never silent: if we hit the safety ceiling, say so loudly.
@@ -505,6 +548,23 @@ func writeTarFile(tw *tar.Writer, name string, body []byte) error {
 	return err
 }
 
+// writeTarStream writes a tar entry of a known size by streaming from
+// r, so a large payload (e.g. a spilled mbox file) never has to be
+// fully buffered in memory to be added to the archive.
+func writeTarStream(tw *tar.Writer, name string, size int64, r io.Reader) error {
+	hdr := &tar.Header{
+		Name:    name,
+		Mode:    0o600,
+		Size:    size,
+		ModTime: time.Now().UTC(),
+	}
+	if err := tw.WriteHeader(hdr); err != nil {
+		return err
+	}
+	_, err := io.Copy(tw, r)
+	return err
+}
+
 // parseDateRange parses a "YYYY-MM-DD..YYYY-MM-DD" scope_ref into a
 // half-open [after, before) window. `before` is the day AFTER the
 // end date so the end day is fully included.
@@ -536,8 +596,11 @@ func extractVEvent(ical string) string {
 	return ical[start : end+len("END:VEVENT")]
 }
 
-// auditPageSize is the per-call page size for the audit export. It
-// matches the hard Limit cap enforced by audit.Service.Query.
+// auditPageSize is the per-call page size requested for the audit
+// export. audit.Service.Query enforces its own hard cap; the
+// pagination loop in writeAudit advances by the rows actually
+// returned, so correctness holds even if the service returns fewer
+// than auditPageSize per call.
 const auditPageSize = 1000
 
 // auditMaxEntries bounds the total audit entries pulled into one
@@ -548,14 +611,19 @@ const auditMaxEntries = 100000
 // uniqueName returns base the first time it is seen and base-N for
 // the N-th repeat, so callers can guarantee distinct archive entry
 // paths even when two source ids collapse to the same sanitised
-// string. The supplied map tracks occurrence counts across calls.
-func uniqueName(used map[string]int, base string) string {
-	n := used[base]
-	used[base] = n + 1
-	if n == 0 {
-		return base
+// string. It records every name it hands out in used (not just the
+// bases) and probes increasing suffixes until it finds one that is
+// genuinely free, so a generated "base-2" can never collide with a
+// natural id that already sanitised to "base-2".
+func uniqueName(used map[string]struct{}, base string) string {
+	candidate := base
+	for i := 2; ; i++ {
+		if _, taken := used[candidate]; !taken {
+			used[candidate] = struct{}{}
+			return candidate
+		}
+		candidate = fmt.Sprintf("%s-%d", base, i)
 	}
-	return fmt.Sprintf("%s-%d", base, n+1)
 }
 
 // sanitize makes an arbitrary id safe to use as a tar entry path
