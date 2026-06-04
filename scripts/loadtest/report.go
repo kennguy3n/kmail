@@ -121,6 +121,15 @@ func defaultSLO() slo {
 	}
 }
 
+// sloOverride mirrors slo but takes the error budget as a pointer so an
+// explicit "error_budget_pct": 0 (a valid "zero errors tolerated" policy) is
+// distinguishable from the field being omitted — a plain float64 would treat
+// both as 0 and silently fall back to the default.
+type sloOverride struct {
+	ErrorBudgetPct *float64           `json:"error_budget_pct"`
+	Ops            map[string]float64 `json:"ops"`
+}
+
 func loadSLO(path string) (slo, error) {
 	s := defaultSLO()
 	if path == "" {
@@ -130,12 +139,15 @@ func loadSLO(path string) (slo, error) {
 	if err != nil {
 		return s, err
 	}
-	var override slo
+	var override sloOverride
 	if err := json.Unmarshal(b, &override); err != nil {
 		return s, err
 	}
-	if override.ErrorBudgetPct > 0 {
-		s.ErrorBudgetPct = override.ErrorBudgetPct
+	if override.ErrorBudgetPct != nil {
+		if *override.ErrorBudgetPct < 0 {
+			return s, fmt.Errorf("error_budget_pct must be >= 0, got %g", *override.ErrorBudgetPct)
+		}
+		s.ErrorBudgetPct = *override.ErrorBudgetPct
 	}
 	for k, v := range override.Ops {
 		s.Ops[k] = v

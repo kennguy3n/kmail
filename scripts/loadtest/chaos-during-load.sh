@@ -167,8 +167,16 @@ done
 CHAOS_END_OFF=$(( $(date +%s) - LOAD_START ))
 
 echo "chaos-during-load: waiting for load run to finish"
-wait "$LOAD_PID"
+# Capture the load generator's exit code without letting `set -e` abort here:
+# if it died (e.g. chaos disrupted the generator itself, OOM, signal) we still
+# want to render the report and impact summary from whatever it managed to
+# write, then surface the failure at the very end.
+LOAD_RC=0
+wait "$LOAD_PID" || LOAD_RC=$?
 trap - EXIT INT TERM
+if [ "$LOAD_RC" -ne 0 ]; then
+  echo "chaos-during-load: load generator exited non-zero (rc=${LOAD_RC}) — rendering from any partial summary" >&2
+fi
 
 if [ ! -f "$JSON_OUT" ]; then
   echo "chaos-during-load: load run produced no summary at ${JSON_OUT}" >&2
@@ -196,3 +204,9 @@ else
 fi
 
 echo "chaos-during-load: done — report at ${MD_OUT}"
+
+# Propagate a load-generator failure so callers/CI still see it, now that the
+# report has been produced.
+if [ "$LOAD_RC" -ne 0 ]; then
+  exit "$LOAD_RC"
+fi

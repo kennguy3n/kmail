@@ -633,6 +633,16 @@ func (c *apiClient) seedMessages(ctx context.Context, cfg config, tenantID strin
 		return 0, nil
 	}
 
+	// Derive a cancellable context so the first worker error tears down the
+	// whole fan-out. Without it, if every worker exits on error there are no
+	// receivers left on the unbuffered `batches` channel and the producer
+	// goroutine below blocks forever on its send — a leak of one goroutine
+	// per tenant (up to --tenants) whenever the BFF is consistently failing.
+	// Cancelling unblocks the producer's ctx.Done() case and stops the
+	// remaining workers promptly.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	batches := make(chan [2]int) // [startIndex, count]
 	var (
 		wg       sync.WaitGroup
@@ -651,6 +661,7 @@ func (c *apiClient) seedMessages(ctx context.Context, cfg config, tenantID strin
 				n, err := c.sendBatch(ctx, tenantID, u, b[0], b[1])
 				if err != nil {
 					errOnce.Do(func() { firstErr = err })
+					cancel()
 					return
 				}
 				atomic.AddInt64(&created, int64(n))

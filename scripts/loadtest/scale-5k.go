@@ -416,8 +416,12 @@ func percentile(sorted []float64, p int) float64 {
 	return sorted[rank-1]
 }
 
-func round1(f float64) float64 { return float64(int64(f*10+0.5)) / 10 }
-func round2(f float64) float64 { return float64(int64(f*100+0.5)) / 100 }
+// round1/round2 round half away from zero. Current callers only pass
+// non-negative latencies/percentages, but rounding symmetrically keeps the
+// helpers correct if reused for signed values (a bare +0.5 truncation would
+// round e.g. -0.15 to -0.1 toward zero rather than to -0.2).
+func round1(f float64) float64 { return math.Round(f*10) / 10 }
+func round2(f float64) float64 { return math.Round(f*100) / 100 }
 
 // ---------------------------------------------------------------
 // Main
