@@ -437,8 +437,11 @@ services:
     entrypoint: ["/usr/local/bin/kmail-worker"]
     environment:
       # Reach the compose-network services by name (the host-run BFF
-      # uses the published localhost ports instead).
-      DATABASE_URL: "postgresql://kmail:kmail@postgres:5432/kmail?sslmode=disable"
+      # uses the published localhost ports instead). KMAIL_-prefixed
+      # to match the rest of this block and the Helm Secret
+      # (deploy/helm/kmail/values.yaml uses KMAIL_DATABASE_URL); the
+      # bare DATABASE_URL fallback in config.Load works too.
+      KMAIL_DATABASE_URL: "postgresql://kmail:kmail@postgres:5432/kmail?sslmode=disable"
       KMAIL_VALKEY_URL: "redis://valkey:6379"
       KMAIL_STALWART_URL: "http://stalwart:8080"
       KMAIL_MEILISEARCH_URL: "http://meilisearch:7700"
@@ -452,6 +455,18 @@ services:
         condition: service_healthy
       valkey:
         condition: service_started
+      # The dispatch/export workers submit through the internal
+      # JMAP proxy to Stalwart, which only accepts traffic once the
+      # one-shot stalwart-init has POSTed its blob-store / search /
+      # listener config. Without this gate the worker boots first,
+      # its Run loops fail to reach http://stalwart:8080, and the
+      # supervisor restart-loops (inflating kmail_worker_restarts_total
+      # and delaying real work) until init lands. Gate on it like the
+      # stalwart service gates on its own deps. Pulling this service
+      # up via `--profile workers` therefore also brings up the full
+      # mail stack it needs to do useful work.
+      stalwart-init:
+        condition: service_completed_successfully
     # busybox wget ships in the alpine runtime image; /healthz is the
     # process-liveness probe (readiness additionally pings Postgres).
     healthcheck:

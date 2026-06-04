@@ -64,17 +64,24 @@ type workerDeps struct {
 // Construction errors are returned (not logged-and-fataled) so the
 // caller owns process exit and tests can assert on them.
 //
-// INVARIANT — construction must stay query-free: worker constructors
-// here may only stash their dependencies (pool handle, valkey client,
-// config); they must NOT touch the database or Valkey (no Ping, no
-// SELECT, no migration check). The actual I/O happens later in each
-// worker's Run loop under workerCtx. This keeps buildWorkers a pure
-// config-driven assembly step, which is what lets worker_test.go
-// (TestBuildWorkersBaselineRegistry / ...OptionalGatesEnabled) run
-// without a live Postgres — pgxpool.New is lazy and nothing dials it
-// at build time. If you add a constructor that probes a backend at
-// build time, those tests will start requiring a real DB; gate the
-// probe behind the Run loop (or inject a stub in the tests) instead.
+// INVARIANT — construction must stay Postgres-query-free: worker
+// constructors here may only stash their dependencies (pool handle,
+// valkey client, config); they must NOT touch the *database* (no
+// Ping, no SELECT, no migration check). The actual DB I/O happens
+// later in each worker's Run loop under workerCtx. This keeps
+// buildWorkers a pure config-driven assembly step, which is what lets
+// worker_test.go (TestBuildWorkersBaselineRegistry /
+// ...OptionalGatesEnabled) run without a live Postgres — pgxpool.New
+// is lazy and nothing dials it at build time.
+//
+// The one Valkey exception is the shared buildInternalJMAP helper,
+// which Pings Valkey at construction *only when a non-nil client is
+// supplied* (to pick the shared vs. local circuit breaker). The tests
+// stay backend-free precisely because they pass valkey == nil, so
+// that Ping is never reached. If you add a constructor that probes
+// Postgres — or unconditionally probes Valkey — at build time, those
+// tests will start requiring a live backend; gate the probe behind
+// the Run loop (or inject a stub in the tests) instead.
 func buildWorkers(ctx context.Context, d workerDeps) ([]workerRegistration, error) {
 	cfg := d.cfg
 	pool := d.pool
