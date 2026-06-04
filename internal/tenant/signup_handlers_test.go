@@ -199,18 +199,20 @@ func TestSignupHandler_XForwardedFor_SpoofResistant(t *testing.T) {
 	}
 }
 
-// TestSignupHandler_TrustedProxyDepthZero verifies that, configured as
-// directly internet-facing, the handler ignores X-Forwarded-For entirely
-// and keys on the transport peer.
+// TestSignupHandler_TrustedProxyDepthZero verifies that an explicit depth
+// of 0 (directly internet-facing, as documented on the config field) makes
+// the handler ignore X-Forwarded-For entirely and key on the transport
+// peer — i.e. a set 0 is honored, not silently promoted to the default 1.
 func TestSignupHandler_TrustedProxyDepthZero(t *testing.T) {
 	limiter := newFakeRateLimiter()
 	repo := newFakeSignupRepo()
 	svc := newTestService(repo, newFakeProvisioner(), &fakeStripe{})
+	zero := 0
 	h := NewSignupHandlers(SignupHandlersConfig{
 		Service:           svc,
 		Limiter:           limiter,
 		Metrics:           NewSignupMetrics(nil),
-		TrustedProxyDepth: -1, // ignore X-Forwarded-For
+		TrustedProxyDepth: &zero, // explicit 0 = ignore X-Forwarded-For
 	})
 	mux := http.NewServeMux()
 	h.Register(mux)

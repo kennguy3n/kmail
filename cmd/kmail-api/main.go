@@ -1245,16 +1245,18 @@ func main() {
 		PublicBaseURL: os.Getenv("KMAIL_PUBLIC_BASE_URL"),
 		Logger:        logger,
 	})
+	// Number of trusted reverse proxies in front of the API so the signup
+	// rate limiter reads the real client IP without trusting a spoofable
+	// X-Forwarded-For prefix. Defaults to 1 (a single Kubernetes ingress);
+	// set to 0 (or negative) to declare the API directly internet-facing
+	// and ignore X-Forwarded-For entirely.
+	signupTrustedProxyDepth := config.GetenvInt("KMAIL_SIGNUP_TRUSTED_PROXY_DEPTH", 1)
 	tenant.NewSignupHandlers(tenant.SignupHandlersConfig{
-		Service: signupSvc,
-		Limiter: limiterStore,
-		Metrics: signupMetrics,
-		Logger:  logger,
-		// Number of trusted reverse proxies in front of the API so the
-		// signup rate limiter reads the real client IP without trusting
-		// a spoofable X-Forwarded-For prefix. Defaults to 1 (a single
-		// Kubernetes ingress); set negative to ignore X-Forwarded-For.
-		TrustedProxyDepth: config.GetenvInt("KMAIL_SIGNUP_TRUSTED_PROXY_DEPTH", 1),
+		Service:           signupSvc,
+		Limiter:           limiterStore,
+		Metrics:           signupMetrics,
+		Logger:            logger,
+		TrustedProxyDepth: &signupTrustedProxyDepth,
 	}).Register(mux)
 	stripeWebhook.SetSignupCompleter(signupSvc)
 

@@ -85,11 +85,11 @@ type PlanTier struct {
 	Features    []string `json:"features"`
 }
 
-// PLAN_CATALOG is the authoritative list of self-service plans. The
+// PlanCatalog is the authoritative list of self-service plans. The
 // price the customer actually pays is governed by the Stripe price
 // id wired per-plan at the composition root (KMAIL_STRIPE_PRICE_*),
 // so this catalog intentionally carries marketing copy, not amounts.
-var PLAN_CATALOG = []PlanTier{
+var PlanCatalog = []PlanTier{
 	{
 		ID:          "core",
 		Name:        "Core",
@@ -126,7 +126,7 @@ var PLAN_CATALOG = []PlanTier{
 
 // PlanByID returns the catalog entry for id and whether it exists.
 func PlanByID(id string) (PlanTier, bool) {
-	for _, p := range PLAN_CATALOG {
+	for _, p := range PlanCatalog {
 		if p.ID == id {
 			return p, true
 		}

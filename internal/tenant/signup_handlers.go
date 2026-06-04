@@ -61,10 +61,15 @@ type SignupHandlersConfig struct {
 	// front of this server (e.g. 1 for a single Kubernetes ingress).
 	// Only the rightmost TrustedProxyDepth hops of the forwarded chain
 	// are trusted, so a spoofed X-Forwarded-For prefix can't forge the
-	// rate-limit identity. Defaults to 1. Set to 0 when the server is
-	// directly internet-facing (trust only the transport peer and
-	// ignore X-Forwarded-For entirely).
-	TrustedProxyDepth int
+	// rate-limit identity.
+	//
+	// It is a *int so the zero value (a directly internet-facing
+	// deployment) is distinguishable from "unset":
+	//   - nil        -> default to 1 (a single ingress, the common case).
+	//   - 0 (or < 0) -> directly internet-facing: ignore X-Forwarded-For
+	//                   entirely and trust only the transport peer.
+	//   - n > 0      -> trust the rightmost n forwarded hops.
+	TrustedProxyDepth *int
 }
 
 // NewSignupHandlers constructs SignupHandlers with sensible defaults.
@@ -78,15 +83,17 @@ func NewSignupHandlers(cfg SignupHandlersConfig) *SignupHandlers {
 	if cfg.Window <= 0 {
 		cfg.Window = time.Minute
 	}
-	// Default an unset (zero) depth to a single ingress hop — the common
-	// Kubernetes deployment. A caller that is genuinely internet-facing
-	// passes a negative value, which we normalize to depth 0 (ignore
-	// X-Forwarded-For, trust only the transport peer).
-	switch {
-	case cfg.TrustedProxyDepth == 0:
-		cfg.TrustedProxyDepth = 1
-	case cfg.TrustedProxyDepth < 0:
-		cfg.TrustedProxyDepth = 0
+	// A nil depth means "unset": default to a single ingress hop, the
+	// common Kubernetes deployment. An explicit value (including 0) is
+	// honored verbatim, so a caller can set 0 to declare the server
+	// directly internet-facing (ignore X-Forwarded-For). A negative
+	// value is clamped to 0 (same internet-facing behavior).
+	depth := 1
+	if cfg.TrustedProxyDepth != nil {
+		depth = *cfg.TrustedProxyDepth
+		if depth < 0 {
+			depth = 0
+		}
 	}
 	return &SignupHandlers{
 		svc:               cfg.Service,
@@ -95,7 +102,7 @@ func NewSignupHandlers(cfg SignupHandlersConfig) *SignupHandlers {
 		logger:            cfg.Logger,
 		limit:             cfg.Limit,
 		window:            cfg.Window,
-		trustedProxyDepth: cfg.TrustedProxyDepth,
+		trustedProxyDepth: depth,
 	}
 }
 
