@@ -161,6 +161,52 @@ func TestQuotaWorker_DriftSweep_ContinuesOnError(t *testing.T) {
 	}
 }
 
+// TestQuotaWorker_DriftSweep_PrunesDeletedTenantLabels ensures the
+// per-tenant drift gauge label is removed once a tenant leaves the
+// active set, so kmail_storage_event_drift_bytes does not leak
+// cardinality for deleted tenants over the process lifetime.
+func TestQuotaWorker_DriftSweep_PrunesDeletedTenantLabels(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	tenant := seedTenant(t, pool, "active")
+
+	events := NewStorageEventService(pool)
+	mustRecord(t, events, tenant, EventObjectCreated, 100)
+	scanner := fakeScanner{bytes: map[string]int64{tenant: 300}}
+	metrics := NewQuotaWorkerMetrics(nil)
+
+	w := NewQuotaWorker(QuotaWorkerConfig{
+		Pool:    pool,
+		Billing: NewService(Config{Pool: pool}),
+		Scanner: scanner,
+		Events:  events,
+		Mode:    ModeEvent,
+		Metrics: metrics,
+		Logger:  quietLogger(),
+	})
+
+	// First sweep: tenant active → one gauge sample recorded.
+	if err := w.tick(ctx); err != nil {
+		t.Fatalf("tick 1: %v", err)
+	}
+	if got := collectCount(metrics.DriftBytes); got != 1 {
+		t.Fatalf("gauge samples after first sweep = %d, want 1", got)
+	}
+
+	// Tenant leaves the active set (deleted).
+	if _, err := pool.Exec(ctx, `UPDATE tenants SET status='deleted' WHERE id=$1::uuid`, tenant); err != nil {
+		t.Fatalf("mark tenant deleted: %v", err)
+	}
+
+	// Second sweep: the stale label must be pruned.
+	if err := w.tick(ctx); err != nil {
+		t.Fatalf("tick 2: %v", err)
+	}
+	if got := collectCount(metrics.DriftBytes); got != 0 {
+		t.Fatalf("gauge samples after tenant deleted = %d, want 0 (pruned)", got)
+	}
+}
+
 // gaugeValue reads the current value of a single Gauge via the
 // client_model serialisation (avoids a test-only testutil dependency).
 func gaugeValue(t *testing.T, g prometheus.Gauge) float64 {

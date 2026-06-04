@@ -122,6 +122,12 @@ type QuotaWorker struct {
 	cfg      QuotaWorkerConfig
 	mode     ReconciliationMode
 	interval time.Duration
+	// driftLabels tracks tenant IDs that currently have a
+	// kmail_storage_event_drift_bytes gauge sample, so labels for
+	// tenants that leave the active set can be deleted and the metric
+	// does not leak cardinality for the process lifetime. Touched only
+	// from the single Run goroutine, so no lock is needed.
+	driftLabels map[string]struct{}
 }
 
 // NewQuotaWorker builds a worker with sensible defaults. The
@@ -134,7 +140,7 @@ func NewQuotaWorker(cfg QuotaWorkerConfig) *QuotaWorker {
 	}
 	mode := resolveMode(cfg)
 	interval := resolveInterval(cfg, mode)
-	return &QuotaWorker{cfg: cfg, mode: mode, interval: interval}
+	return &QuotaWorker{cfg: cfg, mode: mode, interval: interval, driftLabels: map[string]struct{}{}}
 }
 
 // Mode reports the reconciliation mode the worker resolved at
@@ -239,6 +245,15 @@ func (w *QuotaWorker) driftTick(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("list tenants: %w", err)
 	}
+	active := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		active[id] = struct{}{}
+	}
+	// Drop gauge labels for tenants that are no longer active (deleted)
+	// so kmail_storage_event_drift_bytes does not retain a stale sample
+	// for the rest of the process lifetime.
+	w.pruneDriftLabels(active)
+
 	for _, id := range ids {
 		actual, err := w.cfg.Scanner.ScanTenantBytes(ctx, id)
 		if err != nil {
@@ -258,6 +273,7 @@ func (w *QuotaWorker) driftTick(ctx context.Context) error {
 		drift := actual - eventTotal
 		if w.cfg.Metrics != nil {
 			w.cfg.Metrics.DriftBytes.WithLabelValues(id).Set(float64(drift))
+			w.driftLabels[id] = struct{}{}
 		}
 		if drift != 0 {
 			w.cfg.Logger.Printf("quota worker: storage drift tenant %s: s3=%d event=%d drift=%d",
@@ -266,6 +282,20 @@ func (w *QuotaWorker) driftTick(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// pruneDriftLabels deletes the drift gauge sample for every tenant
+// that previously had one but is no longer in the active set.
+func (w *QuotaWorker) pruneDriftLabels(active map[string]struct{}) {
+	for id := range w.driftLabels {
+		if _, ok := active[id]; ok {
+			continue
+		}
+		if w.cfg.Metrics != nil {
+			w.cfg.Metrics.DriftBytes.DeleteLabelValues(id)
+		}
+		delete(w.driftLabels, id)
+	}
 }
 
 func (w *QuotaWorker) auditDrift(ctx context.Context, tenantID string, actual, eventTotal, drift int64) {

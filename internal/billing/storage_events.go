@@ -62,27 +62,60 @@ func NewStorageEventService(pool *pgxpool.Pool) *StorageEventService {
 // insert runs inside a tenant-scoped transaction so the permissive
 // RLS policy on `storage_events` still pins the row to `tenantID`.
 func (s *StorageEventService) RecordEvent(ctx context.Context, tenantID, eventType, objectKey string, sizeBytes int64) error {
+	return s.RecordEvents(ctx, tenantID, []StorageEvent{{
+		EventType: eventType,
+		ObjectKey: objectKey,
+		SizeBytes: sizeBytes,
+	}})
+}
+
+// StorageEvent is a single object lifecycle event to append for a
+// tenant. It is the batch unit consumed by RecordEvents.
+type StorageEvent struct {
+	EventType string
+	ObjectKey string
+	SizeBytes int64
+}
+
+// RecordEvents appends a batch of lifecycle events for `tenantID` in a
+// single tenant-scoped transaction, so the whole batch commits or
+// rolls back atomically. Atomicity is what makes the storage-event
+// webhook safe under at-least-once delivery: if any row in a delivered
+// batch fails, none are persisted, so the producer's retry re-inserts
+// the batch exactly once instead of duplicating the rows that happened
+// to succeed before the failure (which would inflate the tenant's
+// event-sourced total until the next drift sweep). All events are
+// validated up front; an invalid event fails the whole batch with
+// ErrInvalidInput before any write. A nil pool or empty batch is a
+// no-op.
+func (s *StorageEventService) RecordEvents(ctx context.Context, tenantID string, events []StorageEvent) error {
 	if tenantID == "" {
 		return fmt.Errorf("%w: tenantID required", ErrInvalidInput)
 	}
-	if !validStorageEventType(eventType) {
-		return fmt.Errorf("%w: unknown storage event type %q", ErrInvalidInput, eventType)
+	for _, e := range events {
+		if !validStorageEventType(e.EventType) {
+			return fmt.Errorf("%w: unknown storage event type %q", ErrInvalidInput, e.EventType)
+		}
+		if e.SizeBytes < 0 {
+			return fmt.Errorf("%w: sizeBytes must be >= 0", ErrInvalidInput)
+		}
 	}
-	if sizeBytes < 0 {
-		return fmt.Errorf("%w: sizeBytes must be >= 0", ErrInvalidInput)
-	}
-	if s.pool == nil {
+	if s.pool == nil || len(events) == 0 {
 		return nil
 	}
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
 			return err
 		}
-		_, err := tx.Exec(ctx, `
-			INSERT INTO storage_events (tenant_id, event_type, object_key, size_bytes)
-			VALUES ($1::uuid, $2, $3, $4)
-		`, tenantID, eventType, objectKey, sizeBytes)
-		return err
+		for _, e := range events {
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO storage_events (tenant_id, event_type, object_key, size_bytes)
+				VALUES ($1::uuid, $2, $3, $4)
+			`, tenantID, e.EventType, e.ObjectKey, e.SizeBytes); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 }
 

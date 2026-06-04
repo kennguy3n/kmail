@@ -301,14 +301,20 @@ func (h *StorageEventWebhook) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Tally per-tenant so a delivered batch produces one audit entry
-	// per tenant instead of one per object.
-	type tally struct {
+	// Group records by tenant first, then persist each tenant's whole
+	// batch in a single transaction (StorageEventService.RecordEvents).
+	// Per-record inserts would let a mid-batch failure commit a prefix
+	// of the batch; the producer's at-least-once retry would then
+	// re-insert that prefix, double-counting it until the next drift
+	// sweep. Atomic per-tenant batches make a retry re-insert the batch
+	// exactly once. Tallies drive a single audit entry per tenant.
+	type pending struct {
+		events           []StorageEvent
 		created, deleted int
 		netBytes         int64
 	}
-	tallies := map[string]*tally{}
-	var failed bool
+	byTenant := map[string]*pending{}
+	order := make([]string, 0)
 	for _, rec := range env.Records {
 		eventType, ok := classifyEventName(rec.EventName)
 		if !ok {
@@ -318,7 +324,7 @@ func (h *StorageEventWebhook) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		tenantID := tenantIDFromBucket(rec.S3.Bucket.Name)
 		if tenantID == "" {
-			h.cfg.Logger.Printf("billing.storage_webhook: empty tenant for bucket %q", rec.S3.Bucket.Name)
+			h.cfg.Logger.Printf("billing.storage_webhook: unroutable bucket %q (no %q prefix)", rec.S3.Bucket.Name, bucketPrefix)
 			continue
 		}
 		var size int64
@@ -326,28 +332,36 @@ func (h *StorageEventWebhook) serve(w http.ResponseWriter, r *http.Request) {
 			size = *rec.S3.Object.Size
 		}
 		key := decodeObjectKey(rec.S3.Object.Key)
-		if err := h.cfg.Events.RecordEvent(r.Context(), tenantID, eventType, key, size); err != nil {
-			h.cfg.Logger.Printf("billing.storage_webhook: record %s/%s: %v", tenantID, eventType, err)
-			failed = true
-			continue
+		p := byTenant[tenantID]
+		if p == nil {
+			p = &pending{}
+			byTenant[tenantID] = p
+			order = append(order, tenantID)
 		}
-		h.cfg.Metrics.incIngested(eventType)
-		t := tallies[tenantID]
-		if t == nil {
-			t = &tally{}
-			tallies[tenantID] = t
-		}
+		p.events = append(p.events, StorageEvent{EventType: eventType, ObjectKey: key, SizeBytes: size})
 		if eventType == EventObjectCreated {
-			t.created++
-			t.netBytes += size
+			p.created++
+			p.netBytes += size
 		} else {
-			t.deleted++
-			t.netBytes -= size
+			p.deleted++
+			p.netBytes -= size
 		}
 	}
 
-	if h.cfg.Audit != nil {
-		for tenantID, t := range tallies {
+	var failed bool
+	for _, tenantID := range order {
+		p := byTenant[tenantID]
+		if err := h.cfg.Events.RecordEvents(r.Context(), tenantID, p.events); err != nil {
+			// Whole tenant batch rolled back; mark failed so the gateway
+			// retries and re-inserts it atomically (no partial dupes).
+			h.cfg.Logger.Printf("billing.storage_webhook: record batch tenant %s: %v", tenantID, err)
+			failed = true
+			continue
+		}
+		for _, e := range p.events {
+			h.cfg.Metrics.incIngested(e.EventType)
+		}
+		if h.cfg.Audit != nil {
 			if _, err := h.cfg.Audit.Log(r.Context(), audit.Entry{
 				TenantID:     tenantID,
 				ActorID:      "zk-object-fabric",
@@ -355,9 +369,9 @@ func (h *StorageEventWebhook) serve(w http.ResponseWriter, r *http.Request) {
 				Action:       "storage.events_ingested",
 				ResourceType: "storage_events",
 				Metadata: map[string]any{
-					"created":   t.created,
-					"deleted":   t.deleted,
-					"net_bytes": t.netBytes,
+					"created":   p.created,
+					"deleted":   p.deleted,
+					"net_bytes": p.netBytes,
 				},
 			}); err != nil {
 				h.cfg.Logger.Printf("billing.storage_webhook: audit tenant %s: %v", tenantID, err)
@@ -366,8 +380,10 @@ func (h *StorageEventWebhook) serve(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if failed {
-		// At-least-once: surface a 5xx so the gateway retries. Any
-		// resulting duplicate events are bounded and corrected by the
+		// At-least-once: surface a 5xx so the gateway retries. Because
+		// each tenant's batch is atomic, a retry re-inserts the batch
+		// exactly once; any residual duplication (a fully-committed
+		// batch whose ACK was lost) is bounded and surfaced by the
 		// QuotaWorker's hourly drift sweep against the S3 scan.
 		http.Error(w, "one or more events failed to record", http.StatusInternalServerError)
 		return
@@ -452,13 +468,17 @@ func classifyEventName(name string) (string, bool) {
 // tenantIDFromBucket reverses `tenant.BucketNameFor`, stripping the
 // `kmail-` prefix to recover the tenant UUID from a notification's
 // bucket name. The match is case-insensitive because bucket names are
-// lowercased at provisioning time.
+// lowercased at provisioning time. A bucket that lacks the prefix is
+// not a KMail tenant bucket, so "" is returned and the caller skips it
+// — returning the raw name instead would feed a non-UUID into
+// RecordEvent, fail the `::uuid` cast, and trap the producer in a
+// permanent 5xx retry loop on a notification that can never succeed.
 func tenantIDFromBucket(bucket string) string {
 	b := strings.TrimSpace(bucket)
-	if len(b) >= len(bucketPrefix) && strings.EqualFold(b[:len(bucketPrefix)], bucketPrefix) {
+	if len(b) > len(bucketPrefix) && strings.EqualFold(b[:len(bucketPrefix)], bucketPrefix) {
 		return b[len(bucketPrefix):]
 	}
-	return b
+	return ""
 }
 
 // decodeObjectKey best-effort URL-decodes an S3 object key (S3

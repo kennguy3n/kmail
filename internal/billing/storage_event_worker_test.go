@@ -130,8 +130,12 @@ func TestTenantIDFromBucket(t *testing.T) {
 		"kmail-abc123": "abc123",
 		"KMAIL-AbC":    "AbC",
 		"  kmail-x  ":  "x",
-		"raw-bucket":   "raw-bucket",
-		"":             "",
+		// Buckets without the kmail- prefix are not tenant buckets and
+		// must map to "" so the webhook skips them instead of feeding a
+		// non-UUID into RecordEvent (which would 500 + retry forever).
+		"raw-bucket": "",
+		"kmail-":     "", // prefix only, no tenant id
+		"":           "",
 	}
 	for in, want := range cases {
 		if got := tenantIDFromBucket(in); got != want {

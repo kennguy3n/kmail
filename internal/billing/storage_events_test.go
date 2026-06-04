@@ -154,3 +154,58 @@ func TestStorageEventService_ReconcileEmpty(t *testing.T) {
 		t.Fatalf("empty tenant total = %d, want 0", total)
 	}
 }
+
+// TestStorageEventService_RecordEventsAtomic verifies RecordEvents is
+// all-or-nothing. A batch whose first event is valid but a later event
+// is rejected must write nothing — under the old per-record path the
+// valid first event would have committed, so on a webhook retry it
+// would be double-counted. A fully valid batch commits every row in
+// one transaction, and a DB-level failure (FK violation) also rolls
+// the whole batch back.
+func TestStorageEventService_RecordEventsAtomic(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	tenant := seedTenant(t, pool, "active")
+	svc := NewStorageEventService(pool)
+
+	// Valid-then-invalid: rejected up front, nothing persisted.
+	err := svc.RecordEvents(ctx, tenant, []StorageEvent{
+		{EventType: EventObjectCreated, ObjectKey: "a", SizeBytes: 100},
+		{EventType: "bogus", ObjectKey: "b", SizeBytes: 50},
+	})
+	if !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("invalid batch: want ErrInvalidInput, got %v", err)
+	}
+	if n := countStorageEvents(t, pool, tenant); n != 0 {
+		t.Fatalf("rows after rejected batch = %d, want 0 (atomic)", n)
+	}
+
+	// Fully valid batch: every row commits in one transaction.
+	if err := svc.RecordEvents(ctx, tenant, []StorageEvent{
+		{EventType: EventObjectCreated, ObjectKey: "a", SizeBytes: 100},
+		{EventType: EventObjectCreated, ObjectKey: "b", SizeBytes: 200},
+		{EventType: EventObjectDeleted, ObjectKey: "a", SizeBytes: 100},
+	}); err != nil {
+		t.Fatalf("valid batch: %v", err)
+	}
+	if n := countStorageEvents(t, pool, tenant); n != 3 {
+		t.Fatalf("rows after valid batch = %d, want 3", n)
+	}
+	if total, err := svc.ReconcileTenant(ctx, tenant); err != nil || total != 200 {
+		t.Fatalf("reconcile after batch = (%d,%v), want (200,nil)", total, err)
+	}
+
+	// DB-level failure: a well-formed but non-existent tenant UUID
+	// violates the storage_events → tenants FK; the batch rolls back
+	// and the error surfaces (so the webhook returns 5xx for a retry).
+	bogus := "00000000-0000-0000-0000-0000000000ff"
+	if err := svc.RecordEvents(ctx, bogus, []StorageEvent{
+		{EventType: EventObjectCreated, ObjectKey: "x", SizeBytes: 10},
+		{EventType: EventObjectCreated, ObjectKey: "y", SizeBytes: 20},
+	}); err == nil {
+		t.Fatalf("FK-violating batch: want error, got nil")
+	}
+	if n := countStorageEvents(t, pool, bogus); n != 0 {
+		t.Fatalf("rows after FK-violating batch = %d, want 0", n)
+	}
+}
