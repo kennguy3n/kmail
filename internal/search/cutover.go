@@ -10,6 +10,10 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/kennguy3n/kmail/internal/audit"
+	"github.com/kennguy3n/kmail/internal/middleware"
 )
 
 // MailboxSizer reports the cumulative mailbox size for a tenant in
@@ -68,9 +72,35 @@ type BackendFlipper interface {
 	// leaves the tenant readable on the source backend.
 	ReindexTo(ctx context.Context, tenantID, backend string, msgs []Message) error
 	// SetBackend flips the tenant's `search_backend` column.
-	// Called only AFTER ReindexTo succeeds so reads route to a
-	// fully-populated index.
+	// Called only AFTER ReindexTo succeeds AND Validate passes so
+	// reads route to a fully-populated, verified index.
 	SetBackend(ctx context.Context, tenantID, backend string) error
+	// Validate confirms the destination index is actually
+	// queryable after ReindexTo — it samples a handful of the
+	// just-migrated messages and searches for them in `backend`.
+	// Called BETWEEN ReindexTo and SetBackend so a reindex that
+	// "succeeded" but produced an unsearchable index (mapping
+	// drift, silent bulk-import drop) is caught while the tenant
+	// is still safely readable on the source backend. A non-nil
+	// return aborts the cutover and leaves the tenant on source.
+	Validate(ctx context.Context, tenantID, backend string, msgs []Message) error
+}
+
+// AuditLogger is the slice of `audit.Service` the cutover paths
+// depend on. Kept as an interface so the worker / service can be
+// unit-tested with a recording fake and so a nil value cleanly
+// disables audit logging.
+type AuditLogger interface {
+	Log(ctx context.Context, e audit.Entry) (*audit.Entry, error)
+}
+
+// BackendGetter reports a tenant's current `search_backend`. The
+// manual CutoverService uses it to record the source backend in
+// the audit trail and to reject a no-op cutover (target already
+// equals current). *Service satisfies it; it's optional on the
+// service (nil simply skips the source-backend annotation).
+type BackendGetter interface {
+	GetBackend(ctx context.Context, tenantID string) (string, error)
 }
 
 // CutoverState enumerates the per-tenant cutover job states.
@@ -199,406 +229,40 @@ type CutoverStore interface {
 	// passes `cfg.Now()` so all four reconciliation/claim/mark
 	// methods share one clock source.
 	ReconcileStale(ctx context.Context, sourceBackend, targetBackend string, before, now time.Time) (int64, error)
+	// UpsertPending inserts a `pending` job row for the given
+	// (tenant, target) if none exists, refreshing `mailbox_size`
+	// / `threshold` on an existing non-terminal row. It is the
+	// entry point for the operator-triggered manual cutover: it
+	// makes the tenant a claimable candidate without itself
+	// running the migration. Returns the resulting job. If a row
+	// is already `in_progress` it is returned unchanged (the
+	// caller treats that as "a cutover is already running").
+	UpsertPending(ctx context.Context, tenantID, targetBackend string, size, threshold int64, now time.Time) (*CutoverJob, error)
+	// Get returns the job row for a specific (tenant, target) or
+	// ErrNotFound when none exists.
+	Get(ctx context.Context, tenantID, targetBackend string) (*CutoverJob, error)
+	// List returns every job row for a tenant ordered most-recent
+	// first, so the admin UI can render the cutover history across
+	// all targets the tenant has ever been promoted toward.
+	List(ctx context.Context, tenantID string) ([]CutoverJob, error)
 }
 
-// CutoverTransition pairs a `source` backend with the `target`
-// backend a tenant on `source` should be promoted to. The worker
-// runs one full scan per configured transition each tick. Two
-// transitions ship by default:
-//
-//   - {meilisearch -> opensearch}: the legacy per-tenant index
-//     path that existed before the shared-index work landed.
-//   - {shared_meilisearch -> shared_opensearch}: the modern
-//     shared-index path for tenants on the shared-index default.
-//
-// Operators who need a custom pair (e.g. forcing a shared tenant
-// onto a dedicated index) inject their own slice via
-// `CutoverConfig.Transitions`.
-type CutoverTransition struct {
-	// Source is the `tenants.search_backend` value that makes a
-	// tenant eligible. The worker filters ListCandidates on it.
-	Source string
-	// Target is the backend the worker reindexes INTO and then
-	// SetBackend flips the column to. The worker only marks a
-	// row `completed` after Target is fully populated.
-	Target string
-}
-
-// DefaultCutoverTransitions is what the worker uses when no
-// Transitions are explicitly configured. Listed in execution
-// order — the legacy pair runs first because that's the path
-// that has historically been in production.
-var DefaultCutoverTransitions = []CutoverTransition{
-	{Source: BackendMeilisearch, Target: BackendOpenSearch},
-	{Source: BackendSharedMeilisearch, Target: BackendSharedOpenSearch},
-}
-
-// CutoverConfig parameterises the auto-cutover worker.
-//
-//	Threshold:        mailbox-size (bytes) at or above which a tenant
-//	                  becomes a candidate. Defaults to the per-tenant
-//	                  equivalent of 100k messages × ~16 KiB / message.
-//	Interval:         how often the worker scans for eligible tenants.
-//	                  Defaults to 1h. The worker also runs once at start.
-//	MaxFailures:      after this many consecutive Reindex failures,
-//	                  the worker leaves the tenant in `failed` state
-//	                  and stops retrying. Defaults to 5.
-//	MaxRetryGap:      the worker won't retry a `failed` job until this
-//	                  long after its last `updated_at`. Defaults to 1h.
-//	                  Mostly relevant when a transient OpenSearch
-//	                  outage causes a wave of failures the worker
-//	                  shouldn't bash on every tick.
-//	ReconcileAfter:   how long an `in_progress` row whose tenant is
-//	                  already on OpenSearch is allowed to sit before
-//	                  the worker forcibly promotes it to `completed`.
-//	                  Defaults to 30m. The migration normally finishes
-//	                  within seconds-to-minutes, so 30m is well past
-//	                  any legitimate in-flight migration window.
-type CutoverConfig struct {
-	Pool           *pgxpool.Pool
-	Store          CutoverStore
-	Service        BackendFlipper
-	Sizer          MailboxSizer
-	Source         MessageSource
-	Logger         *log.Logger
-	Threshold      int64
-	Interval       time.Duration
-	MaxFailures    int
-	MaxRetryGap    time.Duration
-	ReconcileAfter time.Duration
-	// Transitions enumerates the (source, target) backend pairs
-	// the worker considers each tick. Defaults to
-	// `DefaultCutoverTransitions` (legacy meili->opensearch plus
-	// modern shared_meili->shared_opensearch). Operators can
-	// override to bias only one path or to add a custom pair.
-	Transitions []CutoverTransition
-	// MarkCompletedRetries bounds the retry loop around the
-	// post-SetBackend MarkCompleted call. Defaults to 3. A bounded
-	// retry covers a Postgres connection blip without spinning the
-	// goroutine on a genuinely-broken store; the periodic
-	// reconciliation pass picks up anything the retry can't.
-	MarkCompletedRetries int
-	// StartupJitter caps the random delay applied before the first
-	// Tick when `Run` is invoked. Spreads the deploy-time burst of
-	// ListCandidates / TenantMailboxSize calls across pods so a
-	// rolling restart of N replicas doesn't hammer the database +
-	// Stalwart admin API in a single instant. Defaults to 30s; set
-	// to 0 for deterministic test runs that drive `Run` directly.
-	StartupJitter time.Duration
-	// Now is the wall-clock source; defaults to time.Now. Tests
-	// inject a fixed clock so retry-backoff is deterministic.
-	Now func() time.Time
-	// Sleep lets tests skip the retry backoff. Defaults to
-	// time.Sleep. In production this only ever fires on the rare
-	// post-SetBackend MarkCompleted retry path, so the latency
-	// hit (a few hundred ms) is acceptable.
-	Sleep func(time.Duration)
-
-	// disableStartupJitter is set internally by the test entry
-	// point so the default-applied jitter doesn't slow the unit
-	// suite. Not exported — production should always go through
-	// the explicit `StartupJitter` knob or accept the default.
-	disableStartupJitter bool
-}
-
-// DisableStartupJitter is the explicit opt-out used by tests that
-// drive `Run` directly. Production callers should set
-// `CutoverConfig.StartupJitter` to a positive value (or leave it
-// zero to accept the default) instead.
-func DisableStartupJitter(cfg *CutoverConfig) {
-	cfg.disableStartupJitter = true
-}
-
-// CutoverWorker auto-promotes tenants from Meilisearch to
-// OpenSearch when their mailbox size crosses the configured
-// threshold. Run it once per pod via `Run(ctx)` — the worker
-// claims tenants atomically through the store so two replicas can
-// race the same tick without double-migrating the same tenant.
-type CutoverWorker struct {
-	cfg CutoverConfig
-}
-
-const (
-	defaultCutoverThreshold          = 100_000 * 16 * 1024 // ~100k messages × 16 KiB
-	defaultCutoverInterval           = time.Hour
-	defaultCutoverMaxFailures        = 5
-	defaultCutoverMaxRetryGap        = time.Hour
-	defaultCutoverReconcileAfter     = 30 * time.Minute
-	defaultCutoverMarkCompletedTries = 3
-	defaultCutoverStartupJitter      = 30 * time.Second
-	cutoverMarkCompletedBaseBackoff  = 250 * time.Millisecond
-)
-
-// NewCutoverWorker wires the worker. Validates required deps so a
-// misconfiguration surfaces at startup, not on the first tick.
-func NewCutoverWorker(cfg CutoverConfig) (*CutoverWorker, error) {
-	if cfg.Service == nil {
-		return nil, errors.New("search.NewCutoverWorker: Service is required")
-	}
-	if cfg.Sizer == nil {
-		return nil, errors.New("search.NewCutoverWorker: Sizer is required")
-	}
-	if cfg.Source == nil {
-		return nil, errors.New("search.NewCutoverWorker: Source is required")
-	}
-	if cfg.Store == nil {
-		if cfg.Pool == nil {
-			return nil, errors.New("search.NewCutoverWorker: Store or Pool is required")
-		}
-		cfg.Store = NewPostgresCutoverStore(cfg.Pool)
-	}
-	if cfg.Logger == nil {
-		cfg.Logger = log.Default()
-	}
-	if cfg.Threshold <= 0 {
-		cfg.Threshold = defaultCutoverThreshold
-	}
-	if cfg.Interval <= 0 {
-		cfg.Interval = defaultCutoverInterval
-	}
-	if cfg.MaxFailures <= 0 {
-		cfg.MaxFailures = defaultCutoverMaxFailures
-	}
-	if cfg.MaxRetryGap <= 0 {
-		cfg.MaxRetryGap = defaultCutoverMaxRetryGap
-	}
-	if cfg.ReconcileAfter <= 0 {
-		cfg.ReconcileAfter = defaultCutoverReconcileAfter
-	}
-	if len(cfg.Transitions) == 0 {
-		cfg.Transitions = DefaultCutoverTransitions
-	}
-	if cfg.MarkCompletedRetries <= 0 {
-		cfg.MarkCompletedRetries = defaultCutoverMarkCompletedTries
-	}
-	if cfg.StartupJitter < 0 {
-		// Negative is operator-error; treat as zero (no jitter)
-		// rather than panicking inside mathrand.Int64N.
-		cfg.StartupJitter = 0
-	} else if cfg.StartupJitter == 0 && !cfg.disableStartupJitter {
-		cfg.StartupJitter = defaultCutoverStartupJitter
-	}
-	if cfg.Now == nil {
-		cfg.Now = time.Now
-	}
-	if cfg.Sleep == nil {
-		cfg.Sleep = time.Sleep
-	}
-	return &CutoverWorker{cfg: cfg}, nil
-}
-
-// Run drives the worker in a loop until ctx is cancelled. Each
-// tick is independent — a failing tick logs and waits out the
-// interval rather than terminating the goroutine.
-//
-// A small randomised delay (0..cfg.StartupJitter) precedes the
-// initial tick so a rolling deployment with N replicas doesn't
-// fire N simultaneous ListCandidates + N×M TenantMailboxSize
-// calls within the same millisecond. The jitter is bounded so the
-// "don't wait a full interval after restart" guarantee still
-// holds. Tests that exercise `Run` can set StartupJitter to 0 to
-// keep behavior deterministic; tests that drive the state machine
-// directly via `Tick` are unaffected.
-func (w *CutoverWorker) Run(ctx context.Context) {
-	if w.cfg.StartupJitter > 0 {
-		jitter := time.Duration(mathrand.Int64N(int64(w.cfg.StartupJitter)))
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(jitter):
-		}
-	}
-	t := time.NewTicker(w.cfg.Interval)
-	defer t.Stop()
-	// One immediate tick so a pod restart doesn't add up to a
-	// full interval of delay on tenants who are already past
-	// the threshold.
-	w.Tick(ctx)
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			w.Tick(ctx)
-		}
-	}
-}
-
-// Tick scans for eligible tenants and migrates each one. Exposed
-// (capitalised) so tests can drive the worker deterministically
-// without spinning the time.Ticker. Errors per tenant are logged
-// and counted; they do NOT abort the tick (one bad tenant must not
-// stop the rest of the fleet from migrating).
-//
-// The tick walks every configured transition pair in order. For
-// each pair it:
-//
-//  1. Runs the reconcile passes scoped to that pair's source /
-//     target so a stale `in_progress` row left by a previous
-//     transition's worker is cleaned up before new candidates
-//     are scanned.
-//  2. Lists candidates whose `search_backend` matches the
-//     pair's source AND for which there is no existing
-//     completed-or-blocking job row for the pair's target.
-//  3. Migrates each candidate from source -> target.
-//
-// `search_cutover_jobs` rows are keyed by
-// `(tenant_id, target_backend)`, so transitions are first-class:
-// a tenant previously promoted to one target can re-enter the
-// pipeline against a different target without a manual row
-// reset. Every store method below threads the target backend
-// through so two concurrent transitions on the same tenant don't
-// collide.
-func (w *CutoverWorker) Tick(ctx context.Context) {
-	for _, tr := range w.cfg.Transitions {
-		w.tickTransition(ctx, tr)
-	}
-}
-
-// tickTransition runs one (source, target) pair of the cutover
-// pipeline. Two complementary reconcile passes prefix the scan:
-//
-//   (a) ReconcileCompleted: tenant ALREADY on `target`
-//       (SetBackend committed, MarkCompleted didn't). Promote
-//       the row to `completed`.
-//   (b) ReconcileStale:     tenant STILL on `source`
-//       (pod crashed during ReindexTo or before SetBackend).
-//       Demote the row to `failed` so the normal back-off /
-//       retry path picks it up on a subsequent tick. Without
-//       this, the row sits in `in_progress` forever — neither
-//       ListCandidates (excludes `in_progress`) nor
-//       ReconcileCompleted (gates on `search_backend = target`)
-//       recovers it.
-//
-// Reconciliation failures are logged and ignored — the main
-// cutover loop is independent of them, and a transient store
-// blip shouldn't bring the worker down.
-func (w *CutoverWorker) tickTransition(ctx context.Context, tr CutoverTransition) {
-	now := w.cfg.Now()
-	staleBefore := now.Add(-w.cfg.ReconcileAfter)
-	if n, err := w.cfg.Store.ReconcileCompleted(ctx, tr.Target, staleBefore, now); err != nil {
-		w.cfg.Logger.Printf("search.cutover[%s->%s]: reconcile completed: %v", tr.Source, tr.Target, err)
-	} else if n > 0 {
-		w.cfg.Logger.Printf("search.cutover[%s->%s]: reconcile completed: promoted %d stale in_progress rows to completed", tr.Source, tr.Target, n)
-	}
-	if n, err := w.cfg.Store.ReconcileStale(ctx, tr.Source, tr.Target, staleBefore, now); err != nil {
-		w.cfg.Logger.Printf("search.cutover[%s->%s]: reconcile stale: %v", tr.Source, tr.Target, err)
-	} else if n > 0 {
-		w.cfg.Logger.Printf("search.cutover[%s->%s]: reconcile stale: demoted %d crashed in_progress rows to failed", tr.Source, tr.Target, n)
-	}
-	ids, err := w.cfg.Store.ListCandidates(ctx, CandidateFilter{
-		SourceBackend:    tr.Source,
-		TargetBackend:    tr.Target,
-		MaxFailures:      w.cfg.MaxFailures,
-		RetryAfterBefore: now.Add(-w.cfg.MaxRetryGap),
-	})
-	if err != nil {
-		w.cfg.Logger.Printf("search.cutover[%s->%s]: list candidates: %v", tr.Source, tr.Target, err)
-		return
-	}
-	for _, tenantID := range ids {
-		size, err := w.cfg.Sizer.TenantMailboxSize(ctx, tenantID)
-		if err != nil {
-			w.cfg.Logger.Printf("search.cutover[%s->%s]: sizer tenant=%s: %v", tr.Source, tr.Target, tenantID, err)
-			continue
-		}
-		if size < w.cfg.Threshold {
-			continue
-		}
-		if err := w.cutoverOne(ctx, tenantID, size, tr); err != nil {
-			w.cfg.Logger.Printf("search.cutover[%s->%s]: tenant %s: %v", tr.Source, tr.Target, tenantID, err)
-		}
-	}
-}
-
-// cutoverOne runs the full cutover dance for a single tenant. The
-// state machine is the load-bearing piece: every state transition
-// is a separate store write so a crash mid-flight resumes from the
-// last persisted state. Concurrent workers race the `Claim` call;
-// the loser short-circuits and lets the winner finish.
-//
-// The `tr` parameter scopes which (source, target) backend pair
-// the migration is for — the same worker handles every
-// configured pair in turn, so the destination is not implicit.
-// Every store call threads `tr.Target` through so the claim, mark,
-// and reconcile paths all key on `(tenant_id, target_backend)`
-// per the `search_cutover_jobs` composite PK.
-func (w *CutoverWorker) cutoverOne(ctx context.Context, tenantID string, size int64, tr CutoverTransition) error {
-	now := w.cfg.Now()
-	claimed, err := w.cfg.Store.Claim(ctx, tenantID, tr.Target, size, w.cfg.Threshold, now)
-	if err != nil {
-		return fmt.Errorf("claim: %w", err)
-	}
-	if !claimed {
-		// Another worker grabbed it; let them finish.
-		return nil
-	}
-	// From here on, every error path MUST flip the row to
-	// `failed` so the next tick can retry.
-	msgs, fetchErr := w.cfg.Source.MessagesForTenant(ctx, tenantID)
-	if fetchErr != nil {
-		_ = w.cfg.Store.MarkFailed(ctx, tenantID, tr.Target, fmt.Sprintf("fetch messages: %v", fetchErr), w.cfg.Now())
-		return fmt.Errorf("fetch messages: %w", fetchErr)
-	}
-	// Reindex into `tr.Target` FIRST so reads keep going to
-	// `tr.Source` until the target is fully populated. If the
-	// reindex fails for any reason — destination 502, partial
-	// network failure, schema rejection — the tenant's
-	// `search_backend` column is still the source, which keeps
-	// the tenant readable AND keeps it visible to
-	// `ListCandidates` for the next retry. ReindexTo deletes the
-	// destination index first so a half-written previous attempt
-	// doesn't leave orphan documents.
-	if err := w.cfg.Service.ReindexTo(ctx, tenantID, tr.Target, msgs); err != nil {
-		_ = w.cfg.Store.MarkFailed(ctx, tenantID, tr.Target, fmt.Sprintf("reindex: %v", err), w.cfg.Now())
-		return fmt.Errorf("reindex: %w", err)
-	}
-	// Target is now warm; atomically flip reads over. A SetBackend
-	// failure here is the unfortunate-but-recoverable case: the
-	// target index is fully populated but reads still go to the
-	// source. The next tick re-discovers the tenant (still on the
-	// source), the ReindexTo wipes & re-fills the target
-	// (idempotent), and the SetBackend is retried.
-	if err := w.cfg.Service.SetBackend(ctx, tenantID, tr.Target); err != nil {
-		_ = w.cfg.Store.MarkFailed(ctx, tenantID, tr.Target, fmt.Sprintf("set backend: %v", err), w.cfg.Now())
-		return fmt.Errorf("set backend: %w", err)
-	}
-	// SetBackend committed; the tenant is live on `tr.Target`.
-	// MarkCompleted is the bookkeeping update — it must not
-	// cause a re-migration if it transiently fails. Retry with
-	// exponential backoff to absorb a single connection blip; if
-	// the retry budget is exhausted, the next Tick's
-	// ReconcileCompleted pass will promote the row (the tenant
-	// is already on `tr.Target`, so the reconcile guard fires).
-	if err := w.markCompletedWithRetry(ctx, tenantID, tr.Target); err != nil {
-		w.cfg.Logger.Printf("search.cutover[%s->%s]: tenant=%s SetBackend OK but MarkCompleted persistently failed; will be reconciled on next tick: %v", tr.Source, tr.Target, tenantID, err)
-		return fmt.Errorf("mark completed: %w", err)
-	}
-	w.cfg.Logger.Printf("search.cutover[%s->%s]: tenant=%s migrated %d messages", tr.Source, tr.Target, tenantID, len(msgs))
-	return nil
-}
-
-// markCompletedWithRetry retries MarkCompleted with exponential
-// backoff up to cfg.MarkCompletedRetries times. Ctx-cancellation
-// short-circuits the loop immediately so a pod shutdown isn't
-// delayed by the backoff.
-func (w *CutoverWorker) markCompletedWithRetry(ctx context.Context, tenantID, targetBackend string) error {
-	var lastErr error
-	for attempt := 0; attempt < w.cfg.MarkCompletedRetries; attempt++ {
-		if err := w.cfg.Store.MarkCompleted(ctx, tenantID, targetBackend, w.cfg.Now()); err == nil {
-			return nil
-		} else {
-			lastErr = err
-		}
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		if attempt < w.cfg.MarkCompletedRetries-1 {
-			backoff := cutoverMarkCompletedBaseBackoff << attempt
-			w.cfg.Sleep(backoff)
-		}
-	}
-	return lastErr
+// CutoverJob is a row of `search_cutover_jobs` — the persisted
+// state of one (tenant, target_backend) cutover. It is the shape
+// returned by the store's Get / List / UpsertPending methods and
+// serialised by the REST handlers for the admin UI.
+type CutoverJob struct {
+	TenantID      string       `json:"tenant_id"`
+	TargetBackend string       `json:"target_backend"`
+	State         CutoverState `json:"cutover_state"`
+	MailboxSize   int64        `json:"mailbox_size"`
+	Threshold     int64        `json:"threshold"`
+	StartedAt     *time.Time   `json:"started_at,omitempty"`
+	CompletedAt   *time.Time   `json:"completed_at,omitempty"`
+	FailureCount  int          `json:"failure_count"`
+	LastError     string       `json:"last_error,omitempty"`
+	CreatedAt     time.Time    `json:"created_at"`
+	UpdatedAt     time.Time    `json:"updated_at"`
 }
 
 // PostgresCutoverStore is the default CutoverStore wired against
@@ -618,9 +282,21 @@ func NewPostgresCutoverStore(pool *pgxpool.Pool) *PostgresCutoverStore {
 // target is still eligible. Filter SQL:
 //
 //   - tenant currently on f.SourceBackend, AND
-//   - no job row for f.TargetBackend, OR the only row for
-//     f.TargetBackend is a recoverable `failed` (failure_count
-//     and back-off window predicates apply).
+//   - no job row for f.TargetBackend, OR the row for
+//     f.TargetBackend is `pending` (operator-initiated intent that
+//     hasn't executed yet), OR it is a recoverable `failed`
+//     (failure_count and back-off window predicates apply).
+//
+// `pending` rows are candidates so InitiateCutover's documented
+// contract holds: an operator-initiated cutover whose synchronous
+// ExecuteCutover never ran (e.g. the HTTP request was cancelled
+// between the UpsertPending and the Claim) is still discovered by
+// the worker and driven to completion instead of wedging the tenant
+// in `pending` forever (and suppressing the auto-promotion that the
+// bare-NULL branch would otherwise have triggered). The worker's own
+// size-threshold gate still applies, so a below-threshold manual
+// initiation is left for the operator to re-trigger rather than
+// auto-promoted.
 //
 // `in_progress` rows are NOT candidates — they're either being
 // actively driven by another worker (the Claim race-loser path)
@@ -635,6 +311,7 @@ func (s *PostgresCutoverStore) ListCandidates(ctx context.Context, f CandidateFi
 		WHERE t.search_backend = $1
 		  AND (
 		      j.tenant_id IS NULL
+		      OR j.cutover_state = 'pending'
 		      OR (j.cutover_state = 'failed'
 		          AND j.failure_count < $3
 		          AND j.updated_at < $4)
@@ -663,6 +340,16 @@ func (s *PostgresCutoverStore) ListCandidates(ctx context.Context, f CandidateFi
 // (tenant, target) pair land on a single winner. The composite
 // `(tenant_id, target_backend)` PK lets the same tenant carry
 // multiple rows (one per target) simultaneously.
+//
+// The in_progress transition nulls `completed_at`: every claim
+// starts a FRESH attempt, so any timestamp left over from a prior
+// completion (a re-claimed `failed` row, or a `pending` row that a
+// completed cutover was reset to) must not survive onto the new
+// attempt — otherwise a subsequent MarkFailed would leave a `failed`
+// row still advertising the old "Completed" date. Claim is the
+// single chokepoint every fresh attempt (manual and worker) passes
+// through, so clearing it here keeps the invariant "a non-completed
+// row never carries a completed_at" intact.
 func (s *PostgresCutoverStore) Claim(ctx context.Context, tenantID, targetBackend string, size, threshold int64, now time.Time) (bool, error) {
 	var claimed bool
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
@@ -679,6 +366,7 @@ func (s *PostgresCutoverStore) Claim(ctx context.Context, tenantID, targetBacken
 			   SET cutover_state = 'in_progress',
 			       mailbox_size  = $3,
 			       started_at    = $4,
+			       completed_at  = NULL,
 			       updated_at    = $4
 			 WHERE tenant_id      = $1
 			   AND target_backend = $2
@@ -810,4 +498,729 @@ func (s *PostgresCutoverStore) ReconcileStale(ctx context.Context, sourceBackend
 		return 0, err
 	}
 	return tag.RowsAffected(), nil
+}
+
+// cutoverJobColumns is the SELECT/RETURNING projection shared by
+// the Get / List / UpsertPending readers so the scan order stays
+// in lockstep with scanCutoverJob.
+const cutoverJobColumns = `tenant_id::text, target_backend, cutover_state,
+	mailbox_size, threshold, started_at, completed_at,
+	failure_count, last_error, created_at, updated_at`
+
+// rowScanner is the minimal surface shared by pgx.Row and
+// pgx.Rows so scanCutoverJob works for both single-row and
+// iterating reads.
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+// scanCutoverJob reads one `search_cutover_jobs` row into a
+// CutoverJob. started_at / completed_at are nullable in the
+// schema, so they scan into *time.Time (nil == SQL NULL).
+func scanCutoverJob(row rowScanner) (*CutoverJob, error) {
+	var j CutoverJob
+	if err := row.Scan(
+		&j.TenantID,
+		&j.TargetBackend,
+		&j.State,
+		&j.MailboxSize,
+		&j.Threshold,
+		&j.StartedAt,
+		&j.CompletedAt,
+		&j.FailureCount,
+		&j.LastError,
+		&j.CreatedAt,
+		&j.UpdatedAt,
+	); err != nil {
+		return nil, err
+	}
+	return &j, nil
+}
+
+// UpsertPending implements CutoverStore. Runs inside a
+// tenant-scoped transaction so the RLS policy's WITH CHECK clause
+// (`tenant_id = app.tenant_id`) is satisfied for the INSERT/UPDATE
+// — unlike the worker's cross-tenant scans, the manual path is
+// always operating on a single known tenant.
+//
+// An existing `in_progress` row is returned UNCHANGED — including
+// its `updated_at` — so a manual re-initiate can't trample a cutover
+// the worker (or a prior request) is actively running. Crucially,
+// leaving `updated_at` alone keeps ReconcileStale's crash-recovery
+// clock running: bumping it here would push the stale-detection
+// window out by another ReconcileAfter on every manual re-initiate.
+// Any other state (`pending`, `failed`, `completed`) is reset to
+// `pending` with a refreshed mailbox_size / threshold and a cleared
+// failure_count / last_error so the operator's explicit trigger
+// overrides the failure back-off and the completed-row guard,
+// making the tenant immediately claimable again. `completed_at` is
+// also nulled on reset: re-initiating a previously-`completed` row
+// must not carry its old completion timestamp into the new
+// lifecycle, or a subsequent failure would render a `failed` row
+// that still shows a "Completed" date.
+func (s *PostgresCutoverStore) UpsertPending(ctx context.Context, tenantID, targetBackend string, size, threshold int64, now time.Time) (*CutoverJob, error) {
+	var job *CutoverJob
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
+			return err
+		}
+		row := tx.QueryRow(ctx, `
+			INSERT INTO search_cutover_jobs
+				(tenant_id, target_backend, cutover_state, mailbox_size, threshold, updated_at)
+			VALUES ($1::uuid, $2, 'pending', $3, $4, $5)
+			ON CONFLICT (tenant_id, target_backend) DO UPDATE
+			   SET cutover_state = CASE WHEN search_cutover_jobs.cutover_state = 'in_progress'
+			                            THEN search_cutover_jobs.cutover_state ELSE 'pending' END,
+			       mailbox_size  = CASE WHEN search_cutover_jobs.cutover_state = 'in_progress'
+			                            THEN search_cutover_jobs.mailbox_size ELSE EXCLUDED.mailbox_size END,
+			       threshold     = CASE WHEN search_cutover_jobs.cutover_state = 'in_progress'
+			                            THEN search_cutover_jobs.threshold ELSE EXCLUDED.threshold END,
+			       failure_count = CASE WHEN search_cutover_jobs.cutover_state = 'in_progress'
+			                            THEN search_cutover_jobs.failure_count ELSE 0 END,
+			       last_error    = CASE WHEN search_cutover_jobs.cutover_state = 'in_progress'
+			                            THEN search_cutover_jobs.last_error ELSE '' END,
+			       completed_at  = CASE WHEN search_cutover_jobs.cutover_state = 'in_progress'
+			                            THEN search_cutover_jobs.completed_at ELSE NULL END,
+			       updated_at    = CASE WHEN search_cutover_jobs.cutover_state = 'in_progress'
+			                            THEN search_cutover_jobs.updated_at ELSE $5 END
+			RETURNING `+cutoverJobColumns,
+			tenantID, targetBackend, size, threshold, now.UTC())
+		j, err := scanCutoverJob(row)
+		if err != nil {
+			return err
+		}
+		job = j
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("upsert pending cutover: %w", err)
+	}
+	return job, nil
+}
+
+// Get implements CutoverStore.
+func (s *PostgresCutoverStore) Get(ctx context.Context, tenantID, targetBackend string) (*CutoverJob, error) {
+	var job *CutoverJob
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
+			return err
+		}
+		row := tx.QueryRow(ctx, `SELECT `+cutoverJobColumns+`
+			FROM search_cutover_jobs
+			WHERE tenant_id = $1::uuid AND target_backend = $2`, tenantID, targetBackend)
+		j, err := scanCutoverJob(row)
+		if err != nil {
+			return err
+		}
+		job = j
+		return nil
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get cutover job: %w", err)
+	}
+	return job, nil
+}
+
+// List implements CutoverStore. Ordered most-recently-updated
+// first so the admin UI shows the freshest cutover at the top.
+func (s *PostgresCutoverStore) List(ctx context.Context, tenantID string) ([]CutoverJob, error) {
+	var jobs []CutoverJob
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
+			return err
+		}
+		rows, err := tx.Query(ctx, `SELECT `+cutoverJobColumns+`
+			FROM search_cutover_jobs
+			WHERE tenant_id = $1::uuid
+			ORDER BY updated_at DESC, target_backend`, tenantID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			j, err := scanCutoverJob(rows)
+			if err != nil {
+				return err
+			}
+			jobs = append(jobs, *j)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list cutover jobs: %w", err)
+	}
+	return jobs, nil
+}
+
+// CutoverMetrics is the Prometheus metric set for the cutover
+// subsystem (both the auto-worker and the manual service share
+// it). Exposed so main.go can register the collectors with the
+// same registry the BFF serves on `/metrics`.
+type CutoverMetrics struct {
+	Completed  prometheus.Counter
+	Failed     prometheus.Counter
+	InProgress prometheus.Gauge
+}
+
+// NewCutoverMetrics builds the metric set and registers it with
+// `reg`. Pass `nil` to skip registration (tests, and the
+// worker/service defaults) — the collectors are still constructed
+// so Inc/Dec calls are always safe, they're just not exported.
+func NewCutoverMetrics(reg prometheus.Registerer) *CutoverMetrics {
+	m := &CutoverMetrics{
+		Completed: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "kmail_search_cutover_completed_total",
+			Help: "Total search cutovers that migrated, validated, and flipped a tenant to the target backend.",
+		}),
+		Failed: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "kmail_search_cutover_failed_total",
+			Help: "Total search cutovers that failed and left the tenant on the source backend.",
+		}),
+		InProgress: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "kmail_search_cutover_in_progress",
+			Help: "Search cutovers currently executing (claimed, not yet completed or failed).",
+		}),
+	}
+	if reg != nil {
+		reg.MustRegister(m.Completed, m.Failed, m.InProgress)
+	}
+	return m
+}
+
+// Register attaches the collectors to `reg`, tolerating a
+// double-registration (returns the already-registered collector
+// rather than panicking). Used when the metric set is built before
+// the serving registry exists — e.g. the cutover worker is
+// constructed earlier in main() than the Prometheus registry, so
+// it's created with `nil` and registered here once the registry is
+// available.
+func (m *CutoverMetrics) Register(reg prometheus.Registerer) {
+	if reg == nil {
+		return
+	}
+	for _, c := range []prometheus.Collector{m.Completed, m.Failed, m.InProgress} {
+		if err := reg.Register(c); err != nil {
+			var already prometheus.AlreadyRegisteredError
+			if !errors.As(err, &already) {
+				panic(fmt.Errorf("search: register cutover metric: %w", err))
+			}
+		}
+	}
+}
+
+// migrationDeps bundles the collaborators the post-claim cutover
+// dance needs. Both the auto-cutover worker and the manual
+// CutoverService build one so the export→reindex→validate→flip→
+// mark sequence (and its audit + metric side effects) stays
+// byte-for-byte identical across the automatic and
+// operator-triggered paths.
+type migrationDeps struct {
+	store                CutoverStore
+	flipper              BackendFlipper
+	source               MessageSource
+	audit                AuditLogger
+	metrics              *CutoverMetrics
+	logger               *log.Logger
+	now                  func() time.Time
+	sleep                func(time.Duration)
+	markCompletedRetries int
+	// actorType / actorID attribute the audit entry. The worker
+	// leaves these zero (defaults to ActorSystem); the manual
+	// service sets ActorAdmin + the operator's user ID per call.
+	actorType audit.ActorType
+	actorID   string
+}
+
+// runMigration performs the export→reindex→validate→flip→mark
+// dance for a tenant whose (tenant, target) row is ALREADY claimed
+// (in_progress). `sourceBackend` is the backend the tenant is
+// migrating off of; it's used for log + audit context. On any
+// step failure the row is moved to `failed` (preserving the tenant
+// on the source backend, since SetBackend hasn't run) and the
+// error is returned. The in-flight gauge is held for the duration.
+func runMigration(ctx context.Context, d migrationDeps, tenantID, sourceBackend, targetBackend string) error {
+	d.metrics.InProgress.Inc()
+	defer d.metrics.InProgress.Dec()
+
+	msgs, err := d.source.MessagesForTenant(ctx, tenantID)
+	if err != nil {
+		return d.markFailed(ctx, tenantID, sourceBackend, targetBackend, "fetch messages", err)
+	}
+	// Reindex into the target FIRST so reads keep going to the
+	// source until the target is fully populated and verified.
+	if err := d.flipper.ReindexTo(ctx, tenantID, targetBackend, msgs); err != nil {
+		return d.markFailed(ctx, tenantID, sourceBackend, targetBackend, "reindex", err)
+	}
+	// Validate the freshly-written index is actually queryable
+	// before flipping reads onto it. A validation failure leaves
+	// the tenant on the source backend (SetBackend hasn't run).
+	if err := d.flipper.Validate(ctx, tenantID, targetBackend, msgs); err != nil {
+		return d.markFailed(ctx, tenantID, sourceBackend, targetBackend, "validate", err)
+	}
+	// Target is warm and verified; atomically flip reads over.
+	if err := d.flipper.SetBackend(ctx, tenantID, targetBackend); err != nil {
+		return d.markFailed(ctx, tenantID, sourceBackend, targetBackend, "set backend", err)
+	}
+	// SetBackend committed — the tenant is now live on the target, so
+	// the cutover has *succeeded* regardless of what happens to the
+	// store bookkeeping below. Record the completion metric + audit
+	// entry HERE, before the MarkCompleted retry, so a persistent
+	// bookkeeping failure can't drop them: ReconcileCompleted only
+	// repairs the store row on a later tick, it never touches the
+	// counter or the audit trail, so deferring these until after a
+	// successful MarkCompleted would permanently undercount and
+	// leave a gap in the tamper-evident log.
+	d.metrics.Completed.Inc()
+	d.recordAudit(ctx, tenantID, sourceBackend, targetBackend, "search_cutover_completed", len(msgs), "")
+	d.logger.Printf("search.cutover[%s->%s]: tenant=%s migrated %d messages", sourceBackend, targetBackend, tenantID, len(msgs))
+	// MarkCompleted is bookkeeping — a transient failure here must
+	// not re-migrate, so retry with backoff and let the next tick's
+	// ReconcileCompleted pass promote the row if the budget is
+	// exhausted.
+	if err := d.markCompletedWithRetry(ctx, tenantID, targetBackend); err != nil {
+		d.logger.Printf("search.cutover[%s->%s]: tenant=%s SetBackend OK but MarkCompleted persistently failed; will be reconciled on next tick: %v", sourceBackend, targetBackend, tenantID, err)
+		return fmt.Errorf("mark completed: %w", err)
+	}
+	return nil
+}
+
+// markFailed flips the row to `failed`, bumps the failure metric,
+// emits an audit entry, and returns the wrapped error. The
+// MarkFailed store write uses a fresh `now()` so the back-off
+// window is measured from the moment of failure.
+func (d migrationDeps) markFailed(ctx context.Context, tenantID, sourceBackend, targetBackend, stage string, cause error) error {
+	reason := fmt.Sprintf("%s: %v", stage, cause)
+	if err := d.store.MarkFailed(ctx, tenantID, targetBackend, reason, d.now()); err != nil {
+		d.logger.Printf("search.cutover[%s->%s]: tenant=%s mark failed after %s error: %v", sourceBackend, targetBackend, tenantID, stage, err)
+	}
+	d.metrics.Failed.Inc()
+	d.recordAudit(ctx, tenantID, sourceBackend, targetBackend, "search_cutover_failed", 0, reason)
+	return fmt.Errorf("%s: %w", stage, cause)
+}
+
+// markCompletedWithRetry retries MarkCompleted with exponential
+// backoff up to markCompletedRetries times. Ctx-cancellation
+// short-circuits immediately so a pod shutdown isn't delayed by
+// the backoff.
+func (d migrationDeps) markCompletedWithRetry(ctx context.Context, tenantID, targetBackend string) error {
+	var lastErr error
+	for attempt := 0; attempt < d.markCompletedRetries; attempt++ {
+		if err := d.store.MarkCompleted(ctx, tenantID, targetBackend, d.now()); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if attempt < d.markCompletedRetries-1 {
+			d.sleep(cutoverMarkCompletedBaseBackoff << attempt)
+		}
+	}
+	return lastErr
+}
+
+// recordAudit writes one cutover audit entry. No-op when no
+// AuditLogger is wired. Audit failures are logged but never abort
+// the cutover — the migration's source of truth is the job row,
+// not the audit trail.
+func (d migrationDeps) recordAudit(ctx context.Context, tenantID, sourceBackend, targetBackend, action string, messages int, failure string) {
+	if d.audit == nil {
+		return
+	}
+	actorType := d.actorType
+	if actorType == "" {
+		actorType = audit.ActorSystem
+	}
+	meta := map[string]any{"target_backend": targetBackend}
+	if sourceBackend != "" {
+		meta["source_backend"] = sourceBackend
+	}
+	if action == "search_cutover_completed" {
+		meta["messages_migrated"] = messages
+	}
+	if failure != "" {
+		meta["error"] = failure
+	}
+	if _, err := d.audit.Log(ctx, audit.Entry{
+		TenantID:     tenantID,
+		ActorID:      d.actorID,
+		ActorType:    actorType,
+		Action:       action,
+		ResourceType: "search_backend",
+		ResourceID:   targetBackend,
+		Metadata:     meta,
+	}); err != nil {
+		d.logger.Printf("search.cutover[%s->%s]: tenant=%s audit %s: %v", sourceBackend, targetBackend, tenantID, action, err)
+	}
+}
+
+// cutoverValidationSampleSize bounds how many migrated messages
+// Service.Validate searches for in the destination index. Ten is
+// enough to catch a wholesale mapping/import failure without
+// turning validation into a second full scan.
+const cutoverValidationSampleSize = 10
+
+// cutoverValidationLimit is the page size of the per-message search
+// probe. It also doubles as the saturation threshold in
+// validateSearchable: a result set this full means the term matches
+// at least this many docs, so a missing target is "ranked beyond the
+// window" rather than "absent". See validateSearchable.
+const cutoverValidationLimit = 50
+
+// cutoverValidationAttempts / cutoverValidationRetryDelay bound the
+// per-message retry loop that absorbs the destination index's
+// write-visibility latency (OpenSearch refresh interval, async
+// Meilisearch indexing). 5 attempts * 200ms ~= 1s, which comfortably
+// clears the default 1s OpenSearch refresh window while keeping the
+// worst-case delay on a genuine validation failure bounded.
+const (
+	cutoverValidationAttempts   = 5
+	cutoverValidationRetryDelay = 200 * time.Millisecond
+)
+
+// validationRetrySleep is the sleep used between validation retries.
+// A package var (not a direct time.Sleep call) so tests can swap in
+// a no-op and exercise the retry path without real delays.
+//
+// It MUST only be mutated from tests (set-then-defer-restore) and the
+// tests that swap it MUST NOT run with t.Parallel(): production never
+// writes it, but it is process-global, so a parallel swap would race.
+// If the cutover validation knobs ever move onto Service, fold this in
+// as a Service field instead.
+var validationRetrySleep = time.Sleep
+
+// Validate implements BackendFlipper.Validate. After a reindex it
+// samples up to cutoverValidationSampleSize of the just-migrated
+// messages and confirms each is searchable in `backend` by a
+// free-text query on its subject (falling back to sender). A
+// reindex that "succeeded" but produced an empty / unsearchable
+// index (mapping drift, silently-dropped bulk import) is caught
+// here, BEFORE SetBackend flips reads onto it.
+//
+// Messages with neither a message ID nor any searchable term are
+// skipped — they can't be round-tripped through a query. If
+// nothing in the batch is searchable (e.g. an empty mailbox) the
+// reindex itself is the only signal and validation passes.
+func (s *Service) Validate(ctx context.Context, tenantID, backend string, msgs []Message) error {
+	if tenantID == "" || backend == "" {
+		return fmt.Errorf("%w: tenantID and backend required", ErrInvalidInput)
+	}
+	b, ok := s.backends[backend]
+	if !ok {
+		return fmt.Errorf("%w: backend %q not configured", ErrNotFound, backend)
+	}
+	searchable := make([]Message, 0, len(msgs))
+	for _, m := range msgs {
+		if m.MessageID == "" || validationQuery(m) == "" {
+			continue
+		}
+		searchable = append(searchable, m)
+	}
+	if len(searchable) == 0 {
+		return nil
+	}
+	for _, m := range sampleMessages(searchable, cutoverValidationSampleSize) {
+		if err := s.validateSearchable(ctx, b, tenantID, backend, m); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateSearchable confirms a single migrated message is findable
+// in `backend`, retrying with a short backoff to absorb the search
+// index's write-visibility latency. Reindex writes don't become
+// searchable synchronously — OpenSearch's `_bulk` only makes docs
+// queryable after the next refresh (default ~1s) and Meilisearch
+// indexes asynchronously — so a search fired immediately after
+// ReindexTo can legitimately miss a freshly-written doc. Retrying
+// turns that transient invisibility (and transient query errors)
+// into a wait rather than a spurious cutover failure, while a
+// genuinely empty / broken index still fails once the budget is
+// exhausted. The budget is small and bounded, so a real failure
+// adds at most cutoverValidationAttempts*cutoverValidationRetryDelay
+// (~1s) before returning.
+//
+// The probe is a free-text query on the message's own subject (or
+// sender), since the backend's multi_match indexes those fields but
+// NOT the message_id. That means a tenant with many messages sharing
+// a common subject ("Re: thanks", a newsletter) can push the target
+// doc past the `cutoverValidationLimit`-sized result window even
+// though it is correctly indexed. We must not treat that as a
+// failure: when the result set is SATURATED (== limit hits) the term
+// demonstrably matches at least `limit` docs, so the index is
+// populated + queryable for it and the target is merely ranked
+// lower — inconclusive for this message, not the empty/broken-index
+// failure mode Validate guards against. Only a NON-saturated result
+// (< limit hits) that still lacks the target is a real miss: the
+// doc's own subject is the query, so if fewer than `limit` docs
+// matched, every match was returned and the target is genuinely
+// absent — which is retried (write-visibility) and ultimately fails.
+func (s *Service) validateSearchable(ctx context.Context, b SearchBackend, tenantID, backend string, m Message) error {
+	var lastErr error
+	for attempt := 0; attempt < cutoverValidationAttempts; attempt++ {
+		if attempt > 0 {
+			validationRetrySleep(cutoverValidationRetryDelay)
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+		}
+		hits, err := b.SearchMessages(ctx, tenantID, validationQuery(m), cutoverValidationLimit)
+		if err != nil {
+			lastErr = fmt.Errorf("validate: search in %q: %w", backend, err)
+			continue
+		}
+		if containsMessageID(hits, m.MessageID) {
+			return nil
+		}
+		if len(hits) >= cutoverValidationLimit {
+			// Saturated window: index is populated + queryable for
+			// this term, the target is just ranked beyond it. Don't
+			// fail the cutover on a ranking artefact.
+			return nil
+		}
+		lastErr = fmt.Errorf("validate: message %q not searchable in %q after reindex", m.MessageID, backend)
+	}
+	return lastErr
+}
+
+// validationQuery picks the free-text term used to look a message
+// back up after reindex: the subject, or the sender when the
+// subject is empty.
+func validationQuery(m Message) string {
+	if m.Subject != "" {
+		return m.Subject
+	}
+	return m.From
+}
+
+// sampleMessages returns up to n messages chosen at random (no
+// replacement). Random sampling means a corrupt index can't hide
+// behind always-checking the same first-N documents.
+func sampleMessages(msgs []Message, n int) []Message {
+	if len(msgs) <= n {
+		return msgs
+	}
+	perm := mathrand.Perm(len(msgs))
+	out := make([]Message, 0, n)
+	for _, idx := range perm[:n] {
+		out = append(out, msgs[idx])
+	}
+	return out
+}
+
+// containsMessageID reports whether any hit carries the given
+// message ID.
+func containsMessageID(hits []SearchHit, id string) bool {
+	for _, h := range hits {
+		if h.MessageID == id {
+			return true
+		}
+	}
+	return false
+}
+
+// ErrCutoverInProgress is returned by ExecuteCutover when the
+// tenant's (tenant, target) row is already `in_progress` — the
+// auto-worker or a prior request holds the claim, so the manual
+// trigger must not double-run it.
+var ErrCutoverInProgress = errors.New("search: cutover already in progress for tenant/target")
+
+// CutoverService is the operator-facing, synchronous counterpart
+// to the auto-cutover worker. Where the worker scans the fleet on
+// a timer, the service exposes explicit InitiateCutover /
+// ExecuteCutover / ListCutoverJobs entry points the admin REST
+// surface drives. Both paths share the same migrationDeps machine,
+// so a manual cutover validates + flips + audits exactly like the
+// automatic one.
+type CutoverService struct {
+	store     CutoverStore
+	sizer     MailboxSizer
+	getter    BackendGetter
+	logger    *log.Logger
+	exec      migrationDeps
+	threshold int64
+	now       func() time.Time
+}
+
+// CutoverServiceConfig wires NewCutoverService.
+type CutoverServiceConfig struct {
+	Store                CutoverStore
+	Flipper              BackendFlipper
+	Source               MessageSource
+	Sizer                MailboxSizer
+	Getter               BackendGetter
+	Audit                AuditLogger
+	Metrics              *CutoverMetrics
+	Logger               *log.Logger
+	Threshold            int64
+	Now                  func() time.Time
+	Sleep                func(time.Duration)
+	MarkCompletedRetries int
+}
+
+// NewCutoverService validates required deps and applies defaults.
+func NewCutoverService(cfg CutoverServiceConfig) (*CutoverService, error) {
+	if cfg.Store == nil {
+		return nil, errors.New("search.NewCutoverService: Store is required")
+	}
+	if cfg.Flipper == nil {
+		return nil, errors.New("search.NewCutoverService: Flipper is required")
+	}
+	if cfg.Source == nil {
+		return nil, errors.New("search.NewCutoverService: Source is required")
+	}
+	if cfg.Logger == nil {
+		cfg.Logger = log.Default()
+	}
+	if cfg.Metrics == nil {
+		cfg.Metrics = NewCutoverMetrics(nil)
+	}
+	if cfg.Threshold <= 0 {
+		cfg.Threshold = defaultCutoverThreshold
+	}
+	if cfg.Now == nil {
+		cfg.Now = time.Now
+	}
+	if cfg.Sleep == nil {
+		cfg.Sleep = time.Sleep
+	}
+	if cfg.MarkCompletedRetries <= 0 {
+		cfg.MarkCompletedRetries = defaultCutoverMarkCompletedTries
+	}
+	return &CutoverService{
+		store:     cfg.Store,
+		sizer:     cfg.Sizer,
+		getter:    cfg.Getter,
+		logger:    cfg.Logger,
+		threshold: cfg.Threshold,
+		now:       cfg.Now,
+		exec: migrationDeps{
+			store:                cfg.Store,
+			flipper:              cfg.Flipper,
+			source:               cfg.Source,
+			audit:                cfg.Audit,
+			metrics:              cfg.Metrics,
+			logger:               cfg.Logger,
+			now:                  cfg.Now,
+			sleep:                cfg.Sleep,
+			markCompletedRetries: cfg.MarkCompletedRetries,
+		},
+	}, nil
+}
+
+// InitiateCutover records operator intent to migrate `tenantID`
+// onto `targetBackend`: it upserts a `pending` job row (resetting
+// any prior failed/completed row's back-off) so the tenant becomes
+// immediately claimable. It does NOT run the migration — call
+// ExecuteCutover to drive it synchronously, or let the auto-worker
+// pick the pending row up on its next tick (ListCandidates includes
+// `pending` rows, so a never-executed initiation is recovered rather
+// than wedged — subject to the worker's size threshold). Returns the
+// resulting job. Rejects an unknown backend value and a no-op
+// cutover (the tenant is already on the target).
+func (c *CutoverService) InitiateCutover(ctx context.Context, tenantID, targetBackend string) (*CutoverJob, error) {
+	if tenantID == "" || targetBackend == "" {
+		return nil, fmt.Errorf("%w: tenantID and targetBackend required", ErrInvalidInput)
+	}
+	if !IsValidBackend(targetBackend) {
+		return nil, fmt.Errorf("%w: backend %q is not a recognised value", ErrInvalidInput, targetBackend)
+	}
+	if c.getter != nil {
+		cur, err := c.getter.GetBackend(ctx, tenantID)
+		if err != nil {
+			return nil, err
+		}
+		if cur == targetBackend {
+			return nil, fmt.Errorf("%w: tenant already on backend %q", ErrInvalidInput, targetBackend)
+		}
+	}
+	size := c.tenantSize(ctx, tenantID)
+	job, err := c.store.UpsertPending(ctx, tenantID, targetBackend, size, c.threshold, c.now())
+	if err != nil {
+		return nil, err
+	}
+	return job, nil
+}
+
+// ExecuteCutover synchronously runs the migration for an already
+// initiated (or auto-discovered) tenant: it claims the (tenant,
+// target) row and, if the claim wins, drives the full
+// export→reindex→validate→flip→mark dance. A failed claim means
+// the row is already `in_progress` or not in a claimable state, so
+// it returns ErrCutoverInProgress rather than racing the holder.
+// `actorID` attributes the audit trail to the operator who
+// triggered the manual cutover.
+func (c *CutoverService) ExecuteCutover(ctx context.Context, tenantID, targetBackend, actorID string) error {
+	if tenantID == "" || targetBackend == "" {
+		return fmt.Errorf("%w: tenantID and targetBackend required", ErrInvalidInput)
+	}
+	if !IsValidBackend(targetBackend) {
+		return fmt.Errorf("%w: backend %q is not a recognised value", ErrInvalidInput, targetBackend)
+	}
+	sourceBackend := ""
+	if c.getter != nil {
+		cur, err := c.getter.GetBackend(ctx, tenantID)
+		if err != nil {
+			return err
+		}
+		if cur == targetBackend {
+			return fmt.Errorf("%w: tenant already on backend %q", ErrInvalidInput, targetBackend)
+		}
+		sourceBackend = cur
+	}
+	size := c.tenantSize(ctx, tenantID)
+	claimed, err := c.store.Claim(ctx, tenantID, targetBackend, size, c.threshold, c.now())
+	if err != nil {
+		return fmt.Errorf("claim: %w", err)
+	}
+	if !claimed {
+		return ErrCutoverInProgress
+	}
+	// Per-call deps copy so the audit entry is attributed to the
+	// triggering operator (ActorAdmin) instead of the system.
+	d := c.exec
+	d.actorType = audit.ActorAdmin
+	d.actorID = actorID
+	return runMigration(ctx, d, tenantID, sourceBackend, targetBackend)
+}
+
+// ListCutoverJobs returns the tenant's cutover history across all
+// targets, most-recent first.
+func (c *CutoverService) ListCutoverJobs(ctx context.Context, tenantID string) ([]CutoverJob, error) {
+	if tenantID == "" {
+		return nil, fmt.Errorf("%w: tenantID required", ErrInvalidInput)
+	}
+	return c.store.List(ctx, tenantID)
+}
+
+// GetCutoverJob returns the single (tenant, target) job row, or
+// ErrNotFound if no cutover has ever been initiated for that pair.
+// The REST layer uses it to report the terminal state back to the
+// operator after a synchronous ExecuteCutover.
+func (c *CutoverService) GetCutoverJob(ctx context.Context, tenantID, targetBackend string) (*CutoverJob, error) {
+	if tenantID == "" || targetBackend == "" {
+		return nil, fmt.Errorf("%w: tenantID and targetBackend required", ErrInvalidInput)
+	}
+	return c.store.Get(ctx, tenantID, targetBackend)
+}
+
+// tenantSize best-effort reads the tenant's mailbox size for the
+// job row's bookkeeping. A sizer error is non-fatal — the manual
+// path is operator-driven, so we record 0 and proceed rather than
+// blocking the cutover on a transient sizer hiccup.
+func (c *CutoverService) tenantSize(ctx context.Context, tenantID string) int64 {
+	if c.sizer == nil {
+		return 0
+	}
+	size, err := c.sizer.TenantMailboxSize(ctx, tenantID)
+	if err != nil {
+		c.logger.Printf("search.cutover: tenant=%s size lookup: %v", tenantID, err)
+		return 0
+	}
+	return size
 }
