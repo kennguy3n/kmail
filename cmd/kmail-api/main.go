@@ -1218,7 +1218,14 @@ func main() {
 		signupCheckout = &tenant.StripeCheckoutHTTP{
 			APIKey:  k,
 			BaseURL: os.Getenv("KMAIL_STRIPE_API_BASE"),
-			HTTP:    http.DefaultClient,
+			// Dedicated client with a hard timeout rather than
+			// http.DefaultClient (which has none). The per-request
+			// context already cancels on client disconnect / shutdown,
+			// but http.Server applies no default handler timeout, so a
+			// hung Stripe connection could otherwise pin a goroutine
+			// indefinitely. This is the backstop independent of context
+			// propagation.
+			HTTP: &http.Client{Timeout: 30 * time.Second},
 		}
 	}
 	signupWelcomeMailer := tenant.NewJMAPWelcomeMailer(
