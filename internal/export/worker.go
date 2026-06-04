@@ -2,6 +2,7 @@ package export
 
 import (
 	"context"
+	"errors"
 	"log"
 	"time"
 
@@ -46,9 +47,21 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 // realistic export runtime so an in-flight job is never run twice.
 const defaultStaleTimeout = 60 * time.Minute
 
+// jobSource is the slice of *Service the worker drives. Declaring it
+// as an interface lets tests inject a fake to assert the worker's
+// scheduling and metric-accounting contracts (e.g. that a run the
+// service abandoned via errJobNotCurrent is counted as neither
+// completed nor failed) without standing up Postgres. *Service
+// satisfies it in production.
+type jobSource interface {
+	RequeueStaleJobs(ctx context.Context, olderThan time.Duration) (int64, error)
+	claimNextJob(ctx context.Context) (*Job, error)
+	RunExport(ctx context.Context, job Job) (Result, error)
+}
+
 // Worker is the export job runner pool.
 type Worker struct {
-	svc          *Service
+	svc          jobSource
 	logger       *log.Logger
 	interval     time.Duration
 	parallel     int
@@ -100,15 +113,28 @@ func (w *Worker) Run(ctx context.Context) {
 					w.logger.Printf("export.worker: requeued %d stale running job(s)", n)
 				}
 			}
+			// Reserve a worker slot *before* claiming. This keeps two
+			// invariants: (1) a claimed ('running') job is never held
+			// idle in a local var waiting for a slot to free, and (2)
+			// cancellation stays responsive — if both slots are busy with
+			// long-running exports we block here on a select that also
+			// watches ctx.Done(), instead of blocking on a bare channel
+			// send that ignores shutdown.
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
 			job, err := w.svc.claimNextJob(ctx)
 			if err != nil {
+				<-sem
 				w.logger.Printf("export.worker: claim: %v", err)
 				continue
 			}
 			if job == nil {
+				<-sem
 				continue
 			}
-			sem <- struct{}{}
 			go func(j Job) {
 				defer func() { <-sem }()
 				w.runOne(ctx, j)
@@ -121,6 +147,14 @@ func (w *Worker) Run(ctx context.Context) {
 func (w *Worker) runOne(ctx context.Context, j Job) {
 	res, err := w.svc.RunExport(ctx, j)
 	if err != nil {
+		if errors.Is(err, errJobNotCurrent) {
+			// The job was requeued by the stale-timeout sweep (and may
+			// already be re-claimed) while this run was in flight, so its
+			// outcome was intentionally discarded. The authoritative run
+			// is the retry — don't count this one as completed or failed.
+			w.logger.Printf("export.worker: job %s requeued mid-run; outcome discarded", j.ID)
+			return
+		}
 		w.logger.Printf("export.worker: run %s: %v", j.ID, err)
 		if w.metrics != nil {
 			w.metrics.JobsFailed.Inc()

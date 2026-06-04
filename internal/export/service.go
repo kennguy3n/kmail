@@ -67,6 +67,15 @@ type Runner interface {
 	Run(ctx context.Context, job Job) (Result, error)
 }
 
+// errJobNotCurrent reports that a terminal-state write (markComplete /
+// markFailed) matched no row because the job is no longer the running
+// instance this goroutine claimed: RequeueStaleJobs reset it to
+// 'pending' (and another worker may have re-claimed it) while this run
+// was still in flight. The run's outcome is therefore abandoned — the
+// caller must not count it or treat it as the job's result, since the
+// authoritative run is the re-claimed one.
+var errJobNotCurrent = errors.New("export: job no longer in the claimed running state; terminal update skipped")
+
 // AuditLogger is the subset of *audit.Service the export service
 // writes to when a job changes state. Optional (nil disables audit
 // emission).
@@ -250,14 +259,27 @@ func (s *Service) markComplete(ctx context.Context, job Job, res Result) error {
 		if err := middleware.SetTenantGUC(ctx, tx, job.TenantID); err != nil {
 			return err
 		}
-		_, err := tx.Exec(ctx, `
+		// Fence the write to the exact run we claimed: only update a row
+		// that is still 'running' with the same started_at this goroutine
+		// saw at claim time. If RequeueStaleJobs reset the job to 'pending'
+		// (started_at NULL) or another worker re-claimed it (a new
+		// started_at) while we ran, this matches zero rows so we neither
+		// clobber the re-claimed run's state nor resurrect a 'pending' job
+		// into 'completed' with a stale artifact.
+		tag, err := tx.Exec(ctx, `
 			UPDATE export_jobs
 			SET status = 'completed', download_url = $2, completed_at = now(),
 			    artifact_url = $3, artifact_size_bytes = $4, artifact_checksum = $5
 			WHERE id = $1::uuid AND tenant_id = $6::uuid
-		`, job.ID, res.DownloadURL, res.ArtifactURL, res.ArtifactSizeBytes, res.ArtifactChecksum, job.TenantID)
+			  AND status = 'running' AND started_at = $7
+		`, job.ID, res.DownloadURL, res.ArtifactURL, res.ArtifactSizeBytes, res.ArtifactChecksum, job.TenantID, job.StartedAt)
 		if err != nil {
 			return fmt.Errorf("update export_jobs: %w", err)
+		}
+		if tag.RowsAffected() == 0 {
+			// Job was requeued/re-claimed mid-run: skip the manifest
+			// insert and signal the abandoned run to the caller.
+			return errJobNotCurrent
 		}
 		// Insert the whole manifest in one round-trip by unnesting the
 		// id array, rather than issuing one INSERT per message. A large
@@ -282,6 +304,8 @@ func (s *Service) markComplete(ctx context.Context, job Job, res Result) error {
 	if err != nil {
 		return err
 	}
+	// Only emit the audit entry for a run that actually recorded the
+	// terminal state (gated on the UPDATE above taking effect).
 	s.logAudit(ctx, job, "export.completed", map[string]any{
 		"format":              job.Format,
 		"scope":               job.Scope,
@@ -297,11 +321,22 @@ func (s *Service) markFailed(ctx context.Context, job Job, runErr error) error {
 		if err := middleware.SetTenantGUC(ctx, tx, job.TenantID); err != nil {
 			return err
 		}
-		_, err := tx.Exec(ctx, `
+		// Same run-fencing as markComplete: never mark a job 'failed' once
+		// it has been requeued/re-claimed, otherwise a slow run that
+		// errored out after the stale-timeout would permanently fail a job
+		// that is already being retried, defeating RequeueStaleJobs.
+		tag, err := tx.Exec(ctx, `
 			UPDATE export_jobs SET status = 'failed', error_message = $2, completed_at = now()
 			WHERE id = $1::uuid AND tenant_id = $3::uuid
-		`, job.ID, runErr.Error(), job.TenantID)
-		return err
+			  AND status = 'running' AND started_at = $4
+		`, job.ID, runErr.Error(), job.TenantID, job.StartedAt)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return errJobNotCurrent
+		}
+		return nil
 	})
 	if err != nil {
 		return err
@@ -344,6 +379,12 @@ func (s *Service) RunExport(ctx context.Context, job Job) (Result, error) {
 	if s.runner == nil {
 		err := errors.New("export: no runner registered")
 		if mErr := s.markFailed(ctx, job, err); mErr != nil {
+			// If the job was requeued/re-claimed mid-run the failure
+			// write is a no-op; surface that abandonment verbatim so the
+			// worker neither double-counts nor masks it with the run err.
+			if errors.Is(mErr, errJobNotCurrent) {
+				return Result{}, mErr
+			}
 			return Result{}, fmt.Errorf("%w (and mark-failed: %v)", err, mErr)
 		}
 		return Result{}, err
@@ -351,11 +392,17 @@ func (s *Service) RunExport(ctx context.Context, job Job) (Result, error) {
 	res, err := s.runner.Run(ctx, job)
 	if err != nil {
 		if mErr := s.markFailed(ctx, job, err); mErr != nil {
+			if errors.Is(mErr, errJobNotCurrent) {
+				return Result{}, mErr
+			}
 			return Result{}, fmt.Errorf("%w (and mark-failed: %v)", err, mErr)
 		}
 		return Result{}, err
 	}
 	if err := s.markComplete(ctx, job, res); err != nil {
+		// errJobNotCurrent propagates here too: the artifact was built
+		// and uploaded but the job was requeued, so the result is
+		// discarded and the retry will produce the authoritative one.
 		return Result{}, err
 	}
 	return res, nil
