@@ -17,15 +17,80 @@
 import { useCallback, useEffect, useState } from "react";
 
 import {
+  ADMIN_API_BASE,
+  adminAuthHeaders,
   getSearchBackend,
   listAvailableSearchBackends,
   reindexSearch,
+  requestJSON,
   SEARCH_BACKENDS,
   setSearchBackend,
   type SearchBackendConfig,
   type SearchBackendName,
 } from "../../api/admin";
 import { useTenantSelection } from "./useTenantSelection";
+
+/**
+ * One row of `search_cutover_jobs` as serialised by
+ * `internal/search/cutover.go#CutoverJob`. A tenant can carry one
+ * row per target backend, so the history is keyed by
+ * (tenant, target_backend).
+ */
+export interface CutoverJob {
+  tenant_id: string;
+  target_backend: SearchBackendName;
+  cutover_state: "pending" | "in_progress" | "completed" | "failed";
+  mailbox_size: number;
+  threshold: number;
+  started_at?: string;
+  completed_at?: string;
+  failure_count: number;
+  last_error?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+/**
+ * listCutoverJobs returns the tenant's cutover history across all
+ * targets. The endpoint wraps the array in `{ jobs }`; we unwrap to
+ * the bare slice (and tolerate a missing/`null` field) so callers
+ * always get an array.
+ */
+async function listCutoverJobs(tenantId: string): Promise<CutoverJob[]> {
+  const res = await requestJSON<{ jobs: CutoverJob[] | null }>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/search/cutover`,
+    { headers: adminAuthHeaders(tenantId) },
+  );
+  return res.jobs ?? [];
+}
+
+/**
+ * initiateCutover records operator intent and synchronously runs
+ * the migration, returning the terminal job row. A reindex/
+ * validation failure surfaces as a thrown AdminApiError and leaves
+ * the tenant on its source backend.
+ */
+async function initiateCutover(
+  tenantId: string,
+  targetBackend: SearchBackendName,
+): Promise<CutoverJob> {
+  return requestJSON<CutoverJob>(
+    `${ADMIN_API_BASE}/tenants/${encodeURIComponent(tenantId)}/search/cutover`,
+    {
+      method: "POST",
+      headers: adminAuthHeaders(tenantId, { "Content-Type": "application/json" }),
+      body: JSON.stringify({ target_backend: targetBackend }),
+    },
+  );
+}
+
+/** Human-readable label for a cutover state. */
+const CUTOVER_STATE_LABEL: Record<CutoverJob["cutover_state"], string> = {
+  pending: "Pending",
+  in_progress: "In progress",
+  completed: "Completed",
+  failed: "Failed",
+};
 
 /**
  * Human-readable labels and one-line descriptions for each
@@ -69,13 +134,28 @@ export default function SearchAdmin() {
   // `null` until the fetch completes; we disable ALL cards in
   // that initial state so a fast-clicker can't beat the gate.
   const [available, setAvailable] = useState<Set<SearchBackendName> | null>(null);
+  // Cutover history + manual-trigger state. `null` until the first
+  // fetch completes so the table can show a loading affordance.
+  const [cutoverJobs, setCutoverJobs] = useState<CutoverJob[] | null>(null);
+  const [cutoverTarget, setCutoverTarget] = useState<SearchBackendName | "">("");
+  const [cutoverPending, setCutoverPending] = useState(false);
 
-  const reload = useCallback((tid: string) => {
-    setError(null);
-    getSearchBackend(tid)
-      .then(setConfig)
+  const reloadCutover = useCallback((tid: string) => {
+    listCutoverJobs(tid)
+      .then(setCutoverJobs)
       .catch((e: unknown) => setError(String(e)));
   }, []);
+
+  const reload = useCallback(
+    (tid: string) => {
+      setError(null);
+      getSearchBackend(tid)
+        .then(setConfig)
+        .catch((e: unknown) => setError(String(e)));
+      reloadCutover(tid);
+    },
+    [reloadCutover],
+  );
 
   useEffect(() => {
     if (selectedTenantId) reload(selectedTenantId);
@@ -120,6 +200,33 @@ export default function SearchAdmin() {
       setError(String(e));
     } finally {
       setPending(false);
+    }
+  };
+
+  // onCutover synchronously migrates the tenant to the chosen
+  // target backend (export → reindex → validate → flip). The button
+  // blocks with a progress indicator until the BFF returns the
+  // terminal job; a validation failure throws and leaves the tenant
+  // safely on its source backend, which we surface as an error.
+  const onCutover = async () => {
+    if (!selectedTenantId || !cutoverTarget) return;
+    setCutoverPending(true);
+    setError(null);
+    setInfo(null);
+    try {
+      const job = await initiateCutover(selectedTenantId, cutoverTarget);
+      setInfo(`Cutover to ${job.target_backend} ${CUTOVER_STATE_LABEL[job.cutover_state].toLowerCase()}.`);
+      setCutoverTarget("");
+      // The backend column moved; refresh both the current-backend
+      // card and the history table.
+      reload(selectedTenantId);
+    } catch (e: unknown) {
+      setError(String(e));
+      // Even on failure the history table now carries a `failed`
+      // row — refresh so the operator sees it.
+      reloadCutover(selectedTenantId);
+    } finally {
+      setCutoverPending(false);
     }
   };
 
@@ -186,6 +293,78 @@ export default function SearchAdmin() {
               Reindex now
             </button>
           </div>
+
+          <section className="cutover-section" aria-labelledby="cutover-heading">
+            <h3 id="cutover-heading">Cutover</h3>
+            <p className="muted">
+              Migrate this tenant&apos;s search index to another backend (export → reindex → validate → flip). A
+              failed validation leaves the tenant on its current backend. The auto-cutover worker performs the same
+              migration in the background once a mailbox outgrows the threshold.
+            </p>
+            <div className="actions cutover-trigger">
+              <label>
+                Target backend{" "}
+                <select
+                  value={cutoverTarget}
+                  disabled={cutoverPending}
+                  onChange={(e) => setCutoverTarget(e.target.value as SearchBackendName | "")}
+                >
+                  <option value="">— select —</option>
+                  {SEARCH_BACKENDS.filter(
+                    (b) => b !== config.backend && available !== null && available.has(b),
+                  ).map((b) => (
+                    <option key={b} value={b}>
+                      {BACKEND_DESCRIPTIONS[b]?.label ?? b}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <button
+                type="button"
+                disabled={cutoverPending || cutoverTarget === ""}
+                onClick={onCutover}
+              >
+                Start cutover
+              </button>
+              {cutoverPending && (
+                <span className="cutover-progress" role="status">
+                  Cutover in progress…
+                </span>
+              )}
+            </div>
+
+            <h4>History</h4>
+            {cutoverJobs === null ? (
+              <p className="muted">Loading…</p>
+            ) : cutoverJobs.length === 0 ? (
+              <p className="muted">No cutovers have run for this tenant.</p>
+            ) : (
+              <table className="cutover-history">
+                <thead>
+                  <tr>
+                    <th>Target backend</th>
+                    <th>State</th>
+                    <th>Started</th>
+                    <th>Completed</th>
+                    <th>Failures</th>
+                    <th>Last error</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {cutoverJobs.map((job) => (
+                    <tr key={job.target_backend} className={`cutover-${job.cutover_state}`}>
+                      <td>{job.target_backend}</td>
+                      <td>{CUTOVER_STATE_LABEL[job.cutover_state]}</td>
+                      <td>{job.started_at ? new Date(job.started_at).toLocaleString() : "—"}</td>
+                      <td>{job.completed_at ? new Date(job.completed_at).toLocaleString() : "—"}</td>
+                      <td>{job.failure_count}</td>
+                      <td className="cutover-error">{job.last_error || "—"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </section>
         </div>
       )}
     </div>

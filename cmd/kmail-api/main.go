@@ -781,6 +781,38 @@ func main() {
 	})
 	search.NewHandlers(searchSvc, logger).Register(mux, authMW)
 
+	// Cutover plumbing. The Prometheus collectors are shared by
+	// the operator-facing CutoverService (manual REST trigger)
+	// and the background auto-cutover worker below, and attached
+	// to the serving registry once `middleware.NewMetrics()` runs.
+	cutoverMetrics := search.NewCutoverMetrics(nil)
+	cutoverStore := search.NewPostgresCutoverStore(pool)
+	cutoverSource := search.MessageSourceFunc(func(ctx context.Context, tenantID string) ([]search.Message, error) {
+		return searchSvc.Export(ctx, tenantID)
+	})
+	cutoverSizer := search.MailboxSizerFunc(func(ctx context.Context, tenantID string) (int64, error) {
+		q, err := billingSvc.GetQuota(ctx, tenantID)
+		if err != nil {
+			return 0, err
+		}
+		return q.StorageUsedBytes, nil
+	})
+	cutoverSvc, err := search.NewCutoverService(search.CutoverServiceConfig{
+		Store:     cutoverStore,
+		Flipper:   searchSvc,
+		Source:    cutoverSource,
+		Sizer:     cutoverSizer,
+		Getter:    searchSvc,
+		Audit:     auditSvc,
+		Metrics:   cutoverMetrics,
+		Logger:    logger,
+		Threshold: int64(config.GetenvInt64("KMAIL_SEARCH_CUTOVER_THRESHOLD_BYTES", 0)),
+	})
+	if err != nil {
+		logger.Fatalf("search.NewCutoverService: %v", err)
+	}
+	search.NewCutoverHandlers(cutoverSvc, logger).Register(mux, authMW)
+
 	// Ensure every shared index exists with the correct
 	// settings before the first per-tenant write lands. We do
 	// this synchronously at startup so the admin / search
@@ -858,22 +890,17 @@ func main() {
 		}
 	}
 	if hasMeili && hasOpen {
-		sizer := search.MailboxSizerFunc(func(ctx context.Context, tenantID string) (int64, error) {
-			q, err := billingSvc.GetQuota(ctx, tenantID)
-			if err != nil {
-				return 0, err
-			}
-			return q.StorageUsedBytes, nil
-		})
-		source := search.MessageSourceFunc(func(ctx context.Context, tenantID string) ([]search.Message, error) {
-			return searchSvc.Export(ctx, tenantID)
-		})
+		// Reuse the cutover store/source/sizer/metrics built with
+		// the CutoverService above so the manual and automatic
+		// paths share one metric set and one mailbox-size source.
 		cutover, cutErr := search.NewCutoverWorker(search.CutoverConfig{
 			Pool:        pool,
 			Service:     searchSvc,
-			Sizer:       sizer,
-			Source:      source,
+			Sizer:       cutoverSizer,
+			Source:      cutoverSource,
 			Logger:      logger,
+			Audit:       auditSvc,
+			Metrics:     cutoverMetrics,
 			Threshold:   int64(config.GetenvInt64("KMAIL_SEARCH_CUTOVER_THRESHOLD_BYTES", 0)),
 			Interval:    getenvDuration("KMAIL_SEARCH_CUTOVER_INTERVAL", time.Hour),
 			MaxFailures: config.GetenvInt("KMAIL_SEARCH_CUTOVER_MAX_FAILURES", 5),
@@ -943,6 +970,10 @@ func main() {
 
 	// Observability: Prometheus /metrics + OpenTelemetry tracing.
 	metrics := middleware.NewMetrics()
+	// Attach the search cutover collectors to the serving registry
+	// now that it exists (CutoverService / worker were constructed
+	// earlier with a nil registry).
+	cutoverMetrics.Register(metrics.Registry)
 	if cfg.Observability.MetricsEnabled {
 		mux.Handle("GET /metrics", metrics.Handler())
 	}
