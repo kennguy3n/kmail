@@ -186,6 +186,37 @@ func TestPostUnsubscribe_RecordedWhenNoOneClick(t *testing.T) {
 	if out["mailto"] != "mailto:u@list.example" {
 		t.Fatalf("expected mailto passthrough, got %v", out)
 	}
+	// Intent was persisted (store present, list id derived), so the GET
+	// handler will agree on reload — safe to report done.
+	if out["already_done"] != true {
+		t.Fatalf("expected already_done=true after a persisted record, got %v", out)
+	}
+}
+
+// When no unsubscribe store is wired (Valkey unavailable) and there's no
+// one-click POST, the recorded path persists nothing — so already_done
+// must be false. Reporting true would flip-flop the button: the next GET
+// (which also has no store) returns already_done=false.
+func TestPostUnsubscribe_RecordedNotDoneWithoutStore(t *testing.T) {
+	h := NewHandlers(HandlersConfig{
+		Fetcher: &fakeFetcher{msgs: map[string]Message{
+			"E1": {ID: "E1", Headers: map[string]string{
+				"List-Unsubscribe": "<mailto:u@list.example>",
+			}},
+		}},
+		// No Unsub store, no OneClick.
+	})
+	r := authed(http.MethodPost, "/api/v1/emails/E1/unsubscribe")
+	r.SetPathValue("id", "E1")
+	w := httptest.NewRecorder()
+	h.postUnsubscribe(w, r)
+	out := decode(t, w)
+	if out["method"] != "recorded" {
+		t.Fatalf("expected recorded method, got %v", out)
+	}
+	if out["already_done"] != false {
+		t.Fatalf("expected already_done=false when nothing was persisted, got %v", out)
+	}
 }
 
 func TestPostUnsubscribe_NoHeader(t *testing.T) {

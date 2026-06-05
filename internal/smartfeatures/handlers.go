@@ -227,16 +227,27 @@ func (h *Handlers) postUnsubscribe(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	persisted := false
 	if h.unsub != nil && info.ListID != "" {
 		if err := h.unsub.Mark(r.Context(), tenantID, userID, info.ListID); err != nil {
 			h.logger.Printf("smartfeatures: mark unsubscribed %s: %v", info.ListID, err)
+		} else {
+			persisted = true
 		}
 	}
 
 	resp := map[string]any{
-		"email_id":     id,
-		"method":       method,
-		"already_done": true,
+		"email_id": id,
+		"method":   method,
+		// already_done must reflect a *durable* outcome the GET handler
+		// will agree with on reload, or the button flip-flops between
+		// "Unsubscribed" and "Unsubscribe". A one-click POST completed
+		// the action at the sender; otherwise we only claim done if the
+		// intent was actually persisted (Valkey up, Mark succeeded, list
+		// id present). When unsub state can't be stored (no store / Mark
+		// error / no list id), report false so the UI stays consistent
+		// with the GET response.
+		"already_done": method == "one-click" || persisted,
 	}
 	// When we couldn't POST server-side, hand the client the link to
 	// open so it can complete the flow (mailto: or new-tab http).

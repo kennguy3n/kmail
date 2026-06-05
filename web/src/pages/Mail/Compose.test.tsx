@@ -89,9 +89,13 @@ vi.mock("../../api/undoSend", () => ({
 }));
 
 const recordSend = vi.fn();
+const getCoRecipients = vi.fn();
 vi.mock("../../api/smart", () => ({
-  getFrequentContacts: () => Promise.resolve([]),
-  getCoRecipients: () => Promise.resolve({ anchor: "", suggestions: [] }),
+  getFrequentContacts: () => Promise.resolve({ contacts: [] }),
+  getCoRecipients: (anchor: string, exclude: string[]) => {
+    getCoRecipients(anchor, exclude);
+    return Promise.resolve({ anchor, suggestions: [] });
+  },
   recordSend: (recipients: string[]) => {
     recordSend(recipients);
     return Promise.resolve();
@@ -207,6 +211,29 @@ describe("<Compose />", () => {
       "alice@example.com",
       "carol@example.com",
     ]);
+  });
+
+  it("derives the co-recipient anchor from a quoted display name with a comma", async () => {
+    getMailboxes.mockResolvedValueOnce(mailboxes);
+    getIdentities.mockResolvedValueOnce(identities);
+    getCoRecipients.mockClear();
+
+    const user = userEvent.setup();
+    renderCompose();
+
+    await screen.findByRole("button", { name: /^send$/i });
+    // A naive `to.split(",")` would shred this into `"Smith` (no @) and
+    // suppress the lookup entirely. The anchor must be the parsed email.
+    await user.type(
+      screen.getByLabelText(/^to/i),
+      '"Smith, John" <john@example.com>',
+    );
+
+    await waitFor(() =>
+      expect(getCoRecipients).toHaveBeenCalledWith("john@example.com", [
+        "john@example.com",
+      ]),
+    );
   });
 
   it("renders the Undo banner and clears it after the deadline elapses", async () => {

@@ -132,7 +132,13 @@ export default function Compose() {
   }, []);
 
   useEffect(() => {
-    const existing = to.split(",").map((s) => s.trim()).filter(Boolean);
+    // Parse with the same RFC 5322-aware splitter used for sending, so a
+    // quoted display name containing a comma (e.g. `"Smith, John" <j@x>`)
+    // isn't shredded into a non-address fragment. We key on the bare
+    // emails: the anchor + exclude list the backend expects.
+    const existing = parseAddresses(to)
+      .map((a) => a.email.trim())
+      .filter(Boolean);
     const first = existing[0];
     if (!first || !first.includes("@")) {
       setCoRecipients([]);
