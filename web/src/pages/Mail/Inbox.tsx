@@ -679,15 +679,20 @@ export default function Inbox() {
 
   // Apply a label (keyword) to one or many emails. Used by the bulk
   // toolbar's label menu and the drag-onto-label flow.
+  // Resolves to whether the write succeeded, so callers can keep the
+  // selection intact on failure (lets the user retry) instead of
+  // clearing it unconditionally.
   const applyLabelTo = useCallback(
-    async (keyword: string, ids: string[]) => {
-      if (ids.length === 0) return;
+    async (keyword: string, ids: string[]): Promise<boolean> => {
+      if (ids.length === 0) return false;
       setBulkBusy(true);
       try {
         await jmapClient.bulkSetKeyword(ids, keyword, true);
         bumpAfterWrite();
+        return true;
       } catch (err: unknown) {
         setError(errorMessage(err));
+        return false;
       } finally {
         setBulkBusy(false);
       }
@@ -710,9 +715,20 @@ export default function Inbox() {
         void applyLabelTo(target.slice("label:".length), ids);
         return;
       }
-      const email = baseList.find((e) => e.id === emailId);
-      const source = email ? Object.keys(email.mailboxIds)[0] : selectedMailbox;
-      if (!source || source === target) return;
+      // Skip only when *every* message the dragged row represents
+      // already lives in the target; otherwise move it. Gating on the
+      // head message alone would silently skip the move for a collapsed
+      // conversation whose newest message is already in the target but
+      // whose older messages are not. bulkMoveResolvingSource resolves
+      // each message's real source, so a conversation spanning mailboxes
+      // is fully moved.
+      const allInTarget = ids.every((id) => {
+        const e = baseList.find((x) => x.id === id);
+        return (
+          !!e && Object.prototype.hasOwnProperty.call(e.mailboxIds, target)
+        );
+      });
+      if (allInTarget) return;
       setBulkBusy(true);
       bulkMoveResolvingSource(ids, target)
         .then(() => bumpAfterWrite())
@@ -726,7 +742,6 @@ export default function Inbox() {
       bumpAfterWrite,
       dragEmailId,
       expandSelection,
-      selectedMailbox,
     ],
   );
 
@@ -1043,7 +1058,9 @@ export default function Inbox() {
                   const kw = e.target.value;
                   if (!kw) return;
                   void applyLabelTo(kw, expandSelection(selectedIdList)).then(
-                    () => setSelectedIds(new Set()),
+                    (ok) => {
+                      if (ok) setSelectedIds(new Set());
+                    },
                   );
                   e.target.value = "";
                 }}
@@ -1079,7 +1096,7 @@ export default function Inbox() {
               const threadCount = groupEmails.length;
               return (
                 <EmailRow
-                  key={email.threadId ?? email.id}
+                  key={groupThreads ? (email.threadId ?? email.id) : email.id}
                   email={email}
                   threadCount={threadCount}
                   rowLabels={labelsForKeywords(email.keywords)}
