@@ -231,9 +231,15 @@ export default function RichTextEditor({
             const file = item.getAsFile();
             if (file) {
               event.preventDefault();
-              void onImageUpload(file).then((src) => {
-                editor?.chain().focus().setImage({ src }).run();
-              });
+              void onImageUpload(file)
+                .then((src) => {
+                  editor?.chain().focus().setImage({ src }).run();
+                })
+                .catch(() => {
+                  // Mirror the toolbar `pickImage` path: upload errors
+                  // are surfaced by the caller; swallow here so a failed
+                  // paste doesn't become an unhandled rejection.
+                });
               return true;
             }
           }

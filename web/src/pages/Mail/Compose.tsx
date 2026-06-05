@@ -26,6 +26,7 @@ import ContactPicker from "./ContactPicker";
 import TemplatePicker from "./TemplatePicker";
 import { formatBytes } from "./messageContent";
 import {
+  escapeHtml,
   htmlToPlainText,
   isHtmlEmpty,
   plainTextToHtml,
@@ -908,10 +909,22 @@ export default function Compose() {
                   uploadLargeAttachment(file)
                     .then((link) => {
                       setAttachmentLinks((cur) => [...cur, link]);
-                      setBody(
-                        (b) =>
-                          `${b}${b && !b.endsWith("\n") ? "\n" : ""}\nAttachment: ${link.filename} — ${link.url}\n`,
-                      );
+                      // Insert the link into whichever body the active
+                      // mode actually sends: buildDraft reads `html` in
+                      // rich mode and `body` in plain mode, so appending
+                      // only to `body` would silently drop the link from
+                      // a rich-text message.
+                      if (bodyMode === "rich") {
+                        const anchor = `<a href="${escapeHtml(link.url)}">${escapeHtml(link.filename)}</a>`;
+                        setHtml(
+                          (h) => `${h}<p>Attachment: ${anchor}</p>`,
+                        );
+                      } else {
+                        setBody(
+                          (b) =>
+                            `${b}${b && !b.endsWith("\n") ? "\n" : ""}\nAttachment: ${link.filename} — ${link.url}\n`,
+                        );
+                      }
                     })
                     .catch((err: unknown) =>
                       setAttachmentError(
