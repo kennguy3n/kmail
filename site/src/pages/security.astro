@@ -1,0 +1,71 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import TrustBadges from "../components/TrustBadges.astro";
+import CTA from "../components/CTA.astro";
+
+const pillars = [
+  ["Encryption in transit", "All client and server traffic uses TLS 1.3. Mail transport enforces opportunistic and, where supported, strict transport (MTA-STS) with TLS reporting."],
+  ["Encryption at rest", "Message bodies and attachments are encrypted with per-tenant envelope keys. Blob storage runs on the zero-knowledge object fabric."],
+  ["Zero-access vaults", "StrictZK vault folders are encrypted client-side; the server stores only ciphertext and cannot index or read their contents."],
+  ["Customer-managed keys", "On the Privacy plan, bring your own HSM-backed key. KMail wraps data keys with your CMK and honours revocation."],
+  ["Tenant isolation", "Every record is tenant-scoped and enforced with PostgreSQL row-level security. There are no cross-tenant query paths."],
+  ["Strong authentication", "TOTP and WebAuthn/passkeys for users, OIDC bearer tokens for API access, and SCIM for lifecycle management."],
+  ["Tamper-evident audit", "Administrative actions are written to a hash-linked audit chain so tampering is detectable."],
+  ["Deliverability & anti-abuse", "SPF, DKIM, DMARC, DNSBL checks, dedicated IP pools, reputation tracking, and abuse scoring."],
+];
+---
+
+<BaseLayout
+  title="Security"
+  description="How KMail protects your mail: TLS 1.3, per-tenant encryption at rest, zero-access vaults, customer-managed keys, RLS tenant isolation, and a tamper-evident audit chain."
+>
+  <section class="section">
+    <div class="container center">
+      <p class="eyebrow">Security</p>
+      <h1>Security you can verify, not just trust</h1>
+      <p class="lead mx-auto">
+        KMail is engineered so that the people who run it can't quietly read your
+        mail. Encryption, isolation, and auditability are built into the core —
+        not bolted on.
+      </p>
+    </div>
+    <div class="container" style="margin-top:2rem"><TrustBadges /></div>
+  </section>
+
+  <section class="section section--soft">
+    <div class="container">
+      <h2>Defense in depth</h2>
+      <div class="grid grid--2" style="margin-top:1.5rem">
+        {
+          pillars.map(([t, d]) => (
+            <div class="card">
+              <h3>{t}</h3>
+              <p class="muted">{d}</p>
+            </div>
+          ))
+        }
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container prose">
+      <h2>Compliance</h2>
+      <p>
+        KMail is being independently audited for <strong>SOC 2 Type II</strong>;
+        the report will be available under NDA once complete. We support
+        <strong>GDPR</strong> obligations with EU data-residency options, data
+        export, and cryptographic deletion on request.
+      </p>
+      <h2>Responsible disclosure</h2>
+      <p>
+        Found a vulnerability? Email <a href="mailto:security@kmail.kchat.dev">security@kmail.kchat.dev</a>.
+        We acknowledge reports within two business days and will keep you updated
+        through remediation. Please do not publicly disclose until we've shipped a
+        fix.
+      </p>
+    </div>
+  </section>
+
+  <CTA title="Mail that's private by design" subtitle="See how KMail's encryption and isolation model protects your team." />
+</BaseLayout>

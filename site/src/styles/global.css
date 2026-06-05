@@ -1,0 +1,258 @@
+/* KMail public site — global styles.
+ *
+ * A small, dependency-free design system: CSS custom properties for
+ * the palette + spacing, a responsive container, and utility classes
+ * the .astro components compose. No CSS framework so the static
+ * build stays tiny and fast.
+ */
+
+:root {
+  --c-bg: #ffffff;
+  --c-bg-soft: #f6f8fb;
+  --c-bg-inset: #eef2f8;
+  --c-border: #e2e8f0;
+  --c-text: #0f172a;
+  --c-text-soft: #475569;
+  --c-text-faint: #64748b;
+  --c-brand: #4f46e5;
+  --c-brand-dark: #4338ca;
+  --c-brand-soft: #eef2ff;
+  --c-accent: #0ea5e9;
+  --c-success: #16a34a;
+  --c-warning: #d97706;
+  --c-danger: #dc2626;
+
+  --radius: 12px;
+  --radius-sm: 8px;
+  --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.06);
+  --shadow: 0 8px 24px rgba(15, 23, 42, 0.08);
+  --maxw: 1120px;
+  --font: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, Helvetica,
+    Arial, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font);
+  color: var(--c-text);
+  background: var(--c-bg);
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+
+a {
+  color: var(--c-brand);
+  text-decoration: none;
+}
+a:hover {
+  text-decoration: underline;
+}
+
+h1,
+h2,
+h3,
+h4 {
+  line-height: 1.2;
+  color: var(--c-text);
+  margin: 0 0 0.5em;
+}
+
+h1 {
+  font-size: clamp(2rem, 5vw, 3.25rem);
+  letter-spacing: -0.02em;
+}
+h2 {
+  font-size: clamp(1.5rem, 3.5vw, 2.25rem);
+  letter-spacing: -0.01em;
+}
+h3 {
+  font-size: 1.25rem;
+}
+
+p {
+  margin: 0 0 1rem;
+}
+
+.container {
+  width: 100%;
+  max-width: var(--maxw);
+  margin: 0 auto;
+  padding: 0 1.25rem;
+}
+
+.section {
+  padding: 4rem 0;
+}
+.section--soft {
+  background: var(--c-bg-soft);
+}
+.section--tight {
+  padding: 2.5rem 0;
+}
+
+.eyebrow {
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-size: 0.8rem;
+  font-weight: 700;
+  color: var(--c-brand);
+  margin-bottom: 0.5rem;
+}
+
+.lead {
+  font-size: 1.2rem;
+  color: var(--c-text-soft);
+  max-width: 42rem;
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  padding: 0.7rem 1.25rem;
+  border-radius: var(--radius-sm);
+  font-weight: 600;
+  font-size: 1rem;
+  border: 1px solid transparent;
+  cursor: pointer;
+  transition:
+    background 0.15s ease,
+    transform 0.05s ease,
+    border-color 0.15s ease;
+}
+.btn:hover {
+  text-decoration: none;
+}
+.btn:active {
+  transform: translateY(1px);
+}
+.btn--primary {
+  background: var(--c-brand);
+  color: #fff;
+}
+.btn--primary:hover {
+  background: var(--c-brand-dark);
+}
+.btn--ghost {
+  background: transparent;
+  color: var(--c-text);
+  border-color: var(--c-border);
+}
+.btn--ghost:hover {
+  background: var(--c-bg-inset);
+}
+.btn--lg {
+  padding: 0.9rem 1.6rem;
+  font-size: 1.05rem;
+}
+
+.grid {
+  display: grid;
+  gap: 1.5rem;
+}
+.grid--3 {
+  grid-template-columns: repeat(3, 1fr);
+}
+.grid--2 {
+  grid-template-columns: repeat(2, 1fr);
+}
+.grid--4 {
+  grid-template-columns: repeat(4, 1fr);
+}
+
+.card {
+  background: var(--c-bg);
+  border: 1px solid var(--c-border);
+  border-radius: var(--radius);
+  padding: 1.5rem;
+  box-shadow: var(--shadow-sm);
+}
+
+.muted {
+  color: var(--c-text-soft);
+}
+.center {
+  text-align: center;
+}
+.mx-auto {
+  margin-left: auto;
+  margin-right: auto;
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.3rem 0.7rem;
+  border-radius: 999px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  background: var(--c-brand-soft);
+  color: var(--c-brand-dark);
+  border: 1px solid var(--c-border);
+}
+
+/* Generic prose for help/blog markdown pages. */
+.prose {
+  max-width: 46rem;
+}
+.prose h2 {
+  margin-top: 2rem;
+}
+.prose h3 {
+  margin-top: 1.5rem;
+}
+.prose pre {
+  background: var(--c-text);
+  color: #e2e8f0;
+  padding: 1rem 1.25rem;
+  border-radius: var(--radius-sm);
+  overflow-x: auto;
+  font-size: 0.9rem;
+}
+.prose code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.prose :not(pre) > code {
+  background: var(--c-bg-inset);
+  padding: 0.15em 0.4em;
+  border-radius: 4px;
+  font-size: 0.9em;
+}
+.prose table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 1rem 0;
+}
+.prose th,
+.prose td {
+  border: 1px solid var(--c-border);
+  padding: 0.5rem 0.75rem;
+  text-align: left;
+}
+
+@media (max-width: 900px) {
+  .grid--3,
+  .grid--4 {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+@media (max-width: 640px) {
+  .grid--2,
+  .grid--3,
+  .grid--4 {
+    grid-template-columns: 1fr;
+  }
+  .section {
+    padding: 2.5rem 0;
+  }
+}

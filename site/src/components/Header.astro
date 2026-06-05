@@ -1,0 +1,128 @@
+---
+import { SITE, PRIMARY_NAV } from "../data/site";
+const { pathname } = Astro.url;
+const isActive = (href: string) =>
+  href === "/" ? pathname === "/" : pathname.startsWith(href);
+---
+
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/" aria-label={`${SITE.name} home`}>
+      <span class="brand__mark" aria-hidden="true">✦</span>
+      <span class="brand__name">{SITE.name}</span>
+    </a>
+
+    <input type="checkbox" id="nav-toggle" class="nav-toggle" hidden />
+    <label for="nav-toggle" class="nav-toggle__btn" aria-label="Toggle navigation">
+      <span></span><span></span><span></span>
+    </label>
+
+    <nav class="site-nav" aria-label="Primary">
+      {
+        PRIMARY_NAV.map((item) => (
+          <a
+            href={item.href}
+            class:list={["site-nav__link", { "is-active": isActive(item.href) }]}
+            aria-current={isActive(item.href) ? "page" : undefined}
+          >
+            {item.label}
+          </a>
+        ))
+      }
+      <a class="btn btn--ghost site-nav__login" href={SITE.appUrl}>Sign in</a>
+      <a class="btn btn--primary site-nav__cta" href={SITE.signupUrl}>Get started</a>
+    </nav>
+  </div>
+</header>
+
+<style>
+  .site-header {
+    position: sticky;
+    top: 0;
+    z-index: 50;
+    background: rgba(255, 255, 255, 0.85);
+    backdrop-filter: saturate(180%) blur(10px);
+    border-bottom: 1px solid var(--c-border);
+  }
+  .site-header__inner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    height: 64px;
+  }
+  .brand {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-weight: 800;
+    font-size: 1.2rem;
+    color: var(--c-text);
+  }
+  .brand:hover {
+    text-decoration: none;
+  }
+  .brand__mark {
+    color: var(--c-brand);
+  }
+  .site-nav {
+    display: flex;
+    align-items: center;
+    gap: 1.25rem;
+  }
+  .site-nav__link {
+    color: var(--c-text-soft);
+    font-weight: 500;
+  }
+  .site-nav__link:hover,
+  .site-nav__link.is-active {
+    color: var(--c-text);
+    text-decoration: none;
+  }
+  .nav-toggle,
+  .nav-toggle__btn {
+    display: none;
+  }
+  .nav-toggle__btn {
+    flex-direction: column;
+    gap: 5px;
+    cursor: pointer;
+    padding: 8px;
+  }
+  .nav-toggle__btn span {
+    width: 22px;
+    height: 2px;
+    background: var(--c-text);
+    border-radius: 2px;
+  }
+
+  @media (max-width: 820px) {
+    .nav-toggle__btn {
+      display: flex;
+    }
+    .site-nav {
+      position: absolute;
+      top: 64px;
+      left: 0;
+      right: 0;
+      flex-direction: column;
+      align-items: stretch;
+      gap: 0.25rem;
+      padding: 1rem 1.25rem 1.5rem;
+      background: var(--c-bg);
+      border-bottom: 1px solid var(--c-border);
+      box-shadow: var(--shadow);
+      display: none;
+    }
+    .nav-toggle:checked ~ .site-nav {
+      display: flex;
+    }
+    .site-nav__link {
+      padding: 0.6rem 0;
+      border-bottom: 1px solid var(--c-border);
+    }
+    .site-nav__cta,
+    .site-nav__login {
+      margin-top: 0.5rem;
+    }
+  }
+</style>
