@@ -109,8 +109,12 @@ export default function App() {
         <Route path="admin/security" element={<SecuritySettings />} />
         <Route path="contacts" element={<ContactsView />} />
 
-        {/* Non-production component gallery (WS1) for visual QA. */}
-        <Route path="showcase" element={<Showcase />} />
+        {/* Non-production component gallery (WS1) for visual QA.
+            Dev-only: in a production build this route is omitted, so
+            `/showcase` falls through to the catch-all redirect below. */}
+        {import.meta.env.DEV && (
+          <Route path="showcase" element={<Showcase />} />
+        )}
 
         <Route path="*" element={<Navigate to="/mail" replace />} />
       </Route>

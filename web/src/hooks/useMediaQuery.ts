@@ -7,7 +7,7 @@
  * Keep the two in sync: CSS `@media` cannot read custom properties,
  * so the literals necessarily live in both places.
  */
-import { useSyncExternalStore } from "react";
+import { useCallback, useSyncExternalStore } from "react";
 
 export const BREAKPOINTS = {
   sm: 640,
@@ -15,32 +15,41 @@ export const BREAKPOINTS = {
   lg: 1200,
 } as const;
 
+function supportsMatchMedia(): boolean {
+  return (
+    typeof window !== "undefined" &&
+    typeof window.matchMedia === "function"
+  );
+}
+
+// Server snapshot: assume desktop (no match for "max-width" mobile
+// queries) so SSR/test render is the wide layout by default. Defined
+// at module scope so its reference is stable across renders.
+function getServerSnapshot(): boolean {
+  return false;
+}
+
 export function useMediaQuery(query: string): boolean {
-  function subscribe(callback: () => void): () => void {
-    if (
-      typeof window === "undefined" ||
-      typeof window.matchMedia !== "function"
-    ) {
-      return () => {};
-    }
-    const mql = window.matchMedia(query);
-    mql.addEventListener("change", callback);
-    return () => mql.removeEventListener("change", callback);
-  }
+  // Memoize on `query` so `useSyncExternalStore` keeps the same
+  // subscription across renders instead of tearing down and
+  // re-adding a `matchMedia` listener every time the consumer
+  // (e.g. Layout) re-renders.
+  const subscribe = useCallback(
+    (callback: () => void): (() => void) => {
+      if (!supportsMatchMedia()) return () => {};
+      const mql = window.matchMedia(query);
+      mql.addEventListener("change", callback);
+      return () => mql.removeEventListener("change", callback);
+    },
+    [query],
+  );
 
-  function getSnapshot(): boolean {
-    if (
-      typeof window === "undefined" ||
-      typeof window.matchMedia !== "function"
-    ) {
-      return false;
-    }
+  const getSnapshot = useCallback((): boolean => {
+    if (!supportsMatchMedia()) return false;
     return window.matchMedia(query).matches;
-  }
+  }, [query]);
 
-  // Server snapshot: assume desktop (no match for "max-width" mobile
-  // queries) so SSR/test render is the wide layout by default.
-  return useSyncExternalStore(subscribe, getSnapshot, () => false);
+  return useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
 }
 
 /** Convenience: true when the viewport is at or below the `md`

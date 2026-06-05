@@ -114,4 +114,37 @@ describe("Dropdown", () => {
     expect(onSelect).toHaveBeenCalledTimes(1);
     expect(screen.queryByRole("menu")).not.toBeInTheDocument();
   });
+
+  it("focuses the first item on open but keeps focus when items prop identity changes", async () => {
+    // A fresh `items` array on every render simulates a parent that
+    // builds the menu inline (the common case, e.g. Layout's account
+    // menu). Re-rendering must NOT yank focus back to the first item.
+    function Harness(_props: { tick: number }): JSX.Element {
+      const items = [
+        { id: "a", label: "Alpha", onSelect: () => {} },
+        { id: "b", label: "Beta", onSelect: () => {} },
+      ];
+      return (
+        <Dropdown
+          ariaLabel="menu"
+          trigger={<button>Open menu</button>}
+          items={items}
+        />
+      );
+    }
+
+    const { rerender } = render(<Harness tick={0} />);
+    await userEvent.click(screen.getByRole("button", { name: "Open menu" }));
+
+    const itemsOnOpen = screen.getAllByRole("menuitem");
+    expect(itemsOnOpen[0]).toHaveFocus();
+
+    // Move focus to the second item, then force a parent re-render
+    // (new `items` identity) while the menu stays open.
+    itemsOnOpen[1].focus();
+    expect(itemsOnOpen[1]).toHaveFocus();
+    rerender(<Harness tick={1} />);
+
+    expect(screen.getAllByRole("menuitem")[1]).toHaveFocus();
+  });
 });

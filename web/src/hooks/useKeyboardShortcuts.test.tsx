@@ -105,4 +105,28 @@ describe("useKeyboardShortcuts", () => {
     await userEvent.keyboard("?");
     expect(handler).toHaveBeenCalledTimes(1);
   });
+
+  it("prefers the longest match so a single key never shadows a sequence", async () => {
+    const single = vi.fn();
+    const sequence = vi.fn();
+    // Single-key "c" registered BEFORE the "g c" sequence — the engine
+    // must still route "g c" to the sequence regardless of order.
+    render(
+      <Harness
+        shortcuts={[
+          { keys: "c", description: "", handler: single },
+          { keys: "g c", description: "", handler: sequence },
+        ]}
+      />,
+    );
+
+    await userEvent.keyboard("gc");
+    expect(sequence).toHaveBeenCalledTimes(1);
+    expect(single).not.toHaveBeenCalled();
+
+    // A lone "c" still fires the single-key shortcut.
+    await userEvent.keyboard("c");
+    expect(single).toHaveBeenCalledTimes(1);
+    expect(sequence).toHaveBeenCalledTimes(1);
+  });
 });

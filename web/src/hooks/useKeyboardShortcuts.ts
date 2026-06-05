@@ -8,6 +8,12 @@
  * symbol shortcuts like `"#"` and `"?"` correct across keyboard
  * layouts without hard-coding `shift+3` etc.
  *
+ * When several registered shortcuts match the current key buffer,
+ * the one with the *longest* sequence wins. This makes registration
+ * order irrelevant: a single-key `"c"` can coexist with a `"g c"`
+ * sequence without shadowing it (pressing `g` then `c` runs `g c`,
+ * pressing `c` alone runs `c`).
+ *
  * Safety rails:
  *   - Events carrying Ctrl / Meta / Alt are ignored so we never
  *     hijack browser/OS chords (Ctrl+C, Cmd+L, …).
@@ -111,16 +117,23 @@ export function useKeyboardShortcuts(
 
       const editable = isEditableTarget(event.target);
 
+      // Pick the longest matching shortcut so a single key never
+      // shadows a sequence that ends with it (e.g. "c" vs "g c").
+      let best: KeyboardShortcut | undefined;
+      let bestLength = 0;
       for (const shortcut of shortcutsRef.current) {
         if (editable && !shortcut.allowInInput) continue;
         const steps = parseSteps(shortcut.keys);
         if (steps.length === 0) continue;
-        if (bufferEndsWith(buffer, steps)) {
-          if (shortcut.preventDefault !== false) event.preventDefault();
-          shortcut.handler(event);
-          resetBuffer();
-          break;
+        if (bufferEndsWith(buffer, steps) && steps.length > bestLength) {
+          best = shortcut;
+          bestLength = steps.length;
         }
+      }
+      if (best) {
+        if (best.preventDefault !== false) event.preventDefault();
+        best.handler(event);
+        resetBuffer();
       }
 
       // Restart the inactivity timer that clears partial sequences.

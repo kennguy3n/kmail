@@ -53,6 +53,7 @@ export function Dropdown({
   const containerRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLElement>(null);
   const itemRefs = useRef<Array<HTMLButtonElement | null>>([]);
+  const wasOpen = useRef(false);
 
   const enabledIndexes = items
     .map((item, i) => (item.disabled ? -1 : i))
@@ -73,11 +74,16 @@ export function Dropdown({
   }, [open]);
 
   useEffect(() => {
-    if (!open) return;
-    // Focus the first enabled item when the menu opens. Derived from
-    // `items` inside the effect so the dependency list stays honest.
-    const firstEnabled = items.findIndex((item) => !item.disabled);
-    if (firstEnabled >= 0) itemRefs.current[firstEnabled]?.focus();
+    // Focus the first enabled item only on the closed→open transition.
+    // Guarding on the previous open state keeps `items` in the
+    // dependency list (so the lookup stays honest) without stealing
+    // focus back whenever the parent re-renders with a fresh `items`
+    // array while the menu is already open.
+    if (open && !wasOpen.current) {
+      const firstEnabled = items.findIndex((item) => !item.disabled);
+      if (firstEnabled >= 0) itemRefs.current[firstEnabled]?.focus();
+    }
+    wasOpen.current = open;
   }, [open, items]);
 
   const onMenuKeyDown = (event: KeyboardEvent<HTMLDivElement>): void => {
