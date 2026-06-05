@@ -7,6 +7,7 @@
 //   sync    — SQLite-backed offline store + delta-pull engine.
 //   crypto  — RustCrypto AEAD / KDF primitives + KeyStore trait.
 //   push    — APNs / FCM / Web Push payload parsing + token wire.
+//   notification — push payload → renderable LocalNotification.
 //   cache   — Attachment LRU disk cache.
 //   client  — `KMailClient` façade composed from the layers above.
 //
@@ -35,10 +36,14 @@ pub mod crypto;
 pub mod error;
 pub mod jmap;
 pub mod models;
+pub mod notification;
 pub mod push;
 pub mod sync;
 
-pub use client::{ClientConfig, KMailClient, SyncSummary};
+pub use client::{
+    BackgroundSyncHandle, ClientConfig, KMailClient, PushIngestOutcome, SyncSummary,
+};
+pub use notification::LocalNotification;
 pub use crypto::{
     AeadEnvelope, ConfidentialEnvelope, KeyMaterial, MlsKeyProvider, StaticMlsKeyProvider,
 };

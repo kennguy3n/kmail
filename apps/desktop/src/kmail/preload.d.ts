@@ -32,7 +32,9 @@ import type {
   JsClientConfig,
   JsEmailAddress,
   JsEmailSummary,
+  JsLocalNotification,
   JsMailbox,
+  JsPushIngestOutcome,
   JsSyncSummary,
 } from '@kmail/sdk-native';
 
@@ -40,7 +42,9 @@ export type {
   JsClientConfig,
   JsEmailAddress,
   JsEmailSummary,
+  JsLocalNotification,
   JsMailbox,
+  JsPushIngestOutcome,
   JsSyncSummary,
 };
 
@@ -55,6 +59,7 @@ export interface KMailBridge {
   sendEmail(draftJson: string): Promise<string>;
   enqueueSetKeywords(emailId: string, keywordsJson: string): Promise<void>;
   notify(title: string, body: string): Promise<void>;
+  ingestPush(data: Record<string, string>): Promise<JsPushIngestOutcome>;
   // Source the SDK's canonical defaults from the napi crate's
   // `default_client_config` helper. The renderer-side
   // `useDefaultClientConfig` hook (or any test that wants to

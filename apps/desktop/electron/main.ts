@@ -45,6 +45,7 @@ import type {
   JsClientConfig,
   JsEmailSummary,
   JsMailbox,
+  JsPushIngestOutcome,
   JsSyncSummary,
   KMailClientJs,
 } from '@kmail/sdk-native';
@@ -516,17 +517,55 @@ function registerIpc(): void {
       title: string,
       body: string,
     ): Promise<void> => {
-      if (!Notification.isSupported()) return;
-      const n = new Notification({ title, body, silent: false });
-      n.on('click', () => {
-        if (mainWindow) {
-          mainWindow.show();
-          mainWindow.focus();
-        }
-      });
-      n.show();
+      showOsNotification(title, body);
     },
   );
+
+  // Ingest a transport-level push payload (the `data` map from
+  // whatever push channel the desktop wires up) entirely in the
+  // main process: the SDK parses it, caches a preview row, and
+  // returns a ready-to-render notification. We surface the OS
+  // notification here — closest to the `Notification` API and so a
+  // backgrounded window still alerts — and hand the parsed outcome
+  // back to the renderer so it can refresh the inbox and decide
+  // whether to kick off a `sync()` (a push is a hint, not an
+  // authoritative delta cursor, so `needsDeltaSync` is almost
+  // always true).
+  ipcMain.handle(
+    'kmail:ingest-push',
+    async (
+      _evt,
+      data: Record<string, string>,
+    ): Promise<JsPushIngestOutcome> => {
+      return inSession((s) => {
+        const outcome = s.client.ingestPushDelivery(data);
+        if (outcome.notification) {
+          showOsNotification(
+            outcome.notification.title,
+            outcome.notification.body,
+          );
+        }
+        return outcome;
+      });
+    },
+  );
+}
+
+// Show a system-level notification that focuses the main window on
+// click. Shared by the `kmail:notify` (renderer-driven) and
+// `kmail:ingest-push` (SDK-driven) handlers so both honour the
+// `Notification.isSupported()` guard and the click-to-focus
+// behaviour identically.
+function showOsNotification(title: string, body: string): void {
+  if (!Notification.isSupported()) return;
+  const n = new Notification({ title, body, silent: false });
+  n.on('click', () => {
+    if (mainWindow) {
+      mainWindow.show();
+      mainWindow.focus();
+    }
+  });
+  n.show();
 }
 
 // ---------------------------------------------------------------

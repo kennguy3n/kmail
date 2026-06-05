@@ -27,17 +27,22 @@ use crate::error::{Error, Result};
 use crate::jmap::transport::TransportConfig;
 use crate::jmap::JmapClient;
 use crate::models::{
-    BootstrapRequest, BootstrapResponse, Email, EmailDraft, EmailSummary, JmapSession, Mailbox,
+    BootstrapRequest, BootstrapResponse, Email, EmailAddress, EmailDraft, EmailSummary,
+    JmapSession, Mailbox,
 };
-use crate::push::{PushSubscriptionRequest, PushTransport, WebPushKeys};
+use crate::notification::LocalNotification;
+use crate::push::{EmailDeliveryHint, PushSubscriptionRequest, PushTransport, WebPushKeys};
 use crate::sync::{
     ActionsRepo, EmailMutation, EmailRepo, MailboxRepo, PendingAction, PendingActionKind,
     StateRepo, Store, SyncTypeName,
 };
+use chrono::{DateTime, Utc};
+use std::collections::BTreeMap;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 
 /// Upper bound on the number of `Email/changes` batches we will
 /// drain in a single `sync()` call.
@@ -241,6 +246,36 @@ pub struct SyncSummary {
     pub pending_actions_deferred: u64,
 }
 
+/// Result of ingesting a transport-level push payload via
+/// [`KMailClient::ingest_push_delivery`].
+///
+/// The shell uses this to drive two side effects: render
+/// `notification` (when present) and, when `needs_delta_sync` is
+/// set, kick a `sync()` so the local cache converges to the
+/// canonical server state.
+#[derive(Clone, Debug, Default)]
+pub struct PushIngestOutcome {
+    /// A ready-to-render notification, when the payload carried
+    /// enough metadata to build one. `None` for a metadata-only
+    /// `StateChange` push or a malformed payload.
+    pub notification: Option<LocalNotification>,
+    /// Whether a preview email row was written straight into the
+    /// local cache from the push hint (instant inbox update, no
+    /// network round-trip). The row is reconciled to the canonical
+    /// `Email/get` shape on the next delta `sync()`.
+    pub email_cached: bool,
+    /// Whether the shell should run a delta `sync()` to converge.
+    ///
+    /// Always `true`: even when we cached the preview row, the push
+    /// `email_state` token is a *snapshot identifier*, not a proven
+    /// successor of our local `Email/changes` cursor — adopting it
+    /// blindly could skip mutations that landed on other messages
+    /// while the device was offline. The authoritative cursor only
+    /// advances through the delta-pull path, so a follow-up sync is
+    /// always required for correctness.
+    pub needs_delta_sync: bool,
+}
+
 /// Internal per-outcome counts from a single
 /// `flush_pending_actions` invocation. Promoted into
 /// [`SyncSummary`] by `sync()`. Kept private so we can rename or
@@ -250,6 +285,68 @@ struct FlushOutcome {
     applied: u64,
     failed: u64,
     deferred: u64,
+}
+
+/// Handle to a running background sync worker.
+///
+/// Spawned by [`KMailClient::spawn_background_sync`]; the worker
+/// calls `sync()` on a fixed cadence until [`stop`](Self::stop) is
+/// invoked or the handle is dropped. The worker swallows
+/// per-tick errors (logging them via `tracing`) so a transient
+/// network failure doesn't kill the loop — a mail app that stops
+/// syncing forever after one offline blip is worse than one that
+/// retries on the next tick.
+///
+/// Drop semantics: dropping the handle signals cancellation (so a
+/// shell that forgets to call `stop()` doesn't leak the task), but
+/// does NOT block on the task finishing. Call
+/// [`stop_and_join`](Self::stop_and_join) when you need to be sure
+/// the in-flight `sync()` has fully wound down (e.g. before closing
+/// the SQLite store on logout).
+pub struct BackgroundSyncHandle {
+    cancel: Arc<Notify>,
+    join: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl BackgroundSyncHandle {
+    /// Signal the worker to stop after its current tick. Idempotent
+    /// and non-blocking.
+    ///
+    /// Uses `notify_one`, not `notify_waiters`: `notify_one` stores a
+    /// permit when the worker is not currently parked on
+    /// `notified()` (e.g. it's mid-`sync()`), so the cancellation is
+    /// observed on the worker's next `notified()` poll instead of
+    /// being silently lost. `notify_waiters` has no such permit and
+    /// would race — a stop signal sent while the worker is between
+    /// selects would be dropped, hanging `stop_and_join` forever.
+    pub fn stop(&self) {
+        self.cancel.notify_one();
+    }
+
+    /// Signal cancellation and await the worker's clean shutdown.
+    /// Returns once any in-flight `sync()` has returned and the
+    /// task has exited.
+    pub async fn stop_and_join(mut self) {
+        self.cancel.notify_one();
+        if let Some(join) = self.join.take() {
+            // A `JoinError` here only means the task panicked or was
+            // aborted; either way the worker is no longer running,
+            // which is all `stop_and_join` promises.
+            let _ = join.await;
+        }
+    }
+}
+
+impl Drop for BackgroundSyncHandle {
+    fn drop(&mut self) {
+        // Best-effort cancellation so a dropped handle doesn't leave
+        // the periodic task running against a client whose store may
+        // be about to close. We intentionally do NOT block on the
+        // join here — `Drop` can run on any thread (including outside
+        // a runtime), and blocking would risk a deadlock. Callers
+        // that need synchronous teardown use `stop_and_join`.
+        self.cancel.notify_one();
+    }
 }
 
 /// Public SDK façade.
@@ -963,6 +1060,206 @@ impl KMailClient {
         Ok(())
     }
 
+    /// Ingest a transport-level push `data` map (the APNs
+    /// notification `data` dictionary / FCM `data` map / Web Push
+    /// JSON object, already flattened to `String → String` by the
+    /// platform shell).
+    ///
+    /// This is the single entry point a shell calls from its push
+    /// handler. It does two things:
+    ///   1. If the payload is a `new_email` delivery hint (has at
+    ///      least `email_id`), it writes a *preview* email row into
+    ///      the local cache so the inbox updates instantly, and
+    ///      builds a [`LocalNotification`] for the shell to render.
+    ///   2. It always asks the shell to run a delta `sync()` (via
+    ///      `needs_delta_sync`) so the cache converges to the
+    ///      canonical server state — see [`PushIngestOutcome`] for
+    ///      why the push token alone is not a safe sync cursor.
+    ///
+    /// A malformed or metadata-only (`StateChange`) payload returns
+    /// `notification: None, email_cached: false, needs_delta_sync:
+    /// true` — the shell silently falls back to a full sync rather
+    /// than guessing.
+    pub fn ingest_push_delivery(&self, data: &BTreeMap<String, String>) -> Result<PushIngestOutcome> {
+        let Some(hint) = EmailDeliveryHint::from_data(data) else {
+            return Ok(PushIngestOutcome {
+                notification: None,
+                email_cached: false,
+                needs_delta_sync: true,
+            });
+        };
+        let notification = LocalNotification::from_email_delivery(&hint);
+        let email_cached = self.cache_delivery_hint(&hint)?;
+        Ok(PushIngestOutcome {
+            notification,
+            email_cached,
+            needs_delta_sync: true,
+        })
+    }
+
+    /// Write a preview email row from a push delivery hint.
+    ///
+    /// The hint is a *projection* — it carries enough to render an
+    /// inbox row and a notification, but not the full header set. We
+    /// upsert it so the row appears immediately; the next delta
+    /// `sync()` (`Email/get`) overwrites it with the canonical,
+    /// fully-hydrated row. The upsert is idempotent, so that later
+    /// reconciliation is free of duplicates.
+    ///
+    /// Crucially this does NOT advance the `Email` state token. The
+    /// `email_state` carried in the push is a snapshot identifier,
+    /// not a guaranteed successor of our local cursor; adopting it
+    /// here would let the next `Email/changes` start from the wrong
+    /// place and skip mutations on other messages. Correctness is
+    /// delegated to the delta-pull path; this method only buys an
+    /// instant first paint.
+    ///
+    /// Returns `Ok(false)` when the hint has no email id (nothing to
+    /// cache).
+    fn cache_delivery_hint(&self, hint: &EmailDeliveryHint) -> Result<bool> {
+        let Some(email_id) = hint.email_id.clone().filter(|s| !s.is_empty()) else {
+            return Ok(false);
+        };
+
+        let mut mailbox_ids = BTreeMap::new();
+        if let Some(mbox) = hint.mailbox_id.clone().filter(|s| !s.is_empty()) {
+            // Only attach mailbox membership when the mailbox is
+            // already cached. `email_mailboxes.mailbox_id` carries a
+            // foreign key into `mailboxes` (ON DELETE CASCADE), so
+            // inserting a membership row for a mailbox the device
+            // hasn't synced yet — a brand-new server-side label, or
+            // the very first push before any `Mailbox/get` — would
+            // fail the whole upsert and lose the notification too. In
+            // that case we still cache the email headers; the next
+            // delta `sync()` pulls the mailbox and links membership.
+            if self.mailbox_repo.get(&mbox)?.is_some() {
+                mailbox_ids.insert(mbox, true);
+            }
+        }
+        let keywords = hint.keywords.iter().map(|k| (k.clone(), true)).collect();
+        let received_at = hint
+            .received_at_unix
+            .and_then(|ts| DateTime::<Utc>::from_timestamp(ts, 0))
+            .unwrap_or_else(|| DateTime::<Utc>::from_timestamp(0, 0).expect("epoch in range"));
+        let from = match hint.from.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(display) => vec![parse_address_display(display)],
+            None => Vec::new(),
+        };
+
+        let summary = EmailSummary {
+            id: email_id,
+            blob_id: String::new(),
+            thread_id: hint.thread_id.clone().unwrap_or_default(),
+            mailbox_ids,
+            keywords,
+            size: 0,
+            received_at,
+            sent_at: None,
+            from,
+            to: Vec::new(),
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            reply_to: Vec::new(),
+            subject: hint.subject.clone().unwrap_or_default(),
+            preview: hint.snippet.clone().unwrap_or_default(),
+            has_attachment: hint.has_attachment.unwrap_or(false),
+        };
+        self.email_repo
+            .apply(&[EmailMutation::Upsert(Box::new(summary))])?;
+        Ok(true)
+    }
+
+    /// Spawn a background worker that calls [`sync()`](Self::sync) on
+    /// a fixed `interval` until the returned handle is stopped or
+    /// dropped.
+    ///
+    /// The first sync fires after `interval` (not immediately) — the
+    /// shell is expected to drive the initial foreground sync itself;
+    /// this worker is for steady-state delta pulls while the app is
+    /// open. Errors are logged and swallowed so a transient failure
+    /// doesn't tear down the loop.
+    ///
+    /// Must be called from within a Tokio runtime context (the FFI /
+    /// napi layers provide one).
+    pub fn spawn_background_sync(&self, interval: Duration) -> BackgroundSyncHandle {
+        let client = self.clone();
+        spawn_periodic(interval, move || {
+            let client = client.clone();
+            async move {
+                if let Err(e) = client.sync().await {
+                    tracing::warn!(error = %e, "background sync tick failed; will retry next interval");
+                }
+            }
+        })
+    }
+}
+
+/// Spawn a task that runs `tick` every `interval`, cancellable via
+/// the returned handle. Factored out of [`KMailClient::spawn_background_sync`]
+/// so the loop / cancellation semantics can be unit-tested without a
+/// live network or SQLite store.
+fn spawn_periodic<F, Fut>(interval: Duration, mut tick: F) -> BackgroundSyncHandle
+where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send,
+{
+    let cancel = Arc::new(Notify::new());
+    let worker_cancel = cancel.clone();
+    let join = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        // If a `tick` runs longer than `interval`, don't try to
+        // "catch up" by firing back-to-back — skip the missed ticks
+        // and resume the cadence. Bursting would hammer the BFF after
+        // a slow sync, which is exactly when we want to back off.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Consume the immediate first tick so the first real sync
+        // fires after `interval`, not at t=0.
+        ticker.tick().await;
+        loop {
+            tokio::select! {
+                // Bias toward cancellation so a stop signal that
+                // arrives at the same time as a tick wins, and we
+                // don't start one more sync after being told to stop.
+                biased;
+                () = worker_cancel.notified() => break,
+                _ = ticker.tick() => tick().await,
+            }
+        }
+    });
+    BackgroundSyncHandle {
+        cancel,
+        join: Some(join),
+    }
+}
+
+/// Parse an RFC 5322-ish address display string
+/// (`"Alice Example <alice@example.com>"`, a bare address, or a
+/// bare display name) into a structured [`EmailAddress`]. Used to
+/// give push-preview rows a best-effort sender column until the
+/// next sync hydrates the canonical address.
+fn parse_address_display(s: &str) -> EmailAddress {
+    let s = s.trim();
+    if let (Some(lt), Some(gt)) = (s.rfind('<'), s.rfind('>')) {
+        if lt < gt {
+            let email = s[lt + 1..gt].trim().to_string();
+            let name = s[..lt].trim().trim_matches('"').trim().to_string();
+            return EmailAddress { name, email };
+        }
+    }
+    if s.contains('@') {
+        EmailAddress {
+            name: String::new(),
+            email: s.to_string(),
+        }
+    } else {
+        EmailAddress {
+            name: s.to_string(),
+            email: String::new(),
+        }
+    }
+}
+
+impl KMailClient {
     /// One-shot bootstrap sync via the BFF's
     /// `POST /api/v1/sync/bootstrap` endpoint.
     ///
@@ -3625,5 +3922,210 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(pt, body, "round-tripped envelope must yield original body");
+    }
+
+    // -----------------------------------------------------------
+    // Push ingestion → local notification + preview-row caching.
+    // -----------------------------------------------------------
+
+    fn delivery_data(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    /// A `new_email` push must (a) cache a preview row so the inbox
+    /// updates instantly, (b) hand back a renderable notification,
+    /// and (c) leave the `Email` sync cursor untouched — the push
+    /// state token is a snapshot id, not a safe delta cursor.
+    #[test]
+    fn ingest_push_delivery_caches_preview_and_builds_notification() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("kmail-push.db");
+        let mut cfg = ClientConfig::new("https://kmail.example.com", "tok", db);
+        cfg.account_id = Some("acct-1".into());
+        let client = KMailClient::open(cfg).unwrap();
+
+        // A push normally arrives after the device has logged in and
+        // pulled its mailboxes (push registration happens post-sync),
+        // so seed the inbox the hint references.
+        client
+            .mailbox_repo
+            .upsert(&Mailbox {
+                id: "mb-inbox".into(),
+                name: "Inbox".into(),
+                role: Some(MailboxRole::Inbox),
+                parent_id: None,
+                sort_order: 0,
+                total_emails: 0,
+                unread_emails: 0,
+                total_threads: 0,
+                unread_threads: 0,
+                is_vault: false,
+                my_rights: None,
+            })
+            .unwrap();
+
+        // Precondition: cold email cache, no Email state cursor.
+        assert!(client.state_repo.get(SyncTypeName::Email).unwrap().is_none());
+
+        let data = delivery_data(&[
+            ("account_id", "acct-1"),
+            ("email_id", "e-100"),
+            ("mailbox_id", "mb-inbox"),
+            ("thread_id", "t-1"),
+            ("from", "Bob <bob@example.com>"),
+            ("subject", "Hi"),
+            ("snippet", "hello there"),
+            ("email_state", "srv-state-xyz"),
+            ("has_attachment", "true"),
+            ("received_at_unix", "1700000000"),
+        ]);
+        let outcome = client.ingest_push_delivery(&data).unwrap();
+        assert!(outcome.email_cached);
+        assert!(outcome.needs_delta_sync);
+        let n = outcome.notification.expect("notification built from hint");
+        assert_eq!(n.title, "Bob <bob@example.com>");
+        assert_eq!(n.body, "Hi");
+        assert_eq!(n.email_id.as_deref(), Some("e-100"));
+        assert_eq!(n.tag, "e-100");
+
+        // The preview row landed in the inbox mailbox with a
+        // best-effort parsed sender.
+        let rows = client.cached_emails_in_mailbox("mb-inbox", 10).unwrap();
+        assert_eq!(rows.len(), 1, "preview row should be cached in the inbox");
+        assert_eq!(rows[0].id, "e-100");
+        assert_eq!(rows[0].subject, "Hi");
+        assert!(rows[0].has_attachment);
+        assert_eq!(rows[0].from.len(), 1);
+        assert_eq!(rows[0].from[0].name, "Bob");
+        assert_eq!(rows[0].from[0].email, "bob@example.com");
+
+        // Cursor invariant: a push must not adopt the server state
+        // token as the `Email/changes` cursor.
+        assert!(
+            client.state_repo.get(SyncTypeName::Email).unwrap().is_none(),
+            "push delivery must not advance the Email sync cursor"
+        );
+    }
+
+    /// A metadata-only / malformed payload (no `email_id`) can't be
+    /// short-circuited: no notification, nothing cached, but the
+    /// shell is still told to run a delta sync.
+    #[test]
+    fn ingest_push_delivery_malformed_falls_back_to_full_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("kmail-push-bad.db");
+        let client =
+            KMailClient::open(ClientConfig::new("https://kmail.example.com", "tok", db)).unwrap();
+
+        let data = delivery_data(&[("@type", "StateChange"), ("account_id", "acct-1")]);
+        let outcome = client.ingest_push_delivery(&data).unwrap();
+        assert!(outcome.notification.is_none());
+        assert!(!outcome.email_cached);
+        assert!(outcome.needs_delta_sync);
+    }
+
+    /// A push naming a mailbox the device hasn't synced yet must not
+    /// fail (the `email_mailboxes` FK would reject the membership):
+    /// we cache the email headers without membership and still build
+    /// the notification. The next sync links it into the mailbox.
+    #[test]
+    fn ingest_push_delivery_without_cached_mailbox_caches_headers_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("kmail-push-nomb.db");
+        let mut cfg = ClientConfig::new("https://kmail.example.com", "tok", db);
+        cfg.account_id = Some("acct-1".into());
+        let client = KMailClient::open(cfg).unwrap();
+
+        let data = delivery_data(&[
+            ("email_id", "e-200"),
+            ("mailbox_id", "mb-brand-new-label"),
+            ("subject", "Welcome"),
+        ]);
+        let outcome = client.ingest_push_delivery(&data).unwrap();
+        assert!(outcome.email_cached, "headers should still cache");
+        assert!(outcome.notification.is_some());
+
+        // The row exists in the email cache...
+        let row = client.email_repo.get("e-200").unwrap().expect("email row");
+        assert_eq!(row.subject, "Welcome");
+        assert!(
+            row.mailbox_ids.is_empty(),
+            "membership must be skipped for an unsynced mailbox"
+        );
+        // ...but is not (yet) linked into the unsynced mailbox.
+        assert!(client
+            .cached_emails_in_mailbox("mb-brand-new-label", 10)
+            .unwrap()
+            .is_empty());
+    }
+
+    // -----------------------------------------------------------
+    // Background sync worker — loop + cancellation semantics.
+    // -----------------------------------------------------------
+
+    /// The periodic worker fires its tick repeatedly and stops
+    /// cleanly: no further ticks run after `stop_and_join`.
+    #[tokio::test]
+    async fn background_worker_ticks_then_stops() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let counter = Arc::new(AtomicU64::new(0));
+        let c = counter.clone();
+        let handle = spawn_periodic(Duration::from_millis(20), move || {
+            let c = c.clone();
+            async move {
+                c.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let ticks = counter.load(Ordering::SeqCst);
+        assert!(ticks >= 2, "worker should have ticked at least twice, got {ticks}");
+
+        handle.stop_and_join().await;
+        let after_stop = counter.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            after_stop,
+            "no ticks may run after stop_and_join"
+        );
+    }
+
+    /// Cancelling before the first interval elapses must run zero
+    /// ticks (the first sync fires after `interval`, not at t=0).
+    #[tokio::test]
+    async fn background_worker_cancel_before_first_tick_runs_nothing() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let counter = Arc::new(AtomicU64::new(0));
+        let c = counter.clone();
+        let handle = spawn_periodic(Duration::from_secs(3600), move || {
+            let c = c.clone();
+            async move {
+                c.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        handle.stop_and_join().await;
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+    }
+
+    /// A failing `sync()` (here: BFF returns 404 for the session
+    /// document) must not kill the worker — it logs and retries on
+    /// the next tick, and the handle still shuts down cleanly.
+    #[tokio::test]
+    async fn background_sync_swallows_errors_and_can_be_stopped() {
+        let server = MockServer::start().await; // no routes mounted → 404
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("kmail-bgsync.db");
+        let client = KMailClient::open(ClientConfig::new(server.uri(), "tok", db)).unwrap();
+
+        let handle = client.spawn_background_sync(Duration::from_millis(15));
+        tokio::time::sleep(Duration::from_millis(70)).await;
+        // Reaching here (rather than the test task aborting) is the
+        // assertion: the failing syncs were swallowed and the loop
+        // kept running. Shutdown must also complete promptly.
+        handle.stop_and_join().await;
     }
 }

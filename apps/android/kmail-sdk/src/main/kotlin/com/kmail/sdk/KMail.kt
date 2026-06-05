@@ -41,11 +41,14 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import uniffi.kmail_ffi.FfiAeadEnvelope
+import uniffi.kmail_ffi.FfiBackgroundSyncHandle
 import uniffi.kmail_ffi.FfiConfidentialEnvelope
 import uniffi.kmail_ffi.FfiEmailAddress
 import uniffi.kmail_ffi.FfiEmailSummary
+import uniffi.kmail_ffi.FfiLocalNotification
 import uniffi.kmail_ffi.FfiMailbox
 import uniffi.kmail_ffi.FfiMlsKeyProvider
+import uniffi.kmail_ffi.FfiPushIngestOutcome
 import uniffi.kmail_ffi.FfiSyncSummary
 import uniffi.kmail_ffi.KMailClientConfig
 import uniffi.kmail_ffi.KMailClientHandle
@@ -100,6 +103,25 @@ public typealias ConfidentialEnvelope = FfiConfidentialEnvelope
  * Swift surface.
  */
 public typealias MlsKeyProvider = FfiMlsKeyProvider
+
+/**
+ * A ready-to-render local notification parsed from a push payload.
+ * Map onto `NotificationCompat.Builder` in the FCM service.
+ */
+public typealias LocalNotification = FfiLocalNotification
+
+/**
+ * Result of ingesting a push payload: the parsed notification (if
+ * any), whether a preview row was cached, and whether a delta
+ * `sync()` is still required.
+ */
+public typealias PushIngestOutcome = FfiPushIngestOutcome
+
+/**
+ * Handle to a running background sync worker. Call `stop()` to halt
+ * it; releasing the handle also stops the worker.
+ */
+public typealias BackgroundSyncHandle = FfiBackgroundSyncHandle
 
 // ---------------------------------------------------------------
 // Email draft
@@ -365,6 +387,32 @@ constructor(configuration: ClientConfiguration) {
     public suspend fun registerFcmToken(token: String) {
         handle.registerFcmToken(token = token)
     }
+
+    /**
+     * Ingest a remote-message payload (the FCM `RemoteMessage.data`
+     * map) from `FirebaseMessagingService.onMessageReceived`.
+     *
+     * The returned [PushIngestOutcome] carries a ready-to-render
+     * [LocalNotification] (when the payload named a specific email),
+     * tells you whether a preview row was cached for an instant
+     * inbox update, and whether a follow-up `sync()` is still
+     * required to converge (it almost always is — a push is a hint,
+     * not an authoritative delta cursor).
+     */
+    @Throws(KMailException::class)
+    public fun ingestPushDelivery(data: Map<String, String>): PushIngestOutcome =
+        handle.ingestPushDelivery(data = data)
+
+    /**
+     * Start a background worker that runs `sync()` every
+     * [intervalSeconds]. Returns a handle whose `stop()` halts the
+     * worker; releasing the handle also stops it. Prefer a
+     * `WorkManager` `PeriodicWorkRequest` for OS-scheduled sync —
+     * this worker is for foreground-session freshness.
+     */
+    @Throws(KMailException::class)
+    public fun startBackgroundSync(intervalSeconds: ULong): BackgroundSyncHandle =
+        handle.startBackgroundSync(intervalSeconds = intervalSeconds)
 
     // Crypto convenience -------------------------------------------------
 

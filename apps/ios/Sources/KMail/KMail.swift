@@ -47,6 +47,20 @@ public typealias VaultEnvelope = FfiAeadEnvelope
 /// random DEK wrapped by an MLS-derived KEK).
 public typealias ConfidentialEnvelope = FfiConfidentialEnvelope
 
+/// A ready-to-render local notification parsed from a push payload.
+/// Re-exported from the FFI layer; map onto `UNNotificationContent`
+/// in the APNs handler.
+public typealias LocalNotification = FfiLocalNotification
+
+/// Result of ingesting a push payload: the parsed notification (if
+/// any), whether a preview row was cached, and whether a delta
+/// `sync()` is still required.
+public typealias PushIngestOutcome = FfiPushIngestOutcome
+
+/// Handle to a running background sync worker. Call `stop()` to
+/// halt it; releasing the handle also stops the worker.
+public typealias BackgroundSyncHandle = FfiBackgroundSyncHandle
+
 // MARK: - Error type
 
 extension KMailError: LocalizedError {
@@ -539,6 +553,33 @@ public final class KMailClient {
     /// string, not raw `Data`.
     public func registerAPNsToken(_ token: String) async throws {
         try await handle.registerApnsToken(token: token)
+    }
+
+    /// Ingest a remote-notification payload (the APNs `userInfo`
+    /// dictionary, flattened to `[String: String]`).
+    ///
+    /// Call this from `application(_:didReceiveRemoteNotification:)`
+    /// or the `UNNotificationServiceExtension`. The returned
+    /// `PushIngestOutcome` carries a ready-to-render
+    /// `LocalNotification` (when the payload named a specific
+    /// email), tells you whether a preview row was cached for an
+    /// instant inbox update, and whether a follow-up `sync()` is
+    /// still required to converge (it almost always is — a push is
+    /// a hint, not an authoritative delta cursor).
+    public func ingestPushDelivery(_ payload: [String: String]) throws -> PushIngestOutcome {
+        try handle.ingestPushDelivery(data: payload)
+    }
+
+    /// Start a background worker that runs `sync()` every
+    /// `interval`. Returns a handle whose `stop()` halts the
+    /// worker; releasing the handle also stops it.
+    ///
+    /// `interval` is rounded to whole seconds (the SDK's periodic
+    /// tick granularity) and must be at least one second.
+    @discardableResult
+    public func startBackgroundSync(interval: TimeInterval) throws -> BackgroundSyncHandle {
+        let seconds = UInt64(max(1, interval.rounded()))
+        return try handle.startBackgroundSync(intervalSeconds: seconds)
     }
 
     // MARK: Crypto convenience
