@@ -3,7 +3,7 @@ import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom"
 
 import { jmapClient } from "../../api/jmap";
 import { snoozeEmail } from "../../api/snooze";
-import { categorize, getPriorityInbox, type EmailCategory, type PriorityItem } from "../../api/smart";
+import { categorize, formatAddresses, getPriorityInbox, type EmailCategory, type PriorityItem } from "../../api/smart";
 import SnoozePicker from "./SnoozePicker";
 import type { Email, Mailbox } from "../../types";
 
@@ -101,12 +101,28 @@ export default function Inbox() {
   const [priorityItems, setPriorityItems] = useState<PriorityItem[]>([]);
   const [isPriorityLoading, setIsPriorityLoading] = useState(false);
 
+  // Only categorize messages we haven't seen yet, then merge the
+  // result into the existing map. This avoids re-fetching the whole
+  // window every time the list reloads (e.g. after a mark-read or a
+  // category-tab switch), which the previous "categorize all on each
+  // change" effect did. `categorizedRef` tracks known ids without
+  // adding `emailCategories` to the dependency list (which would loop).
+  const categorizedRef = useRef<Set<string>>(new Set());
   useEffect(() => {
     if (!emails || emails.length === 0) return;
-    const ids = emails.map((e) => e.id);
-    categorize(ids)
-      .then((res) => setEmailCategories(res.categories))
+    const unknown = emails
+      .map((e) => e.id)
+      .filter((id) => !categorizedRef.current.has(id));
+    if (unknown.length === 0) return;
+    let cancelled = false;
+    categorize(unknown)
+      .then((res) => {
+        if (cancelled) return;
+        for (const id of unknown) categorizedRef.current.add(id);
+        setEmailCategories((prev) => ({ ...prev, ...res.categories }));
+      })
       .catch(() => { /* categorization is best-effort */ });
+    return () => { cancelled = true; };
   }, [emails]);
 
   useEffect(() => {
@@ -663,7 +679,7 @@ export default function Inbox() {
                       {item.subject || "(no subject)"}
                     </div>
                     <div style={{ fontSize: "0.85rem", color: "#666" }}>
-                      {item.from} — score {item.score}
+                      {formatAddresses(item.from)} — score {item.score}
                     </div>
                     <div style={{ fontSize: "0.8rem", color: "#999" }}>
                       {item.preview?.slice(0, 120)}

@@ -2,6 +2,7 @@ package smartfeatures
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/kennguy3n/kmail/internal/jmap"
@@ -87,6 +88,36 @@ func TestJMAPFetcher_QualifiedIDKeyedAsRequested(t *testing.T) {
 	ids := args["ids"].([]string)
 	if len(ids) != 1 || ids[0] != "E1" {
 		t.Fatalf("expected bare id sent, got %#v", ids)
+	}
+}
+
+// TestHeaderPropsCoverCategorizationRules guards against the
+// categorizer checking a header the fetcher never requests. JMAP
+// only returns headers a client explicitly asks for, so any header
+// referenced by categorize.go must appear in headerProps or the rule
+// silently never fires in production.
+func TestHeaderPropsCoverCategorizationRules(t *testing.T) {
+	requested := map[string]bool{}
+	for _, p := range headerProps {
+		// "header:List-Unsubscribe:asText" → "list-unsubscribe"
+		parts := strings.Split(p, ":")
+		if len(parts) >= 2 {
+			requested[strings.ToLower(parts[1])] = true
+		}
+	}
+	// Every header the categorizer reads (see categorize.go isForum /
+	// isPromotion / isUpdate).
+	needed := []string{
+		"List-Id", "List-Post", "Mailing-List",
+		"List-Unsubscribe",
+		"Precedence", "Auto-Submitted", "X-Auto-Response-Suppress",
+		"X-Campaign", "X-Campaignid", "X-Mailchimp-Campaign",
+		"X-Marketing-Email", "X-SG-EID", "X-Marketo-Campaign",
+	}
+	for _, h := range needed {
+		if !requested[strings.ToLower(h)] {
+			t.Errorf("categorizer reads %q but it is not requested in headerProps", h)
+		}
 	}
 }
 

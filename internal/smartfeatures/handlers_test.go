@@ -238,6 +238,38 @@ func TestContactsEndpoints(t *testing.T) {
 	}
 }
 
+// TestCoRecipientsExcludeRepeatedParams pins that every repeated
+// `exclude` query param is honored (the client sends one param per
+// already-added recipient), not just the first.
+func TestCoRecipientsExcludeRepeatedParams(t *testing.T) {
+	tr, _ := NewContactTracker(newTestRedis(t), time.Hour)
+	h := NewHandlers(HandlersConfig{Fetcher: &fakeFetcher{}, Contacts: tr})
+
+	// A message to alice+bob+carol records bob and carol as
+	// co-recipients of alice.
+	rec := authedBody(http.MethodPost, "/api/v1/contacts/record",
+		`{"recipients":["alice@example.com","bob@example.com","carol@example.com"]}`)
+	w := httptest.NewRecorder()
+	h.recordSend(w, rec)
+	if w.Code != http.StatusOK {
+		t.Fatalf("record status = %d body=%s", w.Code, w.Body.String())
+	}
+
+	// Exclude bob AND carol via two separate params. If only the
+	// first were read, carol would leak into the suggestions.
+	w = httptest.NewRecorder()
+	h.coRecipients(w, authed(http.MethodGet,
+		"/api/v1/contacts/suggestions?anchor=alice@example.com&exclude=bob@example.com&exclude=carol@example.com"))
+	if w.Code != http.StatusOK {
+		t.Fatalf("suggestions status = %d body=%s", w.Code, w.Body.String())
+	}
+	out := decode(t, w)
+	list, _ := out["suggestions"].([]any)
+	if len(list) != 0 {
+		t.Fatalf("expected both co-recipients excluded, got %v", out["suggestions"])
+	}
+}
+
 func TestContactsEndpoints_UnavailableWhenNoTracker(t *testing.T) {
 	h := NewHandlers(HandlersConfig{Fetcher: &fakeFetcher{}})
 	w := httptest.NewRecorder()

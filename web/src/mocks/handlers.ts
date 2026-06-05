@@ -1557,9 +1557,9 @@ export const handlers = [
     HttpResponse.json({
       cached: false,
       items: [
-        { email_id: "E-p1", thread_id: "T-p1", score: 95, subject: "Q4 budget review — action needed", preview: "Hi team, please review the attached budget proposal and share your feedback by Friday.", from: "cfo@acme.corp", received_at: relPast(600) },
-        { email_id: "E-p2", thread_id: "T-p2", score: 82, subject: "Re: Project Zephyr launch timeline", preview: "Looks good to me. I've updated the Gantt chart with the revised milestones.", from: "pm@acme.corp", received_at: relPast(1800) },
-        { email_id: "E-p3", thread_id: "T-p3", score: 70, subject: "Onboarding checklist for new hire", preview: "Welcome aboard! Here's the checklist for your first week at Acme Corp.", from: "hr@acme.corp", received_at: relPast(3600) },
+        { email_id: "E-p1", thread_id: "T-p1", score: 95, subject: "Q4 budget review — action needed", preview: "Hi team, please review the attached budget proposal and share your feedback by Friday.", from: [{ name: "CFO Office", email: "cfo@acme.corp" }], received_at: relPast(600) },
+        { email_id: "E-p2", thread_id: "T-p2", score: 82, subject: "Re: Project Zephyr launch timeline", preview: "Looks good to me. I've updated the Gantt chart with the revised milestones.", from: [{ name: "PM Lead", email: "pm@acme.corp" }], received_at: relPast(1800) },
+        { email_id: "E-p3", thread_id: "T-p3", score: 70, subject: "Onboarding checklist for new hire", preview: "Welcome aboard! Here's the checklist for your first week at Acme Corp.", from: [{ name: "HR Team", email: "hr@acme.corp" }], received_at: relPast(3600) },
       ],
     }),
   ),

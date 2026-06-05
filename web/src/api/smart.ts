@@ -82,6 +82,24 @@ async function errorText(res: Response): Promise<string> {
 
 // ─── Priority inbox ──────────────────────────────────────────────
 
+/**
+ * An RFC 8621 mailbox address. Mirrors `smartfeatures.Address`
+ * (`{ name?, email }`) — the Go handlers serialize sender/recipient
+ * lists as arrays of these objects, never as pre-formatted strings.
+ */
+export interface EmailAddress {
+  name?: string;
+  email: string;
+}
+
+/** Format an address list as `Name <email>, …` for display. */
+export function formatAddresses(addrs?: EmailAddress[]): string {
+  if (!addrs || addrs.length === 0) return "";
+  return addrs
+    .map((a) => (a.name ? `${a.name} <${a.email}>` : a.email))
+    .join(", ");
+}
+
 /** One ranked message in the priority inbox. */
 export interface PriorityItem {
   email_id: string;
@@ -89,7 +107,7 @@ export interface PriorityItem {
   score: number;
   subject: string;
   preview: string;
-  from: string;
+  from?: EmailAddress[];
   received_at: string;
 }
 

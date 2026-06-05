@@ -131,15 +131,29 @@ export default function Compose() {
   }, []);
 
   useEffect(() => {
-    const first = to.split(",").map((s) => s.trim()).filter(Boolean)[0];
+    const existing = to.split(",").map((s) => s.trim()).filter(Boolean);
+    const first = existing[0];
     if (!first || !first.includes("@")) {
       setCoRecipients([]);
       return;
     }
-    const existing = to.split(",").map((s) => s.trim()).filter(Boolean);
-    getCoRecipients(first, existing)
-      .then((r) => setCoRecipients(r.suggestions ?? []))
-      .catch(() => setCoRecipients([]));
+    // Debounce so a burst of keystrokes fires a single request, and
+    // guard against out-of-order responses: a stale in-flight reply
+    // (resolved after a newer `to` value) must not overwrite state.
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      getCoRecipients(first, existing)
+        .then((r) => {
+          if (!cancelled) setCoRecipients(r.suggestions ?? []);
+        })
+        .catch(() => {
+          if (!cancelled) setCoRecipients([]);
+        });
+    }, 250);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
   }, [to]);
 
   // Scheduled Send (WS4) state. `sendMode` toggles the Send

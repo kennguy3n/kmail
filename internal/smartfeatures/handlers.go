@@ -309,9 +309,17 @@ func (h *Handlers) coRecipients(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, errBody("missing anchor"))
 		return
 	}
+	// The client sends each excluded address as its own repeated
+	// `exclude` query param (smart.ts uses params.append), so read
+	// every value — not just the first — and also tolerate a single
+	// comma-joined value for manual callers.
 	var exclude []string
-	if ex := strings.TrimSpace(r.URL.Query().Get("exclude")); ex != "" {
-		exclude = strings.Split(ex, ",")
+	for _, ex := range r.URL.Query()["exclude"] {
+		for _, part := range strings.Split(ex, ",") {
+			if trimmed := strings.TrimSpace(part); trimmed != "" {
+				exclude = append(exclude, trimmed)
+			}
+		}
 	}
 	limit := clampLimit(r.URL.Query().Get("limit"), 3, 10)
 	suggestions, err := h.contacts.SuggestCoRecipients(r.Context(), tenantID, userID, anchor, exclude, limit)

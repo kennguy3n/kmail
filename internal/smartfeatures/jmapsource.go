@@ -40,11 +40,16 @@ var headerProps = []string{
 	"header:List-Unsubscribe-Post:asText",
 	"header:List-Id:asText",
 	"header:List-Post:asText",
+	"header:Mailing-List:asText",
 	"header:Precedence:asText",
 	"header:Auto-Submitted:asText",
 	"header:X-Auto-Response-Suppress:asText",
 	"header:X-Campaign:asText",
+	"header:X-Campaignid:asText",
 	"header:X-Mailchimp-Campaign:asText",
+	"header:X-Marketing-Email:asText",
+	"header:X-SG-EID:asText",
+	"header:X-Marketo-Campaign:asText",
 }
 
 // JMAPFetcher implements EmailFetcher against the BFF's JMAP
