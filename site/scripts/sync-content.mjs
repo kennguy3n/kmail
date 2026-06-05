@@ -93,6 +93,10 @@ function firstSentence(s, max = 280) {
 }
 
 async function generateChangelog() {
+  // Ensure the output dir exists before either the fallback or success
+  // write below (src/data/ may not exist on a clean build).
+  await fs.mkdir(path.dirname(CHANGELOG_OUT), { recursive: true });
+
   let raw;
   try {
     raw = await fs.readFile(DEV_LOG, "utf8");
@@ -158,7 +162,6 @@ async function generateChangelog() {
     /* PROGRESS.md optional */
   }
 
-  await fs.mkdir(path.dirname(CHANGELOG_OUT), { recursive: true });
   await fs.writeFile(
     CHANGELOG_OUT,
     JSON.stringify({ status, generatedAt: new Date().toISOString(), entries: deduped }, null, 2),

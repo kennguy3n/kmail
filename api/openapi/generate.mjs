@@ -270,7 +270,7 @@ async function main() {
     const op = {
       tags: [tagFor(p)],
       summary: summaryFor(method, p),
-      operationId: `${method.toLowerCase()}${p
+      operationId: `${method.toLowerCase()}_${p
         .replace(/[/{}]/g, " ")
         .trim()
         .replace(/\s+/g, "_")

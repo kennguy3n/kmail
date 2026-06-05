@@ -52,7 +52,7 @@ export const PLANS: Plan[] = [
     highlighted: true,
     features: [
       "Everything in Core",
-      "CalDAV / CardDAV calendars + contacts",
+      "CardDAV contacts + address book",
       "Advanced spam + DNSBL",
       "Migration automation (Gmail / M365)",
       "Custom retention policies",

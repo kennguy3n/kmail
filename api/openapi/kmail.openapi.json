@@ -91,7 +91,7 @@
           "Discovery"
         ],
         "summary": "List Config V1.1.Xml",
-        "operationId": "get.well-known_autoconfig_mail_config-v1.1.xml",
+        "operationId": "get_.well-known_autoconfig_mail_config-v1.1.xml",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -118,7 +118,7 @@
           "Discovery"
         ],
         "summary": "List Caldav",
-        "operationId": "get.well-known_caldav",
+        "operationId": "get_.well-known_caldav",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -145,7 +145,7 @@
           "Platform Admin"
         ],
         "summary": "List Ip Pools",
-        "operationId": "getapi_v1_admin_ip-pools",
+        "operationId": "get_api_v1_admin_ip-pools",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -169,7 +169,7 @@
           "Platform Admin"
         ],
         "summary": "Create Ip Pools",
-        "operationId": "postapi_v1_admin_ip-pools",
+        "operationId": "post_api_v1_admin_ip-pools",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -209,7 +209,7 @@
           "Platform Admin"
         ],
         "summary": "List Ips",
-        "operationId": "getapi_v1_admin_ip-pools_id_ips",
+        "operationId": "get_api_v1_admin_ip-pools_id_ips",
         "parameters": [
           {
             "name": "id",
@@ -244,7 +244,7 @@
           "Platform Admin"
         ],
         "summary": "Create Ips",
-        "operationId": "postapi_v1_admin_ip-pools_id_ips",
+        "operationId": "post_api_v1_admin_ip-pools_id_ips",
         "parameters": [
           {
             "name": "id",
@@ -295,7 +295,7 @@
           "Platform Admin"
         ],
         "summary": "List Ip Reputation",
-        "operationId": "getapi_v1_admin_ip-reputation",
+        "operationId": "get_api_v1_admin_ip-reputation",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -321,7 +321,7 @@
           "Platform Admin"
         ],
         "summary": "List History",
-        "operationId": "getapi_v1_admin_ip-reputation_ipId_history",
+        "operationId": "get_api_v1_admin_ip-reputation_ipId_history",
         "parameters": [
           {
             "name": "ipId",
@@ -358,7 +358,7 @@
           "Platform Admin"
         ],
         "summary": "Create Access",
-        "operationId": "postapi_v1_admin_proxy_tenantId_access",
+        "operationId": "post_api_v1_admin_proxy_tenantId_access",
         "parameters": [
           {
             "name": "tenantId",
@@ -409,7 +409,7 @@
           "Platform Admin"
         ],
         "summary": "List Sessions",
-        "operationId": "getapi_v1_admin_proxy_tenantId_sessions",
+        "operationId": "get_api_v1_admin_proxy_tenantId_sessions",
         "parameters": [
           {
             "name": "tenantId",
@@ -446,7 +446,7 @@
           "Platform Admin"
         ],
         "summary": "Create Revoke",
-        "operationId": "postapi_v1_admin_proxy_tenantId_sessions_sessionId_revoke",
+        "operationId": "post_api_v1_admin_proxy_tenantId_sessions_sessionId_revoke",
         "parameters": [
           {
             "name": "tenantId",
@@ -506,7 +506,7 @@
           "Platform Admin"
         ],
         "summary": "List Shards",
-        "operationId": "getapi_v1_admin_shards",
+        "operationId": "get_api_v1_admin_shards",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -530,7 +530,7 @@
           "Platform Admin"
         ],
         "summary": "Create Shards",
-        "operationId": "postapi_v1_admin_shards",
+        "operationId": "post_api_v1_admin_shards",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -570,7 +570,7 @@
           "Platform Admin"
         ],
         "summary": "Get Shards",
-        "operationId": "getapi_v1_admin_shards_id",
+        "operationId": "get_api_v1_admin_shards_id",
         "parameters": [
           {
             "name": "id",
@@ -605,7 +605,7 @@
           "Platform Admin"
         ],
         "summary": "Replace Shards",
-        "operationId": "putapi_v1_admin_shards_id",
+        "operationId": "put_api_v1_admin_shards_id",
         "parameters": [
           {
             "name": "id",
@@ -656,7 +656,7 @@
           "Platform Admin"
         ],
         "summary": "Create Rebalance",
-        "operationId": "postapi_v1_admin_shards_id_rebalance",
+        "operationId": "post_api_v1_admin_shards_id_rebalance",
         "parameters": [
           {
             "name": "id",
@@ -707,7 +707,7 @@
           "Platform Admin"
         ],
         "summary": "List Slo",
-        "operationId": "getapi_v1_admin_slo",
+        "operationId": "get_api_v1_admin_slo",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -733,7 +733,7 @@
           "Platform Admin"
         ],
         "summary": "Get Slo",
-        "operationId": "getapi_v1_admin_slo_tenantId",
+        "operationId": "get_api_v1_admin_slo_tenantId",
         "parameters": [
           {
             "name": "tenantId",
@@ -770,7 +770,7 @@
           "Platform Admin"
         ],
         "summary": "List Breaches",
-        "operationId": "getapi_v1_admin_slo_breaches",
+        "operationId": "get_api_v1_admin_slo_breaches",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -796,7 +796,7 @@
           "Platform Admin"
         ],
         "summary": "List Regions",
-        "operationId": "getapi_v1_admin_slo_regions",
+        "operationId": "get_api_v1_admin_slo_regions",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -822,7 +822,7 @@
           "Mail"
         ],
         "summary": "Delete Attachments",
-        "operationId": "deleteapi_v1_attachments_id",
+        "operationId": "delete_api_v1_attachments_id",
         "parameters": [
           {
             "name": "id",
@@ -862,7 +862,7 @@
           "Mail"
         ],
         "summary": "List Link",
-        "operationId": "getapi_v1_attachments_id_link",
+        "operationId": "get_api_v1_attachments_id_link",
         "parameters": [
           {
             "name": "id",
@@ -899,7 +899,7 @@
           "Mail"
         ],
         "summary": "Create Upload",
-        "operationId": "postapi_v1_attachments_upload",
+        "operationId": "post_api_v1_attachments_upload",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -939,7 +939,7 @@
           "Authentication"
         ],
         "summary": "Delete Totp",
-        "operationId": "deleteapi_v1_auth_totp",
+        "operationId": "delete_api_v1_auth_totp",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -968,7 +968,7 @@
           "Authentication"
         ],
         "summary": "Create Check",
-        "operationId": "postapi_v1_auth_totp_check",
+        "operationId": "post_api_v1_auth_totp_check",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -1008,7 +1008,7 @@
           "Authentication"
         ],
         "summary": "Create Enroll",
-        "operationId": "postapi_v1_auth_totp_enroll",
+        "operationId": "post_api_v1_auth_totp_enroll",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -1048,7 +1048,7 @@
           "Authentication"
         ],
         "summary": "List Status",
-        "operationId": "getapi_v1_auth_totp_status",
+        "operationId": "get_api_v1_auth_totp_status",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -1074,7 +1074,7 @@
           "Authentication"
         ],
         "summary": "Create Verify",
-        "operationId": "postapi_v1_auth_totp_verify",
+        "operationId": "post_api_v1_auth_totp_verify",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -1114,7 +1114,7 @@
           "Authentication"
         ],
         "summary": "List Credentials",
-        "operationId": "getapi_v1_auth_webauthn_credentials",
+        "operationId": "get_api_v1_auth_webauthn_credentials",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -1140,7 +1140,7 @@
           "Authentication"
         ],
         "summary": "Delete Credentials",
-        "operationId": "deleteapi_v1_auth_webauthn_credentials_id",
+        "operationId": "delete_api_v1_auth_webauthn_credentials_id",
         "parameters": [
           {
             "name": "id",
@@ -1180,7 +1180,7 @@
           "Authentication"
         ],
         "summary": "Create Begin",
-        "operationId": "postapi_v1_auth_webauthn_login_begin",
+        "operationId": "post_api_v1_auth_webauthn_login_begin",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -1220,7 +1220,7 @@
           "Authentication"
         ],
         "summary": "Create Finish",
-        "operationId": "postapi_v1_auth_webauthn_login_finish",
+        "operationId": "post_api_v1_auth_webauthn_login_finish",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -1260,7 +1260,7 @@
           "Authentication"
         ],
         "summary": "Create Begin",
-        "operationId": "postapi_v1_auth_webauthn_register_begin",
+        "operationId": "post_api_v1_auth_webauthn_register_begin",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -1300,7 +1300,7 @@
           "Authentication"
         ],
         "summary": "Create Finish",
-        "operationId": "postapi_v1_auth_webauthn_register_finish",
+        "operationId": "post_api_v1_auth_webauthn_register_finish",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -1340,7 +1340,7 @@
           "API"
         ],
         "summary": "Create Stripe",
-        "operationId": "postapi_v1_billing_webhooks_stripe",
+        "operationId": "post_api_v1_billing_webhooks_stripe",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -1380,7 +1380,7 @@
           "Calendars"
         ],
         "summary": "Create Calendars",
-        "operationId": "postapi_v1_calendars",
+        "operationId": "post_api_v1_calendars",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -1420,7 +1420,7 @@
           "Calendars"
         ],
         "summary": "Get Calendars",
-        "operationId": "getapi_v1_calendars_accountID",
+        "operationId": "get_api_v1_calendars_accountID",
         "parameters": [
           {
             "name": "accountID",
@@ -1457,7 +1457,7 @@
           "Calendars"
         ],
         "summary": "List Events",
-        "operationId": "getapi_v1_calendars_accountID_calendarID_events",
+        "operationId": "get_api_v1_calendars_accountID_calendarID_events",
         "parameters": [
           {
             "name": "accountID",
@@ -1501,7 +1501,7 @@
           "Calendars"
         ],
         "summary": "Create Events",
-        "operationId": "postapi_v1_calendars_accountID_calendarID_events",
+        "operationId": "post_api_v1_calendars_accountID_calendarID_events",
         "parameters": [
           {
             "name": "accountID",
@@ -1561,7 +1561,7 @@
           "Calendars"
         ],
         "summary": "Delete Events",
-        "operationId": "deleteapi_v1_calendars_accountID_calendarID_events_eventUID",
+        "operationId": "delete_api_v1_calendars_accountID_calendarID_events_eventUID",
         "parameters": [
           {
             "name": "accountID",
@@ -1617,7 +1617,7 @@
           "Calendars"
         ],
         "summary": "Replace Events",
-        "operationId": "putapi_v1_calendars_accountID_calendarID_events_eventUID",
+        "operationId": "put_api_v1_calendars_accountID_calendarID_events_eventUID",
         "parameters": [
           {
             "name": "accountID",
@@ -1686,7 +1686,7 @@
           "Calendars"
         ],
         "summary": "Create Respond",
-        "operationId": "postapi_v1_calendars_accountID_calendarID_events_eventUID_respond",
+        "operationId": "post_api_v1_calendars_accountID_calendarID_events_eventUID_respond",
         "parameters": [
           {
             "name": "accountID",
@@ -1755,7 +1755,7 @@
           "Calendars"
         ],
         "summary": "List Freebusy",
-        "operationId": "getapi_v1_calendars_accountID_calendarID_freebusy",
+        "operationId": "get_api_v1_calendars_accountID_calendarID_freebusy",
         "parameters": [
           {
             "name": "accountID",
@@ -1801,7 +1801,7 @@
           "Calendars"
         ],
         "summary": "Delete Notification Channel",
-        "operationId": "deleteapi_v1_calendars_calendarId_notification-channel",
+        "operationId": "delete_api_v1_calendars_calendarId_notification-channel",
         "parameters": [
           {
             "name": "calendarId",
@@ -1839,7 +1839,7 @@
           "Calendars"
         ],
         "summary": "List Notification Channel",
-        "operationId": "getapi_v1_calendars_calendarId_notification-channel",
+        "operationId": "get_api_v1_calendars_calendarId_notification-channel",
         "parameters": [
           {
             "name": "calendarId",
@@ -1874,7 +1874,7 @@
           "Calendars"
         ],
         "summary": "Replace Notification Channel",
-        "operationId": "putapi_v1_calendars_calendarId_notification-channel",
+        "operationId": "put_api_v1_calendars_calendarId_notification-channel",
         "parameters": [
           {
             "name": "calendarId",
@@ -1925,7 +1925,7 @@
           "Calendars"
         ],
         "summary": "Delete Calendars",
-        "operationId": "deleteapi_v1_calendars_id",
+        "operationId": "delete_api_v1_calendars_id",
         "parameters": [
           {
             "name": "id",
@@ -1963,7 +1963,7 @@
           "Calendars"
         ],
         "summary": "Replace Calendars",
-        "operationId": "putapi_v1_calendars_id",
+        "operationId": "put_api_v1_calendars_id",
         "parameters": [
           {
             "name": "id",
@@ -2014,7 +2014,7 @@
           "Calendars"
         ],
         "summary": "Create Book",
-        "operationId": "postapi_v1_calendars_id_book",
+        "operationId": "post_api_v1_calendars_id_book",
         "parameters": [
           {
             "name": "id",
@@ -2065,7 +2065,7 @@
           "Calendars"
         ],
         "summary": "Create Share",
-        "operationId": "postapi_v1_calendars_id_share",
+        "operationId": "post_api_v1_calendars_id_share",
         "parameters": [
           {
             "name": "id",
@@ -2116,7 +2116,7 @@
           "Calendars"
         ],
         "summary": "List Shared",
-        "operationId": "getapi_v1_calendars_shared",
+        "operationId": "get_api_v1_calendars_shared",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -2142,7 +2142,7 @@
           "Chat Bridge"
         ],
         "summary": "List Routes",
-        "operationId": "getapi_v1_chat-bridge_routes",
+        "operationId": "get_api_v1_chat-bridge_routes",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -2166,7 +2166,7 @@
           "Chat Bridge"
         ],
         "summary": "Create Routes",
-        "operationId": "postapi_v1_chat-bridge_routes",
+        "operationId": "post_api_v1_chat-bridge_routes",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -2206,7 +2206,7 @@
           "Chat Bridge"
         ],
         "summary": "Delete Routes",
-        "operationId": "deleteapi_v1_chat-bridge_routes_routeID",
+        "operationId": "delete_api_v1_chat-bridge_routes_routeID",
         "parameters": [
           {
             "name": "routeID",
@@ -2246,7 +2246,7 @@
           "Chat Bridge"
         ],
         "summary": "Create Share",
-        "operationId": "postapi_v1_chat-bridge_share",
+        "operationId": "post_api_v1_chat-bridge_share",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -2286,7 +2286,7 @@
           "Contacts"
         ],
         "summary": "Get {AccountID}",
-        "operationId": "getapi_v1_contacts_accountID_addressBookID",
+        "operationId": "get_api_v1_contacts_accountID_addressBookID",
         "parameters": [
           {
             "name": "accountID",
@@ -2330,7 +2330,7 @@
           "Contacts"
         ],
         "summary": "Create {AccountID}",
-        "operationId": "postapi_v1_contacts_accountID_addressBookID",
+        "operationId": "post_api_v1_contacts_accountID_addressBookID",
         "parameters": [
           {
             "name": "accountID",
@@ -2390,7 +2390,7 @@
           "Contacts"
         ],
         "summary": "Delete {AddressBookID}",
-        "operationId": "deleteapi_v1_contacts_accountID_addressBookID_uid",
+        "operationId": "delete_api_v1_contacts_accountID_addressBookID_uid",
         "parameters": [
           {
             "name": "accountID",
@@ -2446,7 +2446,7 @@
           "Contacts"
         ],
         "summary": "Get {AddressBookID}",
-        "operationId": "getapi_v1_contacts_accountID_addressBookID_uid",
+        "operationId": "get_api_v1_contacts_accountID_addressBookID_uid",
         "parameters": [
           {
             "name": "accountID",
@@ -2499,7 +2499,7 @@
           "Contacts"
         ],
         "summary": "Replace {AddressBookID}",
-        "operationId": "putapi_v1_contacts_accountID_addressBookID_uid",
+        "operationId": "put_api_v1_contacts_accountID_addressBookID_uid",
         "parameters": [
           {
             "name": "accountID",
@@ -2568,7 +2568,7 @@
           "Contacts"
         ],
         "summary": "List Export",
-        "operationId": "getapi_v1_contacts_accountID_addressBookID_export",
+        "operationId": "get_api_v1_contacts_accountID_addressBookID_export",
         "parameters": [
           {
             "name": "accountID",
@@ -2614,7 +2614,7 @@
           "Contacts"
         ],
         "summary": "Create Import",
-        "operationId": "postapi_v1_contacts_accountID_addressBookID_import",
+        "operationId": "post_api_v1_contacts_accountID_addressBookID_import",
         "parameters": [
           {
             "name": "accountID",
@@ -2674,7 +2674,7 @@
           "Contacts"
         ],
         "summary": "List Addressbooks",
-        "operationId": "getapi_v1_contacts_accountID_addressbooks",
+        "operationId": "get_api_v1_contacts_accountID_addressbooks",
         "parameters": [
           {
             "name": "accountID",
@@ -2711,7 +2711,7 @@
           "Contacts"
         ],
         "summary": "List Gal",
-        "operationId": "getapi_v1_contacts_gal",
+        "operationId": "get_api_v1_contacts_gal",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -2737,7 +2737,7 @@
           "Contacts"
         ],
         "summary": "List Search",
-        "operationId": "getapi_v1_contacts_gal_search",
+        "operationId": "get_api_v1_contacts_gal_search",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -2763,7 +2763,7 @@
           "Contacts"
         ],
         "summary": "Create Sync",
-        "operationId": "postapi_v1_contacts_gal_sync",
+        "operationId": "post_api_v1_contacts_gal_sync",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -2803,7 +2803,7 @@
           "Webhooks & Integrations"
         ],
         "summary": "List Webhooks",
-        "operationId": "getapi_v1_integ_webhooks",
+        "operationId": "get_api_v1_integ_webhooks",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -2827,7 +2827,7 @@
           "Webhooks & Integrations"
         ],
         "summary": "Create Webhooks",
-        "operationId": "postapi_v1_integ_webhooks",
+        "operationId": "post_api_v1_integ_webhooks",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -2867,7 +2867,7 @@
           "Webhooks & Integrations"
         ],
         "summary": "Delete Webhooks",
-        "operationId": "deleteapi_v1_integ_webhooks_webhookId",
+        "operationId": "delete_api_v1_integ_webhooks_webhookId",
         "parameters": [
           {
             "name": "webhookId",
@@ -2907,7 +2907,7 @@
           "Webhooks & Integrations"
         ],
         "summary": "Create Test",
-        "operationId": "postapi_v1_integ_webhooks_webhookId_test",
+        "operationId": "post_api_v1_integ_webhooks_webhookId_test",
         "parameters": [
           {
             "name": "webhookId",
@@ -2958,7 +2958,7 @@
           "API"
         ],
         "summary": "Create Scan",
-        "operationId": "postapi_v1_malware_scan",
+        "operationId": "post_api_v1_malware_scan",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -2998,7 +2998,7 @@
           "Migration"
         ],
         "summary": "List Migrations",
-        "operationId": "getapi_v1_migrations",
+        "operationId": "get_api_v1_migrations",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -3022,7 +3022,7 @@
           "Migration"
         ],
         "summary": "Create Migrations",
-        "operationId": "postapi_v1_migrations",
+        "operationId": "post_api_v1_migrations",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -3062,7 +3062,7 @@
           "Migration"
         ],
         "summary": "Delete Migrations",
-        "operationId": "deleteapi_v1_migrations_jobId",
+        "operationId": "delete_api_v1_migrations_jobId",
         "parameters": [
           {
             "name": "jobId",
@@ -3100,7 +3100,7 @@
           "Migration"
         ],
         "summary": "Get Migrations",
-        "operationId": "getapi_v1_migrations_jobId",
+        "operationId": "get_api_v1_migrations_jobId",
         "parameters": [
           {
             "name": "jobId",
@@ -3137,7 +3137,7 @@
           "Migration"
         ],
         "summary": "Create Pause",
-        "operationId": "postapi_v1_migrations_jobId_pause",
+        "operationId": "post_api_v1_migrations_jobId_pause",
         "parameters": [
           {
             "name": "jobId",
@@ -3188,7 +3188,7 @@
           "Migration"
         ],
         "summary": "Create Resume",
-        "operationId": "postapi_v1_migrations_jobId_resume",
+        "operationId": "post_api_v1_migrations_jobId_resume",
         "parameters": [
           {
             "name": "jobId",
@@ -3239,7 +3239,7 @@
           "Migration"
         ],
         "summary": "Create Test Connection",
-        "operationId": "postapi_v1_migrations_test-connection",
+        "operationId": "post_api_v1_migrations_test-connection",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -3279,7 +3279,7 @@
           "Push"
         ],
         "summary": "List Preferences",
-        "operationId": "getapi_v1_push_preferences",
+        "operationId": "get_api_v1_push_preferences",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -3303,7 +3303,7 @@
           "Push"
         ],
         "summary": "Replace Preferences",
-        "operationId": "putapi_v1_push_preferences",
+        "operationId": "put_api_v1_push_preferences",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -3343,7 +3343,7 @@
           "Push"
         ],
         "summary": "Create Subscribe",
-        "operationId": "postapi_v1_push_subscribe",
+        "operationId": "post_api_v1_push_subscribe",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -3383,7 +3383,7 @@
           "Push"
         ],
         "summary": "List Subscriptions",
-        "operationId": "getapi_v1_push_subscriptions",
+        "operationId": "get_api_v1_push_subscriptions",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -3409,7 +3409,7 @@
           "Push"
         ],
         "summary": "Delete Subscriptions",
-        "operationId": "deleteapi_v1_push_subscriptions_id",
+        "operationId": "delete_api_v1_push_subscriptions_id",
         "parameters": [
           {
             "name": "id",
@@ -3449,7 +3449,7 @@
           "Calendars"
         ],
         "summary": "List Resource Calendars",
-        "operationId": "getapi_v1_resource-calendars",
+        "operationId": "get_api_v1_resource-calendars",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -3473,7 +3473,7 @@
           "Calendars"
         ],
         "summary": "Create Resource Calendars",
-        "operationId": "postapi_v1_resource-calendars",
+        "operationId": "post_api_v1_resource-calendars",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -3513,7 +3513,7 @@
           "Mail"
         ],
         "summary": "List Scheduled Sends",
-        "operationId": "getapi_v1_scheduled-sends",
+        "operationId": "get_api_v1_scheduled-sends",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -3539,7 +3539,7 @@
           "Mail"
         ],
         "summary": "Delete Scheduled Sends",
-        "operationId": "deleteapi_v1_scheduled-sends_id",
+        "operationId": "delete_api_v1_scheduled-sends_id",
         "parameters": [
           {
             "name": "id",
@@ -3577,7 +3577,7 @@
           "Mail"
         ],
         "summary": "Get Scheduled Sends",
-        "operationId": "getapi_v1_scheduled-sends_id",
+        "operationId": "get_api_v1_scheduled-sends_id",
         "parameters": [
           {
             "name": "id",
@@ -3614,7 +3614,7 @@
           "Search"
         ],
         "summary": "List Backends",
-        "operationId": "getapi_v1_search_backends",
+        "operationId": "get_api_v1_search_backends",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -3640,7 +3640,7 @@
           "Confidential Send"
         ],
         "summary": "Get Secure",
-        "operationId": "getapi_v1_secure_token",
+        "operationId": "get_api_v1_secure_token",
         "parameters": [
           {
             "name": "token",
@@ -3676,7 +3676,7 @@
           "Confidential Send"
         ],
         "summary": "Create Secure",
-        "operationId": "postapi_v1_secure_token",
+        "operationId": "post_api_v1_secure_token",
         "parameters": [
           {
             "name": "token",
@@ -3728,7 +3728,7 @@
           "Mail"
         ],
         "summary": "Get Send",
-        "operationId": "getapi_v1_send_id",
+        "operationId": "get_api_v1_send_id",
         "parameters": [
           {
             "name": "id",
@@ -3766,7 +3766,7 @@
           "Mail"
         ],
         "summary": "Create Cancel",
-        "operationId": "postapi_v1_send_id_cancel",
+        "operationId": "post_api_v1_send_id_cancel",
         "parameters": [
           {
             "name": "id",
@@ -3818,7 +3818,7 @@
           "Shared Inboxes"
         ],
         "summary": "List Assignments",
-        "operationId": "getapi_v1_shared-inboxes_inboxId_assignments",
+        "operationId": "get_api_v1_shared-inboxes_inboxId_assignments",
         "parameters": [
           {
             "name": "inboxId",
@@ -3855,7 +3855,7 @@
           "Shared Inboxes"
         ],
         "summary": "Delete Assign",
-        "operationId": "deleteapi_v1_shared-inboxes_inboxId_emails_emailId_assign",
+        "operationId": "delete_api_v1_shared-inboxes_inboxId_emails_emailId_assign",
         "parameters": [
           {
             "name": "inboxId",
@@ -3902,7 +3902,7 @@
           "Shared Inboxes"
         ],
         "summary": "Create Assign",
-        "operationId": "postapi_v1_shared-inboxes_inboxId_emails_emailId_assign",
+        "operationId": "post_api_v1_shared-inboxes_inboxId_emails_emailId_assign",
         "parameters": [
           {
             "name": "inboxId",
@@ -3962,7 +3962,7 @@
           "Shared Inboxes"
         ],
         "summary": "List Notes",
-        "operationId": "getapi_v1_shared-inboxes_inboxId_emails_emailId_notes",
+        "operationId": "get_api_v1_shared-inboxes_inboxId_emails_emailId_notes",
         "parameters": [
           {
             "name": "inboxId",
@@ -4006,7 +4006,7 @@
           "Shared Inboxes"
         ],
         "summary": "Create Notes",
-        "operationId": "postapi_v1_shared-inboxes_inboxId_emails_emailId_notes",
+        "operationId": "post_api_v1_shared-inboxes_inboxId_emails_emailId_notes",
         "parameters": [
           {
             "name": "inboxId",
@@ -4066,7 +4066,7 @@
           "Shared Inboxes"
         ],
         "summary": "Replace Status",
-        "operationId": "putapi_v1_shared-inboxes_inboxId_emails_emailId_status",
+        "operationId": "put_api_v1_shared-inboxes_inboxId_emails_emailId_status",
         "parameters": [
           {
             "name": "inboxId",
@@ -4126,7 +4126,7 @@
           "Shared Inboxes"
         ],
         "summary": "List Status",
-        "operationId": "getapi_v1_shared-inboxes_inboxId_mls_status",
+        "operationId": "get_api_v1_shared-inboxes_inboxId_mls_status",
         "parameters": [
           {
             "name": "inboxId",
@@ -4163,7 +4163,7 @@
           "Signup"
         ],
         "summary": "Create Signup",
-        "operationId": "postapi_v1_signup",
+        "operationId": "post_api_v1_signup",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -4216,7 +4216,7 @@
           "Signup"
         ],
         "summary": "List Status",
-        "operationId": "getapi_v1_signup_id_status",
+        "operationId": "get_api_v1_signup_id_status",
         "parameters": [
           {
             "name": "id",
@@ -4254,7 +4254,7 @@
           "API"
         ],
         "summary": "Create Snooze",
-        "operationId": "postapi_v1_snooze",
+        "operationId": "post_api_v1_snooze",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -4294,7 +4294,7 @@
           "Mail"
         ],
         "summary": "List Snoozed",
-        "operationId": "getapi_v1_snoozed",
+        "operationId": "get_api_v1_snoozed",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -4320,7 +4320,7 @@
           "Mail"
         ],
         "summary": "Delete Snoozed",
-        "operationId": "deleteapi_v1_snoozed_id",
+        "operationId": "delete_api_v1_snoozed_id",
         "parameters": [
           {
             "name": "id",
@@ -4358,7 +4358,7 @@
           "Mail"
         ],
         "summary": "Get Snoozed",
-        "operationId": "getapi_v1_snoozed_id",
+        "operationId": "get_api_v1_snoozed_id",
         "parameters": [
           {
             "name": "id",
@@ -4395,7 +4395,7 @@
           "Storage"
         ],
         "summary": "Create Events",
-        "operationId": "postapi_v1_storage_events",
+        "operationId": "post_api_v1_storage_events",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -4435,7 +4435,7 @@
           "Storage"
         ],
         "summary": "List Regions",
-        "operationId": "getapi_v1_storage_regions",
+        "operationId": "get_api_v1_storage_regions",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -4461,7 +4461,7 @@
           "API"
         ],
         "summary": "Create Bootstrap",
-        "operationId": "postapi_v1_sync_bootstrap",
+        "operationId": "post_api_v1_sync_bootstrap",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -4501,7 +4501,7 @@
           "Tenants & Admin"
         ],
         "summary": "List Tenants",
-        "operationId": "getapi_v1_tenants",
+        "operationId": "get_api_v1_tenants",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -4547,7 +4547,7 @@
           "Tenants & Admin"
         ],
         "summary": "Create Tenants",
-        "operationId": "postapi_v1_tenants",
+        "operationId": "post_api_v1_tenants",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -4587,7 +4587,7 @@
           "Tenants & Admin"
         ],
         "summary": "Delete Tenants",
-        "operationId": "deleteapi_v1_tenants_id",
+        "operationId": "delete_api_v1_tenants_id",
         "parameters": [
           {
             "name": "id",
@@ -4625,7 +4625,7 @@
           "Tenants & Admin"
         ],
         "summary": "Get Tenants",
-        "operationId": "getapi_v1_tenants_id",
+        "operationId": "get_api_v1_tenants_id",
         "parameters": [
           {
             "name": "id",
@@ -4660,7 +4660,7 @@
           "Tenants & Admin"
         ],
         "summary": "Update Tenants",
-        "operationId": "patchapi_v1_tenants_id",
+        "operationId": "patch_api_v1_tenants_id",
         "parameters": [
           {
             "name": "id",
@@ -4709,7 +4709,7 @@
           "Tenants & Admin"
         ],
         "summary": "Replace Tenants",
-        "operationId": "putapi_v1_tenants_id",
+        "operationId": "put_api_v1_tenants_id",
         "parameters": [
           {
             "name": "id",
@@ -4760,7 +4760,7 @@
           "Tenants & Admin"
         ],
         "summary": "List Alerts",
-        "operationId": "getapi_v1_tenants_id_abuse_alerts",
+        "operationId": "get_api_v1_tenants_id_abuse_alerts",
         "parameters": [
           {
             "name": "id",
@@ -4797,7 +4797,7 @@
           "Tenants & Admin"
         ],
         "summary": "Create Acknowledge",
-        "operationId": "postapi_v1_tenants_id_abuse_alerts_alertId_acknowledge",
+        "operationId": "post_api_v1_tenants_id_abuse_alerts_alertId_acknowledge",
         "parameters": [
           {
             "name": "id",
@@ -4857,7 +4857,7 @@
           "Tenants & Admin"
         ],
         "summary": "List Score",
-        "operationId": "getapi_v1_tenants_id_abuse_score",
+        "operationId": "get_api_v1_tenants_id_abuse_score",
         "parameters": [
           {
             "name": "id",
@@ -4894,7 +4894,7 @@
           "Tenants & Admin"
         ],
         "summary": "List Aliases",
-        "operationId": "getapi_v1_tenants_id_aliases",
+        "operationId": "get_api_v1_tenants_id_aliases",
         "parameters": [
           {
             "name": "id",
@@ -4929,7 +4929,7 @@
           "Tenants & Admin"
         ],
         "summary": "Create Aliases",
-        "operationId": "postapi_v1_tenants_id_aliases",
+        "operationId": "post_api_v1_tenants_id_aliases",
         "parameters": [
           {
             "name": "id",
@@ -4980,7 +4980,7 @@
           "Tenants & Admin"
         ],
         "summary": "Delete Aliases",
-        "operationId": "deleteapi_v1_tenants_id_aliases_aliasId",
+        "operationId": "delete_api_v1_tenants_id_aliases_aliasId",
         "parameters": [
           {
             "name": "id",
@@ -5029,7 +5029,7 @@
           "Tenants & Admin"
         ],
         "summary": "List Approvals",
-        "operationId": "getapi_v1_tenants_id_approvals",
+        "operationId": "get_api_v1_tenants_id_approvals",
         "parameters": [
           {
             "name": "id",
@@ -5064,7 +5064,7 @@
           "Tenants & Admin"
         ],
         "summary": "Create Approvals",
-        "operationId": "postapi_v1_tenants_id_approvals",
+        "operationId": "post_api_v1_tenants_id_approvals",
         "parameters": [
           {
             "name": "id",
@@ -5115,7 +5115,7 @@
           "Tenants & Admin"
         ],
         "summary": "Create Approve",
-        "operationId": "postapi_v1_tenants_id_approvals_approvalId_approve",
+        "operationId": "post_api_v1_tenants_id_approvals_approvalId_approve",
         "parameters": [
           {
             "name": "id",
@@ -5175,7 +5175,7 @@
           "Tenants & Admin"
         ],
         "summary": "Create Execute",
-        "operationId": "postapi_v1_tenants_id_approvals_approvalId_execute",
+        "operationId": "post_api_v1_tenants_id_approvals_approvalId_execute",
         "parameters": [
           {
             "name": "id",
@@ -5235,7 +5235,7 @@
           "Tenants & Admin"
         ],
         "summary": "Create Reject",
-        "operationId": "postapi_v1_tenants_id_approvals_approvalId_reject",
+        "operationId": "post_api_v1_tenants_id_approvals_approvalId_reject",
         "parameters": [
           {
             "name": "id",
@@ -5295,7 +5295,7 @@
           "Tenants & Admin"
         ],
         "summary": "List Config",
-        "operationId": "getapi_v1_tenants_id_approvals_config",
+        "operationId": "get_api_v1_tenants_id_approvals_config",
         "parameters": [
           {
             "name": "id",
@@ -5330,7 +5330,7 @@
           "Tenants & Admin"
         ],
         "summary": "Replace Config",
-        "operationId": "putapi_v1_tenants_id_approvals_config",
+        "operationId": "put_api_v1_tenants_id_approvals_config",
         "parameters": [
           {
             "name": "id",
@@ -5381,7 +5381,7 @@
           "Tenants & Admin"
         ],
         "summary": "List Billing",
-        "operationId": "getapi_v1_tenants_id_billing",
+        "operationId": "get_api_v1_tenants_id_billing",
         "parameters": [
           {
             "name": "id",
@@ -5416,7 +5416,7 @@
           "Tenants & Admin"
         ],
         "summary": "Update Billing",
-        "operationId": "patchapi_v1_tenants_id_billing",
+        "operationId": "patch_api_v1_tenants_id_billing",
         "parameters": [
           {
             "name": "id",
@@ -5467,7 +5467,7 @@
           "Tenants & Admin"
         ],
         "summary": "List History",
-        "operationId": "getapi_v1_tenants_id_billing_history",
+        "operationId": "get_api_v1_tenants_id_billing_history",
         "parameters": [
           {
             "name": "id",
@@ -5504,7 +5504,7 @@
           "Tenants & Admin"
         ],
         "summary": "Create Invoice",
-        "operationId": "postapi_v1_tenants_id_billing_invoice",
+        "operationId": "post_api_v1_tenants_id_billing_invoice",
         "parameters": [
           {
             "name": "id",
@@ -5555,7 +5555,7 @@
           "Tenants & Admin"
         ],
         "summary": "Update Plan",
-        "operationId": "patchapi_v1_tenants_id_billing_plan",
+        "operationId": "patch_api_v1_tenants_id_billing_plan",
         "parameters": [
           {
             "name": "id",
@@ -5606,7 +5606,7 @@
           "Tenants & Admin"
         ],
         "summary": "Create Portal",
-        "operationId": "postapi_v1_tenants_id_billing_portal",
+        "operationId": "post_api_v1_tenants_id_billing_portal",
         "parameters": [
           {
             "name": "id",
@@ -5657,7 +5657,7 @@
           "Tenants & Admin"
         ],
         "summary": "List Proration Preview",
-        "operationId": "getapi_v1_tenants_id_billing_proration-preview",
+        "operationId": "get_api_v1_tenants_id_billing_proration-preview",
         "parameters": [
           {
             "name": "id",
@@ -5694,7 +5694,7 @@
           "Tenants & Admin"
         ],
         "summary": "List Usage",
-        "operationId": "getapi_v1_tenants_id_billing_usage",
+        "operationId": "get_api_v1_tenants_id_billing_usage",
         "parameters": [
           {
             "name": "id",
@@ -5731,7 +5731,7 @@
           "Tenants & Admin"
         ],
         "summary": "List Bounces",
-        "operationId": "getapi_v1_tenants_id_bounces",
+        "operationId": "get_api_v1_tenants_id_bounces",
         "parameters": [
           {
             "name": "id",
@@ -5766,7 +5766,7 @@
           "Tenants & Admin"
         ],
         "summary": "Create Bounces",
-        "operationId": "postapi_v1_tenants_id_bounces",
+        "operationId": "post_api_v1_tenants_id_bounces",
         "parameters": [
           {
             "name": "id",
@@ -5817,7 +5817,7 @@
           "Tenants & Admin"
         ],
         "summary": "List Calendar Default Channel",
-        "operationId": "getapi_v1_tenants_id_calendar-default-channel",
+        "operationId": "get_api_v1_tenants_id_calendar-default-channel",
         "parameters": [
           {
             "name": "id",
@@ -5852,7 +5852,7 @@
           "Tenants & Admin"
         ],
         "summary": "Replace Calendar Default Channel",
-        "operationId": "putapi_v1_tenants_id_calendar-default-channel",
+        "operationId": "put_api_v1_tenants_id_calendar-default-channel",
         "parameters": [
           {
             "name": "id",
@@ -5903,7 +5903,7 @@
           "Tenants & Admin"
         ],
         "summary": "List Cmk",
-        "operationId": "getapi_v1_tenants_id_cmk",
+        "operationId": "get_api_v1_tenants_id_cmk",
         "parameters": [
           {
             "name": "id",
@@ -5938,7 +5938,7 @@
           "Tenants & Admin"
         ],
         "summary": "Create Cmk",
-        "operationId": "postapi_v1_tenants_id_cmk",
+        "operationId": "post_api_v1_tenants_id_cmk",
         "parameters": [
           {
             "name": "id",
@@ -5989,7 +5989,7 @@
           "Tenants & Admin"
         ],
         "summary": "Delete Revoke",
-        "operationId": "deleteapi_v1_tenants_id_cmk_keyId_revoke",
+        "operationId": "delete_api_v1_tenants_id_cmk_keyId_revoke",
         "parameters": [
           {
             "name": "id",
@@ -6038,7 +6038,7 @@
           "Tenants & Admin"
         ],
         "summary": "Replace Rotate",
-        "operationId": "putapi_v1_tenants_id_cmk_keyId_rotate",
+        "operationId": "put_api_v1_tenants_id_cmk_keyId_rotate",
         "parameters": [
           {
             "name": "id",
@@ -6098,7 +6098,7 @@
           "Tenants & Admin"
         ],
         "summary": "List Active",
-        "operationId": "getapi_v1_tenants_id_cmk_active",
+        "operationId": "get_api_v1_tenants_id_cmk_active",
         "parameters": [
           {
             "name": "id",
@@ -6135,7 +6135,7 @@
           "Tenants & Admin"
         ],
         "summary": "List Hsm",
-        "operationId": "getapi_v1_tenants_id_cmk_hsm",
+        "operationId": "get_api_v1_tenants_id_cmk_hsm",
         "parameters": [
           {
             "name": "id",
@@ -6170,7 +6170,7 @@
           "Tenants & Admin"
         ],
         "summary": "Create Hsm",
-        "operationId": "postapi_v1_tenants_id_cmk_hsm",
+        "operationId": "post_api_v1_tenants_id_cmk_hsm",
         "parameters": [
           {
             "name": "id",
@@ -6221,7 +6221,7 @@
           "Tenants & Admin"
         ],
         "summary": "Create Test",
-        "operationId": "postapi_v1_tenants_id_cmk_hsm_configId_test",
+        "operationId": "post_api_v1_tenants_id_cmk_hsm_configId_test",
         "parameters": [
           {
             "name": "id",
@@ -6281,7 +6281,7 @@
           "Tenants & Admin"
         ],
         "summary": "List Confidential Send",
-        "operationId": "getapi_v1_tenants_id_confidential-send",
+        "operationId": "get_api_v1_tenants_id_confidential-send",
         "parameters": [
           {
             "name": "id",
@@ -6316,7 +6316,7 @@
           "Tenants & Admin"
         ],
         "summary": "Create Confidential Send",
-        "operationId": "postapi_v1_tenants_id_confidential-send",
+        "operationId": "post_api_v1_tenants_id_confidential-send",
         "parameters": [
           {
             "name": "id",
@@ -6367,7 +6367,7 @@
           "Tenants & Admin"
         ],
         "summary": "Delete Confidential Send",
-        "operationId": "deleteapi_v1_tenants_id_confidential-send_linkId",
+        "operationId": "delete_api_v1_tenants_id_confidential-send_linkId",
         "parameters": [
           {
             "name": "id",
@@ -6416,7 +6416,7 @@
           "Tenants & Admin"
         ],
         "summary": "Create Rekey",
-        "operationId": "postapi_v1_tenants_id_confidential-send_linkId_mls_rekey",
+        "operationId": "post_api_v1_tenants_id_confidential-send_linkId_mls_rekey",
         "parameters": [
           {
             "name": "id",
@@ -6476,7 +6476,7 @@
           "Tenants & Admin"
         ],
         "summary": "List Status",
-        "operationId": "getapi_v1_tenants_id_confidential-send_mls_status",
+        "operationId": "get_api_v1_tenants_id_confidential-send_mls_status",
         "parameters": [
           {
             "name": "id",
@@ -6513,7 +6513,7 @@
           "Tenants & Admin"
         ],
         "summary": "Create Wrap",
-        "operationId": "postapi_v1_tenants_id_confidential-send_mls_wrap",
+        "operationId": "post_api_v1_tenants_id_confidential-send_mls_wrap",
         "parameters": [
           {
             "name": "id",
@@ -6564,7 +6564,7 @@
           "Tenants & Admin"
         ],
         "summary": "List Alerts",
-        "operationId": "getapi_v1_tenants_id_deliverability_alerts",
+        "operationId": "get_api_v1_tenants_id_deliverability_alerts",
         "parameters": [
           {
             "name": "id",
@@ -6601,7 +6601,7 @@
           "Tenants & Admin"
         ],
         "summary": "Create Acknowledge",
-        "operationId": "postapi_v1_tenants_id_deliverability_alerts_alertId_acknowledge",
+        "operationId": "post_api_v1_tenants_id_deliverability_alerts_alertId_acknowledge",
         "parameters": [
           {
             "name": "id",
@@ -6661,7 +6661,7 @@
           "Tenants & Admin"
         ],
         "summary": "List Thresholds",
-        "operationId": "getapi_v1_tenants_id_deliverability_thresholds",
+        "operationId": "get_api_v1_tenants_id_deliverability_thresholds",
         "parameters": [
           {
             "name": "id",
@@ -6696,7 +6696,7 @@
           "Tenants & Admin"
         ],
         "summary": "Replace Thresholds",
-        "operationId": "putapi_v1_tenants_id_deliverability_thresholds",
+        "operationId": "put_api_v1_tenants_id_deliverability_thresholds",
         "parameters": [
           {
             "name": "id",
@@ -6747,7 +6747,7 @@
           "Tenants & Admin"
         ],
         "summary": "List Dmarc Reports",
-        "operationId": "getapi_v1_tenants_id_dmarc-reports",
+        "operationId": "get_api_v1_tenants_id_dmarc-reports",
         "parameters": [
           {
             "name": "id",
@@ -6782,7 +6782,7 @@
           "Tenants & Admin"
         ],
         "summary": "Create Dmarc Reports",
-        "operationId": "postapi_v1_tenants_id_dmarc-reports",
+        "operationId": "post_api_v1_tenants_id_dmarc-reports",
         "parameters": [
           {
             "name": "id",
@@ -6833,7 +6833,7 @@
           "Tenants & Admin"
         ],
         "summary": "List Summary",
-        "operationId": "getapi_v1_tenants_id_dmarc-reports_summary",
+        "operationId": "get_api_v1_tenants_id_dmarc-reports_summary",
         "parameters": [
           {
             "name": "id",
@@ -6870,7 +6870,7 @@
           "Tenants & Admin"
         ],
         "summary": "List Domains",
-        "operationId": "getapi_v1_tenants_id_domains",
+        "operationId": "get_api_v1_tenants_id_domains",
         "parameters": [
           {
             "name": "id",
@@ -6905,7 +6905,7 @@
           "Tenants & Admin"
         ],
         "summary": "Create Domains",
-        "operationId": "postapi_v1_tenants_id_domains",
+        "operationId": "post_api_v1_tenants_id_domains",
         "parameters": [
           {
             "name": "id",
@@ -6956,7 +6956,7 @@
           "Tenants & Admin"
         ],
         "summary": "List Dkim",
-        "operationId": "getapi_v1_tenants_id_domains_domainId_dkim",
+        "operationId": "get_api_v1_tenants_id_domains_domainId_dkim",
         "parameters": [
           {
             "name": "id",
@@ -7000,7 +7000,7 @@
           "Tenants & Admin"
         ],
         "summary": "Create Dkim",
-        "operationId": "postapi_v1_tenants_id_domains_domainId_dkim",
+        "operationId": "post_api_v1_tenants_id_domains_domainId_dkim",
         "parameters": [
           {
             "name": "id",
@@ -7060,7 +7060,7 @@
           "Tenants & Admin"
         ],
         "summary": "Delete Dkim",
-        "operationId": "deleteapi_v1_tenants_id_domains_domainId_dkim_keyId",
+        "operationId": "delete_api_v1_tenants_id_domains_domainId_dkim_keyId",
         "parameters": [
           {
             "name": "id",
@@ -7118,7 +7118,7 @@
           "Tenants & Admin"
         ],
         "summary": "Create Rotate",
-        "operationId": "postapi_v1_tenants_id_domains_domainId_dkim_keyId_rotate",
+        "operationId": "post_api_v1_tenants_id_domains_domainId_dkim_keyId_rotate",
         "parameters": [
           {
             "name": "id",
@@ -7187,7 +7187,7 @@
           "Tenants & Admin"
         ],
         "summary": "List Dns Records",
-        "operationId": "getapi_v1_tenants_id_domains_domainId_dns-records",
+        "operationId": "get_api_v1_tenants_id_domains_domainId_dns-records",
         "parameters": [
           {
             "name": "id",
@@ -7233,7 +7233,7 @@
           "Tenants & Admin"
         ],
         "summary": "Create Verify",
-        "operationId": "postapi_v1_tenants_id_domains_domainId_verify",
+        "operationId": "post_api_v1_tenants_id_domains_domainId_verify",
         "parameters": [
           {
             "name": "id",
@@ -7293,7 +7293,7 @@
           "Tenants & Admin"
         ],
         "summary": "List Exports",
-        "operationId": "getapi_v1_tenants_id_exports",
+        "operationId": "get_api_v1_tenants_id_exports",
         "parameters": [
           {
             "name": "id",
@@ -7328,7 +7328,7 @@
           "Tenants & Admin"
         ],
         "summary": "Create Exports",
-        "operationId": "postapi_v1_tenants_id_exports",
+        "operationId": "post_api_v1_tenants_id_exports",
         "parameters": [
           {
             "name": "id",
@@ -7379,7 +7379,7 @@
           "Tenants & Admin"
         ],
         "summary": "Get Exports",
-        "operationId": "getapi_v1_tenants_id_exports_jobId",
+        "operationId": "get_api_v1_tenants_id_exports_jobId",
         "parameters": [
           {
             "name": "id",
@@ -7425,7 +7425,7 @@
           "Tenants & Admin"
         ],
         "summary": "List Feedback Loops",
-        "operationId": "getapi_v1_tenants_id_feedback-loops",
+        "operationId": "get_api_v1_tenants_id_feedback-loops",
         "parameters": [
           {
             "name": "id",
@@ -7462,7 +7462,7 @@
           "Tenants & Admin"
         ],
         "summary": "Create Gmail",
-        "operationId": "postapi_v1_tenants_id_feedback-loops_gmail",
+        "operationId": "post_api_v1_tenants_id_feedback-loops_gmail",
         "parameters": [
           {
             "name": "id",
@@ -7513,7 +7513,7 @@
           "Tenants & Admin"
         ],
         "summary": "List Summary",
-        "operationId": "getapi_v1_tenants_id_feedback-loops_summary",
+        "operationId": "get_api_v1_tenants_id_feedback-loops_summary",
         "parameters": [
           {
             "name": "id",
@@ -7550,7 +7550,7 @@
           "Tenants & Admin"
         ],
         "summary": "Create Yahoo",
-        "operationId": "postapi_v1_tenants_id_feedback-loops_yahoo",
+        "operationId": "post_api_v1_tenants_id_feedback-loops_yahoo",
         "parameters": [
           {
             "name": "id",
@@ -7601,7 +7601,7 @@
           "Tenants & Admin"
         ],
         "summary": "List Ip Pool",
-        "operationId": "getapi_v1_tenants_id_ip-pool",
+        "operationId": "get_api_v1_tenants_id_ip-pool",
         "parameters": [
           {
             "name": "id",
@@ -7636,7 +7636,7 @@
           "Tenants & Admin"
         ],
         "summary": "Create Ip Pool",
-        "operationId": "postapi_v1_tenants_id_ip-pool",
+        "operationId": "post_api_v1_tenants_id_ip-pool",
         "parameters": [
           {
             "name": "id",
@@ -7687,7 +7687,7 @@
           "Tenants & Admin"
         ],
         "summary": "List Onboarding",
-        "operationId": "getapi_v1_tenants_id_onboarding",
+        "operationId": "get_api_v1_tenants_id_onboarding",
         "parameters": [
           {
             "name": "id",
@@ -7724,7 +7724,7 @@
           "Tenants & Admin"
         ],
         "summary": "Create Skip",
-        "operationId": "postapi_v1_tenants_id_onboarding_stepId_skip",
+        "operationId": "post_api_v1_tenants_id_onboarding_stepId_skip",
         "parameters": [
           {
             "name": "id",
@@ -7784,7 +7784,7 @@
           "Tenants & Admin"
         ],
         "summary": "Create Unskip",
-        "operationId": "postapi_v1_tenants_id_onboarding_stepId_unskip",
+        "operationId": "post_api_v1_tenants_id_onboarding_stepId_unskip",
         "parameters": [
           {
             "name": "id",
@@ -7844,7 +7844,7 @@
           "Tenants & Admin"
         ],
         "summary": "Create Reset",
-        "operationId": "postapi_v1_tenants_id_onboarding_reset",
+        "operationId": "post_api_v1_tenants_id_onboarding_reset",
         "parameters": [
           {
             "name": "id",
@@ -7895,7 +7895,7 @@
           "Tenants & Admin"
         ],
         "summary": "List Protected Folders",
-        "operationId": "getapi_v1_tenants_id_protected-folders",
+        "operationId": "get_api_v1_tenants_id_protected-folders",
         "parameters": [
           {
             "name": "id",
@@ -7930,7 +7930,7 @@
           "Tenants & Admin"
         ],
         "summary": "Create Protected Folders",
-        "operationId": "postapi_v1_tenants_id_protected-folders",
+        "operationId": "post_api_v1_tenants_id_protected-folders",
         "parameters": [
           {
             "name": "id",
@@ -7981,7 +7981,7 @@
           "Tenants & Admin"
         ],
         "summary": "List Access",
-        "operationId": "getapi_v1_tenants_id_protected-folders_folderId_access",
+        "operationId": "get_api_v1_tenants_id_protected-folders_folderId_access",
         "parameters": [
           {
             "name": "id",
@@ -8027,7 +8027,7 @@
           "Tenants & Admin"
         ],
         "summary": "List Access Log",
-        "operationId": "getapi_v1_tenants_id_protected-folders_folderId_access-log",
+        "operationId": "get_api_v1_tenants_id_protected-folders_folderId_access-log",
         "parameters": [
           {
             "name": "id",
@@ -8073,7 +8073,7 @@
           "Tenants & Admin"
         ],
         "summary": "Create Share",
-        "operationId": "postapi_v1_tenants_id_protected-folders_folderId_share",
+        "operationId": "post_api_v1_tenants_id_protected-folders_folderId_share",
         "parameters": [
           {
             "name": "id",
@@ -8133,7 +8133,7 @@
           "Tenants & Admin"
         ],
         "summary": "Create Unshare",
-        "operationId": "postapi_v1_tenants_id_protected-folders_folderId_unshare",
+        "operationId": "post_api_v1_tenants_id_protected-folders_folderId_unshare",
         "parameters": [
           {
             "name": "id",
@@ -8193,7 +8193,7 @@
           "Tenants & Admin"
         ],
         "summary": "List Retention",
-        "operationId": "getapi_v1_tenants_id_retention",
+        "operationId": "get_api_v1_tenants_id_retention",
         "parameters": [
           {
             "name": "id",
@@ -8228,7 +8228,7 @@
           "Tenants & Admin"
         ],
         "summary": "Create Retention",
-        "operationId": "postapi_v1_tenants_id_retention",
+        "operationId": "post_api_v1_tenants_id_retention",
         "parameters": [
           {
             "name": "id",
@@ -8279,7 +8279,7 @@
           "Tenants & Admin"
         ],
         "summary": "Delete Retention",
-        "operationId": "deleteapi_v1_tenants_id_retention_policyId",
+        "operationId": "delete_api_v1_tenants_id_retention_policyId",
         "parameters": [
           {
             "name": "id",
@@ -8326,7 +8326,7 @@
           "Tenants & Admin"
         ],
         "summary": "Replace Retention",
-        "operationId": "putapi_v1_tenants_id_retention_policyId",
+        "operationId": "put_api_v1_tenants_id_retention_policyId",
         "parameters": [
           {
             "name": "id",
@@ -8386,7 +8386,7 @@
           "Tenants & Admin"
         ],
         "summary": "List Status",
-        "operationId": "getapi_v1_tenants_id_retention_status",
+        "operationId": "get_api_v1_tenants_id_retention_status",
         "parameters": [
           {
             "name": "id",
@@ -8423,7 +8423,7 @@
           "Tenants & Admin"
         ],
         "summary": "List Tokens",
-        "operationId": "getapi_v1_tenants_id_scim_tokens",
+        "operationId": "get_api_v1_tenants_id_scim_tokens",
         "parameters": [
           {
             "name": "id",
@@ -8458,7 +8458,7 @@
           "Tenants & Admin"
         ],
         "summary": "Create Tokens",
-        "operationId": "postapi_v1_tenants_id_scim_tokens",
+        "operationId": "post_api_v1_tenants_id_scim_tokens",
         "parameters": [
           {
             "name": "id",
@@ -8509,7 +8509,7 @@
           "Tenants & Admin"
         ],
         "summary": "Delete Tokens",
-        "operationId": "deleteapi_v1_tenants_id_scim_tokens_tokenId",
+        "operationId": "delete_api_v1_tenants_id_scim_tokens_tokenId",
         "parameters": [
           {
             "name": "id",
@@ -8558,7 +8558,7 @@
           "Tenants & Admin"
         ],
         "summary": "List Backend",
-        "operationId": "getapi_v1_tenants_id_search_backend",
+        "operationId": "get_api_v1_tenants_id_search_backend",
         "parameters": [
           {
             "name": "id",
@@ -8593,7 +8593,7 @@
           "Tenants & Admin"
         ],
         "summary": "Replace Backend",
-        "operationId": "putapi_v1_tenants_id_search_backend",
+        "operationId": "put_api_v1_tenants_id_search_backend",
         "parameters": [
           {
             "name": "id",
@@ -8644,7 +8644,7 @@
           "Tenants & Admin"
         ],
         "summary": "List Cutover",
-        "operationId": "getapi_v1_tenants_id_search_cutover",
+        "operationId": "get_api_v1_tenants_id_search_cutover",
         "parameters": [
           {
             "name": "id",
@@ -8679,7 +8679,7 @@
           "Tenants & Admin"
         ],
         "summary": "Create Cutover",
-        "operationId": "postapi_v1_tenants_id_search_cutover",
+        "operationId": "post_api_v1_tenants_id_search_cutover",
         "parameters": [
           {
             "name": "id",
@@ -8730,7 +8730,7 @@
           "Tenants & Admin"
         ],
         "summary": "Create Reindex",
-        "operationId": "postapi_v1_tenants_id_search_reindex",
+        "operationId": "post_api_v1_tenants_id_search_reindex",
         "parameters": [
           {
             "name": "id",
@@ -8781,7 +8781,7 @@
           "Tenants & Admin"
         ],
         "summary": "List Send Limit",
-        "operationId": "getapi_v1_tenants_id_send-limit",
+        "operationId": "get_api_v1_tenants_id_send-limit",
         "parameters": [
           {
             "name": "id",
@@ -8816,7 +8816,7 @@
           "Tenants & Admin"
         ],
         "summary": "Update Send Limit",
-        "operationId": "patchapi_v1_tenants_id_send-limit",
+        "operationId": "patch_api_v1_tenants_id_send-limit",
         "parameters": [
           {
             "name": "id",
@@ -8867,7 +8867,7 @@
           "Tenants & Admin"
         ],
         "summary": "List Shared Inboxes",
-        "operationId": "getapi_v1_tenants_id_shared-inboxes",
+        "operationId": "get_api_v1_tenants_id_shared-inboxes",
         "parameters": [
           {
             "name": "id",
@@ -8902,7 +8902,7 @@
           "Tenants & Admin"
         ],
         "summary": "Create Shared Inboxes",
-        "operationId": "postapi_v1_tenants_id_shared-inboxes",
+        "operationId": "post_api_v1_tenants_id_shared-inboxes",
         "parameters": [
           {
             "name": "id",
@@ -8953,7 +8953,7 @@
           "Tenants & Admin"
         ],
         "summary": "Create Members",
-        "operationId": "postapi_v1_tenants_id_shared-inboxes_inboxId_members",
+        "operationId": "post_api_v1_tenants_id_shared-inboxes_inboxId_members",
         "parameters": [
           {
             "name": "id",
@@ -9013,7 +9013,7 @@
           "Tenants & Admin"
         ],
         "summary": "Delete Members",
-        "operationId": "deleteapi_v1_tenants_id_shared-inboxes_inboxId_members_userId",
+        "operationId": "delete_api_v1_tenants_id_shared-inboxes_inboxId_members_userId",
         "parameters": [
           {
             "name": "id",
@@ -9071,7 +9071,7 @@
           "Tenants & Admin"
         ],
         "summary": "List Sieve Rules",
-        "operationId": "getapi_v1_tenants_id_sieve-rules",
+        "operationId": "get_api_v1_tenants_id_sieve-rules",
         "parameters": [
           {
             "name": "id",
@@ -9106,7 +9106,7 @@
           "Tenants & Admin"
         ],
         "summary": "Create Sieve Rules",
-        "operationId": "postapi_v1_tenants_id_sieve-rules",
+        "operationId": "post_api_v1_tenants_id_sieve-rules",
         "parameters": [
           {
             "name": "id",
@@ -9157,7 +9157,7 @@
           "Tenants & Admin"
         ],
         "summary": "Delete Sieve Rules",
-        "operationId": "deleteapi_v1_tenants_id_sieve-rules_ruleId",
+        "operationId": "delete_api_v1_tenants_id_sieve-rules_ruleId",
         "parameters": [
           {
             "name": "id",
@@ -9204,7 +9204,7 @@
           "Tenants & Admin"
         ],
         "summary": "Replace Sieve Rules",
-        "operationId": "putapi_v1_tenants_id_sieve-rules_ruleId",
+        "operationId": "put_api_v1_tenants_id_sieve-rules_ruleId",
         "parameters": [
           {
             "name": "id",
@@ -9264,7 +9264,7 @@
           "Tenants & Admin"
         ],
         "summary": "Create Deploy",
-        "operationId": "postapi_v1_tenants_id_sieve-rules_deploy",
+        "operationId": "post_api_v1_tenants_id_sieve-rules_deploy",
         "parameters": [
           {
             "name": "id",
@@ -9315,7 +9315,7 @@
           "Tenants & Admin"
         ],
         "summary": "Create Validate",
-        "operationId": "postapi_v1_tenants_id_sieve-rules_validate",
+        "operationId": "post_api_v1_tenants_id_sieve-rules_validate",
         "parameters": [
           {
             "name": "id",
@@ -9366,7 +9366,7 @@
           "Tenants & Admin"
         ],
         "summary": "List Placement",
-        "operationId": "getapi_v1_tenants_id_storage_placement",
+        "operationId": "get_api_v1_tenants_id_storage_placement",
         "parameters": [
           {
             "name": "id",
@@ -9401,7 +9401,7 @@
           "Tenants & Admin"
         ],
         "summary": "Replace Placement",
-        "operationId": "putapi_v1_tenants_id_storage_placement",
+        "operationId": "put_api_v1_tenants_id_storage_placement",
         "parameters": [
           {
             "name": "id",
@@ -9452,7 +9452,7 @@
           "Tenants & Admin"
         ],
         "summary": "List Suppression",
-        "operationId": "getapi_v1_tenants_id_suppression",
+        "operationId": "get_api_v1_tenants_id_suppression",
         "parameters": [
           {
             "name": "id",
@@ -9487,7 +9487,7 @@
           "Tenants & Admin"
         ],
         "summary": "Create Suppression",
-        "operationId": "postapi_v1_tenants_id_suppression",
+        "operationId": "post_api_v1_tenants_id_suppression",
         "parameters": [
           {
             "name": "id",
@@ -9538,7 +9538,7 @@
           "Tenants & Admin"
         ],
         "summary": "Delete Suppression",
-        "operationId": "deleteapi_v1_tenants_id_suppression_email",
+        "operationId": "delete_api_v1_tenants_id_suppression_email",
         "parameters": [
           {
             "name": "id",
@@ -9587,7 +9587,7 @@
           "Tenants & Admin"
         ],
         "summary": "List Users",
-        "operationId": "getapi_v1_tenants_id_users",
+        "operationId": "get_api_v1_tenants_id_users",
         "parameters": [
           {
             "name": "id",
@@ -9622,7 +9622,7 @@
           "Tenants & Admin"
         ],
         "summary": "Create Users",
-        "operationId": "postapi_v1_tenants_id_users",
+        "operationId": "post_api_v1_tenants_id_users",
         "parameters": [
           {
             "name": "id",
@@ -9673,7 +9673,7 @@
           "Tenants & Admin"
         ],
         "summary": "Delete Users",
-        "operationId": "deleteapi_v1_tenants_id_users_userId",
+        "operationId": "delete_api_v1_tenants_id_users_userId",
         "parameters": [
           {
             "name": "id",
@@ -9720,7 +9720,7 @@
           "Tenants & Admin"
         ],
         "summary": "Get Users",
-        "operationId": "getapi_v1_tenants_id_users_userId",
+        "operationId": "get_api_v1_tenants_id_users_userId",
         "parameters": [
           {
             "name": "id",
@@ -9764,7 +9764,7 @@
           "Tenants & Admin"
         ],
         "summary": "Update Users",
-        "operationId": "patchapi_v1_tenants_id_users_userId",
+        "operationId": "patch_api_v1_tenants_id_users_userId",
         "parameters": [
           {
             "name": "id",
@@ -9822,7 +9822,7 @@
           "Tenants & Admin"
         ],
         "summary": "Replace Users",
-        "operationId": "putapi_v1_tenants_id_users_userId",
+        "operationId": "put_api_v1_tenants_id_users_userId",
         "parameters": [
           {
             "name": "id",
@@ -9882,7 +9882,7 @@
           "Tenants & Admin"
         ],
         "summary": "List Aliases",
-        "operationId": "getapi_v1_tenants_id_users_userId_aliases",
+        "operationId": "get_api_v1_tenants_id_users_userId_aliases",
         "parameters": [
           {
             "name": "id",
@@ -9928,7 +9928,7 @@
           "Tenants & Admin"
         ],
         "summary": "List Folders",
-        "operationId": "getapi_v1_tenants_id_vault_folders",
+        "operationId": "get_api_v1_tenants_id_vault_folders",
         "parameters": [
           {
             "name": "id",
@@ -9963,7 +9963,7 @@
           "Tenants & Admin"
         ],
         "summary": "Create Folders",
-        "operationId": "postapi_v1_tenants_id_vault_folders",
+        "operationId": "post_api_v1_tenants_id_vault_folders",
         "parameters": [
           {
             "name": "id",
@@ -10014,7 +10014,7 @@
           "Tenants & Admin"
         ],
         "summary": "Delete Folders",
-        "operationId": "deleteapi_v1_tenants_id_vault_folders_folderId",
+        "operationId": "delete_api_v1_tenants_id_vault_folders_folderId",
         "parameters": [
           {
             "name": "id",
@@ -10061,7 +10061,7 @@
           "Tenants & Admin"
         ],
         "summary": "Get Folders",
-        "operationId": "getapi_v1_tenants_id_vault_folders_folderId",
+        "operationId": "get_api_v1_tenants_id_vault_folders_folderId",
         "parameters": [
           {
             "name": "id",
@@ -10107,7 +10107,7 @@
           "Tenants & Admin"
         ],
         "summary": "Replace Encryption Meta",
-        "operationId": "putapi_v1_tenants_id_vault_folders_folderId_encryption-meta",
+        "operationId": "put_api_v1_tenants_id_vault_folders_folderId_encryption-meta",
         "parameters": [
           {
             "name": "id",
@@ -10167,7 +10167,7 @@
           "Tenants & Admin"
         ],
         "summary": "List Warmup",
-        "operationId": "getapi_v1_tenants_id_warmup",
+        "operationId": "get_api_v1_tenants_id_warmup",
         "parameters": [
           {
             "name": "id",
@@ -10204,7 +10204,7 @@
           "Tenants & Admin"
         ],
         "summary": "List Webhook Deliveries",
-        "operationId": "getapi_v1_tenants_id_webhook-deliveries",
+        "operationId": "get_api_v1_tenants_id_webhook-deliveries",
         "parameters": [
           {
             "name": "id",
@@ -10241,7 +10241,7 @@
           "Tenants & Admin"
         ],
         "summary": "List Webhooks",
-        "operationId": "getapi_v1_tenants_id_webhooks",
+        "operationId": "get_api_v1_tenants_id_webhooks",
         "parameters": [
           {
             "name": "id",
@@ -10276,7 +10276,7 @@
           "Tenants & Admin"
         ],
         "summary": "Create Webhooks",
-        "operationId": "postapi_v1_tenants_id_webhooks",
+        "operationId": "post_api_v1_tenants_id_webhooks",
         "parameters": [
           {
             "name": "id",
@@ -10327,7 +10327,7 @@
           "Tenants & Admin"
         ],
         "summary": "Delete Webhooks",
-        "operationId": "deleteapi_v1_tenants_id_webhooks_webhookId",
+        "operationId": "delete_api_v1_tenants_id_webhooks_webhookId",
         "parameters": [
           {
             "name": "id",
@@ -10374,7 +10374,7 @@
           "Tenants & Admin"
         ],
         "summary": "Update Webhooks",
-        "operationId": "patchapi_v1_tenants_id_webhooks_webhookId",
+        "operationId": "patch_api_v1_tenants_id_webhooks_webhookId",
         "parameters": [
           {
             "name": "id",
@@ -10434,7 +10434,7 @@
           "Tenants & Admin"
         ],
         "summary": "Create Test",
-        "operationId": "postapi_v1_tenants_id_webhooks_webhookId_test",
+        "operationId": "post_api_v1_tenants_id_webhooks_webhookId_test",
         "parameters": [
           {
             "name": "id",
@@ -10494,7 +10494,7 @@
           "Tenants & Admin"
         ],
         "summary": "List Audit Log",
-        "operationId": "getapi_v1_tenants_tenantID_audit-log",
+        "operationId": "get_api_v1_tenants_tenantID_audit-log",
         "parameters": [
           {
             "name": "tenantID",
@@ -10531,7 +10531,7 @@
           "Tenants & Admin"
         ],
         "summary": "List Export",
-        "operationId": "getapi_v1_tenants_tenantID_audit-log_export",
+        "operationId": "get_api_v1_tenants_tenantID_audit-log_export",
         "parameters": [
           {
             "name": "tenantID",
@@ -10568,7 +10568,7 @@
           "Tenants & Admin"
         ],
         "summary": "Create Verify",
-        "operationId": "postapi_v1_tenants_tenantID_audit-log_verify",
+        "operationId": "post_api_v1_tenants_tenantID_audit-log_verify",
         "parameters": [
           {
             "name": "tenantID",
@@ -10619,7 +10619,7 @@
           "SCIM"
         ],
         "summary": "List Groups",
-        "operationId": "getscim_v2_Groups",
+        "operationId": "get_scim_v2_Groups",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -10643,7 +10643,7 @@
           "SCIM"
         ],
         "summary": "Create Groups",
-        "operationId": "postscim_v2_Groups",
+        "operationId": "post_scim_v2_Groups",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -10683,7 +10683,7 @@
           "SCIM"
         ],
         "summary": "Delete Groups",
-        "operationId": "deletescim_v2_Groups_id",
+        "operationId": "delete_scim_v2_Groups_id",
         "parameters": [
           {
             "name": "id",
@@ -10721,7 +10721,7 @@
           "SCIM"
         ],
         "summary": "Get Groups",
-        "operationId": "getscim_v2_Groups_id",
+        "operationId": "get_scim_v2_Groups_id",
         "parameters": [
           {
             "name": "id",
@@ -10756,7 +10756,7 @@
           "SCIM"
         ],
         "summary": "Update Groups",
-        "operationId": "patchscim_v2_Groups_id",
+        "operationId": "patch_scim_v2_Groups_id",
         "parameters": [
           {
             "name": "id",
@@ -10807,7 +10807,7 @@
           "SCIM"
         ],
         "summary": "List ResourceTypes",
-        "operationId": "getscim_v2_ResourceTypes",
+        "operationId": "get_scim_v2_ResourceTypes",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -10833,7 +10833,7 @@
           "SCIM"
         ],
         "summary": "Get ResourceTypes",
-        "operationId": "getscim_v2_ResourceTypes_id",
+        "operationId": "get_scim_v2_ResourceTypes_id",
         "parameters": [
           {
             "name": "id",
@@ -10870,7 +10870,7 @@
           "SCIM"
         ],
         "summary": "List Schemas",
-        "operationId": "getscim_v2_Schemas",
+        "operationId": "get_scim_v2_Schemas",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -10896,7 +10896,7 @@
           "SCIM"
         ],
         "summary": "Get Schemas",
-        "operationId": "getscim_v2_Schemas_id",
+        "operationId": "get_scim_v2_Schemas_id",
         "parameters": [
           {
             "name": "id",
@@ -10933,7 +10933,7 @@
           "SCIM"
         ],
         "summary": "List ServiceProviderConfig",
-        "operationId": "getscim_v2_ServiceProviderConfig",
+        "operationId": "get_scim_v2_ServiceProviderConfig",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -10959,7 +10959,7 @@
           "SCIM"
         ],
         "summary": "List Users",
-        "operationId": "getscim_v2_Users",
+        "operationId": "get_scim_v2_Users",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -10983,7 +10983,7 @@
           "SCIM"
         ],
         "summary": "Create Users",
-        "operationId": "postscim_v2_Users",
+        "operationId": "post_scim_v2_Users",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -11023,7 +11023,7 @@
           "SCIM"
         ],
         "summary": "Delete Users",
-        "operationId": "deletescim_v2_Users_id",
+        "operationId": "delete_scim_v2_Users_id",
         "parameters": [
           {
             "name": "id",
@@ -11061,7 +11061,7 @@
           "SCIM"
         ],
         "summary": "Get Users",
-        "operationId": "getscim_v2_Users_id",
+        "operationId": "get_scim_v2_Users_id",
         "parameters": [
           {
             "name": "id",
@@ -11096,7 +11096,7 @@
           "SCIM"
         ],
         "summary": "Update Users",
-        "operationId": "patchscim_v2_Users_id",
+        "operationId": "patch_scim_v2_Users_id",
         "parameters": [
           {
             "name": "id",
@@ -11145,7 +11145,7 @@
           "SCIM"
         ],
         "summary": "Replace Users",
-        "operationId": "putscim_v2_Users_id",
+        "operationId": "put_scim_v2_Users_id",
         "parameters": [
           {
             "name": "id",
