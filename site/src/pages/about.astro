@@ -1,0 +1,48 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import CTA from "../components/CTA.astro";
+---
+
+<BaseLayout
+  title="About"
+  description="KMail is private business email and calendar from the KChat team — built on open standards for businesses that take privacy seriously."
+>
+  <section class="section">
+    <div class="container prose">
+      <p class="eyebrow">About</p>
+      <h1>Private communication for the modern business</h1>
+      <p class="lead">
+        KMail is the private email and calendar product from the KChat team. We
+        believe a business's most sensitive conversations shouldn't be mined for
+        ads or used to train someone else's model.
+      </p>
+
+      <h2>What we're building</h2>
+      <p>
+        A complete communication workspace — mail, calendar, contacts, and shared
+        inboxes — that's fast, standards-based, and private by design. KMail
+        proxies a hardened
+        <a href="https://stalwart.email/" rel="noopener">Stalwart</a> mail core
+        through a multi-tenant backend that adds billing, encryption, compliance,
+        and a clean web app, while still speaking JMAP, IMAP, SMTP, CalDAV, and
+        CardDAV so you're never locked in.
+      </p>
+
+      <h2>Principles</h2>
+      <ul>
+        <li><strong>Privacy is the product.</strong> Encryption and isolation come first.</li>
+        <li><strong>Open standards over lock-in.</strong> Use any standards-compliant client.</li>
+        <li><strong>Transparency.</strong> Clear pricing, a public status page, and a published changelog.</li>
+        <li><strong>Built for teams.</strong> Shared inboxes, delegation, and provisioning that scale.</li>
+      </ul>
+
+      <h2>Get in touch</h2>
+      <p>
+        Questions, partnerships, or press: <a href="mailto:hello@kmail.kchat.dev">hello@kmail.kchat.dev</a>.
+        For support, see the <a href="/help">Help Center</a>.
+      </p>
+    </div>
+  </section>
+
+  <CTA />
+</BaseLayout>

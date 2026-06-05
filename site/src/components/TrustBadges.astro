@@ -1,0 +1,72 @@
+---
+interface Badge {
+  label: string;
+  detail: string;
+  status?: "done" | "progress";
+}
+
+const badges: Badge[] = [
+  { label: "Encrypted at rest & in transit", detail: "TLS 1.3 + envelope encryption", status: "done" },
+  { label: "Zero-access vaults", detail: "Client-side keys, server can't read", status: "done" },
+  { label: "Customer-managed keys", detail: "Bring your own HSM (Privacy plan)", status: "done" },
+  { label: "SOC 2 Type II", detail: "Audit in progress", status: "progress" },
+  { label: "GDPR-ready", detail: "EU data residency options", status: "done" },
+  { label: "DMARC / DKIM / SPF", detail: "Deliverability built-in", status: "done" },
+];
+---
+
+<ul class="trust">
+  {
+    badges.map((b) => (
+      <li class="trust__item">
+        <span class:list={["trust__dot", b.status]} aria-hidden="true" />
+        <span class="trust__label">{b.label}</span>
+        <span class="trust__detail muted">{b.detail}</span>
+      </li>
+    ))
+  }
+</ul>
+
+<style>
+  .trust {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 1rem;
+  }
+  .trust__item {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    grid-template-rows: auto auto;
+    column-gap: 0.6rem;
+    align-items: center;
+    padding: 1rem;
+    border: 1px solid var(--c-border);
+    border-radius: var(--radius-sm);
+    background: var(--c-bg);
+  }
+  .trust__dot {
+    grid-row: span 2;
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background: var(--c-success);
+  }
+  .trust__dot.progress {
+    background: var(--c-warning);
+  }
+  .trust__label {
+    font-weight: 600;
+  }
+  .trust__detail {
+    grid-column: 2;
+    font-size: 0.85rem;
+  }
+  @media (max-width: 820px) {
+    .trust {
+      grid-template-columns: 1fr;
+    }
+  }
+</style>

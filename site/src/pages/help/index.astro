@@ -1,0 +1,96 @@
+---
+import { getCollection } from "astro:content";
+import BaseLayout from "../../layouts/BaseLayout.astro";
+
+const articles = await getCollection("help");
+
+// Group by category, preserving a sensible category order and sorting
+// articles by their `order` field within each category.
+const CATEGORY_ORDER = [
+  "Getting Started",
+  "Email Setup",
+  "Calendar",
+  "Admin",
+  "Security",
+  "Billing",
+  "Migration",
+  "Troubleshooting",
+];
+
+const byCategory = new Map<string, typeof articles>();
+for (const a of articles) {
+  const cat = a.data.category;
+  if (!byCategory.has(cat)) byCategory.set(cat, []);
+  byCategory.get(cat)!.push(a);
+}
+for (const list of byCategory.values()) {
+  list.sort((x, y) => x.data.order - y.data.order);
+}
+
+const categories = [...byCategory.keys()].sort((a, b) => {
+  const ia = CATEGORY_ORDER.indexOf(a);
+  const ib = CATEGORY_ORDER.indexOf(b);
+  return (ia === -1 ? 999 : ia) - (ib === -1 ? 999 : ib);
+});
+---
+
+<BaseLayout
+  title="Help Center"
+  description="Guides and answers for setting up and running KMail: DNS, migration, calendar, admin, security, billing, and troubleshooting."
+>
+  <section class="section">
+    <div class="container">
+      <p class="eyebrow">Help Center</p>
+      <h1>How can we help?</h1>
+      <p class="lead">
+        Setup guides, admin docs, and answers — from DNS to migration to
+        deliverability.
+      </p>
+
+      {
+        categories.length === 0 ? (
+          <p class="muted" style="margin-top:2rem">
+            Help articles are generated from <code>docs/public/</code> at build
+            time.
+          </p>
+        ) : (
+          <div class="grid grid--2" style="margin-top:2rem">
+            {categories.map((cat) => (
+              <div class="card">
+                <h3>{cat}</h3>
+                <ul class="help-list">
+                  {byCategory.get(cat)!.map((a) => (
+                    <li>
+                      <a href={`/help/${a.id}`}>{a.data.title}</a>
+                      <span class="muted help-list__desc">{a.data.description}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ))}
+          </div>
+        )
+      }
+    </div>
+  </section>
+
+  <style>
+    .help-list {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+      display: grid;
+      gap: 0.75rem;
+    }
+    .help-list li {
+      display: grid;
+      gap: 0.1rem;
+    }
+    .help-list a {
+      font-weight: 600;
+    }
+    .help-list__desc {
+      font-size: 0.85rem;
+    }
+  </style>
+</BaseLayout>

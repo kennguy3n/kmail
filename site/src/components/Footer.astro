@@ -1,0 +1,104 @@
+---
+import { SITE, FOOTER_NAV } from "../data/site";
+const year = new Date().getFullYear();
+---
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <div class="site-footer__brand">
+      <a class="brand" href="/">
+        <span class="brand__mark" aria-hidden="true">✦</span>
+        <span class="brand__name">{SITE.name}</span>
+      </a>
+      <p class="muted">{SITE.tagline}.</p>
+      <a class="muted" href={`mailto:${SITE.supportEmail}`}>{SITE.supportEmail}</a>
+    </div>
+
+    <nav class="site-footer__cols" aria-label="Footer">
+      {
+        FOOTER_NAV.map((col) => (
+          <div class="site-footer__col">
+            <h4>{col.heading}</h4>
+            <ul>
+              {col.items.map((item) => (
+                <li>
+                  <a href={item.href}>{item.label}</a>
+                </li>
+              ))}
+            </ul>
+          </div>
+        ))
+      }
+    </nav>
+  </div>
+  <div class="container site-footer__legal">
+    <span>© {year} {SITE.name}. Proprietary — all rights reserved.</span>
+    <span>Built on open standards: JMAP, IMAP, SMTP, CalDAV, CardDAV.</span>
+  </div>
+</footer>
+
+<style>
+  .site-footer {
+    background: var(--c-bg-soft);
+    border-top: 1px solid var(--c-border);
+    padding: 3rem 0 2rem;
+    margin-top: 2rem;
+  }
+  .site-footer__inner {
+    display: grid;
+    grid-template-columns: 1.3fr 3fr;
+    gap: 2rem;
+  }
+  .brand {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-weight: 800;
+    font-size: 1.1rem;
+    color: var(--c-text);
+  }
+  .brand__mark {
+    color: var(--c-brand);
+  }
+  .site-footer__cols {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 1.5rem;
+  }
+  .site-footer__col h4 {
+    font-size: 0.85rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--c-text-faint);
+  }
+  .site-footer__col ul {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    gap: 0.5rem;
+  }
+  .site-footer__col a {
+    color: var(--c-text-soft);
+    font-size: 0.95rem;
+  }
+  .site-footer__legal {
+    display: flex;
+    justify-content: space-between;
+    gap: 1rem;
+    flex-wrap: wrap;
+    margin-top: 2rem;
+    padding-top: 1.5rem;
+    border-top: 1px solid var(--c-border);
+    color: var(--c-text-faint);
+    font-size: 0.85rem;
+  }
+  @media (max-width: 820px) {
+    .site-footer__inner {
+      grid-template-columns: 1fr;
+    }
+    .site-footer__cols {
+      grid-template-columns: repeat(2, 1fr);
+    }
+  }
+</style>

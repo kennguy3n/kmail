@@ -1,0 +1,316 @@
+---
+import BaseLayout from "../../layouts/BaseLayout.astro";
+import {
+  COMPONENTS,
+  INCIDENTS,
+  SLO_TARGET,
+  buildUptimeSeries,
+  overallUptime,
+  overallStatus,
+} from "../../data/status";
+
+const series = buildUptimeSeries(90);
+const uptime = overallUptime(series);
+const overall = overallStatus(COMPONENTS);
+
+const statusLabel: Record<string, string> = {
+  operational: "All systems operational",
+  degraded: "Degraded performance",
+  down: "Major outage",
+};
+const dotClass: Record<string, string> = {
+  operational: "ok",
+  degraded: "warn",
+  down: "down",
+};
+
+const fmtDateTime = (iso: string) =>
+  new Date(iso).toLocaleString("en-US", {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    timeZoneName: "short",
+  });
+const fmtDate = (iso: string) =>
+  new Date(iso).toLocaleDateString("en-US", { month: "short", day: "numeric" });
+---
+
+<BaseLayout
+  title="Status"
+  description="KMail platform status: current operational state, 90-day uptime, and incident history."
+>
+  <section class="section">
+    <div class="container">
+      <div class="status-head">
+        <div>
+          <p class="eyebrow">Status</p>
+          <h1>
+            <span class:list={["dot", dotClass[overall]]} aria-hidden="true"></span>
+            {statusLabel[overall]}
+          </h1>
+        </div>
+        <a class="btn btn--ghost" href="/status/feed.xml">Subscribe (RSS)</a>
+      </div>
+
+      <p class="muted">
+        90-day uptime: <strong>{uptime.toFixed(3)}%</strong> · SLO target{" "}
+        {(SLO_TARGET * 100).toFixed(2)}%
+      </p>
+
+      <!-- Components -->
+      <div class="card" style="margin-top:1.5rem">
+        <h2 style="margin-top:0">Components</h2>
+        <ul class="components">
+          {
+            COMPONENTS.map((c) => (
+              <li class="components__row">
+                <span>
+                  <strong>{c.name}</strong>
+                  <span class="muted components__desc">{c.description}</span>
+                </span>
+                <span class:list={["pill", dotClass[c.status]]}>
+                  <span class:list={["dot", dotClass[c.status]]} aria-hidden="true" />
+                  {c.status}
+                </span>
+              </li>
+            ))
+          }
+        </ul>
+      </div>
+
+      <!-- 90-day uptime bars -->
+      <div class="card" style="margin-top:1.5rem">
+        <h2 style="margin-top:0">90-day uptime</h2>
+        <div class="bars" role="img" aria-label={`90-day uptime, ${uptime.toFixed(3)} percent`}>
+          {
+            series.map((d) => (
+              <span
+                class:list={["bar", dotClass[d.status]]}
+                title={`${d.date}: ${d.uptimePct.toFixed(2)}%`}
+              />
+            ))
+          }
+        </div>
+        <div class="bars__axis muted">
+          <span>{fmtDate(series[0].date)}</span>
+          <span>Today</span>
+        </div>
+      </div>
+
+      <!-- Subscribe -->
+      <div class="card" style="margin-top:1.5rem">
+        <h2 style="margin-top:0">Get status updates</h2>
+        <p class="muted">
+          Subscribe to incident notifications. We'll only email you when an
+          incident opens, updates, or resolves.
+        </p>
+        <form class="subscribe" action="/api/v1/status/subscribe" method="post">
+          <label class="visually-hidden" for="status-email">Email address</label>
+          <input
+            id="status-email"
+            type="email"
+            name="email"
+            placeholder="you@company.com"
+            required
+          />
+          <button class="btn btn--primary" type="submit">Subscribe</button>
+        </form>
+        <p class="muted" style="font-size:0.85rem">
+          Prefer a reader? Use the <a href="/status/feed.xml">RSS feed</a>.
+        </p>
+      </div>
+
+      <!-- Incident history -->
+      <h2 style="margin-top:2.5rem">Incident history</h2>
+      {
+        INCIDENTS.length === 0 ? (
+          <p class="muted">No incidents in the last 90 days.</p>
+        ) : (
+          <div class="incidents">
+            {INCIDENTS.map((inc) => (
+              <article class="card incident">
+                <header class="incident__head">
+                  <h3 style="margin:0">{inc.title}</h3>
+                  <span class:list={["pill", inc.resolved ? "ok" : "warn"]}>
+                    {inc.resolved ? "Resolved" : "Ongoing"}
+                  </span>
+                </header>
+                <p class="muted incident__meta">
+                  {fmtDateTime(inc.date)} · {inc.severity} · affecting{" "}
+                  {inc.affected.join(", ")}
+                </p>
+                <ol class="incident__updates">
+                  {inc.updates
+                    .slice()
+                    .reverse()
+                    .map((u) => (
+                      <li>
+                        <span class="incident__status">{u.status}</span>
+                        <span class="muted incident__ts">{fmtDateTime(u.ts)}</span>
+                        <p>{u.body}</p>
+                      </li>
+                    ))}
+                </ol>
+              </article>
+            ))}
+          </div>
+        )
+      }
+    </div>
+  </section>
+
+  <style>
+    .status-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 1rem;
+      flex-wrap: wrap;
+    }
+    .status-head h1 {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      margin: 0;
+    }
+    .dot {
+      width: 14px;
+      height: 14px;
+      border-radius: 50%;
+      display: inline-block;
+      background: var(--c-success);
+    }
+    .dot.warn {
+      background: var(--c-warning);
+    }
+    .dot.down {
+      background: var(--c-danger);
+    }
+    .components {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+      display: grid;
+      gap: 0.5rem;
+    }
+    .components__row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 0.6rem 0;
+      border-bottom: 1px solid var(--c-border);
+      gap: 1rem;
+    }
+    .components__row:last-child {
+      border-bottom: none;
+    }
+    .components__desc {
+      display: block;
+      font-size: 0.85rem;
+    }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      text-transform: capitalize;
+      font-size: 0.85rem;
+      font-weight: 600;
+      padding: 0.25rem 0.7rem;
+      border-radius: 999px;
+      background: var(--c-bg-inset);
+      border: 1px solid var(--c-border);
+      white-space: nowrap;
+    }
+    .pill.ok {
+      color: var(--c-success);
+    }
+    .pill.warn {
+      color: var(--c-warning);
+    }
+    .pill.down {
+      color: var(--c-danger);
+    }
+    .bars {
+      display: flex;
+      gap: 2px;
+      align-items: stretch;
+      height: 42px;
+    }
+    .bar {
+      flex: 1 1 0;
+      border-radius: 2px;
+      background: var(--c-success);
+      min-width: 2px;
+    }
+    .bar.warn {
+      background: var(--c-warning);
+    }
+    .bar.down {
+      background: var(--c-danger);
+    }
+    .bars__axis {
+      display: flex;
+      justify-content: space-between;
+      font-size: 0.8rem;
+      margin-top: 0.5rem;
+    }
+    .subscribe {
+      display: flex;
+      gap: 0.5rem;
+      max-width: 28rem;
+      margin: 0.5rem 0;
+    }
+    .subscribe input {
+      flex: 1;
+      padding: 0.6rem 0.8rem;
+      border: 1px solid var(--c-border);
+      border-radius: var(--radius-sm);
+      font: inherit;
+    }
+    .incidents {
+      display: grid;
+      gap: 1rem;
+    }
+    .incident__head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 1rem;
+    }
+    .incident__meta {
+      text-transform: capitalize;
+      font-size: 0.9rem;
+    }
+    .incident__updates {
+      list-style: none;
+      margin: 0.5rem 0 0;
+      padding: 0;
+      display: grid;
+      gap: 0.75rem;
+    }
+    .incident__updates li {
+      border-left: 2px solid var(--c-border);
+      padding-left: 1rem;
+    }
+    .incident__status {
+      text-transform: capitalize;
+      font-weight: 700;
+      margin-right: 0.5rem;
+    }
+    .incident__ts {
+      font-size: 0.85rem;
+    }
+    .incident__updates p {
+      margin: 0.25rem 0 0;
+    }
+    .visually-hidden {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      overflow: hidden;
+      clip: rect(0 0 0 0);
+    }
+  </style>
+</BaseLayout>

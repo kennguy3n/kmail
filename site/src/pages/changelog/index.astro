@@ -1,0 +1,110 @@
+---
+import BaseLayout from "../../layouts/BaseLayout.astro";
+
+interface ChangelogEntry {
+  date: string;
+  label: string | null;
+  title: string;
+  summary: string;
+}
+interface ChangelogData {
+  status: string | null;
+  generatedAt?: string;
+  entries: ChangelogEntry[];
+}
+
+// The changelog is generated from docs/DEVELOPMENT_LOG.md by
+// scripts/sync-content.mjs (run via the prebuild hook). Load it
+// through import.meta.glob so a missing file (e.g. before the first
+// sync) degrades gracefully instead of failing the build.
+const mods = import.meta.glob<{ default: ChangelogData }>(
+  "../../data/changelog.generated.json",
+  { eager: true },
+);
+const data: ChangelogData =
+  Object.values(mods)[0]?.default ?? { status: null, entries: [] };
+
+const fmt = (iso: string) => {
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime())
+    ? iso
+    : d.toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" });
+};
+---
+
+<BaseLayout
+  title="Changelog"
+  description="What's new in KMail — product updates and improvements, generated from the engineering development log."
+>
+  <section class="section">
+    <div class="container">
+      <p class="eyebrow">Changelog</p>
+      <h1>What's new</h1>
+      <p class="lead">
+        Product updates and improvements. Generated from our engineering
+        development log.
+      </p>
+
+      {data.status && <p class="badge" style="margin-top:0.5rem">{data.status}</p>}
+
+      {
+        data.entries.length === 0 ? (
+          <p class="muted" style="margin-top:2rem">
+            No changelog entries yet. Entries are generated from{" "}
+            <code>docs/DEVELOPMENT_LOG.md</code>.
+          </p>
+        ) : (
+          <ol class="timeline" style="margin-top:2rem">
+            {data.entries.map((e) => (
+              <li class="timeline__item">
+                <div class="timeline__meta">
+                  <time datetime={e.date}>{fmt(e.date)}</time>
+                  {e.label && <span class="badge">{e.label}</span>}
+                </div>
+                <p class="timeline__summary">{e.summary}</p>
+              </li>
+            ))}
+          </ol>
+        )
+      }
+    </div>
+  </section>
+
+  <style>
+    .timeline {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+      max-width: 48rem;
+      border-left: 2px solid var(--c-border);
+    }
+    .timeline__item {
+      position: relative;
+      padding: 0 0 1.75rem 1.5rem;
+    }
+    .timeline__item::before {
+      content: "";
+      position: absolute;
+      left: -7px;
+      top: 6px;
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      background: var(--c-brand);
+      border: 2px solid var(--c-bg);
+    }
+    .timeline__meta {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      flex-wrap: wrap;
+    }
+    .timeline__meta time {
+      font-weight: 700;
+    }
+    .timeline__summary {
+      margin: 0.4rem 0 0;
+      color: var(--c-text-soft);
+    }
+  </style>
+</BaseLayout>

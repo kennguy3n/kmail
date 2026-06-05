@@ -53,9 +53,40 @@ function renderAt(path: string, onRedirect = vi.fn(), pollTimeoutMs?: number) {
   );
 }
 
+/**
+ * Walk the multi-step wizard from the email step through to the final
+ * "review & pay" step, filling each field. Leaves the caller on the
+ * review step with the "Continue to payment" submit button visible.
+ */
+async function fillWizardToReview(opts?: { email?: string; org?: string }) {
+  const email = opts?.email ?? "a@acme.com";
+  const org = opts?.org ?? "Acme";
+
+  // Step 0 — account email.
+  await userEvent.type(screen.getByLabelText("Work email"), email);
+  await userEvent.click(screen.getByRole("button", { name: /^continue$/i }));
+
+  // Step 1 — company (domain is auto-seeded from the email host).
+  await userEvent.clear(screen.getByLabelText("Organization name"));
+  await userEvent.type(screen.getByLabelText("Organization name"), org);
+  await userEvent.click(screen.getByRole("button", { name: /^continue$/i }));
+
+  // Step 2 — plan (Pro is the default selection).
+  await userEvent.click(screen.getByRole("button", { name: /^continue$/i }));
+}
+
 describe("Signup form", () => {
-  it("renders the three plan cards", () => {
+  it("renders the three plan cards on the plan step", async () => {
     renderAt("/signup");
+    // Advance to the plan step.
+    await userEvent.type(screen.getByLabelText("Work email"), "a@acme.com");
+    await userEvent.click(screen.getByRole("button", { name: /^continue$/i }));
+    await userEvent.type(
+      screen.getByLabelText("Organization name"),
+      "Acme",
+    );
+    await userEvent.click(screen.getByRole("button", { name: /^continue$/i }));
+
     expect(screen.getByText("Core")).toBeInTheDocument();
     expect(screen.getByText("Pro")).toBeInTheDocument();
     expect(screen.getByText("Privacy")).toBeInTheDocument();
@@ -75,11 +106,7 @@ describe("Signup form", () => {
 
     renderAt("/signup", onRedirect);
 
-    await userEvent.type(screen.getByLabelText("Work email"), "a@acme.com");
-    await userEvent.type(
-      screen.getByLabelText("Organization name"),
-      "Acme",
-    );
+    await fillWizardToReview();
     await userEvent.click(
       screen.getByRole("button", { name: /continue to payment/i }),
     );
@@ -94,14 +121,31 @@ describe("Signup form", () => {
     });
   });
 
-  it("shows a validation error when fields are empty", async () => {
+  it("blocks advancing past the email step without a valid email", async () => {
     renderAt("/signup");
-    await userEvent.click(
-      screen.getByRole("button", { name: /continue to payment/i }),
-    );
+    // Empty email — cannot advance.
+    await userEvent.click(screen.getByRole("button", { name: /^continue$/i }));
     expect(
-      await screen.findByText(/email and organization name are required/i),
+      await screen.findByText(/valid work email/i),
     ).toBeInTheDocument();
+    expect(signupApi.initiateSignup).not.toHaveBeenCalled();
+
+    // Malformed email — still blocked.
+    await userEvent.type(screen.getByLabelText("Work email"), "not-an-email");
+    await userEvent.click(screen.getByRole("button", { name: /^continue$/i }));
+    expect(screen.getByText(/valid work email/i)).toBeInTheDocument();
+    expect(signupApi.initiateSignup).not.toHaveBeenCalled();
+  });
+
+  it("requires an organization name before leaving the company step", async () => {
+    renderAt("/signup");
+    await userEvent.type(screen.getByLabelText("Work email"), "a@acme.com");
+    await userEvent.click(screen.getByRole("button", { name: /^continue$/i }));
+    // Org name empty → blocked.
+    await userEvent.click(screen.getByRole("button", { name: /^continue$/i }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      /enter your organization name/i,
+    );
     expect(signupApi.initiateSignup).not.toHaveBeenCalled();
   });
 
@@ -110,8 +154,7 @@ describe("Signup form", () => {
       new signupApi.SignupApiError("/api/v1/signup", 503, "checkout unavailable"),
     );
     renderAt("/signup");
-    await userEvent.type(screen.getByLabelText("Work email"), "a@acme.com");
-    await userEvent.type(screen.getByLabelText("Organization name"), "Acme");
+    await fillWizardToReview();
     await userEvent.click(
       screen.getByRole("button", { name: /continue to payment/i }),
     );

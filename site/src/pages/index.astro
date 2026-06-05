@@ -1,0 +1,257 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import TrustBadges from "../components/TrustBadges.astro";
+import PricingCards from "../components/PricingCards.astro";
+import CTA from "../components/CTA.astro";
+import { SITE } from "../data/site";
+
+const valueProps = [
+  {
+    title: "Private by default",
+    body: "Encrypted mailboxes, zero-access vaults, and customer-managed keys. Your mail is yours — not training data.",
+    icon: "🔒",
+  },
+  {
+    title: "Built for teams",
+    body: "Shared inboxes, delegated calendars, global address list, and SCIM provisioning that scale with your company.",
+    icon: "👥",
+  },
+  {
+    title: "Open standards",
+    body: "JMAP, IMAP, SMTP, CalDAV and CardDAV. Use Thunderbird, Apple Mail, or our fast web app — no lock-in.",
+    icon: "⚙️",
+  },
+  {
+    title: "Effortless onboarding",
+    body: "A guided DNS wizard and one-click migration from Gmail and Microsoft 365 get your domain live in minutes.",
+    icon: "🚀",
+  },
+];
+
+const competitors = [
+  { feature: "Private business email", kmail: "Yes", gmail: "Ads-funded history", m365: "Yes" },
+  { feature: "Zero-access vaults", kmail: "Yes", gmail: "No", m365: "No" },
+  { feature: "Customer-managed keys (CMK)", kmail: "Yes", gmail: "Enterprise add-on", m365: "Enterprise add-on" },
+  { feature: "Shared inboxes (no paid seat)", kmail: "Yes", gmail: "Paid groups", m365: "Shared mailbox" },
+  { feature: "Open JMAP API", kmail: "Yes", gmail: "No", m365: "No" },
+  { feature: "Transparent per-seat pricing", kmail: "$3–$9", gmail: "$7–$22", m365: "$6–$22" },
+];
+---
+
+<BaseLayout>
+  <!-- Hero -->
+  <section class="hero">
+    <div class="container hero__inner">
+      <span class="badge">Privacy-first · KChat for business</span>
+      <h1>Private business email for teams</h1>
+      <p class="lead mx-auto">
+        KMail is encrypted email and calendar built for businesses that take
+        privacy seriously — a clean, fast alternative to Gmail and Microsoft 365,
+        on your own domain.
+      </p>
+      <div class="hero__actions">
+        <a class="btn btn--primary btn--lg" href={SITE.signupUrl}>Get started</a>
+        <a class="btn btn--ghost btn--lg" href="/features">Explore features</a>
+      </div>
+      <p class="hero__note muted">
+        From $3 / seat / month · 5-minute domain setup · cancel anytime
+      </p>
+    </div>
+    <div class="container">
+      <div class="hero__shot" role="img" aria-label="KMail web app inbox preview">
+        <div class="hero__shot-bar">
+          <span></span><span></span><span></span>
+        </div>
+        <div class="hero__shot-body">
+          <aside class="hero__shot-nav">
+            <p>Inbox</p><p>Shared</p><p>Vault</p><p>Calendar</p><p>Contacts</p>
+          </aside>
+          <div class="hero__shot-list">
+            <div class="hero__shot-row"></div>
+            <div class="hero__shot-row"></div>
+            <div class="hero__shot-row"></div>
+            <div class="hero__shot-row"></div>
+            <div class="hero__shot-row"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Value props -->
+  <section class="section">
+    <div class="container">
+      <div class="center">
+        <p class="eyebrow">Why KMail</p>
+        <h2>Email that respects your business</h2>
+      </div>
+      <div class="grid grid--4" style="margin-top:2rem">
+        {
+          valueProps.map((v) => (
+            <div class="card">
+              <div class="vp__icon" aria-hidden="true">{v.icon}</div>
+              <h3>{v.title}</h3>
+              <p class="muted">{v.body}</p>
+            </div>
+          ))
+        }
+      </div>
+    </div>
+  </section>
+
+  <!-- Comparison -->
+  <section class="section section--soft">
+    <div class="container">
+      <div class="center">
+        <p class="eyebrow">How we compare</p>
+        <h2>KMail vs. Gmail &amp; Microsoft 365</h2>
+      </div>
+      <div class="cmp-wrap" style="margin-top:2rem">
+        <table class="cmp">
+          <thead>
+            <tr>
+              <th scope="col">Capability</th>
+              <th scope="col">KMail</th>
+              <th scope="col">Gmail / Workspace</th>
+              <th scope="col">Microsoft 365</th>
+            </tr>
+          </thead>
+          <tbody>
+            {
+              competitors.map((row) => (
+                <tr>
+                  <th scope="row">{row.feature}</th>
+                  <td class="cmp__yes">{row.kmail}</td>
+                  <td>{row.gmail}</td>
+                  <td>{row.m365}</td>
+                </tr>
+              ))
+            }
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- Pricing preview -->
+  <section class="section">
+    <div class="container">
+      <div class="center">
+        <p class="eyebrow">Simple pricing</p>
+        <h2>Three plans, no surprises</h2>
+        <p class="lead mx-auto">Per seat, per month. Upgrade or downgrade anytime.</p>
+      </div>
+      <div style="margin-top:2rem"><PricingCards /></div>
+      <p class="center" style="margin-top:1.5rem">
+        <a href="/pricing">Compare every feature →</a>
+      </p>
+    </div>
+  </section>
+
+  <!-- Trust -->
+  <section class="section section--soft">
+    <div class="container">
+      <div class="center">
+        <p class="eyebrow">Security &amp; compliance</p>
+        <h2>Trusted with your most sensitive mail</h2>
+      </div>
+      <div style="margin-top:2rem"><TrustBadges /></div>
+    </div>
+  </section>
+
+  <CTA />
+
+  <style>
+    .hero {
+      padding: 4rem 0 2rem;
+      text-align: center;
+      background:
+        radial-gradient(60% 60% at 50% 0%, var(--c-brand-soft) 0%, transparent 70%);
+    }
+    .hero__inner {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 0.5rem;
+    }
+    .hero__actions {
+      display: flex;
+      gap: 0.75rem;
+      margin-top: 1rem;
+      flex-wrap: wrap;
+      justify-content: center;
+    }
+    .hero__note {
+      margin-top: 0.75rem;
+      font-size: 0.9rem;
+    }
+    .hero__shot {
+      margin: 3rem auto 0;
+      max-width: 920px;
+      border: 1px solid var(--c-border);
+      border-radius: var(--radius);
+      overflow: hidden;
+      box-shadow: var(--shadow);
+      background: var(--c-bg);
+    }
+    .hero__shot-bar {
+      display: flex;
+      gap: 0.4rem;
+      padding: 0.75rem 1rem;
+      background: var(--c-bg-inset);
+      border-bottom: 1px solid var(--c-border);
+    }
+    .hero__shot-bar span {
+      width: 11px;
+      height: 11px;
+      border-radius: 50%;
+      background: #cbd5e1;
+    }
+    .hero__shot-body {
+      display: grid;
+      grid-template-columns: 180px 1fr;
+      min-height: 320px;
+    }
+    .hero__shot-nav {
+      border-right: 1px solid var(--c-border);
+      padding: 1rem;
+      text-align: left;
+      background: var(--c-bg-soft);
+    }
+    .hero__shot-nav p {
+      margin: 0 0 0.75rem;
+      font-weight: 600;
+      color: var(--c-text-soft);
+    }
+    .hero__shot-nav p:first-child {
+      color: var(--c-brand);
+    }
+    .hero__shot-list {
+      padding: 1rem;
+      display: grid;
+      gap: 0.75rem;
+      align-content: start;
+    }
+    .hero__shot-row {
+      height: 44px;
+      border-radius: var(--radius-sm);
+      background: linear-gradient(90deg, var(--c-bg-inset), var(--c-bg-soft));
+      border: 1px solid var(--c-border);
+    }
+    .vp__icon {
+      font-size: 1.75rem;
+    }
+    .cmp__yes {
+      color: var(--c-success);
+      font-weight: 700;
+    }
+    @media (max-width: 640px) {
+      .hero__shot-body {
+        grid-template-columns: 1fr;
+      }
+      .hero__shot-nav {
+        display: none;
+      }
+    }
+  </style>
+</BaseLayout>
