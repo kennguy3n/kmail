@@ -83,6 +83,7 @@ func (h *Handlers) mlsWrap(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) mlsRekey(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.PathValue("id")
 	linkID := r.PathValue("linkId")
 	var in struct {
 		Participants []string `json:"participants"`
@@ -91,12 +92,15 @@ func (h *Handlers) mlsRekey(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	key, err := h.svc.RekeyConfidentialMessage(r.Context(), linkID, in.Participants)
-	if errors.Is(err, ErrMLSDisabled) {
+	key, err := h.svc.RekeyConfidentialMessage(r.Context(), tenantID, linkID, in.Participants)
+	switch {
+	case errors.Is(err, ErrMLSDisabled):
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 		return
-	}
-	if err != nil {
+	case errors.Is(err, ErrLinkNotFound):
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	case err != nil:
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 		return
 	}
@@ -106,11 +110,13 @@ func (h *Handlers) mlsRekey(w http.ResponseWriter, r *http.Request) {
 func (h *Handlers) create(w http.ResponseWriter, r *http.Request) {
 	tenantID := r.PathValue("id")
 	var in struct {
-		SenderID         string `json:"sender_id"`
-		EncryptedBlobRef string `json:"encrypted_blob_ref"`
-		Password         string `json:"password"`
-		ExpiresInSec     int    `json:"expires_in_seconds"`
-		MaxViews         int    `json:"max_views"`
+		SenderID         string   `json:"sender_id"`
+		EncryptedBlobRef string   `json:"encrypted_blob_ref"`
+		Password         string   `json:"password"`
+		ExpiresInSec     int      `json:"expires_in_seconds"`
+		MaxViews         int      `json:"max_views"`
+		SenderLeafKey    string   `json:"sender_leaf_key"`
+		Recipients       []string `json:"recipients"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -123,7 +129,13 @@ func (h *Handlers) create(w http.ResponseWriter, r *http.Request) {
 		Password:         in.Password,
 		ExpiresIn:        time.Duration(in.ExpiresInSec) * time.Second,
 		MaxViews:         in.MaxViews,
+		SenderLeafKey:    in.SenderLeafKey,
+		Recipients:       in.Recipients,
 	})
+	if errors.Is(err, ErrMLSDisabled) {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+		return
+	}
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return

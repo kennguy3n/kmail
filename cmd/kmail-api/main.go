@@ -152,12 +152,20 @@ func main() {
 	// gate (needs identity) and the JMAP + tenant handlers.
 	var rateLimiter *middleware.RateLimiter
 	if cfg.RateLimit.Enabled {
+		// Fail-closed posture: production replicas degrade to the
+		// in-memory token-bucket fallback (and 503 past it) when
+		// Valkey errors, instead of silently bypassing the
+		// limiter. Default off only for dev environments — gated
+		// through the same IsDevEnv alias table the OIDC
+		// middleware uses (KMAIL_ENV=dev resolves to development).
+		failClosed := config.GetenvBool("KMAIL_RATELIMIT_FAIL_CLOSED", !middleware.IsDevEnv(cfg.Env))
 		rateLimiter = middleware.NewRateLimiter(middleware.RateLimiterConfig{
-			Client:    limiterStore,
-			TenantRPM: cfg.RateLimit.TenantRPM,
-			UserRPM:   cfg.RateLimit.UserRPM,
-			Window:    cfg.RateLimit.Window,
-			Logger:    logger,
+			Client:     limiterStore,
+			TenantRPM:  cfg.RateLimit.TenantRPM,
+			UserRPM:    cfg.RateLimit.UserRPM,
+			Window:     cfg.RateLimit.Window,
+			FailClosed: failClosed,
+			Logger:     logger,
 		})
 	}
 	wrapAuthRL := func(h http.Handler) http.Handler {

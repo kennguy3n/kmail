@@ -24,6 +24,15 @@ type SecurityConfig struct {
 	// HSTSMaxAgeSeconds defaults to one year (31_536_000) when 0.
 	HSTSMaxAgeSeconds int
 
+	// DisableHSTSPreload drops the `preload` token from the
+	// Strict-Transport-Security header. The default (false) emits
+	// `preload`, which is required for inclusion in the browser
+	// HSTS preload list (hstspreload.org). Operators who are not
+	// ready to commit to the preload list's irrevocability — once
+	// submitted, removal takes months to propagate — can set this
+	// to true to keep `includeSubDomains` without `preload`.
+	DisableHSTSPreload bool
+
 	// FrameOptions defaults to "DENY". Override to e.g. "SAMEORIGIN"
 	// only if a deliberate framing requirement exists.
 	FrameOptions string
@@ -57,10 +66,14 @@ func NewSecurity(cfg SecurityConfig) *Security {
 			allow[o] = struct{}{}
 		}
 	}
+	hsts := "max-age=" + itoa(cfg.HSTSMaxAgeSeconds) + "; includeSubDomains"
+	if !cfg.DisableHSTSPreload {
+		hsts += "; preload"
+	}
 	return &Security{
 		cfg:          cfg,
 		csp:          buildCSP(cfg.WebOrigins),
-		hsts:         "max-age=" + itoa(cfg.HSTSMaxAgeSeconds) + "; includeSubDomains",
+		hsts:         hsts,
 		allowOrigins: allow,
 	}
 }
