@@ -188,7 +188,22 @@ func main() {
 		MaxConcurrent: config.GetenvInt("KMAIL_SESSION_MAX_CONCURRENT", middleware.DefaultSessionMaxConcurrent),
 		Logger:        logger,
 	})
-	middleware.NewSessionHandlers(sessionMgr).Register(mux, authMW.Wrap)
+	// Session list/revoke endpoints are auth-gated and rate-limited
+	// (per authenticated tenant/user, same Valkey limiter as the rest
+	// of the API) so an authenticated caller cannot hammer them for
+	// small-scale abuse. They deliberately do NOT run session
+	// *enforcement* middleware: a user holding a revoked session must
+	// still be able to list and revoke their sessions (they have a
+	// valid JWT, only the session record is revoked). See
+	// docs/SESSIONS.md.
+	wrapSessionAPI := func(h http.Handler) http.Handler {
+		inner := h
+		if rateLimiter != nil {
+			inner = rateLimiter.Wrap(h)
+		}
+		return authMW.Wrap(inner)
+	}
+	middleware.NewSessionHandlers(sessionMgr).Register(mux, wrapSessionAPI)
 
 	wrapAuthRL := func(h http.Handler) http.Handler {
 		// Auth always sits at the outermost layer so 401s short
