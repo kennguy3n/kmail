@@ -17,8 +17,10 @@ type fakeSource struct {
 	overrides []Override
 	plans     map[string]string
 	loadCalls int
+	planCalls int
 	loadErr   error
 	loadDelay time.Duration // simulated store latency for race tests
+	planDelay time.Duration // simulated tenantPlan latency for race tests
 }
 
 func (f *fakeSource) loadAll(context.Context) ([]Flag, []Override, error) {
@@ -39,14 +41,26 @@ func (f *fakeSource) loadAll(context.Context) ([]Flag, []Override, error) {
 
 func (f *fakeSource) tenantPlan(_ context.Context, tenantID string) (string, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.plans[tenantID], nil
+	f.planCalls++
+	delay := f.planDelay
+	plan := f.plans[tenantID]
+	f.mu.Unlock()
+	if delay > 0 {
+		time.Sleep(delay)
+	}
+	return plan, nil
 }
 
 func (f *fakeSource) calls() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.loadCalls
+}
+
+func (f *fakeSource) planCallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.planCalls
 }
 
 func TestEvaluatePrecedence(t *testing.T) {
@@ -144,6 +158,51 @@ func TestGetSnapshotSingleFlight(t *testing.T) {
 
 	if got := src.calls(); got != 1 {
 		t.Fatalf("loadAll called %d times under concurrent cold-cache access, want 1 (single-flight)", got)
+	}
+}
+
+// TestPlanForSingleFlight verifies the per-tenant plan-cache guard:
+// when many goroutines resolve the SAME tenant's plan against a cold
+// cache at once, only ONE tenantPlan query runs (single-flight) rather
+// than one per goroutine.
+func TestPlanForSingleFlight(t *testing.T) {
+	src := &fakeSource{
+		plans:     map[string]string{"tenant-A": "privacy"},
+		planDelay: 30 * time.Millisecond, // herd while the leader loads
+	}
+	svc := newService(src, nil)
+
+	const n = 16
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			if got := svc.planFor(context.Background(), "tenant-A"); got != "privacy" {
+				t.Errorf("planFor = %q, want %q", got, "privacy")
+			}
+		}()
+	}
+	wg.Wait()
+
+	if got := src.planCallCount(); got != 1 {
+		t.Fatalf("tenantPlan called %d times under concurrent cold-cache access, want 1 (single-flight)", got)
+	}
+}
+
+// TestPlanForCachesAcrossCalls verifies a warm plan cache serves
+// subsequent lookups without re-querying the store.
+func TestPlanForCachesAcrossCalls(t *testing.T) {
+	src := &fakeSource{plans: map[string]string{"tenant-A": "pro"}}
+	svc := newService(src, nil).WithTTL(time.Hour)
+
+	for i := 0; i < 3; i++ {
+		if got := svc.planFor(context.Background(), "tenant-A"); got != "pro" {
+			t.Fatalf("planFor = %q, want %q", got, "pro")
+		}
+	}
+	if got := src.planCallCount(); got != 1 {
+		t.Fatalf("tenantPlan called %d times across warm-cache reads, want 1", got)
 	}
 }
 

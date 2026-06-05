@@ -42,6 +42,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sync/singleflight"
+
 	"github.com/kennguy3n/kmail/internal/middleware"
 )
 
@@ -159,6 +161,15 @@ type Service struct {
 	// goroutine (a thundering herd against the store). It is held
 	// only around the reload, never while serving a fresh snapshot.
 	loadMu sync.Mutex
+
+	// planSF gives per-tenant single-flight on cold/stale plan
+	// lookups: when many requests for the SAME tenant miss the plan
+	// cache at once, only one tenantPlan query runs and the rest
+	// share its result. Keyed by tenant id so unrelated tenants still
+	// load concurrently (unlike loadMu, which serialises the single
+	// global snapshot). This mirrors getSnapshot's single-flight
+	// design for the previously-unguarded plan cache.
+	planSF singleflight.Group
 }
 
 type planEntry struct {
@@ -350,23 +361,51 @@ func (s *Service) IsEnabled(ctx context.Context, key string) bool {
 
 // planFor resolves and caches a tenant's billing plan. A lookup error
 // yields "" (no plan-scoped match) rather than failing the evaluation.
+//
+// Cold/stale lookups for one tenant are de-duplicated via planSF so a
+// burst of concurrent requests for that tenant issues a single
+// tenantPlan query (per-tenant single-flight) instead of one per
+// goroutine.
 func (s *Service) planFor(ctx context.Context, tenantID string) string {
+	if plan, ok := s.cachedPlan(tenantID); ok {
+		return plan
+	}
+
+	// Miss/stale: serialise same-tenant loaders on planSF. The leader
+	// runs tenantPlan once; followers receive its result without
+	// touching Postgres. Re-check the cache inside the closure so a
+	// just-finished sibling load short-circuits a redundant query.
+	v, err, _ := s.planSF.Do(tenantID, func() (any, error) {
+		if plan, ok := s.cachedPlan(tenantID); ok {
+			return plan, nil
+		}
+		plan, err := s.src.tenantPlan(ctx, tenantID)
+		if err != nil {
+			return "", err
+		}
+		s.mu.Lock()
+		s.plans[tenantID] = planEntry{plan: plan, loaded: time.Now()}
+		s.mu.Unlock()
+		return plan, nil
+	})
+	if err != nil {
+		s.logger.Printf("featureflags: tenant plan %q: %v", tenantID, err)
+		return ""
+	}
+	return v.(string)
+}
+
+// cachedPlan returns the cached plan for tenantID if present and within
+// the TTL.
+func (s *Service) cachedPlan(tenantID string) (string, bool) {
 	s.mu.RLock()
 	entry, ok := s.plans[tenantID]
 	ttl := s.ttl
 	s.mu.RUnlock()
 	if ok && time.Since(entry.loaded) < ttl {
-		return entry.plan
+		return entry.plan, true
 	}
-	plan, err := s.src.tenantPlan(ctx, tenantID)
-	if err != nil {
-		s.logger.Printf("featureflags: tenant plan %q: %v", tenantID, err)
-		return ""
-	}
-	s.mu.Lock()
-	s.plans[tenantID] = planEntry{plan: plan, loaded: time.Now()}
-	s.mu.Unlock()
-	return plan
+	return "", false
 }
 
 // FlagView is one flag plus its overrides, returned by the admin GET.
