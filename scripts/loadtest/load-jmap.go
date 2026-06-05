@@ -18,6 +18,13 @@
 //        --rampup 30s --steady 120s --cooldown 30s \
 //        --iterations 1000
 //
+// Pass --tenants with a comma-separated list of tenant ids to spread
+// the load across multiple shards: each request is routed to one of
+// the listed tenants (via the X-KMail-Dev-Tenant-Id header), so the
+// BFF fans the traffic out to whichever shard each tenant lives on.
+// With --tenants empty the harness drives only the dev account (the
+// original single-shard behaviour).
+//
 // `iterations` caps the total run; the harness stops at whichever
 // of (iterations, total duration) is reached first.
 //
@@ -36,6 +43,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -56,7 +64,27 @@ var (
 	steady      = flag.Duration("steady", 120*time.Second, "Steady-state duration")
 	cooldown    = flag.Duration("cooldown", 30*time.Second, "Cool-down duration")
 	jsonOut     = flag.String("json-out", "", "Optional path to write JSON summary")
+	tenantsCSV  = flag.String("tenants", "", "Comma-separated tenant ids to spread load across shards; empty drives only the dev account")
 )
+
+// tenantList is the parsed form of --tenants. When non-empty,
+// callJMAP round-robins across it and stamps each request with the
+// tenant's routing header so traffic is distributed over every shard
+// those tenants are assigned to. rrCounter drives the round-robin.
+var (
+	tenantList []string
+	rrCounter  int64
+)
+
+// nextTenant returns the next tenant id in round-robin order, or ""
+// when no --tenants were supplied.
+func nextTenant() string {
+	if len(tenantList) == 0 {
+		return ""
+	}
+	i := atomic.AddInt64(&rrCounter, 1) - 1
+	return tenantList[i%int64(len(tenantList))]
+}
 
 // opMix defines the relative weight of each operation. Phase 7
 // uses a 70/15/10/5 read-heavy mix matching the production
@@ -89,6 +117,14 @@ func pickOp(rng *rand.Rand) (string, func(ctx context.Context, c *http.Client) e
 
 func main() {
 	flag.Parse()
+	if *tenantsCSV != "" {
+		for _, t := range strings.Split(*tenantsCSV, ",") {
+			if t = strings.TrimSpace(t); t != "" {
+				tenantList = append(tenantList, t)
+			}
+		}
+		fmt.Printf("multi-shard mode: spreading load across %d tenant(s)\n", len(tenantList))
+	}
 	totalDur := *rampUp + *steady + *cooldown
 	deadline := time.Now().Add(totalDur)
 	ctx, cancel := context.WithDeadline(context.Background(), deadline)
@@ -225,6 +261,12 @@ func callJMAP(ctx context.Context, c *http.Client, body any) (json.RawMessage, e
 	}
 	req.Header.Set("Authorization", "Bearer "+*authToken)
 	req.Header.Set("Content-Type", "application/json")
+	// Route to a specific tenant (hence its shard) when running in
+	// multi-shard mode. The dev-bypass header is how the BFF resolves
+	// the target shard without a full OIDC token in load tests.
+	if t := nextTenant(); t != "" {
+		req.Header.Set("X-KMail-Dev-Tenant-Id", t)
+	}
 	resp, err := c.Do(req)
 	if err != nil {
 		return nil, err
