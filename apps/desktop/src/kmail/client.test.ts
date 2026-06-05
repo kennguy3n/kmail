@@ -46,6 +46,11 @@ function makeStubBridge(
     sendEmail: vi.fn().mockResolvedValue('email-id-1'),
     enqueueSetKeywords: vi.fn().mockResolvedValue(undefined),
     notify: vi.fn().mockResolvedValue(undefined),
+    ingestPush: vi.fn().mockResolvedValue({
+      notification: undefined,
+      emailCached: false,
+      needsDeltaSync: true,
+    }),
     defaultClientConfig: vi.fn().mockResolvedValue({
       bffUrl: 'https://kmail.test',
       bearerToken: 'tok',
@@ -209,6 +214,46 @@ describe('KMailDesktopClient', () => {
       'email-1',
       JSON.stringify({ $seen: true, $flagged: false }),
     );
+  });
+
+  it('routes ingestPush through the bridge and returns the outcome', async () => {
+    const bridge = makeStubBridge({
+      ingestPush: vi.fn().mockResolvedValue({
+        notification: {
+          title: 'Alice',
+          body: 'Lunch?',
+          tag: 'e-1',
+          accountId: 'acct-1',
+          emailId: 'e-1',
+          mailboxId: 'mb-inbox',
+          threadId: 't-1',
+          receivedAtUnix: 1_700_000_000,
+          hasAttachment: false,
+        },
+        emailCached: true,
+        needsDeltaSync: true,
+      }),
+    });
+    const client = new KMailDesktopClient(bridge);
+    const data = { account_id: 'acct-1', email_id: 'e-1' };
+    const outcome = await client.ingestPush(data);
+    expect(bridge.ingestPush).toHaveBeenCalledWith(data);
+    expect(outcome.emailCached).toBe(true);
+    expect(outcome.needsDeltaSync).toBe(true);
+    expect(outcome.notification?.emailId).toBe('e-1');
+  });
+
+  it('rethrows ingestPush bridge errors as a typed KMailError', async () => {
+    const bridge = makeStubBridge({
+      ingestPush: vi
+        .fn()
+        .mockRejectedValue(new Error('[STORE] disk full')),
+    });
+    const client = new KMailDesktopClient(bridge);
+    await expect(client.ingestPush({})).rejects.toMatchObject({
+      kind: 'store',
+      tag: '[STORE]',
+    });
   });
 
   it('forwards defaultClientConfig() through the bridge with the canonical SDK defaults', async () => {

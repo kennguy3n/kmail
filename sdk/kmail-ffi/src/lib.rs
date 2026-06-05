@@ -15,9 +15,9 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
-#[cfg(test)]
 use std::time::Duration;
 
 use kmail_core::{
@@ -519,6 +519,59 @@ impl From<kmail_core::SyncSummary> for FfiSyncSummary {
     }
 }
 
+/// A renderable local notification handed back from
+/// [`KMailClientHandle::ingest_push_delivery`]. Mirrors
+/// [`kmail_core::LocalNotification`]; the shell maps it onto
+/// `UNUserNotificationCenter` (iOS) / `NotificationManagerCompat`
+/// (Android).
+#[derive(uniffi::Record)]
+pub struct FfiLocalNotification {
+    pub title: String,
+    pub body: String,
+    pub tag: String,
+    pub account_id: Option<String>,
+    pub email_id: Option<String>,
+    pub mailbox_id: Option<String>,
+    pub thread_id: Option<String>,
+    pub received_at_unix: Option<i64>,
+    pub has_attachment: bool,
+}
+
+impl From<kmail_core::LocalNotification> for FfiLocalNotification {
+    fn from(n: kmail_core::LocalNotification) -> Self {
+        FfiLocalNotification {
+            title: n.title,
+            body: n.body,
+            tag: n.tag,
+            account_id: n.account_id,
+            email_id: n.email_id,
+            mailbox_id: n.mailbox_id,
+            thread_id: n.thread_id,
+            received_at_unix: n.received_at_unix,
+            has_attachment: n.has_attachment,
+        }
+    }
+}
+
+/// Outcome of [`KMailClientHandle::ingest_push_delivery`]. Mirrors
+/// [`kmail_core::PushIngestOutcome`].
+#[derive(uniffi::Record)]
+pub struct FfiPushIngestOutcome {
+    pub notification: Option<FfiLocalNotification>,
+    pub email_cached: bool,
+    pub needs_delta_sync: bool,
+}
+
+impl From<kmail_core::PushIngestOutcome> for FfiPushIngestOutcome {
+    fn from(o: kmail_core::PushIngestOutcome) -> Self {
+        FfiPushIngestOutcome {
+            notification: o.notification.map(Into::into),
+            email_cached: o.email_cached,
+            needs_delta_sync: o.needs_delta_sync,
+        }
+    }
+}
+
 // ---------------------------------------------------------------
 // Entry point + Object surface
 // ---------------------------------------------------------------
@@ -670,6 +723,27 @@ pub struct KMailClientHandle {
     inner: KMailClient,
 }
 
+/// Handle to a running background sync worker, returned by
+/// [`KMailClientHandle::start_background_sync`].
+///
+/// Call [`stop`](Self::stop) to halt the worker; the inner
+/// [`kmail_core::BackgroundSyncHandle`] also cancels the worker on
+/// drop, so a Swift / Kotlin caller that simply releases its
+/// reference won't leak the periodic task.
+#[derive(uniffi::Object)]
+pub struct FfiBackgroundSyncHandle {
+    inner: kmail_core::BackgroundSyncHandle,
+}
+
+#[uniffi::export]
+impl FfiBackgroundSyncHandle {
+    /// Stop the worker after its current tick. Idempotent and
+    /// non-blocking.
+    pub fn stop(&self) {
+        self.inner.stop();
+    }
+}
+
 #[uniffi::export(async_runtime = "tokio")]
 impl KMailClientHandle {
     pub async fn sync(&self) -> Result<FfiSyncSummary, KMailError> {
@@ -780,6 +854,48 @@ impl KMailClientHandle {
             })
             .await??;
         Ok(())
+    }
+
+    /// Ingest a transport-level push payload (the APNs / FCM `data`
+    /// dictionary, flattened to `String → String` by the shell).
+    ///
+    /// Synchronous: the work is a payload parse plus one local
+    /// SQLite upsert, so there is no benefit to bouncing through the
+    /// runtime. Returns the parsed notification (when present), and
+    /// flags telling the shell whether a preview row was cached and
+    /// whether a delta `sync()` is still required for convergence.
+    pub fn ingest_push_delivery(
+        &self,
+        data: HashMap<String, String>,
+    ) -> Result<FfiPushIngestOutcome, KMailError> {
+        // kmail-core takes a `BTreeMap` (stable iteration order);
+        // UniFFI surfaces a `HashMap` to the foreign side.
+        let data: BTreeMap<String, String> = data.into_iter().collect();
+        Ok(self.inner.ingest_push_delivery(&data)?.into())
+    }
+
+    /// Start a background worker that runs `sync()` every
+    /// `interval_seconds`. Returns a handle whose `stop()` halts the
+    /// worker; dropping the handle also stops it.
+    ///
+    /// The worker runs on the binding's owned Tokio runtime, so we
+    /// enter that runtime's context before spawning — otherwise the
+    /// internal `tokio::spawn` would panic ("no reactor running")
+    /// when called from a foreign thread with no ambient runtime.
+    pub fn start_background_sync(
+        &self,
+        interval_seconds: u64,
+    ) -> Result<Arc<FfiBackgroundSyncHandle>, KMailError> {
+        if interval_seconds == 0 {
+            return Err(KMailError::InvalidArgument {
+                description: "interval_seconds must be greater than zero".into(),
+            });
+        }
+        let _guard = runtime().enter();
+        let inner = self
+            .inner
+            .spawn_background_sync(Duration::from_secs(interval_seconds));
+        Ok(Arc::new(FfiBackgroundSyncHandle { inner }))
     }
 
     // ---------------------------------------------------------
