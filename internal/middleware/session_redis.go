@@ -24,6 +24,14 @@ import (
 // The per-session TTL gives idle expiry for free: a session that is
 // not Touched within the idle window is reaped by Valkey, and List
 // reconciles the user's SET against the surviving sess: keys.
+//
+// Redis Cluster note: the Touch and Revoke TxPipelines span keys from
+// different namespaces (sess:, usess:, srevoked:) which hash to
+// different slots, so they would raise CROSSSLOT on a clustered
+// deployment. This is safe today because the store reuses the single
+// node *redis.Client backing the rate limiter (not a ClusterClient).
+// Moving sessions onto Redis Cluster would require hash-tag alignment
+// (e.g. keying everything by {<userKey>}) so a user's keys co-locate.
 type RedisSessionStore struct {
 	Client *redis.Client
 }
