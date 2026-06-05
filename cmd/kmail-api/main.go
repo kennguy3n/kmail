@@ -34,6 +34,7 @@ import (
 	"github.com/kennguy3n/kmail/internal/deliverability"
 	"github.com/kennguy3n/kmail/internal/dns"
 	"github.com/kennguy3n/kmail/internal/export"
+	"github.com/kennguy3n/kmail/internal/featureflags"
 	"github.com/kennguy3n/kmail/internal/integrations"
 	"github.com/kennguy3n/kmail/internal/jmap"
 	"github.com/kennguy3n/kmail/internal/malware"
@@ -1187,6 +1188,20 @@ func main() {
 	// workflow.
 	adminProxySvc := adminproxy.NewService(pool, approvalSvc, auditSvc, shardSvc)
 	adminproxy.NewHandlers(adminProxySvc, logger, cfg.StalwartURL).Register(mux, authMW)
+
+	// WS4 Task 1 — feature-flag system. Other workstreams gate their
+	// rollouts on featureflags.IsEnabled, so the resolver is installed
+	// as the process-wide default and kept fresh by a background
+	// refresher. The refresher runs regardless of KMAIL_DISABLE_WORKERS
+	// because flag resolution happens *in the API process* on the hot
+	// request path — it is not a background job that belongs to
+	// kmail-worker. The admin API (GET/PUT /api/v1/admin/feature-flags)
+	// sits behind the OIDC middleware like the other admin surfaces.
+	flagStore := featureflags.NewStore(pool)
+	flagSvc := featureflags.NewStoreService(flagStore, logger)
+	featureflags.SetDefault(flagSvc)
+	featureflags.NewHandlers(flagStore, flagSvc, logger).Register(mux, authMW)
+	go flagSvc.Run(ctx)
 	// Phase 6: background watcher emits `session_expired` audit
 	// rows once `expires_at` passes. Register the expiry collector
 	// unconditionally (matching the retention and export workers

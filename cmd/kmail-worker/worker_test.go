@@ -245,6 +245,7 @@ func TestBuildWorkersBaselineRegistry(t *testing.T) {
 		"export",
 		"adminproxy-expiry",
 		"webhooks",
+		"feature-flags-refresh",
 	}
 	for _, name := range wantPresent {
 		if !got[name] {

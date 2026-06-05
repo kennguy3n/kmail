@@ -20,6 +20,7 @@ import (
 	"github.com/kennguy3n/kmail/internal/config"
 	"github.com/kennguy3n/kmail/internal/deliverability"
 	"github.com/kennguy3n/kmail/internal/export"
+	"github.com/kennguy3n/kmail/internal/featureflags"
 	"github.com/kennguy3n/kmail/internal/jmap"
 	"github.com/kennguy3n/kmail/internal/malware"
 	"github.com/kennguy3n/kmail/internal/middleware"
@@ -319,6 +320,17 @@ func buildWorkers(ctx context.Context, d workerDeps) ([]workerRegistration, erro
 	webhookSvc := webhooks.NewService(pool)
 	webhookWorker := webhooks.NewWorker(webhookSvc, logger)
 	regs = append(regs, workerRegistration{name: "webhooks", run: webhookWorker.Run})
+
+	// --- feature-flag resolver refresher (WS4 Task 1) ---
+	// The worker process also evaluates feature flags (e.g. workers
+	// that gate behaviour on a rollout), so it installs the same
+	// process-wide resolver the API does and keeps its snapshot warm.
+	// Construction is Postgres-free (the store loads lazily), so this
+	// honours the buildWorkers no-DB-at-construction invariant.
+	flagStore := featureflags.NewStore(pool)
+	flagSvc := featureflags.NewStoreService(flagStore, logger)
+	featureflags.SetDefault(flagSvc)
+	regs = append(regs, workerRegistration{name: "feature-flags-refresh", run: flagSvc.Run})
 
 	return regs, nil
 }
