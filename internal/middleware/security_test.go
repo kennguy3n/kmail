@@ -34,6 +34,50 @@ func TestSecurity_HeadersAlwaysSet(t *testing.T) {
 	if rec.Header().Get("X-Frame-Options") != "DENY" {
 		t.Errorf("X-Frame-Options = %s, want DENY", rec.Header().Get("X-Frame-Options"))
 	}
+	hsts := rec.Header().Get("Strict-Transport-Security")
+	for _, want := range []string{"max-age=", "includeSubDomains", "preload"} {
+		if !strings.Contains(hsts, want) {
+			t.Errorf("HSTS missing %q: %s", want, hsts)
+		}
+	}
+	// CSP must not weaken script-src with unsafe-inline / unsafe-eval.
+	csp := rec.Header().Get("Content-Security-Policy")
+	for _, banned := range []string{"unsafe-inline", "unsafe-eval"} {
+		if strings.Contains(scriptSrc(csp), banned) {
+			t.Errorf("CSP script-src contains %q: %s", banned, csp)
+		}
+	}
+	if pp := rec.Header().Get("Permissions-Policy"); !strings.Contains(pp, "camera=()") ||
+		!strings.Contains(pp, "microphone=()") || !strings.Contains(pp, "geolocation=()") {
+		t.Errorf("Permissions-Policy must disable camera/microphone/geolocation: %s", pp)
+	}
+}
+
+// scriptSrc extracts the `script-src ...` directive from a CSP
+// string so the unsafe-inline assertion targets the script context
+// specifically (style-src legitimately keeps 'unsafe-inline' for
+// the inline React.CSSProperties the app emits).
+func scriptSrc(csp string) string {
+	for _, d := range strings.Split(csp, ";") {
+		d = strings.TrimSpace(d)
+		if strings.HasPrefix(d, "script-src") {
+			return d
+		}
+	}
+	return ""
+}
+
+func TestSecurity_HSTSPreloadDisabled(t *testing.T) {
+	s := NewSecurity(SecurityConfig{
+		WebOrigins:         []string{"https://kmail.kchat.dev"},
+		DisableHSTSPreload: true,
+	})
+	h := s.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/", nil))
+	if hsts := rec.Header().Get("Strict-Transport-Security"); strings.Contains(hsts, "preload") {
+		t.Errorf("expected no preload token when disabled: %s", hsts)
+	}
 }
 
 func TestSecurity_CORSAllowList(t *testing.T) {
@@ -54,6 +98,33 @@ func TestSecurity_CORSAllowList(t *testing.T) {
 	h.ServeHTTP(rec2, r2)
 	if rec2.Header().Get("Access-Control-Allow-Origin") != "" {
 		t.Errorf("ACAO = %q, want empty for non-allowed origin", rec2.Header().Get("Access-Control-Allow-Origin"))
+	}
+}
+
+func TestSecurity_ExposesRateLimitHeaders(t *testing.T) {
+	s := NewSecurity(SecurityConfig{WebOrigins: []string{"https://allowed.example"}})
+	h := s.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+
+	r := httptest.NewRequest("GET", "/", nil)
+	r.Header.Set("Origin", "https://allowed.example")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, r)
+
+	exposed := rec.Header().Get("Access-Control-Expose-Headers")
+	// The degradation flag and every diagnostic header the rate
+	// limiter emits on 429/503 must be readable by cross-origin JS,
+	// otherwise the SPA cannot honor Retry-After or surface the
+	// degraded state.
+	for _, want := range []string{
+		"X-KMail-Degraded",
+		"Retry-After",
+		"X-RateLimit-Limit",
+		"X-RateLimit-Scope",
+		"X-RateLimit-Fallback",
+	} {
+		if !strings.Contains(exposed, want) {
+			t.Errorf("Access-Control-Expose-Headers = %q, missing %q", exposed, want)
+		}
 	}
 }
 

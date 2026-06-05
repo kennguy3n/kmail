@@ -1,4 +1,4 @@
-.PHONY: build test lint fmt vet tidy docker-build clean help migrate bench e2e scim-test helm-lint loadtest chaos screenshots
+.PHONY: build test cover lint fmt vet tidy docker-build clean help migrate bench e2e scim-test helm-lint loadtest chaos screenshots
 
 # ---------------------------------------------------------------
 # KMail Go control plane — developer Makefile.
@@ -34,6 +34,11 @@ build:
 
 test:
 	$(GO) test $(GOFLAGS) -race $(PKG)
+
+# WS4 Task 5 — coverage gate. Runs the suite with a coverage profile
+# and fails below MIN_COVERAGE (default 30, ratchets up over time).
+cover:
+	./scripts/check-coverage.sh
 
 lint:
 	golangci-lint run $(PKG)
@@ -145,3 +150,25 @@ scale-test:
 	$(GO) run ./scripts/loadtest/report.go \
 	  --in $(SCALE_OUT)/scale-report.json --out $(SCALE_OUT)/scale-report.md \
 	  --fail-on-violation=$(if $(SCALE_DRY),false,true)
+
+# scale-test-multishard drives the sharded fleet (see docs/BENCHMARKS.md
+# "Multi-shard scale benchmark") and reports cross-shard routing
+# latency, shard failover time, and rebalance duration. With SCALE_DRY=1
+# it validates the plan + reporting path offline (the build self-check);
+# a live run wants --discover against a seeded fleet. Failover/rebalance
+# drills mutate fleet state, so they are OFF unless SCALE_DRILLS=1.
+#
+#   make scale-test-multishard SCALE_DRY=1                    # offline
+#   make scale-test-multishard SHARDS=10 SCALE_DRILLS=1       # live drill
+.PHONY: scale-test-multishard
+SHARDS        ?= 10
+SCALE_DISCOVER ?= $(if $(SCALE_DRY),,--discover)
+SCALE_DRILLS  ?=
+SCALE_DRILL_FLAGS := $(if $(SCALE_DRILLS),--failover --rebalance,)
+scale-test-multishard:
+	@mkdir -p $(SCALE_OUT)
+	$(GO) run ./scripts/loadtest/scale-5k-multishard.go \
+	  --tenants $(TENANTS) --shards $(SHARDS) --workers $(SCALE_WORKERS) \
+	  --rampup $(SCALE_RAMPUP) --steady $(DURATION) --cooldown $(SCALE_COOLDOWN) \
+	  --json-out $(SCALE_OUT)/multishard-report.json \
+	  $(SCALE_DISCOVER) $(SCALE_DRILL_FLAGS) $(SCALE_DRY_FLAG)

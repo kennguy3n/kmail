@@ -179,6 +179,15 @@ export interface Email {
   hasAttachment?: boolean;
   preview?: string;
   privacyMode?: PrivacyMode;
+  /**
+   * Read-receipt request header (RFC 8098): present when the sender
+   * asked for a Message Disposition Notification. MessageView reads
+   * it to decide whether to offer to send a receipt. Populated only
+   * when explicitly requested via `header:*:asText` in `Email/get`.
+   */
+  "header:Disposition-Notification-To:asText"?: string | null;
+  /** RFC 5322 Message-ID, used as the MDN's `Original-Message-ID`. */
+  "header:Message-ID:asText"?: string | null;
 }
 
 /** RFC 8621 §4.1.4 EmailBodyValue. */
@@ -206,6 +215,32 @@ export interface EmailDraft {
    * non-default identity must set this field.
    */
   identityId?: string;
+  /**
+   * When set, request a read receipt (RFC 8098 Message Disposition
+   * Notification). The address is stamped into both the
+   * `Disposition-Notification-To` and `Return-Receipt-To` headers
+   * of the outgoing message via JMAP `header:*:asText` properties.
+   */
+  readReceiptTo?: string;
+  /**
+   * Attachments already uploaded to the JMAP blob store. Each entry
+   * is emitted as an `attachment` body part referencing the blob by
+   * id (RFC 8621 §4.1.4), so the recipient sees a real MIME
+   * attachment rather than an inline link.
+   */
+  attachments?: DraftAttachment[];
+}
+
+/** An attachment referenced by a JMAP blob id for an outgoing draft. */
+export interface DraftAttachment {
+  blobId: string;
+  name: string;
+  type: string;
+  size?: number;
+  /** When true, the part is `inline` (Content-Disposition) for cid: images. */
+  inline?: boolean;
+  /** Content-ID used to reference an inline image from the HTML body. */
+  cid?: string;
 }
 
 /**
@@ -442,4 +477,149 @@ export interface GalEntry {
   source_uid?: string;
   source_account?: string;
   last_synced_at?: string;
+}
+
+// ---------------------------------------------------------------
+// WS2 — Email core features (feature depth)
+// ---------------------------------------------------------------
+
+/**
+ * RFC 8621 §3 Thread object. A Thread groups the Emails that belong
+ * to the same conversation; the BFF exposes `Thread/get` as a
+ * faithful pass-through of the spec. `emailIds` is ordered by the
+ * server in receivedAt-ascending order (RFC 8621 §3.2), which is
+ * the order the conversation view renders messages in.
+ */
+export interface Thread {
+  id: string;
+  emailIds: string[];
+}
+
+/**
+ * A reusable email signature. Stored client-side (localStorage) in
+ * the first phase per the WS2 plan; the shape is intentionally a
+ * faithful subset of what a future `internal/jmap/signature.go`
+ * preferences row would persist, so the storage backend can be
+ * swapped without touching callers.
+ *
+ * `identityEmail` scopes a signature to a specific From address
+ * (RFC 8621 §6 Identity.email). A signature with `isDefault: true`
+ * for an identity is auto-appended on compose/reply/forward when
+ * the user sends under that identity; at most one default exists
+ * per identity (enforced by the store on save).
+ */
+export interface Signature {
+  id: string;
+  name: string;
+  /** Rich-text (HTML) signature body. */
+  html: string;
+  /** Identity (From) email this signature is scoped to; null = any. */
+  identityEmail: string | null;
+  isDefault: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** Fields a caller supplies when creating/updating a {@link Signature}. */
+export interface SignatureDraft {
+  name: string;
+  html: string;
+  identityEmail: string | null;
+  isDefault: boolean;
+}
+
+/**
+ * A reusable email template. `body` is HTML and may contain
+ * `{{variable}}` placeholders that {@link renderTemplate} expands
+ * against a value map (built-ins: `sender_name`, `company`,
+ * `date`). `scope` distinguishes a user's private templates from
+ * tenant-shared (admin-managed) ones.
+ */
+export interface EmailTemplate {
+  id: string;
+  name: string;
+  subject: string;
+  body: string;
+  scope: "personal" | "shared";
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** Fields a caller supplies when creating/updating an {@link EmailTemplate}. */
+export interface EmailTemplateDraft {
+  name: string;
+  subject: string;
+  body: string;
+  scope: "personal" | "shared";
+}
+
+/**
+ * A user-defined label/tag. Labels are applied to Emails as JMAP
+ * keywords (RFC 8621 §4.1.1 `keywords`); the keyword token is
+ * derived from the label name via {@link labelKeyword}. The
+ * display name and `color` are kept in a small client-side store
+ * because JMAP keywords carry no presentation metadata.
+ */
+export interface Label {
+  id: string;
+  name: string;
+  /** CSS color string used for the chip/dot. */
+  color: string;
+  /**
+   * The JMAP keyword token this label maps to (lowercase, no
+   * spaces). Stable across renames so re-labelling an email is not
+   * required when only the display name changes.
+   */
+  keyword: string;
+}
+
+/** Fields a caller supplies when creating a {@link Label}. */
+export interface LabelDraft {
+  name: string;
+  color: string;
+}
+
+/**
+ * Out-of-office / vacation auto-reply settings. Persisted as a
+ * generated Sieve `vacation` script (RFC 5230) deployed through the
+ * existing `internal/sieve` rule store; the client keeps this
+ * normalized shape so the editor can round-trip without parsing
+ * Sieve.
+ */
+export interface VacationSettings {
+  enabled: boolean;
+  subject: string;
+  message: string;
+  /** ISO date (YYYY-MM-DD) the auto-reply starts, or null for "now". */
+  startDate: string | null;
+  /** ISO date (YYYY-MM-DD) the auto-reply ends, or null for "until off". */
+  endDate: string | null;
+  /** When true, only reply to senders in the user's contacts/GAL. */
+  contactsOnly: boolean;
+}
+
+/**
+ * A delegate-access / send-as grant. `delegateEmail` is the user
+ * being granted access; `access` is the level of mailbox access
+ * (RFC 8621 mailbox rights are coarser, so we model the product
+ * concept here). `sendAs` allows the delegate to send messages
+ * under the grantor's identity.
+ */
+export interface DelegationGrant {
+  id: string;
+  /** The mailbox owner granting access (From identity email). */
+  ownerEmail: string;
+  /** The user being granted access. */
+  delegateEmail: string;
+  access: "none" | "read" | "read-write";
+  sendAs: boolean;
+  createdAt: string;
+}
+
+/** Fields a caller supplies when creating a {@link DelegationGrant}. */
+export interface DelegationGrantDraft {
+  ownerEmail: string;
+  delegateEmail: string;
+  access: "none" | "read" | "read-write";
+  sendAs: boolean;
 }

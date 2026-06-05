@@ -1,0 +1,61 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import CTA from "../components/CTA.astro";
+const updated = "2026-06-05";
+---
+
+<BaseLayout
+  title="Privacy"
+  description="KMail's privacy commitments: no ads, no scanning your mail for marketing, your data is never sold or used to train models."
+>
+  <section class="section">
+    <div class="container prose">
+      <p class="eyebrow">Privacy</p>
+      <h1>Your mail is yours</h1>
+      <p class="lead">
+        We make money from subscriptions, not from your data. KMail does not show
+        ads, does not scan your mail for advertising, and never sells your data or
+        uses it to train AI models.
+      </p>
+      <p class="muted">Last updated: {updated}</p>
+
+      <h2>Our commitments</h2>
+      <ul>
+        <li><strong>No ads, ever.</strong> Your inbox is a tool, not a billboard.</li>
+        <li><strong>No content scanning for marketing.</strong> Automated processing exists only to deliver mail, filter spam, and provide features you turn on.</li>
+        <li><strong>No data sales.</strong> We never sell or rent your personal data.</li>
+        <li><strong>No model training on your content.</strong> Your mail, calendars, and contacts are not used to train machine-learning models.</li>
+        <li><strong>You can leave.</strong> Export everything at any time; we cryptographically delete data after the cancellation grace period.</li>
+      </ul>
+
+      <h2>What we collect</h2>
+      <p>
+        To run the service we process your account details (email, organization,
+        billing), the mail and calendar data you store, and operational metadata
+        such as logs and aggregate availability metrics. We minimize retention and
+        scope every record to your tenant.
+      </p>
+
+      <h2>Sub-processors</h2>
+      <p>
+        We use a small set of infrastructure and payment providers (for example,
+        a payment processor for billing). A current list of sub-processors is
+        available on request and updated before any material change.
+      </p>
+
+      <h2>Data residency &amp; your rights</h2>
+      <p>
+        EU data-residency options are available. You can access, export, correct,
+        or delete your data. To exercise these rights or ask a privacy question,
+        contact <a href="mailto:privacy@kmail.kchat.dev">privacy@kmail.kchat.dev</a>.
+      </p>
+
+      <p class="muted">
+        This page summarizes our approach to privacy and is not a substitute for
+        the full Data Processing Agreement available to customers.
+      </p>
+    </div>
+  </section>
+
+  <CTA />
+</BaseLayout>

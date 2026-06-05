@@ -1,0 +1,106 @@
+---
+import { PLANS } from "../data/plans";
+import { SITE } from "../data/site";
+---
+
+<div class="pricing-cards grid grid--3">
+  {
+    PLANS.map((plan) => (
+      <div class:list={["plan", { "plan--featured": plan.highlighted }]}>
+        {plan.highlighted && <span class="plan__ribbon">Most popular</span>}
+        <h3 class="plan__name">{plan.name}</h3>
+        <p class="plan__price">
+          <span class="plan__amount">${plan.priceUsd}</span>
+          <span class="plan__unit muted">/ seat / mo</span>
+        </p>
+        <p class="plan__tagline muted">{plan.tagline}</p>
+        <a
+          class:list={["btn", plan.highlighted ? "btn--primary" : "btn--ghost"]}
+          href={`${SITE.signupUrl}?plan=${plan.id}`}
+        >
+          Start with {plan.name}
+        </a>
+        <ul class="plan__features">
+          {plan.features.map((f) => (
+            <li>
+              <span class="plan__check" aria-hidden="true">✓</span>
+              {f}
+            </li>
+          ))}
+        </ul>
+        <p class="plan__meta muted">
+          {plan.storagePerSeatGB} GB / seat · {plan.dailySendLimit.toLocaleString()}{" "}
+          sends / day
+        </p>
+      </div>
+    ))
+  }
+</div>
+
+<style>
+  .plan {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    background: var(--c-bg);
+    border: 1px solid var(--c-border);
+    border-radius: var(--radius);
+    padding: 1.75rem 1.5rem;
+    box-shadow: var(--shadow-sm);
+  }
+  .plan--featured {
+    border-color: var(--c-brand);
+    box-shadow: var(--shadow);
+  }
+  .plan__ribbon {
+    position: absolute;
+    top: -12px;
+    right: 1.25rem;
+    background: var(--c-brand);
+    color: #fff;
+    font-size: 0.75rem;
+    font-weight: 700;
+    padding: 0.25rem 0.6rem;
+    border-radius: 999px;
+  }
+  .plan__name {
+    margin: 0;
+  }
+  .plan__price {
+    margin: 0;
+  }
+  .plan__amount {
+    font-size: 2.5rem;
+    font-weight: 800;
+    letter-spacing: -0.02em;
+  }
+  .plan__tagline {
+    min-height: 3rem;
+    font-size: 0.95rem;
+  }
+  .plan__features {
+    list-style: none;
+    margin: 0.5rem 0 0;
+    padding: 0;
+    display: grid;
+    gap: 0.5rem;
+  }
+  .plan__features li {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 0.5rem;
+    align-items: start;
+    font-size: 0.95rem;
+  }
+  .plan__check {
+    color: var(--c-success);
+    font-weight: 700;
+  }
+  .plan__meta {
+    margin-top: auto;
+    padding-top: 0.75rem;
+    font-size: 0.85rem;
+    border-top: 1px dashed var(--c-border);
+  }
+</style>

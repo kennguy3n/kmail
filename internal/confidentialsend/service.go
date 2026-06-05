@@ -40,6 +40,19 @@ type SecureMessage struct {
 	ViewCount        int       `json:"view_count"`
 	Revoked          bool      `json:"revoked"`
 	CreatedAt        time.Time `json:"created_at"`
+
+	// MLS fields. Populated only when the message was wrapped
+	// under an MLS-derived key (i.e. MLS is configured AND the
+	// caller supplied sender-leaf + recipient material). For a
+	// plain link-portal message these are zero-valued and
+	// MLSWrapped reports false.
+	//
+	// MLSWrappingKey is for server-side bookkeeping (rekey/rotation)
+	// only — GetSecureMessage strips it before returning over the
+	// public portal so it is never handed to a link-token holder.
+	MLSWrapped     bool   `json:"mls_wrapped"`
+	MLSWrappingKey string `json:"mls_wrapping_key,omitempty"`
+	MLSEpoch       int    `json:"mls_epoch"`
 }
 
 // CreateRequest is the input to CreateSecureMessage.
@@ -50,13 +63,24 @@ type CreateRequest struct {
 	Password         string        `json:"password,omitempty"`
 	ExpiresIn        time.Duration `json:"expires_in"`
 	MaxViews         int           `json:"max_views"`
+
+	// MLS wrapping inputs. When MLS is configured and BOTH of
+	// these are supplied, CreateSecureMessage derives a
+	// per-recipient wrapping key from the KChat MLS service and
+	// persists it on the link. When MLS is disabled, or the
+	// caller omits both, the message degrades to the link-portal
+	// flow. Supplying exactly one is a request error — it almost
+	// always signals a client that thinks it is sending MLS but
+	// isn't.
+	SenderLeafKey string   `json:"sender_leaf_key,omitempty"`
+	Recipients    []string `json:"recipients,omitempty"`
 }
 
 // Service is the implementation.
 type Service struct {
-	pool   *pgxpool.Pool
-	now    func() time.Time
-	mls    MLSKeyDeriver
+	pool *pgxpool.Pool
+	now  func() time.Time
+	mls  MLSKeyDeriver
 }
 
 // NewService returns a service.
@@ -96,16 +120,136 @@ func (s *Service) DeriveMLSWrappingKey(ctx context.Context, senderLeafKey, recip
 }
 
 // RekeyConfidentialMessage triggers an MLS rekey when the
-// participant set on a confidential thread changes.
-func (s *Service) RekeyConfidentialMessage(ctx context.Context, messageID string, newParticipants []string) (string, error) {
+// participant set on a confidential link changes (a participant is
+// added or removed). It asks the MLS service for a fresh wrapping
+// key, then atomically persists the new key, the updated
+// participant set, and a bumped epoch on the link row. The new
+// wrapping key is returned so the caller can re-wrap the DEK.
+//
+// The link is loaded tenant-scoped and must be an MLS-wrapped link
+// (created with sender-leaf material); rekeying a plain link-portal
+// message is rejected with ErrLinkNotFound rather than silently
+// upgrading it.
+func (s *Service) RekeyConfidentialMessage(ctx context.Context, tenantID, linkID string, newParticipants []string) (string, error) {
 	if !s.MLSEnabled() {
 		return "", ErrMLSDisabled
 	}
-	return s.mls.RekeyConfidentialMessage(ctx, messageID, newParticipants)
+	if strings.TrimSpace(tenantID) == "" || strings.TrimSpace(linkID) == "" {
+		return "", fmt.Errorf("%w: tenantID and linkID required", ErrInvalidRekeyRequest)
+	}
+	if len(newParticipants) == 0 {
+		return "", fmt.Errorf("%w: rekey requires at least one participant", ErrInvalidRekeyRequest)
+	}
+	if s.pool == nil {
+		return "", errors.New("confidentialsend: pool not configured")
+	}
+	newKey, err := s.mls.RekeyConfidentialMessage(ctx, linkID, newParticipants)
+	if err != nil {
+		return "", fmt.Errorf("confidentialsend: MLS rekey: %w", err)
+	}
+	err = pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
+			return err
+		}
+		tag, err := tx.Exec(ctx, `
+			UPDATE confidential_send_links
+			SET mls_wrapping_key = $3,
+			    mls_participants  = $4,
+			    mls_epoch         = mls_epoch + 1
+			WHERE tenant_id = $1::uuid
+			  AND id = $2::uuid
+			  AND mls_sender_leaf_key <> ''
+		`, tenantID, linkID, newKey, newParticipants)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return ErrLinkNotFound
+		}
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	return newKey, nil
+}
+
+// ErrInvalidRekeyRequest is returned when a rekey request is missing
+// required caller input (no tenant/link id, or an empty participant
+// set). The request never reaches the upstream MLS service, so the
+// HTTP layer maps this to 400 (client error) rather than 502 — a
+// misclassified 5xx would trip false upstream-failure alerts.
+var ErrInvalidRekeyRequest = errors.New("confidentialsend: invalid rekey request")
+
+// ErrMLSPartialRequest is returned when a create request supplies
+// only one of sender_leaf_key / recipients. MLS wrapping needs
+// both; receiving one strongly suggests a client that believes it
+// is sending an MLS-wrapped message but is silently falling back to
+// the link portal — surfacing an error is safer than degrading
+// without telling the caller.
+var ErrMLSPartialRequest = errors.New("confidentialsend: MLS send requires both sender_leaf_key and recipients")
+
+// ErrMLSDeriveFailed wraps a server-side failure to derive the MLS
+// wrapping key (MLS endpoint down / 5xx / network error). The create
+// request itself was well-formed, so the HTTP layer maps this to 502
+// (upstream failure) rather than 400 — mirroring the mlsWrap/mlsRekey
+// handlers. It does NOT cover ErrMLSPartialRequest or ErrMLSDisabled,
+// which are client/config conditions handled separately.
+var ErrMLSDeriveFailed = errors.New("confidentialsend: MLS wrapping-key derivation failed")
+
+// wrapResult carries the MLS material resolved for a new link.
+type wrapResult struct {
+	wrapped      bool
+	wrappingKey  string
+	senderLeaf   string
+	participants []string
+}
+
+// resolveCreateWrapping decides whether a create request is an MLS
+// send and, if so, derives the per-recipient wrapping key from the
+// MLS service. It is intentionally pool-free so the MLS decision is
+// unit-testable without a database.
+//
+//   - MLS not configured            -> link-only (no error)
+//   - MLS configured, no MLS inputs -> link-only (no error)
+//   - exactly one MLS input         -> ErrMLSPartialRequest
+//   - both MLS inputs               -> derive against the service
+func (s *Service) resolveCreateWrapping(ctx context.Context, req CreateRequest) (wrapResult, error) {
+	hasLeaf := strings.TrimSpace(req.SenderLeafKey) != ""
+	hasRecipients := len(req.Recipients) > 0
+	if !hasLeaf && !hasRecipients {
+		return wrapResult{}, nil
+	}
+	if hasLeaf != hasRecipients {
+		return wrapResult{}, ErrMLSPartialRequest
+	}
+	if !s.MLSEnabled() {
+		// The caller asked for MLS but the deployment has no MLS
+		// endpoint wired. Fail loudly rather than minting a link
+		// that pretends to be MLS-protected.
+		return wrapResult{}, ErrMLSDisabled
+	}
+	// One link addresses one external recipient in the portal
+	// model; the first credential is the wrapping target and the
+	// full slice is retained as the participant set for rekey.
+	key, err := s.mls.DeriveWrappingKey(ctx, req.SenderLeafKey, req.Recipients[0])
+	if err != nil {
+		// Tag with ErrMLSDeriveFailed so the HTTP layer can return
+		// 502 (upstream failure) rather than 400 — the request was
+		// valid, the MLS service failed.
+		return wrapResult{}, fmt.Errorf("%w: %w", ErrMLSDeriveFailed, err)
+	}
+	return wrapResult{
+		wrapped:      true,
+		wrappingKey:  key,
+		senderLeaf:   req.SenderLeafKey,
+		participants: req.Recipients,
+	}, nil
 }
 
 // CreateSecureMessage mints a token, hashes the password (if
-// provided), and inserts a row.
+// provided), derives an MLS wrapping key when requested, and
+// inserts a row.
 func (s *Service) CreateSecureMessage(ctx context.Context, req CreateRequest) (*SecureMessage, error) {
 	if strings.TrimSpace(req.TenantID) == "" {
 		return nil, errors.New("confidentialsend: tenant_id required")
@@ -125,6 +269,13 @@ func (s *Service) CreateSecureMessage(ctx context.Context, req CreateRequest) (*
 	if req.MaxViews < 0 {
 		return nil, errors.New("confidentialsend: max_views must be >= 0 (0 = unlimited)")
 	}
+	// Resolve MLS wrapping BEFORE touching the database so a
+	// failed derivation (or partial request) never leaves a
+	// dangling link row.
+	wrap, err := s.resolveCreateWrapping(ctx, req)
+	if err != nil {
+		return nil, err
+	}
 	if s.pool == nil {
 		return nil, errors.New("confidentialsend: pool not configured")
 	}
@@ -142,6 +293,16 @@ func (s *Service) CreateSecureMessage(ctx context.Context, req CreateRequest) (*
 	}
 	expiresAt := s.now().Add(req.ExpiresIn)
 
+	// mls_participants is TEXT[] NOT NULL: a nil slice (every
+	// link-only send, where resolveCreateWrapping returns a zero
+	// wrapResult) would encode as SQL NULL and violate the
+	// constraint. Coerce to an empty array so the link-portal path
+	// inserts cleanly.
+	participants := wrap.participants
+	if participants == nil {
+		participants = []string{}
+	}
+
 	var m SecureMessage
 	err = pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		if err := middleware.SetTenantGUC(ctx, tx, req.TenantID); err != nil {
@@ -150,23 +311,27 @@ func (s *Service) CreateSecureMessage(ctx context.Context, req CreateRequest) (*
 		return tx.QueryRow(ctx, `
 			INSERT INTO confidential_send_links (
 				tenant_id, sender_id, link_token, encrypted_blob_ref,
-				password_hash, expires_at, max_views
-			) VALUES ($1::uuid, $2, $3, $4, $5, $6, $7)
+				password_hash, expires_at, max_views,
+				mls_wrapping_key, mls_sender_leaf_key, mls_participants
+			) VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 			RETURNING id::text, tenant_id::text, sender_id, link_token,
 			          encrypted_blob_ref, expires_at, max_views, view_count,
-			          revoked, created_at
+			          revoked, created_at, mls_epoch
 		`, req.TenantID, req.SenderID, token, req.EncryptedBlobRef,
 			passwordHash, expiresAt, req.MaxViews,
+			wrap.wrappingKey, wrap.senderLeaf, participants,
 		).Scan(
 			&m.ID, &m.TenantID, &m.SenderID, &m.LinkToken,
 			&m.EncryptedBlobRef, &m.ExpiresAt, &m.MaxViews, &m.ViewCount,
-			&m.Revoked, &m.CreatedAt,
+			&m.Revoked, &m.CreatedAt, &m.MLSEpoch,
 		)
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create secure message: %w", err)
 	}
 	m.HasPassword = passwordHash != ""
+	m.MLSWrapped = wrap.wrapped
+	m.MLSWrappingKey = wrap.wrappingKey
 	return &m, nil
 }
 
@@ -206,7 +371,8 @@ func (s *Service) GetSecureMessage(ctx context.Context, token, password string) 
 		err := tx.QueryRow(ctx, `
 			SELECT id::text, tenant_id::text, sender_id, link_token,
 			       encrypted_blob_ref, password_hash, expires_at,
-			       max_views, view_count, revoked, created_at
+			       max_views, view_count, revoked, created_at,
+			       mls_wrapping_key, mls_epoch
 			FROM confidential_send_links
 			WHERE link_token = $1
 			FOR UPDATE
@@ -214,6 +380,7 @@ func (s *Service) GetSecureMessage(ctx context.Context, token, password string) 
 			&m.ID, &m.TenantID, &m.SenderID, &m.LinkToken,
 			&m.EncryptedBlobRef, &passwordHash, &m.ExpiresAt,
 			&m.MaxViews, &m.ViewCount, &m.Revoked, &m.CreatedAt,
+			&m.MLSWrappingKey, &m.MLSEpoch,
 		)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrLinkNotFound
@@ -250,6 +417,17 @@ func (s *Service) GetSecureMessage(ctx context.Context, token, password string) 
 		return nil, err
 	}
 	m.HasPassword = passwordHash != ""
+	m.MLSWrapped = m.MLSWrappingKey != ""
+	// The MLS wrapping key is deliberately NOT served over the public
+	// portal. For an MLS-wrapped message the recipient is an MLS group
+	// member and re-derives the wrapping key from group state via the
+	// auth-gated MLS path; emitting it here would hand the key to any
+	// holder of the (unauthenticated) link token and defeat the
+	// confidentiality the MLS wrapping is meant to provide — the BFF
+	// would effectively distribute the unwrap key to portal visitors.
+	// The portal exposes only MLSWrapped + MLSEpoch so the client
+	// knows to take the MLS-derivation path at the correct epoch.
+	m.MLSWrappingKey = ""
 	return &m, nil
 }
 
@@ -297,7 +475,8 @@ func (s *Service) ListSentSecureMessages(ctx context.Context, tenantID, senderID
 			rows, err = tx.Query(ctx, `
 				SELECT id::text, tenant_id::text, sender_id, link_token,
 				       password_hash <> '' AS has_password, expires_at,
-				       max_views, view_count, revoked, created_at
+				       max_views, view_count, revoked, created_at,
+				       mls_sender_leaf_key <> '' AS mls_wrapped, mls_epoch
 				FROM confidential_send_links
 				WHERE tenant_id = $1::uuid
 				ORDER BY created_at DESC
@@ -307,7 +486,8 @@ func (s *Service) ListSentSecureMessages(ctx context.Context, tenantID, senderID
 			rows, err = tx.Query(ctx, `
 				SELECT id::text, tenant_id::text, sender_id, link_token,
 				       password_hash <> '' AS has_password, expires_at,
-				       max_views, view_count, revoked, created_at
+				       max_views, view_count, revoked, created_at,
+				       mls_sender_leaf_key <> '' AS mls_wrapped, mls_epoch
 				FROM confidential_send_links
 				WHERE tenant_id = $1::uuid AND sender_id = $2
 				ORDER BY created_at DESC
@@ -323,7 +503,7 @@ func (s *Service) ListSentSecureMessages(ctx context.Context, tenantID, senderID
 			if err := rows.Scan(
 				&m.ID, &m.TenantID, &m.SenderID, &m.LinkToken,
 				&m.HasPassword, &m.ExpiresAt, &m.MaxViews, &m.ViewCount,
-				&m.Revoked, &m.CreatedAt,
+				&m.Revoked, &m.CreatedAt, &m.MLSWrapped, &m.MLSEpoch,
 			); err != nil {
 				return err
 			}

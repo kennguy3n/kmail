@@ -10,8 +10,8 @@ import (
 // RequestLogger returns middleware that emits a single log line per
 // request. Format is controlled by `format`: "json" emits one JSON
 // object per line with `method`, `path`, `status`, `duration_ms`,
-// `tenant_id`, `user_id`, and `trace_id` fields; anything else (or
-// empty) falls back to the previous text format.
+// `tenant_id`, `user_id`, `request_id`, and `trace_id` fields;
+// anything else (or empty) falls back to the previous text format.
 func RequestLogger(logger *log.Logger, format string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -32,6 +32,9 @@ func RequestLogger(logger *log.Logger, format string) func(http.Handler) http.Ha
 				}
 				if uid := KChatUserIDFrom(r.Context()); uid != "" {
 					rec["user_id"] = uid
+				}
+				if rid := RequestIDFrom(r.Context()); rid != "" {
+					rec["request_id"] = rid
 				}
 				if trid := TraceIDFrom(r.Context()); trid != "" {
 					rec["trace_id"] = trid

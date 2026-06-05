@@ -17,6 +17,7 @@
 
 #![deny(clippy::all)]
 
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 #[cfg(test)]
@@ -123,6 +124,31 @@ pub struct JsSyncSummary {
     pub pending_actions_applied: BigInt,
     pub pending_actions_failed: BigInt,
     pub pending_actions_deferred: BigInt,
+}
+
+/// Renderable local notification, mirroring
+/// [`kmail_core::LocalNotification`]. The Electron main process maps
+/// this onto an OS-level `Notification`.
+#[napi(object)]
+pub struct JsLocalNotification {
+    pub title: String,
+    pub body: String,
+    pub tag: String,
+    pub account_id: Option<String>,
+    pub email_id: Option<String>,
+    pub mailbox_id: Option<String>,
+    pub thread_id: Option<String>,
+    pub received_at_unix: Option<i64>,
+    pub has_attachment: bool,
+}
+
+/// Outcome of [`KMailClientJs::ingest_push_delivery`], mirroring
+/// [`kmail_core::PushIngestOutcome`].
+#[napi(object)]
+pub struct JsPushIngestOutcome {
+    pub notification: Option<JsLocalNotification>,
+    pub email_cached: bool,
+    pub needs_delta_sync: bool,
 }
 
 /// AEAD envelope at the napi boundary.
@@ -304,6 +330,28 @@ fn sync_summary_to_js(s: kmail_core::SyncSummary) -> JsSyncSummary {
         pending_actions_applied: bigint_u64(s.pending_actions_applied),
         pending_actions_failed: bigint_u64(s.pending_actions_failed),
         pending_actions_deferred: bigint_u64(s.pending_actions_deferred),
+    }
+}
+
+fn notification_to_js(n: kmail_core::LocalNotification) -> JsLocalNotification {
+    JsLocalNotification {
+        title: n.title,
+        body: n.body,
+        tag: n.tag,
+        account_id: n.account_id,
+        email_id: n.email_id,
+        mailbox_id: n.mailbox_id,
+        thread_id: n.thread_id,
+        received_at_unix: n.received_at_unix,
+        has_attachment: n.has_attachment,
+    }
+}
+
+fn push_outcome_to_js(o: kmail_core::PushIngestOutcome) -> JsPushIngestOutcome {
+    JsPushIngestOutcome {
+        notification: o.notification.map(notification_to_js),
+        email_cached: o.email_cached,
+        needs_delta_sync: o.needs_delta_sync,
     }
 }
 
@@ -511,6 +559,26 @@ impl KMailClientJs {
             .register_push_token(kmail_core::push::PushTransport::Fcm, &token, None)
             .await
             .map_err(napi_err)
+    }
+
+    /// Ingest a transport-level push payload (the raw notification
+    /// `data` map) and return the parsed notification plus sync
+    /// flags.
+    ///
+    /// Synchronous (a parse + one local SQLite upsert). Background
+    /// sync on desktop is driven from the Electron main process with
+    /// `setInterval(() => client.sync(), …)` rather than a Rust-side
+    /// worker — `setInterval` integrates with Electron's lifecycle
+    /// (pause on `powerMonitor` suspend, clear on `before-quit`),
+    /// which a detached Rust task cannot observe.
+    #[napi]
+    pub fn ingest_push_delivery(
+        &self,
+        data: HashMap<String, String>,
+    ) -> Result<JsPushIngestOutcome> {
+        let data: BTreeMap<String, String> = data.into_iter().collect();
+        let outcome = self.inner.ingest_push_delivery(&data).map_err(napi_err)?;
+        Ok(push_outcome_to_js(outcome))
     }
 
     // ---------------------------------------------------------

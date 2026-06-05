@@ -23,12 +23,30 @@ import {
 import { createSecureMessage } from "../../api/confidentialSend";
 import { cancelPendingSend } from "../../api/undoSend";
 import { useTenantSelection } from "../Admin/useTenantSelection";
+import {
+  defaultSignatureFor,
+  listSignatures,
+} from "../../api/signatures";
+import { listTemplates } from "../../api/templates";
+import RichTextEditor from "./RichTextEditor";
+import ContactPicker from "./ContactPicker";
+import TemplatePicker from "./TemplatePicker";
+import { formatBytes } from "./messageContent";
+import {
+  escapeHtml,
+  htmlToPlainText,
+  isHtmlEmpty,
+  plainTextToHtml,
+} from "./richText";
+import { newId as genId } from "../../api/localStore";
 import type {
+  DraftAttachment,
   EmailAddress,
   EmailDraft,
   Identity,
   Mailbox,
   PrivacyMode,
+  Signature,
 } from "../../types";
 
 /** Compose-side options that only apply when privacyMode is "confidential-send". */
@@ -183,12 +201,45 @@ export default function Compose() {
   const [scheduledConfirm, setScheduledConfirm] =
     useState<{ id: string; sendAt: Date } | null>(null);
 
+  // Rich-text composition (WS2). `body` holds the plain-text source
+  // of truth; `html` holds the rich body. `bodyMode` selects which
+  // editor is active; toggling converts between the two so no
+  // content is lost.
+  const [bodyMode, setBodyMode] = useState<"rich" | "plain">("rich");
+  const [html, setHtml] = useState(() =>
+    seed?.quotedBody ? plainTextToHtml(initialBody(seed)) : "",
+  );
+  // Real MIME attachments (files + inline images) referenced by JMAP
+  // blob id. Inline images additionally carry a `cid` so the HTML
+  // body can reference them via `cid:` after a send-time rewrite.
+  const [attachments, setAttachments] = useState<DraftAttachment[]>([]);
+  // Maps an in-editor object-URL to the `cid` we'll rewrite it to at
+  // send time. Held in a ref so editor re-renders don't churn it.
+  const inlineCidRef = useRef<Map<string, string>>(new Map());
+  const [signatures, setSignatures] = useState<Signature[]>([]);
+  const [signatureId, setSignatureId] = useState<string>("");
+  const [templates, setTemplates] = useState(() => listTemplates());
+  const [templatePickerOpen, setTemplatePickerOpen] = useState(false);
+  const [requestReceipt, setRequestReceipt] = useState(false);
+  const [isDragging, setDragging] = useState(false);
+  const [fileUploading, setFileUploading] = useState(false);
+
   useEffect(() => {
+    // Capture the ref's Map instance so the cleanup revokes whatever
+    // object URLs exist at unmount even if the ref were reassigned.
+    const inlineUrls = inlineCidRef.current;
     return () => {
       if (navTimerRef.current) {
         clearTimeout(navTimerRef.current);
         navTimerRef.current = null;
       }
+      // Inline-image object URLs (keys of the cid map) live for the
+      // whole compose session; revoke them on unmount so a long
+      // session that pastes many images doesn't leak blob references.
+      for (const objectUrl of inlineUrls.keys()) {
+        URL.revokeObjectURL(objectUrl);
+      }
+      inlineUrls.clear();
     };
   }, []);
 
@@ -270,6 +321,10 @@ export default function Compose() {
     };
   }, []);
 
+  useEffect(() => {
+    setSignatures(listSignatures());
+  }, []);
+
   const draftsMailbox = useMemo(
     () => (mailboxes ?? []).find((m) => m.role === "drafts") ?? null,
     [mailboxes],
@@ -282,6 +337,21 @@ export default function Compose() {
       null,
     [identities, selectedIdentityId],
   );
+
+  // Preselect the identity's default signature once both the
+  // identity and the signature list are known. We only seed an
+  // initial choice — a user who picks "No signature" or another one
+  // is never overridden.
+  const signatureSeededRef = useRef(false);
+  useEffect(() => {
+    if (signatureSeededRef.current) return;
+    if (!identity || signatures.length === 0) return;
+    const def = defaultSignatureFor(identity.email);
+    if (def) {
+      setSignatureId(def.id);
+      signatureSeededRef.current = true;
+    }
+  }, [identity, signatures]);
 
   const canSubmit =
     !!draftsMailbox &&
@@ -306,17 +376,39 @@ export default function Compose() {
       list.filter((a) => a.email.trim().toLowerCase() !== self);
     const toList = strip(parseAddresses(to));
     if (requireTo && toList.length === 0) return null;
-    return {
+
+    const signature = signatures.find((s) => s.id === signatureId) ?? null;
+    const draft: EmailDraft = {
       mailboxIds: { [draftsMailbox.id]: true },
       from: [{ name: identity.name || null, email: identity.email }],
       to: toList,
       cc: strip(parseAddresses(cc)),
       bcc: strip(parseAddresses(bcc)),
       subject: subject.trim(),
-      textBody: body,
       privacyMode,
       identityId: identity.id,
     };
+
+    if (bodyMode === "rich") {
+      // Rewrite in-editor object URLs for pasted/inserted images to
+      // the `cid:` references their inline MIME parts will carry, so
+      // the recipient's client resolves them against the attachment.
+      let outHtml = rewriteInlineCids(html, inlineCidRef.current);
+      if (signature) outHtml = appendHtmlSignature(outHtml, signature.html);
+      draft.htmlBody = outHtml;
+      // Always carry a text/plain alternative for non-HTML clients.
+      draft.textBody = htmlToPlainText(outHtml);
+    } else {
+      let outText = body;
+      if (signature) {
+        outText = `${outText}\n\n-- \n${htmlToPlainText(signature.html)}`;
+      }
+      draft.textBody = outText;
+    }
+
+    if (attachments.length > 0) draft.attachments = attachments;
+    if (requestReceipt) draft.readReceiptTo = identity.email;
+    return draft;
   };
 
   const handleSend = async (e: FormEvent) => {
@@ -499,6 +591,89 @@ export default function Compose() {
     }
   };
 
+  // Upload a pasted/inserted image as an inline attachment and hand
+  // the editor an object URL to display now; the URL→cid mapping is
+  // resolved into a real `cid:` reference at send time.
+  const handleInlineImageUpload = async (file: File): Promise<string> => {
+    const { blobId, type, size } = await jmapClient.uploadBlob(file, file.name);
+    const cid = `${genId()}@kmail`;
+    const objectUrl = URL.createObjectURL(file);
+    inlineCidRef.current.set(objectUrl, cid);
+    setAttachments((cur) => [
+      ...cur,
+      {
+        blobId,
+        name: file.name || "image",
+        type: type || file.type || "image/png",
+        size,
+        inline: true,
+        cid,
+      },
+    ]);
+    return objectUrl;
+  };
+
+  // Upload one or more files as ordinary (non-inline) attachments.
+  const handleFiles = async (files: FileList | File[]) => {
+    const list = Array.from(files);
+    if (list.length === 0) return;
+    setFileUploading(true);
+    setAttachmentError(null);
+    try {
+      for (const f of list) {
+        const { blobId, type, size } = await jmapClient.uploadBlob(f, f.name);
+        setAttachments((cur) => [
+          ...cur,
+          {
+            blobId,
+            name: f.name || "attachment",
+            type: type || f.type || "application/octet-stream",
+            size,
+            inline: false,
+          },
+        ]);
+      }
+    } catch (err: unknown) {
+      setAttachmentError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setFileUploading(false);
+    }
+  };
+
+  const removeAttachment = (index: number) => {
+    setAttachments((cur) => cur.filter((_, i) => i !== index));
+  };
+
+  const toggleBodyMode = () => {
+    if (bodyMode === "rich") {
+      setBody(htmlToPlainText(html));
+      setBodyMode("plain");
+    } else {
+      setHtml(plainTextToHtml(body));
+      setBodyMode("rich");
+    }
+  };
+
+  const applyTemplate = (result: { subject: string; body: string }) => {
+    if (result.subject) setSubject(result.subject);
+    if (bodyMode === "rich") {
+      setHtml((cur) =>
+        cur && !isHtmlEmpty(cur) ? `${cur}${result.body}` : result.body,
+      );
+    } else {
+      const text = htmlToPlainText(result.body);
+      setBody((cur) => (cur ? `${cur}\n${text}` : text));
+    }
+    setTemplatePickerOpen(false);
+  };
+
+  const onComposeDrop = (e: React.DragEvent<HTMLDivElement>) => {
+    if (!e.dataTransfer.files || e.dataTransfer.files.length === 0) return;
+    e.preventDefault();
+    setDragging(false);
+    void handleFiles(e.dataTransfer.files);
+  };
+
   const heading =
     seed?.mode === "reply" || seed?.mode === "replyAll"
       ? "Reply"
@@ -589,41 +764,63 @@ export default function Compose() {
           </select>
         </div>
         <div style={styles.row}>
+          <label htmlFor="compose-signature" style={styles.label}>
+            Signature
+          </label>
+          <select
+            id="compose-signature"
+            value={signatureId}
+            onChange={(e) => setSignatureId(e.target.value)}
+            style={styles.select}
+          >
+            <option value="">No signature</option>
+            {signatures.map((s) => (
+              <option key={s.id} value={s.id}>
+                {s.name}
+                {s.isDefault ? " (default)" : ""}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div style={styles.row}>
           <label htmlFor="compose-to" style={styles.label}>
             To
           </label>
-          <input
+          <ContactPicker
             id="compose-to"
-            type="text"
             value={to}
-            onChange={(e) => setTo(e.target.value)}
+            onChange={setTo}
+            tenantId={selectedTenantId}
             placeholder="name@example.com, other@example.com"
-            style={styles.input}
             required
+            ariaLabel="To recipients"
+            inputStyle={styles.input}
           />
         </div>
         <div style={styles.row}>
           <label htmlFor="compose-cc" style={styles.label}>
             Cc
           </label>
-          <input
+          <ContactPicker
             id="compose-cc"
-            type="text"
             value={cc}
-            onChange={(e) => setCc(e.target.value)}
-            style={styles.input}
+            onChange={setCc}
+            tenantId={selectedTenantId}
+            ariaLabel="Cc recipients"
+            inputStyle={styles.input}
           />
         </div>
         <div style={styles.row}>
           <label htmlFor="compose-bcc" style={styles.label}>
             Bcc
           </label>
-          <input
+          <ContactPicker
             id="compose-bcc"
-            type="text"
             value={bcc}
-            onChange={(e) => setBcc(e.target.value)}
-            style={styles.input}
+            onChange={setBcc}
+            tenantId={selectedTenantId}
+            ariaLabel="Bcc recipients"
+            inputStyle={styles.input}
           />
         </div>
         {/* WS7: frequent contacts + co-recipient suggestions */}
@@ -792,62 +989,173 @@ export default function Compose() {
           <div>
             <input
               type="file"
+              multiple
+              aria-label="Attach files"
               onChange={(e) => {
-                const file = e.target.files?.[0];
-                if (!file) return;
-                if (file.size < ATTACHMENT_LINK_THRESHOLD_BYTES) {
-                  setAttachmentError(
-                    "Files under 10 MB are not yet supported by this form; use a larger file or paste inline.",
-                  );
-                  e.target.value = "";
-                  return;
+                if (e.target.files && e.target.files.length > 0) {
+                  void handleFiles(e.target.files);
                 }
-                setAttachmentError(null);
-                setAttachmentUploading(true);
-                uploadLargeAttachment(file)
-                  .then((link) => {
-                    setAttachmentLinks((cur) => [...cur, link]);
-                    setBody(
-                      (b) =>
-                        `${b}${b && !b.endsWith("\n") ? "\n" : ""}\nAttachment: ${link.filename} — ${link.url}\n`,
-                    );
-                  })
-                  .catch((err: unknown) =>
-                    setAttachmentError(err instanceof Error ? err.message : String(err)),
-                  )
-                  .finally(() => {
-                    setAttachmentUploading(false);
-                    e.target.value = "";
-                  });
+                e.target.value = "";
               }}
-              disabled={attachmentUploading}
+              disabled={fileUploading}
             />
-            {attachmentUploading && <span>&nbsp;Uploading…</span>}
+            {fileUploading && <span>&nbsp;Uploading…</span>}
+            {attachments.filter((a) => !a.inline).length > 0 && (
+              <ul style={styles.attachmentList}>
+                {attachments.map((a, i) =>
+                  a.inline ? null : (
+                    <li key={a.blobId || `att-${i}`} style={styles.attachmentItem}>
+                      <span>
+                        {a.name}
+                        {typeof a.size === "number"
+                          ? ` (${formatBytes(a.size)})`
+                          : ""}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => removeAttachment(i)}
+                        style={styles.attachmentRemove}
+                        aria-label={`Remove ${a.name}`}
+                      >
+                        ×
+                      </button>
+                    </li>
+                  ),
+                )}
+              </ul>
+            )}
+            <details style={styles.largeFileDetails}>
+              <summary style={styles.largeFileSummary}>
+                Send a large file as a link (over 10 MB)
+              </summary>
+              <input
+                type="file"
+                aria-label="Large file to link"
+                onChange={(e) => {
+                  const file = e.target.files?.[0];
+                  if (!file) return;
+                  if (file.size < ATTACHMENT_LINK_THRESHOLD_BYTES) {
+                    setAttachmentError(
+                      "This option is for files over 10 MB; smaller files can be attached directly above.",
+                    );
+                    e.target.value = "";
+                    return;
+                  }
+                  setAttachmentError(null);
+                  setAttachmentUploading(true);
+                  uploadLargeAttachment(file)
+                    .then((link) => {
+                      setAttachmentLinks((cur) => [...cur, link]);
+                      // Insert the link into whichever body the active
+                      // mode actually sends: buildDraft reads `html` in
+                      // rich mode and `body` in plain mode, so appending
+                      // only to `body` would silently drop the link from
+                      // a rich-text message.
+                      if (bodyMode === "rich") {
+                        const anchor = `<a href="${escapeHtml(link.url)}">${escapeHtml(link.filename)}</a>`;
+                        setHtml(
+                          (h) => `${h}<p>Attachment: ${anchor}</p>`,
+                        );
+                      } else {
+                        setBody(
+                          (b) =>
+                            `${b}${b && !b.endsWith("\n") ? "\n" : ""}\nAttachment: ${link.filename} — ${link.url}\n`,
+                        );
+                      }
+                    })
+                    .catch((err: unknown) =>
+                      setAttachmentError(
+                        err instanceof Error ? err.message : String(err),
+                      ),
+                    )
+                    .finally(() => {
+                      setAttachmentUploading(false);
+                      e.target.value = "";
+                    });
+                }}
+                disabled={attachmentUploading}
+              />
+              {attachmentUploading && <span>&nbsp;Uploading…</span>}
+              {attachmentLinks.length > 0 && (
+                <ul style={{ margin: "0.25rem 0 0", paddingLeft: "1.2rem" }}>
+                  {attachmentLinks.map((a) => (
+                    <li key={a.id || a.url}>
+                      {a.filename} ({Math.round(a.size_bytes / 1024 / 1024)} MB)
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </details>
             {attachmentError && (
               <p role="alert" style={{ color: "#991b1b", margin: "0.25rem 0 0" }}>
                 {attachmentError}
               </p>
             )}
-            {attachmentLinks.length > 0 && (
-              <ul style={{ margin: "0.25rem 0 0", paddingLeft: "1.2rem" }}>
-                {attachmentLinks.map((a) => (
-                  <li key={a.id || a.url}>
-                    {a.filename} ({Math.round(a.size_bytes / 1024 / 1024)} MB)
-                  </li>
-                ))}
-              </ul>
-            )}
           </div>
         </div>
-        <div style={styles.bodyRow}>
-          <textarea
-            aria-label="Message body"
-            value={body}
-            onChange={(e) => setBody(e.target.value)}
-            placeholder="Write your message…"
-            style={styles.textarea}
-            rows={16}
-          />
+        <div style={styles.composeToolbar}>
+          <button
+            type="button"
+            onClick={toggleBodyMode}
+            style={styles.toolbarButton}
+          >
+            {bodyMode === "rich" ? "Switch to plain text" : "Switch to rich text"}
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setTemplates(listTemplates());
+              setTemplatePickerOpen(true);
+            }}
+            style={styles.toolbarButton}
+          >
+            Insert template
+          </button>
+          <label style={styles.receiptLabel}>
+            <input
+              type="checkbox"
+              checked={requestReceipt}
+              onChange={(e) => setRequestReceipt(e.target.checked)}
+            />
+            &nbsp;Request read receipt
+          </label>
+        </div>
+        <div
+          style={{
+            ...styles.bodyRow,
+            ...(isDragging ? styles.bodyRowDragging : null),
+          }}
+          onDragOver={(e) => {
+            if (e.dataTransfer.types.includes("Files")) {
+              e.preventDefault();
+              setDragging(true);
+            }
+          }}
+          onDragLeave={() => setDragging(false)}
+          onDrop={onComposeDrop}
+        >
+          {bodyMode === "rich" ? (
+            <RichTextEditor
+              value={html}
+              onChange={setHtml}
+              placeholder="Write your message…"
+              onImageUpload={handleInlineImageUpload}
+              ariaLabel="Message body"
+              minHeight={300}
+            />
+          ) : (
+            <textarea
+              aria-label="Message body"
+              value={body}
+              onChange={(e) => setBody(e.target.value)}
+              placeholder="Write your message…"
+              style={styles.textarea}
+              rows={16}
+            />
+          )}
+          {isDragging && (
+            <div style={styles.dropHint}>Drop files to attach</div>
+          )}
         </div>
         <div style={styles.buttonRow}>
           <button
@@ -906,6 +1214,14 @@ export default function Compose() {
           </button>
         </div>
       </form>
+      {templatePickerOpen && (
+        <TemplatePicker
+          templates={templates}
+          senderName={identity?.name ?? ""}
+          onApply={applyTemplate}
+          onClose={() => setTemplatePickerOpen(false)}
+        />
+      )}
     </section>
   );
 }
@@ -956,6 +1272,24 @@ function buildQuoteHeader(seed: ComposeSeed): string {
     ? new Date(seed.quotedDate).toLocaleString()
     : "(unknown date)";
   return `On ${when}, ${who} wrote:`;
+}
+
+/**
+ * Replace each in-editor object URL with the `cid:` reference of
+ * the inline MIME part it maps to, so the sent HTML body resolves
+ * inline images against their attachments (RFC 2392).
+ */
+function rewriteInlineCids(html: string, map: Map<string, string>): string {
+  let out = html;
+  for (const [url, cid] of map) {
+    out = out.split(url).join(`cid:${cid}`);
+  }
+  return out;
+}
+
+/** Append a signature, separated by the standard `-- ` delimiter. */
+function appendHtmlSignature(html: string, signatureHtml: string): string {
+  return `${html}<br><div class="kmail-signature">-- <br>${signatureHtml}</div>`;
 }
 
 /**
@@ -1150,6 +1484,80 @@ const styles: Record<string, React.CSSProperties> = {
     display: "flex",
     flexDirection: "column",
     marginTop: "0.25rem",
+    position: "relative",
+  },
+  bodyRowDragging: {
+    outline: "2px dashed #2563eb",
+    outlineOffset: "2px",
+    borderRadius: "0.25rem",
+  },
+  dropHint: {
+    position: "absolute",
+    inset: 0,
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    background: "rgba(37,99,235,0.08)",
+    color: "#1d4ed8",
+    fontWeight: 600,
+    pointerEvents: "none",
+    borderRadius: "0.25rem",
+  },
+  composeToolbar: {
+    display: "flex",
+    alignItems: "center",
+    gap: "0.5rem",
+    flexWrap: "wrap",
+    marginTop: "0.5rem",
+  },
+  toolbarButton: {
+    padding: "0.35rem 0.7rem",
+    fontSize: "0.8rem",
+    background: "#fff",
+    border: "1px solid #d1d5db",
+    borderRadius: "0.25rem",
+    cursor: "pointer",
+    color: "#374151",
+  },
+  receiptLabel: {
+    fontSize: "0.82rem",
+    color: "#374151",
+    display: "inline-flex",
+    alignItems: "center",
+    marginLeft: "auto",
+  },
+  attachmentList: {
+    listStyle: "none",
+    margin: "0.4rem 0 0",
+    padding: 0,
+    display: "grid",
+    gap: "0.25rem",
+  },
+  attachmentItem: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: "0.5rem",
+    fontSize: "0.83rem",
+    background: "#f3f4f6",
+    borderRadius: "0.25rem",
+    padding: "0.25rem 0.5rem",
+  },
+  attachmentRemove: {
+    border: "none",
+    background: "none",
+    color: "#6b7280",
+    cursor: "pointer",
+    fontSize: "1rem",
+    lineHeight: 1,
+  },
+  largeFileDetails: {
+    marginTop: "0.5rem",
+    fontSize: "0.83rem",
+  },
+  largeFileSummary: {
+    cursor: "pointer",
+    color: "#6b7280",
   },
   label: {
     fontSize: "0.85rem",

@@ -1,0 +1,80 @@
+---
+import "../../styles/global.css";
+import Header from "../../components/Header.astro";
+import { SITE } from "../../data/site";
+
+const title = `API reference · ${SITE.name}`;
+const description =
+  "KMail REST + SCIM API reference, generated from the Go handlers as an OpenAPI 3.1 spec and rendered with Redoc.";
+
+// Redoc standalone is loaded from a CDN at view time. The site is
+// static and not deployed from CI; the production release pipeline can
+// vendor this bundle if an air-gapped docs build is required.
+const REDOC_SRC =
+  "https://cdn.redocly.com/redoc/v2.5.0/bundles/redoc.standalone.js";
+const SPEC_URL = "/openapi/kmail.openapi.json";
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{title}</title>
+    <meta name="description" content={description} />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <style>
+      body {
+        margin: 0;
+      }
+      .api-note {
+        background: var(--c-brand-soft);
+        border-bottom: 1px solid var(--c-border);
+        padding: 0.6rem 1.25rem;
+        font-size: 0.9rem;
+        color: var(--c-text-soft);
+      }
+      .api-note a {
+        font-weight: 600;
+      }
+      #redoc-fallback {
+        max-width: 46rem;
+        margin: 3rem auto;
+        padding: 0 1.25rem;
+      }
+    </style>
+  </head>
+  <body>
+    <Header />
+    <div class="api-note">
+      Generated from the KMail Go handlers as an OpenAPI 3.1 spec —
+      <a href={SPEC_URL}>download the spec</a>. Auth, webhook, and SCIM guides
+      are in the overview panel and the <a href="/help/admin/webhook-events">Help Center</a>.
+    </div>
+
+    <noscript>
+      <div id="redoc-fallback">
+        <h1>API reference</h1>
+        <p>
+          The interactive API reference requires JavaScript. You can still
+          <a href={SPEC_URL}>download the OpenAPI 3.1 spec</a> and view it in
+          any OpenAPI tool.
+        </p>
+      </div>
+    </noscript>
+
+    <redoc
+      spec-url={SPEC_URL}
+      hide-download-button="false"
+      theme={JSON.stringify({
+        colors: { primary: { main: "#4f46e5" } },
+        typography: {
+          fontFamily:
+            'Inter, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif',
+          headings: { fontFamily: "Inter, system-ui, sans-serif" },
+        },
+      })}></redoc>
+
+    <script src={REDOC_SRC} is:inline></script>
+  </body>
+</html>

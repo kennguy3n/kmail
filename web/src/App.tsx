@@ -11,6 +11,12 @@ import ProtectedFolderView from "./pages/Mail/ProtectedFolderView";
 import ScheduledSends from "./pages/Mail/ScheduledSends";
 import Snoozed from "./pages/Mail/Snoozed";
 import SecurePortal from "./pages/Mail/SecurePortal";
+import ThreadView from "./pages/Mail/ThreadView";
+import SignatureEditor from "./pages/Mail/SignatureEditor";
+import Templates from "./pages/Mail/Templates";
+import Labels from "./pages/Mail/Labels";
+import OutOfOffice from "./pages/Mail/OutOfOffice";
+import Delegation from "./pages/Mail/Delegation";
 import CalendarView from "./pages/Calendar/CalendarView";
 import EventCreate from "./pages/Calendar/EventCreate";
 import SharedCalendars from "./pages/Calendar/SharedCalendars";
@@ -83,6 +89,12 @@ export default function App() {
         <Route path="mail/protected-folders" element={<ProtectedFolderView />} />
         <Route path="mail/scheduled" element={<ScheduledSends />} />
         <Route path="mail/snoozed" element={<Snoozed />} />
+        <Route path="mail/signatures" element={<SignatureEditor />} />
+        <Route path="mail/templates" element={<Templates />} />
+        <Route path="mail/labels" element={<Labels />} />
+        <Route path="mail/out-of-office" element={<OutOfOffice />} />
+        <Route path="mail/delegation" element={<Delegation />} />
+        <Route path="mail/thread/:threadId" element={<ThreadView />} />
         <Route path="mail/:mailboxId/:emailId" element={<MessageView />} />
 
         <Route path="calendar" element={<CalendarView />} />

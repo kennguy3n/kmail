@@ -51,6 +51,16 @@ export const NAV_TREE: NavNode[] = [
       },
       { type: "link", label: "Scheduled", to: "/mail/scheduled", icon: "⏰" },
       { type: "link", label: "Snoozed", to: "/mail/snoozed", icon: "😴" },
+      { type: "link", label: "Labels", to: "/mail/labels", icon: "🏷" },
+      { type: "link", label: "Signatures", to: "/mail/signatures", icon: "✒" },
+      { type: "link", label: "Templates", to: "/mail/templates", icon: "📝" },
+      {
+        type: "link",
+        label: "Out of Office",
+        to: "/mail/out-of-office",
+        icon: "🌴",
+      },
+      { type: "link", label: "Delegation", to: "/mail/delegation", icon: "🔑" },
     ],
   },
   {

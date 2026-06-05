@@ -14,6 +14,7 @@ import type {
   JsClientConfig,
   JsEmailSummary,
   JsMailbox,
+  JsPushIngestOutcome,
   JsSyncSummary,
   KMailBridge,
 } from './preload';
@@ -175,6 +176,24 @@ export class KMailDesktopClient {
   async notify(title: string, body: string): Promise<void> {
     try {
       await this.bridge.notify(title, body);
+    } catch (err) {
+      throw parseKMailError(err);
+    }
+  }
+
+  /**
+   * Ingest a transport-level push payload. The main process parses
+   * it through the SDK, caches a preview row for an instant inbox
+   * update, fires an OS notification when one is produced, and
+   * returns the outcome. Inspect `needsDeltaSync` to decide whether
+   * to follow up with `sync()` (it is almost always `true` — a push
+   * is a hint, not an authoritative delta cursor).
+   */
+  async ingestPush(
+    data: Record<string, string>,
+  ): Promise<JsPushIngestOutcome> {
+    try {
+      return await this.bridge.ingestPush(data);
     } catch (err) {
       throw parseKMailError(err);
     }

@@ -1,0 +1,60 @@
+---
+import { getCollection } from "astro:content";
+import BaseLayout from "../../layouts/BaseLayout.astro";
+
+const posts = (await getCollection("blog")).sort(
+  (a, b) => b.data.pubDate.getTime() - a.data.pubDate.getTime(),
+);
+const fmt = (d: Date) =>
+  d.toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" });
+---
+
+<BaseLayout title="Blog" description="Product news, engineering notes, and privacy thinking from the KMail team.">
+  <section class="section">
+    <div class="container">
+      <p class="eyebrow">Blog</p>
+      <h1>From the KMail team</h1>
+      <p class="lead">Product news, engineering notes, and how we think about privacy.</p>
+
+      <div class="grid grid--2" style="margin-top:2rem">
+        {
+          posts.map((post) => (
+            <a class="card post" href={`/blog/${post.id}`}>
+              <p class="post__date muted">{fmt(post.data.pubDate)}</p>
+              <h3>{post.data.title}</h3>
+              <p class="muted">{post.data.description}</p>
+              <p class="post__tags">
+                {post.data.tags.map((t) => (
+                  <span class="badge">{t}</span>
+                ))}
+              </p>
+            </a>
+          ))
+        }
+      </div>
+    </div>
+  </section>
+
+  <style>
+    .post {
+      display: block;
+      text-decoration: none;
+      color: inherit;
+      transition: box-shadow 0.15s ease;
+    }
+    .post:hover {
+      box-shadow: var(--shadow);
+      text-decoration: none;
+    }
+    .post__date {
+      font-size: 0.85rem;
+      margin-bottom: 0.25rem;
+    }
+    .post__tags {
+      display: flex;
+      gap: 0.4rem;
+      flex-wrap: wrap;
+      margin-top: 0.75rem;
+    }
+  </style>
+</BaseLayout>

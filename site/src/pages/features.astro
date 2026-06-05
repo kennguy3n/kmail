@@ -1,0 +1,80 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import CTA from "../components/CTA.astro";
+
+const groups = [
+  {
+    title: "Mail",
+    features: [
+      ["Encrypted mailboxes", "Per-tenant encryption with envelope keys; optional customer-managed keys on the Privacy plan."],
+      ["Shared inboxes", "Assign, note, and collaborate on shared addresses like support@ without buying extra seats."],
+      ["Confidential Send", "MLS-derived envelope encryption and recipient portals for messages that must stay private."],
+      ["Scheduled & Undo Send", "Hold outbound mail in a Valkey-backed buffer; schedule for later or cancel within the grace window."],
+      ["Snooze & follow-ups", "Bring messages back to the top of the inbox exactly when you need them."],
+    ],
+  },
+  {
+    title: "Calendar & Contacts",
+    features: [
+      ["CalDAV calendars", "Standards-based calendaring that works with Apple Calendar, Thunderbird, and the KMail web app."],
+      ["Shared & resource calendars", "Delegate calendars and book rooms or equipment with free/busy lookup."],
+      ["CardDAV contacts", "Personal address books plus a tenant-wide Global Address List (GAL)."],
+    ],
+  },
+  {
+    title: "Privacy & Security",
+    features: [
+      ["Zero-Access Vault", "Client-side encrypted folders the server can't index or read."],
+      ["Customer-managed keys", "Bring your own HSM-backed key; revoke access on your terms."],
+      ["TOTP & WebAuthn", "Strong second-factor and passkey sign-in for every user."],
+      ["Audit chain", "Hash-linked, tamper-evident log of administrative actions."],
+    ],
+  },
+  {
+    title: "Admin & Deliverability",
+    features: [
+      ["DNS onboarding wizard", "Guided SPF, DKIM, DMARC, MX and autodiscover setup with live verification."],
+      ["DMARC reporting", "Aggregate report ingestion and summaries to protect your domain."],
+      ["Dedicated IP pools", "Warm-up automation and reputation tracking for high-volume senders."],
+      ["SCIM provisioning", "Automatically provision and de-provision users from your IdP."],
+      ["Retention policies", "Automated deletion or cold-tier archiving to meet compliance needs."],
+    ],
+  },
+];
+---
+
+<BaseLayout
+  title="Features"
+  description="Everything KMail does: encrypted mail, shared inboxes, calendar, contacts, zero-access vaults, deliverability tooling, and admin controls."
+>
+  <section class="section">
+    <div class="container center">
+      <p class="eyebrow">Features</p>
+      <h1>One private workspace for your team's communication</h1>
+      <p class="lead mx-auto">
+        Mail, calendar, and contacts on open standards — with the privacy and
+        admin controls a real business needs.
+      </p>
+    </div>
+  </section>
+
+  {
+    groups.map((g, i) => (
+      <section class:list={["section", { "section--soft": i % 2 === 1 }]}>
+        <div class="container">
+          <h2>{g.title}</h2>
+          <div class="grid grid--2" style="margin-top:1.5rem">
+            {g.features.map(([t, d]) => (
+              <div class="card">
+                <h3>{t}</h3>
+                <p class="muted">{d}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+      </section>
+    ))
+  }
+
+  <CTA />
+</BaseLayout>

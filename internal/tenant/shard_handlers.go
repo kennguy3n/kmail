@@ -23,6 +23,12 @@ func NewShardHandlers(svc *ShardService) *ShardHandlers {
 func (h *ShardHandlers) Register(mux *http.ServeMux, authMW *middleware.OIDC) {
 	mux.Handle("GET /api/v1/admin/shards",
 		authMW.Wrap(http.HandlerFunc(h.list)))
+	// WS4 Task 3 — capacity/health snapshot for the admin SloAdmin
+	// dashboard. Registered before the `{id}` routes is unnecessary
+	// (Go 1.22 mux ranks "health" as a more specific literal than
+	// "{id}"), but keeping it adjacent to `list` documents intent.
+	mux.Handle("GET /api/v1/admin/shards/health",
+		authMW.Wrap(http.HandlerFunc(h.health)))
 	mux.Handle("POST /api/v1/admin/shards",
 		authMW.Wrap(http.HandlerFunc(h.register)))
 	mux.Handle("GET /api/v1/admin/shards/{id}",
@@ -40,6 +46,15 @@ func (h *ShardHandlers) list(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	shardJSON(w, http.StatusOK, map[string]any{"shards": out})
+}
+
+func (h *ShardHandlers) health(w http.ResponseWriter, r *http.Request) {
+	rep, err := h.svc.CapacityReportWithThreshold(r.Context(), 0)
+	if err != nil {
+		shardErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	shardJSON(w, http.StatusOK, rep)
 }
 
 func (h *ShardHandlers) register(w http.ResponseWriter, r *http.Request) {

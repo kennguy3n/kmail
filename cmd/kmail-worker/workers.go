@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,6 +21,7 @@ import (
 	"github.com/kennguy3n/kmail/internal/config"
 	"github.com/kennguy3n/kmail/internal/deliverability"
 	"github.com/kennguy3n/kmail/internal/export"
+	"github.com/kennguy3n/kmail/internal/featureflags"
 	"github.com/kennguy3n/kmail/internal/jmap"
 	"github.com/kennguy3n/kmail/internal/malware"
 	"github.com/kennguy3n/kmail/internal/middleware"
@@ -262,6 +264,27 @@ func buildWorkers(ctx context.Context, d workerDeps) ([]workerRegistration, erro
 	}
 	regs = append(regs, workerRegistration{name: "shard-health", run: shardHealth.Run})
 
+	// --- automated shard lifecycle (WS4 Task 3) ---
+	// Provisions a new shard when active capacity crosses the
+	// utilisation threshold. Gated on KMAIL_SHARD_AUTOPROVISION_CMD:
+	// without a provisioning command there is nothing to run (manual
+	// RegisterShard remains the path), so the worker is only
+	// registered when an operator opts in by pointing the var at
+	// e.g. scripts/provision-shard.sh.
+	if cmd := os.Getenv("KMAIL_SHARD_AUTOPROVISION_CMD"); cmd != "" {
+		shardSvc.SetProvisioner(&tenant.ExecShardProvisioner{
+			Command: cmd,
+			Timeout: getenvDuration("KMAIL_SHARD_AUTOPROVISION_TIMEOUT", 15*time.Minute),
+		})
+		autoProvision := &tenant.AutoProvisionWorker{
+			Service:   shardSvc,
+			Interval:  getenvDuration("KMAIL_SHARD_AUTOPROVISION_INTERVAL", 5*time.Minute),
+			Threshold: getenvFloat("KMAIL_SHARD_AUTOPROVISION_THRESHOLD", tenant.DefaultProvisionThreshold),
+			Logger:    logger,
+		}
+		regs = append(regs, workerRegistration{name: "shard-autoprovision", run: autoProvision.Run})
+	}
+
 	// --- retention enforcement ---
 	retentionSvc := retention.NewService(pool)
 	retentionEnforcer := retention.NewJMAPEnforcer(shardSvc, nil, "", cfg.ZKFabric.ConsoleURL, "", logger)
@@ -319,6 +342,17 @@ func buildWorkers(ctx context.Context, d workerDeps) ([]workerRegistration, erro
 	webhookSvc := webhooks.NewService(pool)
 	webhookWorker := webhooks.NewWorker(webhookSvc, logger)
 	regs = append(regs, workerRegistration{name: "webhooks", run: webhookWorker.Run})
+
+	// --- feature-flag resolver refresher (WS4 Task 1) ---
+	// The worker process also evaluates feature flags (e.g. workers
+	// that gate behaviour on a rollout), so it installs the same
+	// process-wide resolver the API does and keeps its snapshot warm.
+	// Construction is Postgres-free (the store loads lazily), so this
+	// honours the buildWorkers no-DB-at-construction invariant.
+	flagStore := featureflags.NewStore(pool)
+	flagSvc := featureflags.NewStoreService(flagStore, logger)
+	featureflags.SetDefault(flagSvc)
+	regs = append(regs, workerRegistration{name: "feature-flags-refresh", run: flagSvc.Run})
 
 	return regs, nil
 }
@@ -542,4 +576,19 @@ func getenvDuration(key string, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	return d
+}
+
+// getenvFloat reads a float64 env var with a fallback. Used for the
+// shard auto-provision utilisation threshold (e.g.
+// KMAIL_SHARD_AUTOPROVISION_THRESHOLD=0.85).
+func getenvFloat(key string, fallback float64) float64 {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		return fallback
+	}
+	return f
 }

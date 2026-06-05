@@ -449,3 +449,152 @@ func TestRateLimiter_TenantOnly_NoUserContext(t *testing.T) {
 		}
 	}
 }
+
+// TestRateLimiter_FailClosed_DegradesToFallback pins the
+// production posture: when Valkey errors AND FailClosed is set, the
+// request is routed through the in-memory token bucket. Requests
+// within the fallback ceiling are served (degraded-but-available)
+// and tagged with X-RateLimit-Fallback; the request past the
+// ceiling gets 503, NOT a silent pass-through.
+func TestRateLimiter_FailClosed_DegradesToFallback(t *testing.T) {
+	store := &fakeStore{fail: errors.New("valkey down")}
+	now := time.Unix(0, 0)
+	rl := NewRateLimiter(RateLimiterConfig{
+		Client:     store,
+		TenantRPM:  100,
+		UserRPM:    2,
+		Window:     time.Minute,
+		FailClosed: true,
+		Now:        func() time.Time { return now },
+	})
+	h := rl.Wrap(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	// User fallback burst == UserRPM == 2: first two served.
+	for i := 0; i < 2; i++ {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, authedRequest("t1", "u1"))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("iter %d: expected 200 (degraded serve), got %d", i, rec.Code)
+		}
+		if rec.Header().Get("X-RateLimit-Fallback") != "memory" {
+			t.Errorf("iter %d: expected X-RateLimit-Fallback=memory, got %q", i, rec.Header().Get("X-RateLimit-Fallback"))
+		}
+	}
+
+	// Third within the same instant exceeds the user fallback
+	// bucket → 503 Service Unavailable.
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, authedRequest("t1", "u1"))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 once fallback exhausted, got %d", rec.Code)
+	}
+	if rec.Header().Get("X-RateLimit-Scope") != "user" {
+		t.Errorf("expected user scope on 503, got %q", rec.Header().Get("X-RateLimit-Scope"))
+	}
+	if rec.Header().Get("Retry-After") == "" {
+		t.Error("expected Retry-After on degraded 503")
+	}
+}
+
+// TestRateLimiter_FailClosed_TenantFallback verifies the tenant
+// fallback bucket also 503s independently of the user scope.
+func TestRateLimiter_FailClosed_TenantFallback(t *testing.T) {
+	store := &fakeStore{fail: errors.New("valkey down")}
+	now := time.Unix(0, 0)
+	rl := NewRateLimiter(RateLimiterConfig{
+		Client:     store,
+		TenantRPM:  2,
+		UserRPM:    1000,
+		Window:     time.Minute,
+		FailClosed: true,
+		Now:        func() time.Time { return now },
+	})
+	h := rl.Wrap(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	// Distinct users sharing a tenant exhaust the tenant bucket.
+	for i, user := range []string{"u1", "u2"} {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, authedRequest("t1", user))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("iter %d (%s): expected 200, got %d", i, user, rec.Code)
+		}
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, authedRequest("t1", "u3"))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 on tenant fallback exhaustion, got %d", rec.Code)
+	}
+	if rec.Header().Get("X-RateLimit-Scope") != "tenant" {
+		t.Errorf("expected tenant scope, got %q", rec.Header().Get("X-RateLimit-Scope"))
+	}
+}
+
+// TestRateLimiter_FailClosed_FallbackRefills confirms the token
+// bucket refills over wall-clock time so a degraded window
+// self-heals as requests space out.
+func TestRateLimiter_FailClosed_FallbackRefills(t *testing.T) {
+	store := &fakeStore{fail: errors.New("valkey down")}
+	now := time.Unix(0, 0)
+	rl := NewRateLimiter(RateLimiterConfig{
+		Client:     store,
+		TenantRPM:  1000,
+		UserRPM:    1, // 1 token / 60s
+		Window:     time.Minute,
+		FailClosed: true,
+		Now:        func() time.Time { return now },
+	})
+	h := rl.Wrap(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, authedRequest("t1", "u1"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("first request: expected 200, got %d", rec.Code)
+	}
+	// Immediately again — bucket empty → 503.
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, authedRequest("t1", "u1"))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("second request: expected 503, got %d", rec.Code)
+	}
+	// Advance one full window — one token refilled.
+	now = now.Add(time.Minute)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, authedRequest("t1", "u1"))
+	if rec.Code != http.StatusOK {
+		t.Errorf("after refill: expected 200, got %d", rec.Code)
+	}
+}
+
+func TestMemoryLimiter_UnlimitedWhenZero(t *testing.T) {
+	m := NewMemoryLimiter(0, time.Minute)
+	now := time.Unix(0, 0)
+	for i := 0; i < 100; i++ {
+		if !m.Allow("k", now) {
+			t.Fatalf("iter %d: zero-limit limiter must admit unconditionally", i)
+		}
+	}
+}
+
+func TestMemoryLimiter_BurstThenSteadyState(t *testing.T) {
+	m := NewMemoryLimiter(3, time.Minute)
+	now := time.Unix(0, 0)
+	// Burst up to capacity.
+	for i := 0; i < 3; i++ {
+		if !m.Allow("k", now) {
+			t.Fatalf("burst iter %d: expected admit", i)
+		}
+	}
+	if m.Allow("k", now) {
+		t.Fatal("expected reject once burst exhausted")
+	}
+	// Distinct key has its own bucket.
+	if !m.Allow("other", now) {
+		t.Fatal("distinct key should start full")
+	}
+}

@@ -1,0 +1,78 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import PricingCards from "../components/PricingCards.astro";
+import FeatureComparison from "../components/FeatureComparison.astro";
+import CTA from "../components/CTA.astro";
+
+const faqs = [
+  ["How is KMail billed?", "Per seat, per month, through Stripe. Shared inboxes don't consume a paid seat. You can change plans anytime and we prorate the difference."],
+  ["Can I use my own domain?", "Yes. Every plan supports custom domains. The DNS onboarding wizard walks you through SPF, DKIM, DMARC, MX and autodiscover records with live verification."],
+  ["Do you offer migration?", "Pro and Privacy include automated migration from Gmail/Google Workspace and Microsoft 365, including mail, calendars, and contacts."],
+  ["What happens to my data if I cancel?", "You can export all mail, calendars, and contacts at any time. After cancellation your data is retained for a grace period and then cryptographically deleted."],
+  ["Is there a free trial?", "You can start a subscription and cancel within the first billing period. Contact us about evaluation options for larger teams."],
+];
+---
+
+<BaseLayout
+  title="Pricing"
+  description="KMail pricing: Core $3, Pro $6, and Privacy $9 per seat per month. Compare every feature across the three plans."
+>
+  <section class="section">
+    <div class="container center">
+      <p class="eyebrow">Pricing</p>
+      <h1>Transparent, per-seat pricing</h1>
+      <p class="lead mx-auto">
+        Three plans that scale from a small team to a privacy-obsessed
+        enterprise. No setup fees, no per-feature upsells.
+      </p>
+    </div>
+    <div class="container" style="margin-top:1rem"><PricingCards /></div>
+  </section>
+
+  <section class="section section--soft">
+    <div class="container">
+      <div class="center">
+        <h2>Compare plans</h2>
+        <p class="lead mx-auto">Every feature, side by side.</p>
+      </div>
+      <div style="margin-top:2rem"><FeatureComparison /></div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <h2>Pricing FAQ</h2>
+      <div class="faq" style="margin-top:1.5rem">
+        {
+          faqs.map(([q, a]) => (
+            <details class="faq__item">
+              <summary>{q}</summary>
+              <p class="muted">{a}</p>
+            </details>
+          ))
+        }
+      </div>
+    </div>
+  </section>
+
+  <CTA title="Start your subscription" subtitle="Pick a plan, add your domain, and invite your team in minutes." />
+
+  <style>
+    .faq {
+      max-width: 46rem;
+      display: grid;
+      gap: 0.75rem;
+    }
+    .faq__item {
+      border: 1px solid var(--c-border);
+      border-radius: var(--radius-sm);
+      padding: 0.5rem 1rem;
+      background: var(--c-bg);
+    }
+    .faq__item summary {
+      cursor: pointer;
+      font-weight: 600;
+      padding: 0.5rem 0;
+    }
+  </style>
+</BaseLayout>

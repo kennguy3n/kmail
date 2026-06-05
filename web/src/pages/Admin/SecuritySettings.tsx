@@ -23,7 +23,7 @@ import {
 } from "../../api/admin";
 import { useTenantSelection } from "./useTenantSelection";
 
-type Tab = "webauthn" | "totp";
+type Tab = "webauthn" | "totp" | "sessions";
 
 interface TOTPStatus {
   enrolled: boolean;
@@ -112,6 +112,9 @@ export default function SecuritySettings() {
         <button type="button" onClick={() => setTab("totp")} aria-pressed={tab === "totp"}>
           TOTP (authenticator app)
         </button>
+        <button type="button" onClick={() => setTab("sessions")} aria-pressed={tab === "sessions"}>
+          Active sessions
+        </button>
       </nav>
       {error && <p className="error">{error}</p>}
       {info && <p className="info">{info}</p>}
@@ -149,7 +152,158 @@ export default function SecuritySettings() {
         </section>
       )}
       {tab === "totp" && <TOTPSection tenantId={selectedTenantId ?? ""} />}
+      {tab === "sessions" && <SessionsSection tenantId={selectedTenantId ?? ""} />}
     </div>
+  );
+}
+
+interface ActiveSession {
+  id: string;
+  user_agent: string;
+  ip: string;
+  created_at: string;
+  last_seen: string;
+  current: boolean;
+}
+
+interface SessionsResponse {
+  sessions: ActiveSession[];
+  max_concurrent: number;
+  idle_timeout_seconds: number;
+}
+
+/**
+ * SessionsSection lists the signed-in user's active sessions and lets
+ * them revoke a single session or sign out everywhere else. The
+ * backend (GET /api/v1/sessions, POST /api/v1/sessions/revoke) derives
+ * identity from the authenticated context, so a user only ever sees
+ * and revokes their own sessions. Server-side enforcement of the
+ * concurrent-session cap is gated by KMAIL_SESSION_ENABLED; this panel
+ * functions whenever the session store is configured.
+ */
+function SessionsSection({ tenantId }: { tenantId: string }) {
+  const [data, setData] = useState<SessionsResponse | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const headers = useCallback((): Record<string, string> => {
+    return tenantId ? { "X-KMail-Dev-Tenant-Id": tenantId } : {};
+  }, [tenantId]);
+
+  const reload = useCallback(async () => {
+    setError(null);
+    try {
+      const res = await fetch("/api/v1/sessions", {
+        credentials: "include",
+        headers: headers(),
+      });
+      if (res.status === 503) {
+        setError("Session management is not configured on this deployment.");
+        setData(null);
+        return;
+      }
+      if (!res.ok) throw new Error(`sessions: ${res.status}`);
+      setData((await res.json()) as SessionsResponse);
+    } catch (e: unknown) {
+      setError(String(e));
+    }
+  }, [headers]);
+
+  useEffect(() => {
+    void reload();
+  }, [reload]);
+
+  const revoke = async (sessionId: string) => {
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await fetch("/api/v1/sessions/revoke", {
+        method: "POST",
+        credentials: "include",
+        headers: { ...headers(), "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId }),
+      });
+      if (!res.ok) throw new Error(`revoke: ${res.status}`);
+      await reload();
+    } catch (e: unknown) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const revokeOthers = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await fetch("/api/v1/sessions/revoke", {
+        method: "POST",
+        credentials: "include",
+        headers: { ...headers(), "Content-Type": "application/json" },
+        body: JSON.stringify({ all_others: true }),
+      });
+      if (!res.ok) throw new Error(`revoke: ${res.status}`);
+      await reload();
+    } catch (e: unknown) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section>
+      {error && <p className="error">{error}</p>}
+      <p>
+        Devices and browsers currently signed in to your account.
+        {data && (
+          <>
+            {" "}
+            Limit: <strong>{data.max_concurrent}</strong> concurrent; idle
+            timeout {Math.round(data.idle_timeout_seconds / 3600)}h.
+          </>
+        )}
+      </p>
+      <div className="actions">
+        <button type="button" onClick={() => void revokeOthers()} disabled={busy}>
+          Sign out everywhere else
+        </button>
+      </div>
+      <table className="admin-table">
+        <thead>
+          <tr>
+            <th>Device / agent</th>
+            <th>IP</th>
+            <th>Started</th>
+            <th>Last active</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {(data?.sessions ?? []).map((s) => (
+            <tr key={s.id}>
+              <td>
+                {s.user_agent || "—"}
+                {s.current && <strong> (this device)</strong>}
+              </td>
+              <td>{s.ip || "—"}</td>
+              <td>{s.created_at}</td>
+              <td>{s.last_seen}</td>
+              <td>
+                <button
+                  type="button"
+                  onClick={() => void revoke(s.id)}
+                  disabled={busy || s.current}
+                  title={s.current ? "Cannot revoke the session you are using" : "Revoke this session"}
+                >
+                  Revoke
+                </button>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </section>
   );
 }
 

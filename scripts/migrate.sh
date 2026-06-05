@@ -1,49 +1,48 @@
 #!/usr/bin/env bash
-# KMail — local database migration runner.
+# KMail — database migration runner (WS4 Task 4).
 #
-# Waits for the compose Postgres to be healthy and applies every SQL
-# file in `migrations/` (lexicographic order) against it. Each
-# migration wraps its own transaction (see the `BEGIN; ... COMMIT;`
-# bookends), so re-running this script is safe only if the migration
-# files are themselves idempotent.
+# Thin wrapper around the `kmail-migrate` Go runner
+# (internal/schemamigrate). The Go runner provides what the old bare
+# psql loop could not:
 #
-# Idempotence is enforced with a tiny `schema_migrations` bookkeeping
-# table: each migration is recorded by filename after it applies, and
-# subsequent runs skip anything already recorded.
+#   - Postgres ADVISORY LOCKING so two concurrent deploys can't apply
+#     the same migration twice (zero-downtime rolling deploys),
+#   - ROLLBACK via optional `migrations/NNN_*.down.sql` companions,
+#   - the same filename-keyed `schema_migrations` bookkeeping table as
+#     before, so an already-migrated database keeps working.
 #
 # Usage:
-#     ./scripts/migrate.sh           # run against the local compose stack
-#     DATABASE_URL=... ./scripts/migrate.sh
+#     ./scripts/migrate.sh                 # apply all pending (up)
+#     ./scripts/migrate.sh up
+#     ./scripts/migrate.sh down [N]        # roll back last N (default 1)
+#     ./scripts/migrate.sh status
+#     DATABASE_URL=... ./scripts/migrate.sh up
 #
-# The script assumes the `docker compose` stack in `docker-compose.yml`
-# is already up (`docker compose up -d postgres`). Override by setting
-# `DATABASE_URL` to any `psql`-compatible connection string.
+# DATABASE_URL defaults to the local compose stack. Bring Postgres up
+# first (`docker compose up -d postgres`).
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MIGRATIONS_DIR="${REPO_ROOT}/migrations"
 
-DATABASE_URL="${DATABASE_URL:-postgresql://kmail:kmail@localhost:5432/kmail}"
+export DATABASE_URL="${DATABASE_URL:-postgresql://kmail:kmail@localhost:5432/kmail}"
 WAIT_TIMEOUT_SECONDS="${WAIT_TIMEOUT_SECONDS:-60}"
 
-log() {
-    printf '[migrate] %s\n' "$*"
-}
-
-require_psql() {
-    if ! command -v psql >/dev/null 2>&1; then
-        log "error: psql is not installed. Install postgresql-client or run via the postgres container."
-        exit 1
-    fi
-}
+log() { printf '[migrate] %s\n' "$*" >&2; }
 
 wait_for_postgres() {
-    log "waiting up to ${WAIT_TIMEOUT_SECONDS}s for ${DATABASE_URL%%\?*} to accept connections"
+    log "waiting up to ${WAIT_TIMEOUT_SECONDS}s for postgres"
     local deadline=$(( $(date +%s) + WAIT_TIMEOUT_SECONDS ))
     while true; do
-        if psql "${DATABASE_URL}" -v ON_ERROR_STOP=1 -Atqc 'SELECT 1' >/dev/null 2>&1; then
-            log "postgres is reachable"
+        if command -v psql >/dev/null 2>&1; then
+            if psql "${DATABASE_URL}" -v ON_ERROR_STOP=1 -Atqc 'SELECT 1' >/dev/null 2>&1; then
+                log "postgres is reachable"
+                return 0
+            fi
+        else
+            # No psql available — let the Go runner's own connect
+            # timeout handle reachability instead of blocking here.
             return 0
         fi
         if [ "$(date +%s)" -ge "${deadline}" ]; then
@@ -54,76 +53,20 @@ wait_for_postgres() {
     done
 }
 
-ensure_bookkeeping_table() {
-    psql "${DATABASE_URL}" -v ON_ERROR_STOP=1 -Atqc "
-        CREATE TABLE IF NOT EXISTS schema_migrations (
-            filename    TEXT PRIMARY KEY,
-            applied_at  TIMESTAMPTZ NOT NULL DEFAULT now()
-        );
-    " >/dev/null
-}
-
-is_applied() {
-    local filename="$1"
-    local count
-    # Use psql's `-v` variable binding and `:'migfile'` interpolation
-    # so the filename is properly quoted by psql rather than spliced
-    # into the SQL string by the shell. psql only expands variables
-    # when the SQL is read from a script (stdin or `-f`), NOT when
-    # passed via `-c`, so the SQL is piped on stdin.
-    count=$(psql "${DATABASE_URL}" -v ON_ERROR_STOP=1 \
-        -v "migfile=${filename}" -Atq <<<"SELECT count(*) FROM schema_migrations WHERE filename = :'migfile';")
-    [ "${count}" = "1" ]
-}
-
-record_applied() {
-    local filename="$1"
-    # Matches is_applied() above: feed SQL on stdin so psql's `:'var'`
-    # interpolation expands. A herestring is used rather than a `<<-SQL`
-    # heredoc because `<<-` strips leading TABs (not spaces), which
-    # makes the script fragile to editors / linters that retab.
-    psql "${DATABASE_URL}" -v ON_ERROR_STOP=1 \
-        -v "migfile=${filename}" -Atq >/dev/null \
-        <<<"INSERT INTO schema_migrations (filename) VALUES (:'migfile') ON CONFLICT (filename) DO NOTHING;"
-}
-
-apply_migration() {
-    local path="$1"
-    local filename
-    filename="$(basename "${path}")"
-    if is_applied "${filename}"; then
-        log "skip ${filename} (already applied)"
-        return 0
-    fi
-    log "apply ${filename}"
-    psql "${DATABASE_URL}" -v ON_ERROR_STOP=1 -f "${path}" >/dev/null
-    record_applied "${filename}"
-}
-
 main() {
-    require_psql
     if [ ! -d "${MIGRATIONS_DIR}" ]; then
         log "error: ${MIGRATIONS_DIR} does not exist"
         exit 1
     fi
     wait_for_postgres
-    ensure_bookkeeping_table
 
-    shopt -s nullglob
-    local files=( "${MIGRATIONS_DIR}"/*.sql )
-    if [ "${#files[@]}" -eq 0 ]; then
-        log "no migration files in ${MIGRATIONS_DIR}"
-        return 0
-    fi
+    # Default subcommand is `up` so existing callers (CI, compose
+    # entrypoints) that invoke `migrate.sh` with no args keep working.
+    local subcmd="${1:-up}"
+    shift || true
 
-    IFS=$'\n' sorted_files=($(sort <<<"${files[*]}"))
-    unset IFS
-
-    for path in "${sorted_files[@]}"; do
-        apply_migration "${path}"
-    done
-
-    log "migrations complete"
+    log "running: kmail-migrate ${subcmd} $*"
+    ( cd "${REPO_ROOT}" && go run ./cmd/kmail-migrate -dir "${MIGRATIONS_DIR}" "${subcmd}" "$@" )
 }
 
 main "$@"

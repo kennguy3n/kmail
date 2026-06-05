@@ -1,0 +1,61 @@
+---
+import { COMPARISON, PLANS } from "../data/plans";
+---
+
+<div class="cmp-wrap">
+  <table class="cmp">
+    <thead>
+      <tr>
+        <th scope="col">Feature</th>
+        {PLANS.map((p) => <th scope="col">{p.name}</th>)}
+      </tr>
+    </thead>
+    <tbody>
+      {
+        COMPARISON.map((row) => (
+          <tr>
+            <th scope="row">{row.label}</th>
+            <td>{row.values.core}</td>
+            <td>{row.values.pro}</td>
+            <td>{row.values.privacy}</td>
+          </tr>
+        ))
+      }
+    </tbody>
+  </table>
+</div>
+
+<style>
+  .cmp-wrap {
+    overflow-x: auto;
+    border: 1px solid var(--c-border);
+    border-radius: var(--radius);
+  }
+  .cmp {
+    border-collapse: collapse;
+    width: 100%;
+    min-width: 560px;
+    font-size: 0.95rem;
+  }
+  .cmp th,
+  .cmp td {
+    padding: 0.8rem 1rem;
+    text-align: left;
+    border-bottom: 1px solid var(--c-border);
+  }
+  .cmp thead th {
+    background: var(--c-bg-inset);
+    font-size: 0.9rem;
+  }
+  .cmp tbody th {
+    font-weight: 600;
+    color: var(--c-text-soft);
+  }
+  .cmp td {
+    text-align: center;
+  }
+  .cmp tbody tr:last-child th,
+  .cmp tbody tr:last-child td {
+    border-bottom: none;
+  }
+</style>
