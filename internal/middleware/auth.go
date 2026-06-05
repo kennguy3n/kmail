@@ -33,6 +33,7 @@ const (
 	ctxKeyTenantID contextKey = iota + 1
 	ctxKeyKChatUserID
 	ctxKeyStalwartAccountID
+	ctxKeyRequestID
 )
 
 // OIDCConfig wires the OIDC middleware. `Issuer` is the KChat OIDC

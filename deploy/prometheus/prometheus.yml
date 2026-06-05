@@ -10,6 +10,21 @@ global:
   scrape_interval: 15s
   evaluation_interval: 15s
 
+# WS4 Task 8 — alerting rules (see alerts.yml). In the dev compose
+# stack the file is mounted at this path; in production it ships in
+# the same ConfigMap as this scrape config.
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+# Route firing alerts to Alertmanager, which fans out to
+# PagerDuty/Opsgenie per alertmanager.tmpl.yml. Commented out by
+# default so the dev stack doesn't require an Alertmanager container;
+# uncomment (and run one) to exercise the routing locally.
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets: ["alertmanager:9093"]
+
 scrape_configs:
   - job_name: "kmail-api"
     metrics_path: /metrics

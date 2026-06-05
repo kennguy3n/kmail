@@ -1,0 +1,173 @@
+# KMail Prometheus alerting rules (WS4 Task 8).
+#
+# Load this from prometheus.yml via:
+#
+#   rule_files:
+#     - /etc/prometheus/alerts.yml
+#
+# and point Prometheus at an Alertmanager (see alertmanager.tmpl.yml
+# for the PagerDuty/Opsgenie routing template). Every alert carries a
+# `severity` label (page | ticket) the Alertmanager template routes on,
+# and annotations written for a human on call: a one-line `summary`
+# and a `description` that names the offending series.
+#
+# Expressions only reference metrics the code actually exports
+# (internal/middleware/metrics.go, cmd/kmail-worker/supervise.go, and
+# the per-feature job counters). Keep them in sync when metric names
+# change.
+
+groups:
+  # ------------------------------------------------------------------
+  # Scrape-target liveness. If Prometheus can't reach a process at all
+  # we won't get any of the alerts below, so these are first.
+  # ------------------------------------------------------------------
+  - name: kmail-targets
+    rules:
+      - alert: KmailTargetDown
+        expr: up{job=~"kmail-.*"} == 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "KMail target {{ $labels.job }} is down"
+          description: "Prometheus has been unable to scrape {{ $labels.job }} ({{ $labels.instance }}) for >2m."
+
+  # ------------------------------------------------------------------
+  # API request health (kmail-api /metrics).
+  # ------------------------------------------------------------------
+  - name: kmail-api
+    rules:
+      - alert: KmailApiHighErrorRate
+        # >5% of requests returning 5xx over 5m, with enough traffic to
+        # be meaningful (avoids paging on 1/1 during idle periods).
+        expr: |
+          (
+            sum(rate(kmail_http_requests_total{status=~"5.."}[5m]))
+            /
+            sum(rate(kmail_http_requests_total[5m]))
+          ) > 0.05
+          and
+          sum(rate(kmail_http_requests_total[5m])) > 1
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "KMail API 5xx error rate >5%"
+          description: "{{ $value | humanizePercentage }} of API requests are 5xx over the last 5m."
+
+      - alert: KmailApiHighLatencyP99
+        # p99 request latency above 1s for 10m.
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum(rate(kmail_http_request_duration_seconds_bucket[5m])) by (le)
+          ) > 1
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "KMail API p99 latency >1s"
+          description: "p99 request latency is {{ $value | humanizeDuration }} over the last 5m."
+
+      - alert: KmailJmapProxyHighLatencyP99
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum(rate(kmail_jmap_proxy_duration_seconds_bucket[5m])) by (le)
+          ) > 2
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "KMail JMAP proxy p99 latency >2s"
+          description: "p99 JMAP proxy latency is {{ $value | humanizeDuration }} over the last 5m."
+
+  # ------------------------------------------------------------------
+  # Background-worker health (kmail-worker /metrics). The supervisor
+  # restarts crashed/panicking workers forever, so a broken worker
+  # shows up as restart/panic churn rather than a dead pod — alert on
+  # the churn, not just on liveness.
+  # ------------------------------------------------------------------
+  - name: kmail-workers
+    rules:
+      - alert: KmailWorkerDown
+        # A registered worker whose `up` gauge has been 0 for 5m.
+        expr: kmail_worker_up == 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "KMail worker {{ $labels.worker }} is down"
+          description: "Worker {{ $labels.worker }} has reported up=0 for >5m on {{ $labels.instance }}."
+
+      - alert: KmailWorkerCrashLooping
+        expr: rate(kmail_worker_restarts_total[5m]) > 0.1
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "KMail worker {{ $labels.worker }} is crash-looping"
+          description: "Worker {{ $labels.worker }} is restarting >0.1/s (sustained 10m); it is likely failing on every run."
+
+      - alert: KmailWorkerPanicking
+        expr: increase(kmail_worker_panics_total[15m]) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: "KMail worker {{ $labels.worker }} panicked"
+          description: "Worker {{ $labels.worker }} recovered {{ $value }} panic(s) in the last 15m."
+
+  # ------------------------------------------------------------------
+  # Per-feature job health. These run inside kmail-worker; a sustained
+  # failure rate means tenant-visible work (retention, exports, search
+  # cutover, storage reconciliation) is silently backing up.
+  # ------------------------------------------------------------------
+  - name: kmail-jobs
+    rules:
+      - alert: KmailRetentionErrors
+        expr: increase(kmail_retention_errors_total[15m]) > 0
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "KMail retention worker is erroring"
+          description: "{{ $value }} retention errors in the last 15m — policy enforcement may be stalled."
+
+      - alert: KmailExportJobsFailing
+        expr: increase(kmail_export_jobs_failed_total[30m]) > 0
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "KMail export jobs are failing"
+          description: "{{ $value }} export jobs failed in the last 30m."
+
+      - alert: KmailSearchCutoverFailing
+        expr: increase(kmail_search_cutover_failed_total[30m]) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: "KMail search cutover failures"
+          description: "{{ $value }} search index cutovers failed in the last 30m."
+
+      - alert: KmailStorageReconcileErrors
+        expr: increase(kmail_storage_event_reconcile_errors_total[30m]) > 0
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "KMail storage reconciliation is erroring"
+          description: "{{ $value }} storage reconcile errors in the last 30m; tenant usage/billing may drift."
+
+      - alert: KmailSignupFailureSpike
+        # More failed signups than completed over 15m (with traffic).
+        expr: |
+          increase(kmail_signup_failed_total[15m])
+            > increase(kmail_signup_completed_total[15m])
+          and increase(kmail_signup_initiated_total[15m]) > 5
+        for: 15m
+        labels:
+          severity: page
+        annotations:
+          summary: "KMail self-service signup failing for most users"
+          description: "Failed signups exceed completions over the last 15m — onboarding is broken."

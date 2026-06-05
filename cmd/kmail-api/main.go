@@ -1396,6 +1396,11 @@ func main() {
 	}
 	handler = middleware.RequestLogger(logger, cfg.Observability.LogFormat)(handler)
 
+	// Assign/propagate a correlation id BEFORE the logger (wrapped
+	// below so it runs first) so every request log line — and any
+	// downstream layer — shares one X-Request-Id.
+	handler = middleware.RequestID(handler)
+
 	// Outermost wrapper: security headers + CORS. The CORS allow
 	// list comes from `KMAIL_CORS_ORIGINS` (comma-separated). The
 	// CSP `app-src` allows the same origins so the React bundle

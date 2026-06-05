@@ -1,0 +1,79 @@
+# KMail Alertmanager configuration TEMPLATE (WS4 Task 8).
+#
+# This is a TEMPLATE, not a ready-to-run config: it references secrets
+# via environment-variable placeholders (${...}) that must be supplied
+# at deploy time (e.g. rendered by Helm/`envsubst` from a Secret).
+# DO NOT commit real integration keys here.
+#
+# Routing model:
+#   * alerts with severity="page"   -> PagerDuty (wakes someone up)
+#   * alerts with severity="ticket" -> Opsgenie  (non-paging queue)
+# Both receivers also keep the other configured but de-prioritised so a
+# single env change can flip a class of alert between page/ticket.
+#
+# The `severity` labels are set by deploy/prometheus/alerts.yml.
+
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: opsgenie-tickets
+  group_by: ["alertname", "job", "worker"]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    # Pages: anything tagged severity=page goes to PagerDuty and is
+    # retried aggressively until acked/resolved.
+    - matchers:
+        - severity = "page"
+      receiver: pagerduty-pages
+      group_wait: 10s
+      repeat_interval: 1h
+      continue: false
+
+    # Everything else (severity=ticket and unlabeled) lands in the
+    # Opsgenie non-paging queue.
+    - matchers:
+        - severity = "ticket"
+      receiver: opsgenie-tickets
+
+inhibit_rules:
+  # If a whole target is down (page), suppress the noisier per-feature
+  # ticket alerts from that same job — the target-down page covers it.
+  - source_matchers:
+      - alertname = "KmailTargetDown"
+    target_matchers:
+      - severity = "ticket"
+    equal: ["job"]
+
+receivers:
+  - name: pagerduty-pages
+    pagerduty_configs:
+      # ${PAGERDUTY_ROUTING_KEY}: the Events API v2 integration key for
+      # the KMail Production service. Supply via Secret at deploy time.
+      - routing_key: "${PAGERDUTY_ROUTING_KEY}"
+        severity: critical
+        description: '{{ template "kmail.pd.description" . }}'
+        details:
+          alertname: '{{ .CommonLabels.alertname }}'
+          job: '{{ .CommonLabels.job }}'
+          worker: '{{ .CommonLabels.worker }}'
+          summary: '{{ .CommonAnnotations.summary }}'
+          description: '{{ .CommonAnnotations.description }}'
+          runbook: 'https://github.com/kennguy3n/kmail/blob/main/docs/RUNBOOK.md#{{ .CommonLabels.alertname }}'
+
+  - name: opsgenie-tickets
+    opsgenie_configs:
+      # ${OPSGENIE_API_KEY}: an Opsgenie API integration key scoped to
+      # the KMail team. Supply via Secret at deploy time.
+      - api_key: "${OPSGENIE_API_KEY}"
+        priority: P3
+        message: '{{ .CommonAnnotations.summary }}'
+        description: '{{ .CommonAnnotations.description }}'
+        tags: "kmail,{{ .CommonLabels.job }}"
+
+# Custom PagerDuty description so the incident title is human-readable
+# rather than the default label dump.
+templates:
+  - "/etc/alertmanager/templates/*.tmpl"
