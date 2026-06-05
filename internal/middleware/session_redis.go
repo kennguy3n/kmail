@@ -141,6 +141,9 @@ func (s *RedisSessionStore) listLive(ctx context.Context, uk string, _ time.Dura
 	}
 	if len(stale) > 0 {
 		// Best-effort prune; ignore error (next call retries).
+		// go-redis flattens the []string into individual SREM members
+		// (its appendArgs type-asserts slices), so each stale id is
+		// removed rather than the slice being treated as one member.
 		_ = s.Client.SRem(ctx, userSessKey(uk), stale).Err()
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
