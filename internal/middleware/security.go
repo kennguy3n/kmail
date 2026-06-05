@@ -102,7 +102,13 @@ func (s *Security) Wrap(next http.Handler) http.Handler {
 			}
 			hdr.Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 			hdr.Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-KMail-Tenant-ID, X-KMail-User-ID")
-			hdr.Set("Access-Control-Expose-Headers", "X-KMail-Degraded")
+			// Expose the diagnostic headers a browser client reads to
+			// drive backoff/degradation UX: the degradation flag plus
+			// the rate-limiter's Retry-After and X-RateLimit-* set
+			// (emitted on 429 throttles and 503 fail-closed responses,
+			// see ratelimit.go). Without this, fetch()/XHR cannot read
+			// them cross-origin.
+			hdr.Set("Access-Control-Expose-Headers", "X-KMail-Degraded, Retry-After, X-RateLimit-Limit, X-RateLimit-Scope, X-RateLimit-Fallback")
 			hdr.Set("Access-Control-Max-Age", "600")
 		}
 

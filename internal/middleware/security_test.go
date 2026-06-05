@@ -101,6 +101,33 @@ func TestSecurity_CORSAllowList(t *testing.T) {
 	}
 }
 
+func TestSecurity_ExposesRateLimitHeaders(t *testing.T) {
+	s := NewSecurity(SecurityConfig{WebOrigins: []string{"https://allowed.example"}})
+	h := s.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+
+	r := httptest.NewRequest("GET", "/", nil)
+	r.Header.Set("Origin", "https://allowed.example")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, r)
+
+	exposed := rec.Header().Get("Access-Control-Expose-Headers")
+	// The degradation flag and every diagnostic header the rate
+	// limiter emits on 429/503 must be readable by cross-origin JS,
+	// otherwise the SPA cannot honor Retry-After or surface the
+	// degraded state.
+	for _, want := range []string{
+		"X-KMail-Degraded",
+		"Retry-After",
+		"X-RateLimit-Limit",
+		"X-RateLimit-Scope",
+		"X-RateLimit-Fallback",
+	} {
+		if !strings.Contains(exposed, want) {
+			t.Errorf("Access-Control-Expose-Headers = %q, missing %q", exposed, want)
+		}
+	}
+}
+
 func TestSecurity_OptionsPreflight(t *testing.T) {
 	s := NewSecurity(SecurityConfig{WebOrigins: []string{"https://allowed.example"}})
 	h := s.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
