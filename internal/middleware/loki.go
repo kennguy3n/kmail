@@ -50,6 +50,7 @@ type LokiLogLine struct {
 	DurationMs int64  `json:"duration_ms"`
 	TenantID   string `json:"tenant_id,omitempty"`
 	UserID     string `json:"user_id,omitempty"`
+	RequestID  string `json:"request_id,omitempty"`
 	TraceID    string `json:"trace_id,omitempty"`
 	Job        string `json:"job"`
 	Env        string `json:"env,omitempty"`
@@ -85,6 +86,7 @@ func BuildLokiLine(start time.Time, r *http.Request, status int, dur time.Durati
 		DurationMs: dur.Milliseconds(),
 		TenantID:   TenantIDFrom(r.Context()),
 		UserID:     KChatUserIDFrom(r.Context()),
+		RequestID:  RequestIDFrom(r.Context()),
 		TraceID:    TraceIDFrom(r.Context()),
 		Job:        job,
 		Env:        labels.Env,

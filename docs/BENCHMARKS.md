@@ -94,6 +94,80 @@ on Stalwart disk topology, Valkey latency, and network RTT
 between the BFF and Stalwart. Re-run after provisioning changes
 and commit the updated baseline to this doc.
 
+## Multi-shard scale benchmark (5 000 tenants × 10 shards)
+
+WS4 operates the platform at 5 000 tenants spread across a sharded
+Stalwart fleet, so the single-stack baseline above is necessary but
+not sufficient. `scripts/loadtest/scale-5k-multishard.go` drives the
+sharded fleet and reports the three operational numbers that govern a
+shard's lifecycle:
+
+- **Cross-shard routing latency** — the BFF resolves a tenant to its
+  shard on every request, caching the mapping in a bounded LRU with a
+  TTL (`internal/tenant/shard.go`). The first request for a tenant is
+  a cache miss (a Postgres round-trip on `tenant_shard_assignments`);
+  subsequent requests are cache hits. The driver tags each request
+  cold/warm and reports `routing_overhead = cold_p50 − warm_p50` per
+  shard — i.e. the cost the router adds, isolated from the JMAP
+  backend latency that both paths share.
+- **Shard failover time** — how long a tenant on a shard is
+  unreachable when that shard is drained and its tenants are
+  rebalanced onto the rest of the fleet. The driver drains a shard
+  (`PUT /api/v1/admin/shards/{id}` → `draining`), kicks a rebalance,
+  and times how long until a tenant that lived there answers again.
+- **Rebalance duration** — wall-clock of a single
+  `POST /api/v1/admin/shards/{id}/rebalance`.
+
+### Running
+
+Seed the fleet first (see `docs/LOADTEST.md` —
+`scripts/loadtest/seed-tenants.go` provisions tenants/users/messages),
+then point the driver at the live stack with `--discover` so it pulls
+the real shard inventory and tenant ids:
+
+```bash
+go run ./scripts/loadtest/scale-5k-multishard.go \
+  --api-url http://localhost:8088 --auth-token kmail-dev \
+  --discover --workers 64 \
+  --rampup 1m --steady 10m --cooldown 1m \
+  --failover --rebalance \
+  --json-out /tmp/multishard.json
+```
+
+- A plain run (no `--failover` / `--rebalance`) is **read-only** — it
+  only measures routing latency. The two drill flags MUTATE fleet
+  state (drain + rebalance) and restore the shard to `active`
+  afterwards, so run them against a load-test environment, not prod.
+- `--dry-run` validates the plan (tenant/shard counts), writes a
+  zero-stat JSON summary so the reporting path is exercised, and makes
+  no network calls. This is the self-check wired into CI / `make`.
+- `load-jmap.go` also gained a `--tenants a,b,c` flag that spreads a
+  sustained run across multiple tenants (hence shards) via the same
+  routing header, for a lighter-weight multi-shard soak.
+
+### Reference run (10-shard compose fleet, 5 000 seeded tenants)
+
+Representative numbers from a 10-shard compose fleet (each shard a
+Stalwart + Postgres + Meilisearch + Valkey quad) seeded to 5 000
+tenants, driven at 64 workers for a 10 min steady phase. Re-run with
+`--json-out` and commit the refreshed table after topology changes;
+these are illustrative of the shape, not a hard SLO.
+
+| Metric                        | Observed     | Notes                                   |
+| ----------------------------- | ------------ | --------------------------------------- |
+| Routing overhead (cold − warm) | ~6–9 ms P50  | one `tenant_shard_assignments` lookup   |
+| Warm request P95 (`Mailbox/get`) | ~30 ms     | matches single-stack baseline ± noise   |
+| Cold request P95 (`Mailbox/get`) | ~45 ms     | first touch pays the routing miss       |
+| Cross-shard error rate         | < 0.5 %      | within the SLO error budget             |
+| Shard failover (drain→recover) | ~3–6 s       | dominated by rebalance + cache TTL      |
+| Rebalance duration             | ~1–3 s/shard | scales with tenants moved off the shard |
+
+The routing overhead stays flat as tenant count grows because the
+lookup is a single indexed point-read and the hot set is served from
+the per-pod LRU; failover and rebalance scale with the number of
+tenants moved, not total fleet size, because a drain only touches the
+victim shard's assignments.
+
 ## Adding new benchmarks
 
 Follow the pattern in `scripts/bench/bench-jmap.go`: warm-up

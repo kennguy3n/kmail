@@ -16,6 +16,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	"github.com/kennguy3n/kmail/internal/config"
+	"github.com/kennguy3n/kmail/internal/featureflags"
 )
 
 func testSupervisor(t *testing.T) *supervisor {
@@ -195,9 +196,16 @@ func TestBuildWorkersBaselineRegistry(t *testing.T) {
 		"KMAIL_OPENSEARCH_URL",
 		"KMAIL_QUOTA_WORKER_ENABLED",
 		"KMAIL_CLAMAV_ADDR",
+		// shard-autoprovision is gated on this; clear it so a host
+		// that happens to export it doesn't add an 11th worker and
+		// fail the strict baseline count.
+		"KMAIL_SHARD_AUTOPROVISION_CMD",
 	} {
 		t.Setenv(k, "")
 	}
+	// buildWorkers installs a process-wide feature-flag default; clear
+	// it afterwards so it can't leak into other tests in this package.
+	t.Cleanup(func() { featureflags.SetDefault(nil) })
 
 	pool, err := pgxpool.New(context.Background(), "postgres://kmail:kmail@127.0.0.1:5432/kmail")
 	if err != nil {
@@ -245,6 +253,7 @@ func TestBuildWorkersBaselineRegistry(t *testing.T) {
 		"export",
 		"adminproxy-expiry",
 		"webhooks",
+		"feature-flags-refresh",
 	}
 	for _, name := range wantPresent {
 		if !got[name] {
@@ -276,6 +285,7 @@ func TestBuildWorkersOptionalGatesEnabled(t *testing.T) {
 	t.Setenv("KMAIL_QUOTA_WORKER_ENABLED", "true")
 	t.Setenv("KMAIL_MEILISEARCH_URL", "http://localhost:7700")
 	t.Setenv("KMAIL_OPENSEARCH_URL", "http://localhost:9200")
+	t.Cleanup(func() { featureflags.SetDefault(nil) })
 
 	pool, err := pgxpool.New(context.Background(), "postgres://kmail:kmail@127.0.0.1:5432/kmail")
 	if err != nil {
