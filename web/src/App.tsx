@@ -1,3 +1,4 @@
+import { Suspense, lazy } from "react";
 import { Navigate, Route, Routes } from "react-router-dom";
 
 import Layout from "./components/Layout";
@@ -41,7 +42,15 @@ import SieveAdmin from "./pages/Admin/SieveAdmin";
 import SecuritySettings from "./pages/Admin/SecuritySettings";
 import ContactsView from "./pages/Mail/ContactsView";
 import Signup from "./pages/Signup";
-import Showcase from "./components/Showcase";
+
+// Dev-only component gallery, code-split via a dynamic import so it is
+// never part of the production bundle. `import.meta.env.DEV` is
+// statically replaced with `false` in production builds, so Rollup
+// drops this whole ternary branch — including the `import()` — and the
+// Showcase chunk is never emitted.
+const Showcase = import.meta.env.DEV
+  ? lazy(() => import("./components/Showcase"))
+  : null;
 
 /**
  * App is the KMail React entrypoint.
@@ -112,8 +121,15 @@ export default function App() {
         {/* Non-production component gallery (WS1) for visual QA.
             Dev-only: in a production build this route is omitted, so
             `/showcase` falls through to the catch-all redirect below. */}
-        {import.meta.env.DEV && (
-          <Route path="showcase" element={<Showcase />} />
+        {Showcase && (
+          <Route
+            path="showcase"
+            element={
+              <Suspense fallback={null}>
+                <Showcase />
+              </Suspense>
+            }
+          />
         )}
 
         <Route path="*" element={<Navigate to="/mail" replace />} />

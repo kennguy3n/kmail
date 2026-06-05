@@ -31,8 +31,10 @@ function cx(...classes: Array<string | false | undefined>): string {
 
 /**
  * Toast — a single notification card. Error and warning toasts use
- * `role="alert"` (assertive) so screen readers interrupt; success
- * and info rely on the provider's polite live region.
+ * `role="alert"` (assertive) so screen readers interrupt; success and
+ * info use `role="status"` (polite). Each toast is its own live region,
+ * so the provider's container deliberately has no `aria-live` (that
+ * would double-announce).
  */
 export function Toast({ toast, onDismiss }: ToastProps): JSX.Element {
   const assertive = toast.variant === "error" || toast.variant === "warning";

@@ -147,4 +147,29 @@ describe("Dropdown", () => {
 
     expect(screen.getAllByRole("menuitem")[1]).toHaveFocus();
   });
+
+  it("stops keydowns from reaching window-level shortcut listeners while open", async () => {
+    // The global keyboard-shortcut engine listens on `window`. An open
+    // menu must own the keyboard so pressing a shortcut key inside it
+    // can't fire a global handler (and navigate away) underneath.
+    const windowHandler = vi.fn();
+    window.addEventListener("keydown", windowHandler);
+    try {
+      render(
+        <Dropdown
+          ariaLabel="menu"
+          trigger={<button>Open menu</button>}
+          items={[{ id: "edit", label: "Edit", onSelect: () => {} }]}
+        />,
+      );
+      await userEvent.click(screen.getByRole("button", { name: "Open menu" }));
+      expect(screen.getByRole("menuitem", { name: "Edit" })).toHaveFocus();
+
+      windowHandler.mockClear();
+      await userEvent.keyboard("c");
+      expect(windowHandler).not.toHaveBeenCalled();
+    } finally {
+      window.removeEventListener("keydown", windowHandler);
+    }
+  });
 });

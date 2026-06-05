@@ -91,28 +91,38 @@ function setPreference(next: ThemePreference): void {
   emit();
 }
 
-function subscribe(listener: () => void): () => void {
-  listeners.add(listener);
+// A single OS-theme listener for the whole app, installed lazily the
+// first time anything subscribes. Installing it per-subscriber would
+// create one `matchMedia` listener per `useTheme()` consumer and fan
+// every OS change out across all of them; one shared listener keeps
+// this O(1). It lives for the app's lifetime, matching this
+// module-level store, so it is never torn down.
+let systemListenerInstalled = false;
 
-  // While in "system" mode, react to live OS theme changes.
-  let mql: MediaQueryList | undefined;
-  const onSystemChange = (): void => {
+function ensureSystemListener(): void {
+  if (systemListenerInstalled) return;
+  if (
+    typeof window === "undefined" ||
+    typeof window.matchMedia !== "function"
+  ) {
+    return;
+  }
+  systemListenerInstalled = true;
+  const mql = window.matchMedia("(prefers-color-scheme: dark)");
+  mql.addEventListener("change", () => {
+    // Only the "system" preference tracks the OS; explicit choices win.
     if (preference === "system") {
       applyResolvedTheme(resolve("system"));
       emit();
     }
-  };
-  if (
-    typeof window !== "undefined" &&
-    typeof window.matchMedia === "function"
-  ) {
-    mql = window.matchMedia("(prefers-color-scheme: dark)");
-    mql.addEventListener("change", onSystemChange);
-  }
+  });
+}
 
+function subscribe(listener: () => void): () => void {
+  ensureSystemListener();
+  listeners.add(listener);
   return () => {
     listeners.delete(listener);
-    mql?.removeEventListener("change", onSystemChange);
   };
 }
 

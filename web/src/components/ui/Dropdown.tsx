@@ -87,6 +87,11 @@ export function Dropdown({
   }, [open, items]);
 
   const onMenuKeyDown = (event: KeyboardEvent<HTMLDivElement>): void => {
+    // While the menu is open it owns the keyboard: stop keydowns from
+    // bubbling to window-level listeners (e.g. the global keyboard
+    // shortcut engine) so pressing "c" or "/" inside the menu can't
+    // navigate away while the menu stays visually open.
+    event.stopPropagation();
     if (event.key === "Escape") {
       event.preventDefault();
       close(true);

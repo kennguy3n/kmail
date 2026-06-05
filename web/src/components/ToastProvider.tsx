@@ -169,12 +169,13 @@ export function ToastProvider({
   return (
     <ToastContext.Provider value={api}>
       {children}
-      <div
-        className={styles.viewport}
-        aria-live="polite"
-        aria-atomic="false"
-        aria-label="Notifications"
-      >
+      {/* No `aria-live` on this container: each Toast carries its own
+          role (`alert` for error/warning = assertive, `status` for
+          success/info = polite), which is the single source of
+          announcements. Wrapping role="alert" toasts inside a polite
+          live region made some screen readers (e.g. NVDA) announce
+          twice. The container is a positioning/grouping element only. */}
+      <div className={styles.viewport} role="region" aria-label="Notifications">
         {toasts.map((t) => (
           <Toast key={t.id} toast={t} onDismiss={dismiss} />
         ))}
