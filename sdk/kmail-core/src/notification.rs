@@ -59,7 +59,24 @@ impl LocalNotification {
     pub fn from_email_delivery(hint: &EmailDeliveryHint) -> Option<Self> {
         let email_id = hint.email_id.clone().filter(|s| !s.trim().is_empty())?;
 
-        let title = non_empty(hint.from.as_deref()).unwrap_or(FALLBACK_TITLE).to_string();
+        // Derive the sender display through the same parser the
+        // push-preview inbox row uses (`parse_address_display`), so a
+        // `from` of `Bob <bob@example.com>` yields the banner title
+        // `Bob` — matching the cached row — instead of the raw
+        // `Bob <bob@example.com>`. Prefer the display name, fall back
+        // to the bare address, then to the generic title.
+        let title = non_empty(hint.from.as_deref())
+            .map(|from| {
+                let addr = crate::client::parse_address_display(from);
+                if !addr.name.is_empty() {
+                    addr.name
+                } else if !addr.email.is_empty() {
+                    addr.email
+                } else {
+                    FALLBACK_TITLE.to_string()
+                }
+            })
+            .unwrap_or_else(|| FALLBACK_TITLE.to_string());
         let body = non_empty(hint.subject.as_deref())
             .or_else(|| non_empty(hint.snippet.as_deref()))
             .unwrap_or(FALLBACK_BODY)
@@ -115,7 +132,10 @@ mod tests {
         .expect("hint");
 
         let n = LocalNotification::from_email_delivery(&hint).expect("notification");
-        assert_eq!(n.title, "Alice Example <alice@example.com>");
+        assert_eq!(
+            n.title, "Alice Example",
+            "title should be the parsed display name, matching the inbox row"
+        );
         assert_eq!(n.body, "Lunch?");
         assert_eq!(n.tag, "e-42", "tag must be the email id for dedupe");
         assert_eq!(n.email_id.as_deref(), Some("e-42"));

@@ -1203,6 +1203,13 @@ where
     F: FnMut() -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send,
 {
+    // `tokio::time::interval` panics on a zero period. Floor to the
+    // smallest non-zero tick so the primitive is total for every
+    // caller — the FFI layer and the Swift facade already reject a
+    // zero interval, but a direct `kmail_core` caller passing
+    // `Duration::ZERO` would otherwise panic *inside* the spawned
+    // task, leaving a dead worker behind a seemingly-valid handle.
+    let interval = interval.max(Duration::from_millis(1));
     let cancel = Arc::new(Notify::new());
     let worker_cancel = cancel.clone();
     let join = tokio::spawn(async move {
@@ -1237,7 +1244,12 @@ where
 /// bare display name) into a structured [`EmailAddress`]. Used to
 /// give push-preview rows a best-effort sender column until the
 /// next sync hydrates the canonical address.
-fn parse_address_display(s: &str) -> EmailAddress {
+///
+/// Shared with [`crate::notification`] so the push-preview inbox row
+/// and the notification banner derive the sender from the exact same
+/// parse — otherwise the banner could show `Bob <bob@example.com>`
+/// while the cached row shows `Bob`.
+pub(crate) fn parse_address_display(s: &str) -> EmailAddress {
     let s = s.trim();
     if let (Some(lt), Some(gt)) = (s.rfind('<'), s.rfind('>')) {
         if lt < gt {
@@ -3986,7 +3998,11 @@ mod tests {
         assert!(outcome.email_cached);
         assert!(outcome.needs_delta_sync);
         let n = outcome.notification.expect("notification built from hint");
-        assert_eq!(n.title, "Bob <bob@example.com>");
+        // The banner sender is parsed through the same
+        // `parse_address_display` the preview row uses, so it shows
+        // the display name `Bob` (asserted to equal `rows[0].from`
+        // below) rather than the raw `Bob <bob@example.com>`.
+        assert_eq!(n.title, "Bob");
         assert_eq!(n.body, "Hi");
         assert_eq!(n.email_id.as_deref(), Some("e-100"));
         assert_eq!(n.tag, "e-100");
@@ -4087,6 +4103,37 @@ mod tests {
         handle.stop_and_join().await;
         let after_stop = counter.load(Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            after_stop,
+            "no ticks may run after stop_and_join"
+        );
+    }
+
+    /// A zero `interval` must not panic the spawned task (it is
+    /// floored to a non-zero tick). The worker stays alive and
+    /// cancellable rather than dying behind a valid-looking handle.
+    #[tokio::test]
+    async fn background_worker_zero_interval_does_not_panic() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let counter = Arc::new(AtomicU64::new(0));
+        let c = counter.clone();
+        let handle = spawn_periodic(Duration::ZERO, move || {
+            let c = c.clone();
+            async move {
+                c.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        // The task survived (didn't panic on the zero period) and
+        // actually ran — then shuts down cleanly on cancellation.
+        assert!(
+            counter.load(Ordering::SeqCst) >= 1,
+            "floored worker should still tick"
+        );
+        handle.stop_and_join().await;
+        let after_stop = counter.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(20)).await;
         assert_eq!(
             counter.load(Ordering::SeqCst),
             after_stop,

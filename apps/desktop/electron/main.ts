@@ -556,16 +556,29 @@ function registerIpc(): void {
 // `kmail:ingest-push` (SDK-driven) handlers so both honour the
 // `Notification.isSupported()` guard and the click-to-focus
 // behaviour identically.
+//
+// Showing a notification is a best-effort, fire-and-forget side
+// effect: it must never fail the operation that triggered it. In
+// particular `kmail:ingest-push` has *already* parsed the payload
+// and cached the preview row by the time we get here, so a broken
+// notification service (e.g. no D-Bus session on a headless Linux
+// WM, where the `Notification` constructor can throw despite
+// `isSupported()`) must not stop the ingest outcome from reaching
+// the renderer. We therefore swallow + log any failure here.
 function showOsNotification(title: string, body: string): void {
   if (!Notification.isSupported()) return;
-  const n = new Notification({ title, body, silent: false });
-  n.on('click', () => {
-    if (mainWindow) {
-      mainWindow.show();
-      mainWindow.focus();
-    }
-  });
-  n.show();
+  try {
+    const n = new Notification({ title, body, silent: false });
+    n.on('click', () => {
+      if (mainWindow) {
+        mainWindow.show();
+        mainWindow.focus();
+      }
+    });
+    n.show();
+  } catch (err) {
+    console.error('showOsNotification failed', err);
+  }
 }
 
 // ---------------------------------------------------------------
