@@ -123,13 +123,48 @@ func guardAddr(addr string) error {
 	return nil
 }
 
+// ssrfBlockedNets are routable-but-not-public ranges that Go's
+// net.IP helpers do NOT classify as private/loopback/etc., yet must
+// never be reachable from an attacker-controlled unsubscribe URL:
+//
+//   - 100.64.0.0/10 (RFC 6598, CGN / Shared Address Space) is used
+//     by cloud providers for internal/VPC and carrier-grade NAT
+//     traffic. IsPrivate() returns false and IsGlobalUnicast() true,
+//     so without this an https://100.64.x.x target could reach
+//     internal cloud infrastructure.
+var ssrfBlockedNets = mustParseCIDRs(
+	"100.64.0.0/10", // RFC 6598 CGN / shared address space
+)
+
+func mustParseCIDRs(cidrs ...string) []*net.IPNet {
+	out := make([]*net.IPNet, 0, len(cidrs))
+	for _, c := range cidrs {
+		_, n, err := net.ParseCIDR(c)
+		if err != nil {
+			panic("smartfeatures: bad SSRF CIDR " + c + ": " + err.Error())
+		}
+		out = append(out, n)
+	}
+	return out
+}
+
 // isGlobalUnicast reports whether ip is a routable public address,
 // rejecting loopback, private (RFC 1918 / ULA), link-local,
-// unspecified, and multicast ranges.
+// unspecified, multicast, and CGN/shared-address (RFC 6598) ranges.
 func isGlobalUnicast(ip net.IP) bool {
 	if ip.IsLoopback() || ip.IsPrivate() || ip.IsUnspecified() ||
 		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() {
 		return false
+	}
+	// Normalize IPv4-mapped IPv6 (::ffff:a.b.c.d) so a mapped address
+	// can't slip past the IPv4 range checks below.
+	if v4 := ip.To4(); v4 != nil {
+		ip = v4
+	}
+	for _, n := range ssrfBlockedNets {
+		if n.Contains(ip) {
+			return false
+		}
 	}
 	return ip.IsGlobalUnicast()
 }

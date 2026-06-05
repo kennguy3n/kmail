@@ -357,11 +357,15 @@ export default function Compose() {
       // Placed here (before the per-mode branches) so it covers every
       // successful path: immediate, scheduled, confidential, and
       // undo-send.
-      const sentRecipients = [
-        ...(draft.to ?? []),
-        ...(draft.cc ?? []),
-        ...(draft.bcc ?? []),
-      ].map((a) => a.email);
+      //
+      // Only the *visible* recipients (To + Cc) are recorded. Bcc is
+      // deliberately excluded: it builds the co-recipient graph, so
+      // recording a blind-copied address could later surface it as a
+      // "you usually CC X" suggestion and leak the hidden Bcc
+      // relationship to anyone composing on this account.
+      const sentRecipients = [...(draft.to ?? []), ...(draft.cc ?? [])].map(
+        (a) => a.email,
+      );
       if (sentRecipients.length > 0) {
         recordSend(sentRecipients).catch(() => {
           /* suggestions are non-critical; ignore */

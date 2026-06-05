@@ -2,11 +2,42 @@ package smartfeatures
 
 import (
 	"context"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 )
+
+func TestIsGlobalUnicast_BlocksNonPublicRanges(t *testing.T) {
+	blocked := []string{
+		"127.0.0.1",         // loopback
+		"10.0.0.5",          // RFC 1918
+		"192.168.1.1",       // RFC 1918
+		"169.254.169.254",   // link-local (cloud metadata)
+		"100.64.0.1",        // RFC 6598 CGN / shared address space
+		"100.127.255.254",   // RFC 6598 upper edge
+		"::ffff:100.64.0.1", // IPv4-mapped CGN must also be blocked
+		"fd00::1",           // ULA (IsPrivate)
+	}
+	for _, s := range blocked {
+		ip := net.ParseIP(s)
+		if ip == nil {
+			t.Fatalf("bad test IP %q", s)
+		}
+		if isGlobalUnicast(ip) {
+			t.Errorf("isGlobalUnicast(%s) = true, want false (non-public)", s)
+		}
+	}
+
+	public := []string{"8.8.8.8", "1.1.1.1", "93.184.216.34", "2606:4700:4700::1111"}
+	for _, s := range public {
+		ip := net.ParseIP(s)
+		if !isGlobalUnicast(ip) {
+			t.Errorf("isGlobalUnicast(%s) = false, want true (public)", s)
+		}
+	}
+}
 
 func TestSafeOneClick_RejectsNonHTTPS(t *testing.T) {
 	s := NewSafeOneClickUnsubscriber(0)

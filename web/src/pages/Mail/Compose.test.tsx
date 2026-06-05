@@ -180,7 +180,7 @@ describe("<Compose />", () => {
     });
   });
 
-  it("records the recipients (To + Cc) after a successful send so the frequent-contacts tracker is populated", async () => {
+  it("records only the visible recipients (To + Cc, never Bcc) after a successful send", async () => {
     getMailboxes.mockResolvedValueOnce(mailboxes);
     getIdentities.mockResolvedValueOnce(identities);
     sendEmail.mockResolvedValueOnce({
@@ -198,9 +198,11 @@ describe("<Compose />", () => {
     await screen.findByRole("button", { name: /^send$/i });
     await user.type(screen.getByLabelText(/^to/i), "alice@example.com");
     await user.type(screen.getByLabelText(/^cc/i), "carol@example.com");
+    await user.type(screen.getByLabelText(/^bcc/i), "secret@example.com");
     await user.click(screen.getByRole("button", { name: /^send$/i }));
 
     await waitFor(() => expect(recordSend).toHaveBeenCalledTimes(1));
+    // Bcc must never feed the co-recipient graph (privacy).
     expect(recordSend).toHaveBeenCalledWith([
       "alice@example.com",
       "carol@example.com",
