@@ -47,6 +47,7 @@ import (
 	"github.com/kennguy3n/kmail/internal/scheduledsend"
 	"github.com/kennguy3n/kmail/internal/scim"
 	"github.com/kennguy3n/kmail/internal/search"
+	"github.com/kennguy3n/kmail/internal/secrets"
 	"github.com/kennguy3n/kmail/internal/sharedinbox"
 	"github.com/kennguy3n/kmail/internal/sieve"
 	"github.com/kennguy3n/kmail/internal/snooze"
@@ -152,24 +153,71 @@ func main() {
 	// gate (needs identity) and the JMAP + tenant handlers.
 	var rateLimiter *middleware.RateLimiter
 	if cfg.RateLimit.Enabled {
+		// Fail-closed posture: production replicas degrade to the
+		// in-memory token-bucket fallback (and 503 past it) when
+		// Valkey errors, instead of silently bypassing the
+		// limiter. Default off only for dev environments — gated
+		// through the same IsDevEnv alias table the OIDC
+		// middleware uses (KMAIL_ENV=dev resolves to development).
+		failClosed := config.GetenvBool("KMAIL_RATELIMIT_FAIL_CLOSED", !middleware.IsDevEnv(cfg.Env))
 		rateLimiter = middleware.NewRateLimiter(middleware.RateLimiterConfig{
-			Client:    limiterStore,
-			TenantRPM: cfg.RateLimit.TenantRPM,
-			UserRPM:   cfg.RateLimit.UserRPM,
-			Window:    cfg.RateLimit.Window,
-			Logger:    logger,
+			Client:     limiterStore,
+			TenantRPM:  cfg.RateLimit.TenantRPM,
+			UserRPM:    cfg.RateLimit.UserRPM,
+			Window:     cfg.RateLimit.Window,
+			FailClosed: failClosed,
+			Logger:     logger,
 		})
 	}
+	// Server-side session ledger layered on top of the stateless
+	// OIDC bearer auth: a concurrent-session cap, session revocation
+	// (refuse a token at the KMail boundary before its JWT expires),
+	// and "active sessions" visibility. The store reuses the rate
+	// limiter's Valkey pool (`limiterStore.Client`) so no second
+	// connection pool is opened, and is shared across replicas so
+	// the cap and revocation are globally consistent.
+	//
+	// Enforcement is gated by KMAIL_SESSION_ENABLED (default off) so
+	// deployments opt in deliberately — when off, sessionMgr.Wrap is
+	// an identity passthrough. The list/revoke API is always served
+	// when a store is present. See docs/SESSIONS.md.
+	sessionMgr := middleware.NewSessionManager(middleware.SessionConfig{
+		Store:         middleware.NewRedisSessionStore(limiterStore.Client),
+		Enabled:       config.GetenvBool("KMAIL_SESSION_ENABLED", false),
+		IdleTimeout:   getenvDuration("KMAIL_SESSION_IDLE_TIMEOUT", middleware.DefaultSessionIdleTimeout),
+		MaxConcurrent: config.GetenvInt("KMAIL_SESSION_MAX_CONCURRENT", middleware.DefaultSessionMaxConcurrent),
+		Logger:        logger,
+	})
+	// Session list/revoke endpoints are auth-gated and rate-limited
+	// (per authenticated tenant/user, same Valkey limiter as the rest
+	// of the API) so an authenticated caller cannot hammer them for
+	// small-scale abuse. They deliberately do NOT run session
+	// *enforcement* middleware: a user holding a revoked session must
+	// still be able to list and revoke their sessions (they have a
+	// valid JWT, only the session record is revoked). See
+	// docs/SESSIONS.md.
+	wrapSessionAPI := func(h http.Handler) http.Handler {
+		inner := h
+		if rateLimiter != nil {
+			inner = rateLimiter.Wrap(h)
+		}
+		return authMW.Wrap(inner)
+	}
+	middleware.NewSessionHandlers(sessionMgr).Register(mux, wrapSessionAPI)
+
 	wrapAuthRL := func(h http.Handler) http.Handler {
 		// Auth always sits at the outermost layer so 401s short
 		// out before the rate limiter ever consults Valkey. The
 		// rate limiter, when enabled, is inserted BETWEEN auth
 		// and the handler so the limiter can read tenant/user IDs
-		// from the context that auth populates.
+		// from the context that auth populates. Session enforcement
+		// sits just inside auth (it also needs identity) and is a
+		// no-op unless KMAIL_SESSION_ENABLED is set.
 		inner := h
 		if rateLimiter != nil {
 			inner = rateLimiter.Wrap(h)
 		}
+		inner = sessionMgr.Wrap(inner)
 		return authMW.Wrap(inner)
 	}
 
@@ -413,7 +461,14 @@ func main() {
 	// and so every consumer shares the same `*cmk.AESGCMEnvelope`
 	// value (cheaper, and makes future KMS-backed rotations a
 	// single swap).
-	secretsEnvelope, secretsEnvelopeErr := cmk.LoadEnvelope()
+	// Rotation-aware load: in addition to KMAIL_SECRETS_KEY this
+	// also honours KMAIL_SECRETS_KEY_RETIRED (comma-separated old
+	// keys) so the master key can be rotated without downtime —
+	// new writes seal under the new key while reads still
+	// decrypt rows sealed under a retired key. With no retired
+	// keys configured this behaves identically to the previous
+	// single-key cmk.LoadEnvelope. See docs/SECRETS.md.
+	secretsEnvelope, secretsEnvelopeErr := secrets.LoadEnvelope(context.Background(), nil)
 	if secretsEnvelopeErr != nil {
 		// DKIM, TOTP, and the zk-object-fabric provisioner fall
 		// back to plaintext-on-disk when the envelope is unset

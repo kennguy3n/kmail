@@ -65,6 +65,41 @@ KMail supports three privacy modes per mailbox:
 * OIDC + SCIM tokens are stored hashed; plaintext is returned
   only at issuance.
 
+### Confidential Send MLS wrapping key
+
+When a Confidential Send message is wrapped under MLS (Messaging
+Layer Security), KMail derives a **per-recipient symmetric wrapping
+key** from the KChat MLS service and persists it on the link row
+(`confidential_send_links.mls_wrapping_key`). KMail never sees the
+underlying MLS leaf secret. This key is handled on a strict
+need-to-know basis, by exposure surface:
+
+* **Authenticated create response (sender only)** — the wrapping
+  key *is* returned exactly once, in the response to the
+  authenticated `POST` that creates the link
+  (`CreateSecureMessage`, behind the OIDC auth gate). This is by
+  design: under the StrictZK model the BFF never sees plaintext,
+  so the sender needs the wrapping key to encrypt the message DEK
+  **client-side** before the ciphertext is stored in
+  zk-object-fabric.
+* **Public portal (unauthenticated recipient)** — the wrapping key
+  is **stripped** from the portal response (`GetSecureMessage`
+  zeroes `MLSWrappingKey`). The portal returns only `mls_wrapped`
+  and `mls_epoch` so the client knows to take the MLS-derivation
+  path; an MLS recipient re-derives the wrapping key from group
+  state via the auth-gated MLS path. Handing the key to any holder
+  of the (unauthenticated) link token would defeat the
+  confidentiality the MLS wrapping provides.
+* **Sender's "sent" list** — `ListSentSecureMessages` never selects
+  the `mls_wrapping_key` column at all; it surfaces only the
+  `mls_wrapped` indicator (derived from `mls_sender_leaf_key`) and
+  `mls_epoch`.
+
+The wrapping key alone does not reveal message content: without the
+encrypted DEK and the StrictZK ciphertext blob (both stored in
+zk-object-fabric) it cannot decrypt anything. See
+`internal/confidentialsend/service.go` and `migrations/006_confidential_send_mls.sql`.
+
 ## 5. Authentication and Authorisation
 
 * End users authenticate with OIDC against the customer's

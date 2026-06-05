@@ -54,9 +54,37 @@ type RateLimiterConfig struct {
 	Now func() time.Time
 
 	// Logger is used for transient-error diagnostics. When a
-	// Valkey call fails we fail-open (allow the request) and log
-	// the error so the limiter never takes the BFF offline.
+	// Valkey call fails the limiter logs the error and then
+	// applies the FailClosed policy below.
 	Logger *log.Logger
+
+	// FailClosed governs behaviour when the Valkey-backed store
+	// returns an error (outage, timeout, OOM eviction of the
+	// script, …).
+	//
+	//   false (development default): fail OPEN — the request is
+	//     allowed through untouched, exactly as before. Convenient
+	//     for local dev where Valkey may not be running.
+	//
+	//   true (production default): fail CLOSED — the request is
+	//     instead subjected to the in-process token-bucket
+	//     fallback (see Fallback). Requests within the fallback
+	//     ceiling are served (degraded but available); requests
+	//     that exceed it receive 503 Service Unavailable rather
+	//     than silently bypassing the limiter.
+	//
+	// The default is wired from KMAIL_RATELIMIT_FAIL_CLOSED in
+	// cmd/kmail-api, defaulting off only for dev environments (see
+	// middleware.IsDevEnv).
+	FailClosed bool
+
+	// FallbackTenant / FallbackUser are the in-memory token-bucket
+	// limiters consulted when FailClosed is true and the Valkey
+	// store errors. When nil, NewRateLimiter installs defaults
+	// sized from TenantRPM / UserRPM / Window. Exposed so tests can
+	// inject deterministic limiters.
+	FallbackTenant *MemoryLimiter
+	FallbackUser   *MemoryLimiter
 }
 
 // RateLimiterStore is the narrow surface RateLimiter depends on.
@@ -138,6 +166,17 @@ func NewRateLimiter(cfg RateLimiterConfig) *RateLimiter {
 	if cfg.Logger == nil {
 		cfg.Logger = log.Default()
 	}
+	// Size the in-memory fallback from the same ceilings the
+	// authoritative limiter uses. Built unconditionally (cheap —
+	// just two empty maps) so a FailClosed flag flipped at runtime
+	// via a future hot-reload still has a fallback to lean on, but
+	// only consulted on the Valkey-error + FailClosed path.
+	if cfg.FallbackTenant == nil {
+		cfg.FallbackTenant = NewMemoryLimiter(cfg.TenantRPM, cfg.Window)
+	}
+	if cfg.FallbackUser == nil {
+		cfg.FallbackUser = NewMemoryLimiter(cfg.UserRPM, cfg.Window)
+	}
 	return &RateLimiter{cfg: cfg}
 }
 
@@ -190,6 +229,24 @@ func (r *RateLimiter) Wrap(next http.Handler) http.Handler {
 		)
 		if err != nil {
 			r.cfg.Logger.Printf("ratelimit: allow tenant=%s user=%s: %v", tenantKey, userKey, err)
+			if !r.cfg.FailClosed {
+				// Development posture: keep serving even when the
+				// limiter backend is down.
+				next.ServeHTTP(w, req)
+				return
+			}
+			// Production posture: degrade to the per-replica
+			// in-memory token bucket so an attacker can't lift
+			// the ceiling by knocking Valkey over.
+			if !r.cfg.FallbackTenant.Allow(tenantKey, now) {
+				writeRateLimitDegraded(w, window, r.cfg.TenantRPM, "tenant")
+				return
+			}
+			if userLimit > 0 && !r.cfg.FallbackUser.Allow(userKey, now) {
+				writeRateLimitDegraded(w, window, r.cfg.UserRPM, "user")
+				return
+			}
+			w.Header().Set("X-RateLimit-Fallback", "memory")
 			next.ServeHTTP(w, req)
 			return
 		}
@@ -216,6 +273,21 @@ func writeRateLimitExceeded(w http.ResponseWriter, window time.Duration, rpm int
 	w.Header().Set("X-RateLimit-Limit", strconv.Itoa(rpm))
 	w.Header().Set("X-RateLimit-Scope", scope)
 	http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+}
+
+// writeRateLimitDegraded is the fail-closed response: the Valkey
+// backend errored AND the in-memory fallback bucket for `scope` is
+// exhausted. We surface 503 (not 429) so callers can tell "the
+// limiter backend is degraded" apart from "you are genuinely over
+// your ceiling" — the former warrants a longer, jittered backoff
+// because the whole replica is shedding load, not just this caller.
+func writeRateLimitDegraded(w http.ResponseWriter, window time.Duration, rpm int, scope string) {
+	retry := int(window.Seconds())
+	w.Header().Set("Retry-After", strconv.Itoa(retry))
+	w.Header().Set("X-RateLimit-Limit", strconv.Itoa(rpm))
+	w.Header().Set("X-RateLimit-Scope", scope)
+	w.Header().Set("X-RateLimit-Fallback", "memory")
+	http.Error(w, "rate limiter degraded (Valkey unavailable)", http.StatusServiceUnavailable)
 }
 
 // slidingWindowScript is the atomic ZSET-based sliding-window log
