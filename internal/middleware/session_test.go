@@ -35,6 +35,42 @@ func TestSessionIDFromRequest_StableAndScoped(t *testing.T) {
 	}
 }
 
+func TestMemoryStore_TouchNeverEvictsCurrentSessionUnderClockSkew(t *testing.T) {
+	ctx := context.Background()
+	st := NewMemorySessionStore()
+	base := time.Unix(1_700_000_000, 0)
+	uk := userKey("t1", "u1")
+
+	// Two existing sessions created "later" in wall-clock terms.
+	if _, err := st.Touch(ctx, SessionInfo{ID: idFor(1), UserKey: uk}, time.Hour, 2, base.Add(10*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Touch(ctx, SessionInfo{ID: idFor(2), UserKey: uk}, time.Hour, 2, base.Add(20*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	// A new current session arrives with an EARLIER timestamp
+	// (backward clock skew / NTP correction), making it the oldest by
+	// CreatedAt. The keepID guard must spare it and evict the
+	// next-oldest (id-1) instead of the caller's own session.
+	ev, err := st.Touch(ctx, SessionInfo{ID: "cur", UserKey: uk}, time.Hour, 2, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ev) != 1 || ev[0] != idFor(1) {
+		t.Fatalf("expected next-oldest id-1 evicted, got %v", ev)
+	}
+	live, _ := st.List(ctx, uk, time.Hour, base.Add(20*time.Minute))
+	found := false
+	for _, s := range live {
+		if s.ID == "cur" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("current session was evicted but must always be retained")
+	}
+}
+
 func TestMemoryStore_TouchEvictsOldestOverCap(t *testing.T) {
 	ctx := context.Background()
 	st := NewMemorySessionStore()

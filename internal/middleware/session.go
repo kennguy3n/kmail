@@ -301,12 +301,25 @@ func (s *MemorySessionStore) Touch(_ context.Context, in SessionInfo, idleTTL ti
 	var evicted []string
 	if maxConcurrent > 0 {
 		for len(s.sessions[in.UserKey]) > maxConcurrent {
+			// Never evict the current request's session (in.ID),
+			// mirroring RedisSessionStore.enforceCap: in normal
+			// operation it is the newest, but a backward clock skew
+			// or an equal CreatedAt must not evict the caller's own
+			// just-touched session. maxConcurrent >= 1 here, so when
+			// the count exceeds the cap there is always at least one
+			// other session to evict instead.
 			oldestID, oldest := "", time.Time{}
 			first := true
 			for sid, info := range s.sessions[in.UserKey] {
+				if sid == in.ID {
+					continue
+				}
 				if first || info.CreatedAt.Before(oldest) {
 					oldestID, oldest, first = sid, info.CreatedAt, false
 				}
+			}
+			if oldestID == "" {
+				break
 			}
 			delete(s.sessions[in.UserKey], oldestID)
 			evicted = append(evicted, oldestID)
