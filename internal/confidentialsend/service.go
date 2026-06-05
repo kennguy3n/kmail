@@ -135,10 +135,10 @@ func (s *Service) RekeyConfidentialMessage(ctx context.Context, tenantID, linkID
 		return "", ErrMLSDisabled
 	}
 	if strings.TrimSpace(tenantID) == "" || strings.TrimSpace(linkID) == "" {
-		return "", errors.New("confidentialsend: tenantID and linkID required")
+		return "", fmt.Errorf("%w: tenantID and linkID required", ErrInvalidRekeyRequest)
 	}
 	if len(newParticipants) == 0 {
-		return "", errors.New("confidentialsend: rekey requires at least one participant")
+		return "", fmt.Errorf("%w: rekey requires at least one participant", ErrInvalidRekeyRequest)
 	}
 	if s.pool == nil {
 		return "", errors.New("confidentialsend: pool not configured")
@@ -173,6 +173,13 @@ func (s *Service) RekeyConfidentialMessage(ctx context.Context, tenantID, linkID
 	}
 	return newKey, nil
 }
+
+// ErrInvalidRekeyRequest is returned when a rekey request is missing
+// required caller input (no tenant/link id, or an empty participant
+// set). The request never reaches the upstream MLS service, so the
+// HTTP layer maps this to 400 (client error) rather than 502 — a
+// misclassified 5xx would trip false upstream-failure alerts.
+var ErrInvalidRekeyRequest = errors.New("confidentialsend: invalid rekey request")
 
 // ErrMLSPartialRequest is returned when a create request supplies
 // only one of sender_leaf_key / recipients. MLS wrapping needs

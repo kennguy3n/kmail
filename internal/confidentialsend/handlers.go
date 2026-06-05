@@ -97,6 +97,9 @@ func (h *Handlers) mlsRekey(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, ErrMLSDisabled):
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 		return
+	case errors.Is(err, ErrInvalidRekeyRequest):
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
 	case errors.Is(err, ErrLinkNotFound):
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
 		return

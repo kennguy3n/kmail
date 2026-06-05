@@ -88,6 +88,51 @@ func TestRedisSessionStore_EvictsOldestOverCap(t *testing.T) {
 	}
 }
 
+func TestRedisSessionStore_EnforceCapNeverEvictsCurrentSession(t *testing.T) {
+	ctx := context.Background()
+	st, _ := newRedisSessionStore(t)
+	uk := userKey("t1", "u1")
+	base := time.Unix(1_700_000_000, 0)
+
+	// Three sessions under a cap of 3; "cur" is the OLDEST (its
+	// CreatedAt is preserved across re-touches).
+	cur := "cur-sess"
+	if _, err := st.Touch(ctx, SessionInfo{ID: cur, UserKey: uk}, time.Hour, 3, base); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Touch(ctx, SessionInfo{ID: idFor(1), UserKey: uk}, time.Hour, 3, base.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Touch(ctx, SessionInfo{ID: idFor(2), UserKey: uk}, time.Hour, 3, base.Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Re-touch the oldest (current) session with a lowered cap of 2.
+	// Even though cur sorts oldest, the keepID guard must spare it and
+	// evict the next-oldest (id-1) instead — without the guard, cur
+	// would be evicted and the caller locked out of their own session.
+	evicted, err := st.Touch(ctx, SessionInfo{ID: cur, UserKey: uk}, time.Hour, 2, base.Add(3*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(evicted) != 1 || evicted[0] != idFor(1) {
+		t.Fatalf("expected next-oldest id-1 evicted, got %v", evicted)
+	}
+	live, _ := st.List(ctx, uk, time.Hour, base.Add(3*time.Minute))
+	if len(live) != 2 {
+		t.Fatalf("expected 2 live, got %d", len(live))
+	}
+	found := false
+	for _, s := range live {
+		if s.ID == cur {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("current session was evicted but must always be retained")
+	}
+}
+
 func TestRedisSessionStore_RevokeAndIsRevoked(t *testing.T) {
 	ctx := context.Background()
 	st, _ := newRedisSessionStore(t)

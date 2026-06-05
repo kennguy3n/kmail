@@ -76,9 +76,14 @@ func (s *RedisSessionStore) Touch(ctx context.Context, in SessionInfo, idleTTL t
 }
 
 // enforceCap reconciles the user's session set and evicts the oldest
-// sessions until at most maxConcurrent remain. It never evicts
-// `keepID` first (the current request's session) — they are evicted
-// by age, and the current session is the newest.
+// sessions until at most maxConcurrent remain. `keepID` (the current
+// request's session) is never evicted: it is guarded explicitly
+// rather than relying solely on it sorting newest-first, so a clock
+// skew or an equal CreatedAt timestamp can't evict the caller's own
+// just-touched session and lock them out (which would otherwise force
+// the middleware down its defensive 401 path). enforceCap is only
+// reached with maxConcurrent >= 1, so there are always enough
+// non-keepID sessions to bring the count back under the cap.
 func (s *RedisSessionStore) enforceCap(ctx context.Context, uk, keepID string, maxConcurrent int, idleTTL time.Duration, now time.Time) ([]string, error) {
 	live, err := s.listLive(ctx, uk, idleTTL, now)
 	if err != nil {
@@ -87,9 +92,15 @@ func (s *RedisSessionStore) enforceCap(ctx context.Context, uk, keepID string, m
 	if len(live) <= maxConcurrent {
 		return nil, nil
 	}
-	// listLive returns newest-first; evict from the tail (oldest).
+	// listLive returns newest-first; evict from the tail (oldest),
+	// skipping keepID, until we're back under the cap.
+	excess := len(live) - maxConcurrent
 	var evicted []string
-	for _, victim := range live[maxConcurrent:] {
+	for i := len(live) - 1; i >= 0 && excess > 0; i-- {
+		victim := live[i]
+		if victim.ID == keepID {
+			continue
+		}
 		pipe := s.Client.TxPipeline()
 		pipe.Del(ctx, sessKey(victim.ID))
 		pipe.SRem(ctx, userSessKey(uk), victim.ID)
@@ -97,6 +108,7 @@ func (s *RedisSessionStore) enforceCap(ctx context.Context, uk, keepID string, m
 			return evicted, fmt.Errorf("session redis: evict: %w", err)
 		}
 		evicted = append(evicted, victim.ID)
+		excess--
 	}
 	return evicted, nil
 }

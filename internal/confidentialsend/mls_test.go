@@ -258,16 +258,17 @@ func TestService_RekeyConfidentialMessage_Validation(t *testing.T) {
 		t.Fatalf("expected ErrMLSDisabled, got %v", err)
 	}
 	s := enabledMockService(&mockDeriver{rekeyKey: "k"})
-	// Missing identifiers.
-	if _, err := s.RekeyConfidentialMessage(context.Background(), "", "l", []string{"bob"}); err == nil {
-		t.Error("expected error on empty tenant")
+	// Missing identifiers and empty participants are caller errors:
+	// they must surface ErrInvalidRekeyRequest so the handler maps
+	// them to 400 (not 502).
+	if _, err := s.RekeyConfidentialMessage(context.Background(), "", "l", []string{"bob"}); !errors.Is(err, ErrInvalidRekeyRequest) {
+		t.Errorf("expected ErrInvalidRekeyRequest on empty tenant, got %v", err)
 	}
-	if _, err := s.RekeyConfidentialMessage(context.Background(), "t", "", []string{"bob"}); err == nil {
-		t.Error("expected error on empty link id")
+	if _, err := s.RekeyConfidentialMessage(context.Background(), "t", "", []string{"bob"}); !errors.Is(err, ErrInvalidRekeyRequest) {
+		t.Errorf("expected ErrInvalidRekeyRequest on empty link id, got %v", err)
 	}
-	// Empty participant set.
-	if _, err := s.RekeyConfidentialMessage(context.Background(), "t", "l", nil); err == nil {
-		t.Error("expected error on empty participants")
+	if _, err := s.RekeyConfidentialMessage(context.Background(), "t", "l", nil); !errors.Is(err, ErrInvalidRekeyRequest) {
+		t.Errorf("expected ErrInvalidRekeyRequest on empty participants, got %v", err)
 	}
 	// Valid args but no pool configured (DB persistence step).
 	if _, err := s.RekeyConfidentialMessage(context.Background(), "t", "l", []string{"bob"}); err == nil {
