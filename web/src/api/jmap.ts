@@ -467,6 +467,22 @@ export class JMAPClient {
   }): Promise<void> {
     const accountId = await this.getAccountId();
     const { to, fromIdentity, originalMessageId, originalSubject } = params;
+    // RFC 8621 §4.1: a created Email MUST belong to at least one
+    // mailbox. The MDN is transient (destroyed via
+    // `onSuccessDestroyEmail` once submitted), so any real mailbox
+    // works as its momentary home — prefer Drafts, then Sent, then
+    // whatever mailbox exists. An empty `mailboxIds` is rejected by
+    // spec-compliant servers and the receipt would never send.
+    const mailboxes = await this.getMailboxes();
+    const homeMailboxId =
+      mailboxes.find((m) => m.role === "drafts")?.id ??
+      mailboxes.find((m) => m.role === "sent")?.id ??
+      mailboxes[0]?.id;
+    if (!homeMailboxId) {
+      throw new Error(
+        "kmail-web: cannot send read receipt: no mailbox available",
+      );
+    }
     const human =
       `Your message${originalSubject ? ` "${originalSubject}"` : ""} ` +
       `was displayed by ${params.originalRecipient}. This is an automatic ` +
@@ -482,7 +498,7 @@ export class JMAPClient {
       `Disposition: manual-action/MDN-sent-manually; displayed\r\n`;
 
     const create: Record<string, unknown> = {
-      mailboxIds: {},
+      mailboxIds: { [homeMailboxId]: true },
       from: [{ name: fromIdentity.name || null, email: fromIdentity.email }],
       to: [{ name: null, email: to }],
       subject: `Read: ${originalSubject ?? "(no subject)"}`,

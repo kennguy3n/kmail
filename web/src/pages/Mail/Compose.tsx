@@ -169,11 +169,21 @@ export default function Compose() {
   const [fileUploading, setFileUploading] = useState(false);
 
   useEffect(() => {
+    // Capture the ref's Map instance so the cleanup revokes whatever
+    // object URLs exist at unmount even if the ref were reassigned.
+    const inlineUrls = inlineCidRef.current;
     return () => {
       if (navTimerRef.current) {
         clearTimeout(navTimerRef.current);
         navTimerRef.current = null;
       }
+      // Inline-image object URLs (keys of the cid map) live for the
+      // whole compose session; revoke them on unmount so a long
+      // session that pastes many images doesn't leak blob references.
+      for (const objectUrl of inlineUrls.keys()) {
+        URL.revokeObjectURL(objectUrl);
+      }
+      inlineUrls.clear();
     };
   }, []);
 

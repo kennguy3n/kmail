@@ -23,6 +23,10 @@ export default function Inbox() {
   const [mailboxes, setMailboxes] = useState<Mailbox[] | null>(null);
   const [emails, setEmails] = useState<Email[] | null>(null);
   const [selectedMailbox, setSelectedMailbox] = useState<string | null>(null);
+  // Active label filter (a JMAP keyword) or null. Declared up here
+  // because the email-loading effect below reads it to decide whether
+  // to query the whole account by keyword or list a single mailbox.
+  const [labelFilter, setLabelFilter] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isLoadingMailboxes, setLoadingMailboxes] = useState(true);
   const [isLoadingEmails, setLoadingEmails] = useState(false);
@@ -103,8 +107,14 @@ export default function Inbox() {
     let cancelled = false;
     setLoadingEmails(true);
     setEmails(null);
-    jmapClient
-      .getEmails(selectedMailbox, { limit: 50 })
+    // A label filter is account-wide: query every mailbox for the
+    // keyword (RFC 8621 `hasKeyword`) instead of filtering only the
+    // current mailbox's first page, otherwise labelled messages in
+    // other mailboxes or beyond the first 50 rows would be invisible.
+    const load = labelFilter
+      ? jmapClient.getEmailsByKeyword(labelFilter, { limit: 50 })
+      : jmapClient.getEmails(selectedMailbox, { limit: 50 });
+    load
       .then((list) => {
         if (!cancelled) setEmails(list);
       })
@@ -117,23 +127,25 @@ export default function Inbox() {
     return () => {
       cancelled = true;
     };
-  }, [selectedMailbox, reloadNonce]);
+  }, [selectedMailbox, reloadNonce, labelFilter]);
 
   const handleOpenEmail = useCallback(
     (emailId: string) => {
-      // In search mode the result may belong to a different
-      // mailbox than the sidebar selection; pick the first mailbox
-      // id on the email so the MessageView URL is always valid.
+      // In search mode, or under an account-wide label filter, the
+      // row may belong to a different mailbox than the sidebar
+      // selection; pick the first mailbox id on the email so the
+      // MessageView URL is always valid.
       let mailboxId: string | null = selectedMailbox;
-      if (inSearchMode) {
-        const hit = (searchResults ?? []).find((e) => e.id === emailId);
+      if (inSearchMode || labelFilter !== null) {
+        const list = inSearchMode ? (searchResults ?? []) : (emails ?? []);
+        const hit = list.find((e) => e.id === emailId);
         const firstOnEmail = hit ? Object.keys(hit.mailboxIds)[0] : undefined;
         mailboxId = firstOnEmail ?? selectedMailbox;
       }
       if (!mailboxId) return;
       navigate(`/mail/${mailboxId}/${emailId}`);
     },
-    [inSearchMode, navigate, searchResults, selectedMailbox],
+    [emails, inSearchMode, labelFilter, navigate, searchResults, selectedMailbox],
   );
 
   const runSearch = useCallback(
@@ -262,9 +274,10 @@ export default function Inbox() {
   // conversation row with a count badge (WS2). Toggleable so users
   // can fall back to the flat list.
   const [groupThreads, setGroupThreads] = useState(true);
-  // Client-side label registry + the active label filter (keyword).
+  // Client-side label registry. The active label filter itself
+  // (`labelFilter`) is declared near the top so the load effect can
+  // read it.
   const [labels, setLabels] = useState<Label[]>(() => listLabels());
-  const [labelFilter, setLabelFilter] = useState<string | null>(null);
   // Drag-and-drop: the email id currently being dragged and the drop
   // target (mailbox id or `label:<keyword>`) under the cursor.
   const [dragEmailId, setDragEmailId] = useState<string | null>(null);
@@ -454,12 +467,14 @@ export default function Inbox() {
         return;
       }
       // Resolve the source mailbox from the email itself in search
-      // mode so the JMAP patch removes it from its actual location
-      // rather than a no-op key on the sidebar selection.
+      // mode, or under an account-wide label filter, so the JMAP
+      // patch removes it from its actual location rather than a no-op
+      // key on the sidebar selection.
       const emailMailboxIds = Object.keys(email.mailboxIds);
-      const sourceMailbox = inSearchMode
-        ? (emailMailboxIds[0] ?? selectedMailbox)
-        : selectedMailbox;
+      const sourceMailbox =
+        inSearchMode || labelFilter !== null
+          ? (emailMailboxIds[0] ?? selectedMailbox)
+          : selectedMailbox;
       if (!sourceMailbox) {
         setError("Could not determine source mailbox for this email");
         return;
@@ -471,7 +486,14 @@ export default function Inbox() {
         setError(errorMessage(err));
       }
     },
-    [bumpAfterWrite, inSearchMode, isEmailInTrash, selectedMailbox, trashMailboxId],
+    [
+      bumpAfterWrite,
+      inSearchMode,
+      isEmailInTrash,
+      labelFilter,
+      selectedMailbox,
+      trashMailboxId,
+    ],
   );
 
   const sortedMailboxes = useMemo(
@@ -536,6 +558,39 @@ export default function Inbox() {
     [displayRows],
   );
 
+  // Map each row's representative (head) id to every email id it
+  // stands for. With conversation grouping on, a row's head id stands
+  // for the whole thread, so bulk/drag actions must act on all member
+  // messages — not just the newest one shown. Off (or for a single
+  // message) the head maps to itself.
+  const headToEmailIds = useMemo(() => {
+    const map = new Map<string, string[]>();
+    for (const row of displayRows) {
+      map.set(
+        row.head.id,
+        row.emails.map((e) => e.id),
+      );
+    }
+    return map;
+  }, [displayRows]);
+
+  // Expand selected head ids into the full set of email ids they
+  // represent so a bulk action on a collapsed conversation applies to
+  // every message in it. Falls back to the id itself for any id not
+  // currently rendered as a head.
+  const expandSelection = useCallback(
+    (ids: string[]): string[] => {
+      const out = new Set<string>();
+      for (const id of ids) {
+        const members = headToEmailIds.get(id);
+        if (members) members.forEach((m) => out.add(m));
+        else out.add(id);
+      }
+      return [...out];
+    },
+    [headToEmailIds],
+  );
+
   const toggleSelected = useCallback((id: string) => {
     setSelectedIds((cur) => {
       const next = new Set(cur);
@@ -555,7 +610,9 @@ export default function Inbox() {
 
   const runBulk = useCallback(
     async (fn: (ids: string[]) => Promise<void>) => {
-      const ids = [...selectedIds];
+      // Act on every message the selected rows represent — a collapsed
+      // conversation expands to all of its messages, not just the head.
+      const ids = expandSelection([...selectedIds]);
       if (ids.length === 0) return;
       setBulkBusy(true);
       try {
@@ -568,20 +625,21 @@ export default function Inbox() {
         setBulkBusy(false);
       }
     },
-    [bumpAfterWrite, selectedIds],
+    [bumpAfterWrite, expandSelection, selectedIds],
   );
 
   // Move many emails to `target`, resolving each email's source
-  // mailbox the same way the single-email handlers do. Outside search
-  // mode every row belongs to the sidebar mailbox, so one batched move
-  // suffices. In search mode the selection can span mailboxes, so we
-  // group by actual source and issue one move per source — otherwise
-  // the `mailboxIds/<selectedMailbox>: null` patch is a no-op on an
-  // email that doesn't live there and it gets added to the target
-  // without being removed from its real location (RFC 8621 §5.3).
+  // mailbox the same way the single-email handlers do. In a plain
+  // mailbox listing every row belongs to the sidebar mailbox, so one
+  // batched move suffices. In search mode or under an account-wide
+  // label filter the selection can span mailboxes, so we group by
+  // actual source and issue one move per source — otherwise the
+  // `mailboxIds/<selectedMailbox>: null` patch is a no-op on an email
+  // that doesn't live there and it gets added to the target without
+  // being removed from its real location (RFC 8621 §5.3).
   const bulkMoveResolvingSource = useCallback(
     async (ids: string[], target: string) => {
-      if (!inSearchMode) {
+      if (!inSearchMode && labelFilter === null) {
         await jmapClient.bulkMove(ids, selectedMailbox, target);
         return;
       }
@@ -597,7 +655,7 @@ export default function Inbox() {
         await jmapClient.bulkMove(groupIds, source, target);
       }
     },
-    [baseList, inSearchMode, selectedMailbox],
+    [baseList, inSearchMode, labelFilter, selectedMailbox],
   );
 
   // Bulk equivalent of handleMoveToTrash: emails already in Trash are
@@ -644,21 +702,31 @@ export default function Inbox() {
       setDragEmailId(null);
       setDropTarget(null);
       if (!emailId) return;
+      // A dragged row may be a collapsed conversation; act on every
+      // message it represents, mirroring the bulk toolbar.
+      const ids = expandSelection([emailId]);
       if (target.startsWith("label:")) {
-        void applyLabelTo(target.slice("label:".length), [emailId]);
+        void applyLabelTo(target.slice("label:".length), ids);
         return;
       }
       const email = baseList.find((e) => e.id === emailId);
       const source = email ? Object.keys(email.mailboxIds)[0] : selectedMailbox;
       if (!source || source === target) return;
       setBulkBusy(true);
-      jmapClient
-        .moveEmail(emailId, source, target)
+      bulkMoveResolvingSource(ids, target)
         .then(() => bumpAfterWrite())
         .catch((err: unknown) => setError(errorMessage(err)))
         .finally(() => setBulkBusy(false));
     },
-    [applyLabelTo, baseList, bumpAfterWrite, dragEmailId, selectedMailbox],
+    [
+      applyLabelTo,
+      baseList,
+      bulkMoveResolvingSource,
+      bumpAfterWrite,
+      dragEmailId,
+      expandSelection,
+      selectedMailbox,
+    ],
   );
 
   const selectedCount = selectedIds.size;
@@ -973,8 +1041,8 @@ export default function Inbox() {
                 onChange={(e) => {
                   const kw = e.target.value;
                   if (!kw) return;
-                  void applyLabelTo(kw, selectedIdList).then(() =>
-                    setSelectedIds(new Set()),
+                  void applyLabelTo(kw, expandSelection(selectedIdList)).then(
+                    () => setSelectedIds(new Set()),
                   );
                   e.target.value = "";
                 }}
