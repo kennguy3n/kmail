@@ -275,7 +275,14 @@ export default function Inbox() {
   // visible.
   useEffect(() => {
     setSelectedIds(new Set());
-  }, [selectedMailbox, submittedQuery, reloadNonce, searchReloadNonce]);
+  }, [
+    selectedMailbox,
+    submittedQuery,
+    reloadNonce,
+    searchReloadNonce,
+    groupThreads,
+    labelFilter,
+  ]);
 
   // Labels are edited on a separate page; refresh the registry when
   // the window regains focus so newly-created labels appear without
@@ -497,9 +504,15 @@ export default function Inbox() {
     [baseList, labelFilter],
   );
 
-  // Group by threadId for the conversation view. Each group keeps
-  // its first-seen email as the representative row and a count.
-  const threadGroups = useMemo(() => {
+  // The rows actually rendered: one per thread (its first-seen
+  // message is the representative `head`) when grouping is on, or
+  // one per email otherwise. Selection and "select all" key off the
+  // head ids so the header checkbox and per-row checkboxes always
+  // agree on the same set.
+  const displayRows = useMemo(() => {
+    if (!groupThreads) {
+      return filteredList.map((email) => ({ head: email, emails: [email] }));
+    }
     const groups = new Map<string, { head: Email; emails: Email[] }>();
     for (const email of filteredList) {
       const key = email.threadId ?? email.id;
@@ -508,7 +521,12 @@ export default function Inbox() {
       else groups.set(key, { head: email, emails: [email] });
     }
     return [...groups.values()];
-  }, [filteredList]);
+  }, [filteredList, groupThreads]);
+
+  const displayedIds = useMemo(
+    () => displayRows.map((r) => r.head.id),
+    [displayRows],
+  );
 
   const toggleSelected = useCallback((id: string) => {
     setSelectedIds((cur) => {
@@ -520,8 +538,8 @@ export default function Inbox() {
   }, []);
 
   const selectAllVisible = useCallback(() => {
-    setSelectedIds(new Set(filteredList.map((e) => e.id)));
-  }, [filteredList]);
+    setSelectedIds(new Set(displayedIds));
+  }, [displayedIds]);
 
   const clearSelection = useCallback(() => setSelectedIds(new Set()), []);
 
@@ -807,13 +825,13 @@ export default function Inbox() {
               <input
                 type="checkbox"
                 checked={
-                  selectedCount > 0 && selectedCount === filteredList.length
+                  selectedCount > 0 && selectedCount === displayedIds.length
                 }
                 ref={(el) => {
                   if (el)
                     el.indeterminate =
                       selectedCount > 0 &&
-                      selectedCount < filteredList.length;
+                      selectedCount < displayedIds.length;
                 }}
                 onChange={(e) =>
                   e.target.checked ? selectAllVisible() : clearSelection()
@@ -933,10 +951,7 @@ export default function Inbox() {
         )}
         {filteredList.length > 0 && (
           <ul style={layoutStyles.emailList}>
-            {(groupThreads
-              ? threadGroups
-              : filteredList.map((e) => ({ head: e, emails: [e] }))
-            ).map(({ head, emails: groupEmails }) => {
+            {displayRows.map(({ head, emails: groupEmails }) => {
               const email = head;
               const rowInTrash = inSearchMode
                 ? trashMailboxId !== null &&
