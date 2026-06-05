@@ -117,9 +117,15 @@ export default function Compose() {
   // the banner clears and Compose navigates the user to the
   // inbox (Stalwart has accepted the submission at that point).
   const [pendingSend, setPendingSend] =
-    useState<{ id: string; deadline: Date } | null>(null);
+    useState<{ id: string; deadline: Date; recipients: string[] } | null>(
+      null,
+    );
   const [remainingMs, setRemainingMs] = useState(0);
   const [isCancelling, setCancelling] = useState(false);
+  // Guards the undo-send commit path so the held send's recipients are
+  // recorded at most once when the hold window elapses (the deadline
+  // timer can fire more than once before the cleared state propagates).
+  const recordedPendingRef = useRef<string | null>(null);
 
   // WS7: frequent contacts + co-recipient suggestions
   const [frequentContacts, setFrequentContacts] = useState<FrequentContact[]>([]);
@@ -196,7 +202,15 @@ export default function Compose() {
       setRemainingMs(Math.max(0, ms));
       if (ms <= 0) {
         // Deadline passed — Stalwart will have accepted the
-        // submission. Clear state and route to /mail.
+        // submission, so the send is now irrevocable. This is the
+        // commit point for an undo-send: only now do we feed the
+        // recipients to the frequent-contacts / co-recipient tracker,
+        // so a send the user cancelled during the hold never pollutes
+        // the suggestion graph. Guarded by a ref to record once.
+        if (recordedPendingRef.current !== pendingSend.id) {
+          recordedPendingRef.current = pendingSend.id;
+          recordRecipients(pendingSend.recipients);
+        }
         setPendingSend(null);
         setSuccessMessage("Message sent.");
         setSending(false);
@@ -357,35 +371,21 @@ export default function Compose() {
       });
       setSavedDraftId(null);
 
-      // WS7: feed the frequent-contacts / co-recipient suggestion
-      // tracker. Fire-and-forget and best-effort so a Valkey hiccup
-      // can never fail or delay the send the user just confirmed.
-      // Placed here (before the per-mode branches) so it covers every
-      // successful path: immediate, scheduled, confidential, and
-      // undo-send.
-      //
-      // Only the *visible* recipients (To + Cc) are recorded. Bcc is
-      // deliberately excluded: it builds the co-recipient graph, so
-      // recording a blind-copied address could later surface it as a
-      // "you usually CC X" suggestion and leak the hidden Bcc
-      // relationship to anyone composing on this account.
-      // Send the full `Name <email>` form (not the bare email) so the
-      // tracker can capture the display name for the suggestion chips;
-      // the BFF parses the address and keys on the bare email.
-      const sentRecipients = [...(draft.to ?? []), ...(draft.cc ?? [])].map(
-        (a) => formatAddress(a),
-      );
-      if (sentRecipients.length > 0) {
-        recordSend(sentRecipients).catch(() => {
-          /* suggestions are non-critical; ignore */
-        });
-      }
+      // WS7: the visible recipients we may feed to the frequent-contacts
+      // / co-recipient tracker. Computed once; *when* we record depends
+      // on the send mode (see recordRecipients calls below) so a send
+      // the user can still cancel never pollutes the suggestion graph.
+      const sentRecipients = recipientsToRecord(draft);
 
       if (sendResult.scheduledSendId && sendResult.scheduledSendAt) {
         // BFF persisted the submission to Postgres; the worker
         // will dispatch it at send_at. Render a confirmation
         // toast that links the user to the Scheduled Sends page
         // where they can cancel/inspect the row.
+        // A scheduled send is committed to Postgres and will be
+        // dispatched by the worker; record now (parity with the
+        // reviewer-confirmed immediate/confidential commit points).
+        recordRecipients(sentRecipients);
         setScheduledConfirm({
           id: sendResult.scheduledSendId,
           sendAt: sendResult.scheduledSendAt,
@@ -399,6 +399,9 @@ export default function Compose() {
       }
 
       if (privacyMode === "confidential-send") {
+        // Confidential Send never opts into undo-send, so the JMAP
+        // submission already committed above — record now.
+        recordRecipients(sentRecipients);
         // For Confidential Send we *additionally* mint a one-time
         // portal link. The encrypted blob ref is the JMAP message
         // id — the actual ciphertext envelope still lives in
@@ -429,14 +432,21 @@ export default function Compose() {
         // BFF intercepted the submission and is holding it in
         // Valkey. Render the undo banner; the deadline-timer
         // effect handles navigation after the hold elapses.
+        // Recipients are deliberately NOT recorded here — the send is
+        // still cancellable. We stash them on the pending state and
+        // record only once the hold elapses (see the timer effect).
+        recordedPendingRef.current = null;
         setPendingSend({
           id: sendResult.pendingSendId,
           deadline: sendResult.undoDeadline,
+          recipients: sentRecipients,
         });
         setSuccessMessage(null);
         return;
       }
 
+      // Immediate send: irrevocable once sendEmail resolved.
+      recordRecipients(sentRecipients);
       setSuccessMessage("Message sent.");
       // Give the user a brief moment to see the success confirmation
       // before we navigate them back to the inbox. We deliberately
@@ -968,6 +978,36 @@ function formatAddress(a: EmailAddress): string {
     ? `"${a.name.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`
     : a.name;
   return `${name} <${a.email}>`;
+}
+
+/**
+ * WS7: the recipients we feed to the frequent-contacts / co-recipient
+ * tracker after a send commits.
+ *
+ * Only the *visible* recipients (To + Cc) are recorded. Bcc is
+ * deliberately excluded: it builds the co-recipient graph, so recording
+ * a blind-copied address could later surface it as a "you usually CC X"
+ * suggestion and leak the hidden Bcc relationship to anyone composing on
+ * this account. The full `Name <email>` form is sent (not the bare
+ * email) so the tracker can capture the display name for the chips; the
+ * BFF parses the address and keys on the bare email.
+ */
+function recipientsToRecord(draft: EmailDraft): string[] {
+  return [...(draft.to ?? []), ...(draft.cc ?? [])].map((a) => formatAddress(a));
+}
+
+/**
+ * Fire-and-forget the send record. Best-effort so a Valkey hiccup can
+ * never fail or delay the send the user just confirmed; suggestions are
+ * non-critical. Callers invoke this only once a send is irrevocable
+ * (immediate/scheduled/confidential at submit, undo-send once the hold
+ * elapses) so a cancelled send never pollutes the suggestion graph.
+ */
+function recordRecipients(recipients: string[]): void {
+  if (recipients.length === 0) return;
+  recordSend(recipients).catch(() => {
+    /* suggestions are non-critical; ignore */
+  });
 }
 
 /**

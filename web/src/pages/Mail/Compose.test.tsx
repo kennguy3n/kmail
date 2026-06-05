@@ -248,6 +248,7 @@ describe("<Compose />", () => {
       scheduledSendId: null,
       scheduledSendAt: null,
     });
+    recordSend.mockClear();
 
     const user = userEvent.setup();
     renderCompose();
@@ -257,6 +258,9 @@ describe("<Compose />", () => {
 
     const undoBtn = await screen.findByTestId("undo-send-cancel");
     expect(undoBtn).toBeEnabled();
+    // While the hold is live the recipients must NOT be recorded yet —
+    // the send is still cancellable.
+    expect(recordSend).not.toHaveBeenCalled();
     // Deadline expires within the timeout: banner disappears,
     // success toast appears, and the route navigates to /mail.
     await waitFor(
@@ -264,6 +268,10 @@ describe("<Compose />", () => {
       { timeout: 3000 },
     );
     await screen.findByText(/back to mail/i);
+    // Now that the hold elapsed the send is irrevocable, so the
+    // recipients are recorded exactly once.
+    await waitFor(() => expect(recordSend).toHaveBeenCalledTimes(1));
+    expect(recordSend).toHaveBeenCalledWith(["alice@example.com"]);
   });
 
   it("cancels the pending send when the Undo button is clicked", async () => {
@@ -277,6 +285,7 @@ describe("<Compose />", () => {
       scheduledSendAt: null,
     });
     cancelPendingSend.mockResolvedValueOnce({ cancelled: true });
+    recordSend.mockClear();
 
     const user = userEvent.setup();
     renderCompose();
@@ -293,6 +302,9 @@ describe("<Compose />", () => {
     expect(
       await screen.findByText(/send cancelled\. edit the message/i),
     ).toBeInTheDocument();
+    // The send was cancelled during the hold, so its recipients must
+    // never enter the frequent-contacts / co-recipient graph.
+    expect(recordSend).not.toHaveBeenCalled();
   });
 
   it("sends the X-KMail-Schedule-At opt-in when the user picks 'Schedule for later'", async () => {
