@@ -47,6 +47,7 @@ import (
 	"github.com/kennguy3n/kmail/internal/scheduledsend"
 	"github.com/kennguy3n/kmail/internal/scim"
 	"github.com/kennguy3n/kmail/internal/search"
+	"github.com/kennguy3n/kmail/internal/secrets"
 	"github.com/kennguy3n/kmail/internal/sharedinbox"
 	"github.com/kennguy3n/kmail/internal/sieve"
 	"github.com/kennguy3n/kmail/internal/snooze"
@@ -421,7 +422,14 @@ func main() {
 	// and so every consumer shares the same `*cmk.AESGCMEnvelope`
 	// value (cheaper, and makes future KMS-backed rotations a
 	// single swap).
-	secretsEnvelope, secretsEnvelopeErr := cmk.LoadEnvelope()
+	// Rotation-aware load: in addition to KMAIL_SECRETS_KEY this
+	// also honours KMAIL_SECRETS_KEY_RETIRED (comma-separated old
+	// keys) so the master key can be rotated without downtime —
+	// new writes seal under the new key while reads still
+	// decrypt rows sealed under a retired key. With no retired
+	// keys configured this behaves identically to the previous
+	// single-key cmk.LoadEnvelope. See docs/SECRETS.md.
+	secretsEnvelope, secretsEnvelopeErr := secrets.LoadEnvelope(context.Background(), nil)
 	if secretsEnvelopeErr != nil {
 		// DKIM, TOTP, and the zk-object-fabric provisioner fall
 		// back to plaintext-on-disk when the envelope is unset
