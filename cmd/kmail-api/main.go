@@ -795,6 +795,12 @@ func main() {
 		logger.Fatalf("priority.NewService: %v", err)
 	}
 	priority.NewHandlers(prioritySvc, priorityStore, logger).Register(mux, authMW)
+
+	analyticsSource, err := smartfeatures.NewJMAPAnalyticsSource(internalJmap)
+	if err != nil {
+		logger.Fatalf("smartfeatures.NewJMAPAnalyticsSource: %v", err)
+	}
+	smartfeatures.NewAnalyticsHandlers(analyticsSource, logger).Register(mux, authMW)
 	logger.Printf("smartfeatures + priority inbox: handlers wired (valkey=%t)", valkeyClient != nil)
 
 	if chained := jmap.ChainSendInterceptors(sendInterceptors...); chained != nil {

@@ -202,3 +202,19 @@ func asString(v any) string {
 	s, _ := v.(string)
 	return s
 }
+
+// stringSlice coerces a JMAP `[]any` of ids into a `[]string`,
+// dropping any non-string entries.
+func stringSlice(v any) []string {
+	list, ok := v.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(list))
+	for _, item := range list {
+		if s, ok := item.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
+}
