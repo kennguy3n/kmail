@@ -41,6 +41,7 @@ import SieveAdmin from "./pages/Admin/SieveAdmin";
 import SecuritySettings from "./pages/Admin/SecuritySettings";
 import ContactsView from "./pages/Mail/ContactsView";
 import Signup from "./pages/Signup";
+import Showcase from "./components/Showcase";
 
 /**
  * App is the KMail React entrypoint.
@@ -107,6 +108,9 @@ export default function App() {
         <Route path="admin/sieve" element={<SieveAdmin />} />
         <Route path="admin/security" element={<SecuritySettings />} />
         <Route path="contacts" element={<ContactsView />} />
+
+        {/* Non-production component gallery (WS1) for visual QA. */}
+        <Route path="showcase" element={<Showcase />} />
 
         <Route path="*" element={<Navigate to="/mail" replace />} />
       </Route>

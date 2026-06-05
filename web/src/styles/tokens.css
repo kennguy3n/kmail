@@ -1,0 +1,146 @@
+/*
+ * KMail design tokens.
+ *
+ * Two layers live here:
+ *
+ *   1. PRIMITIVE tokens — the raw palette / scale values (e.g.
+ *      `--blue-600`, `--space-4`). These never change between
+ *      themes and are referenced only by semantic tokens, not by
+ *      components directly.
+ *   2. NON-COLOR semantic tokens — spacing, typography, radius,
+ *      shadow, z-index, breakpoints and motion. These are
+ *      theme-independent so they live here rather than in a theme
+ *      file.
+ *
+ * Semantic COLOR tokens (`--color-*`) are defined per-theme in
+ * `themes/light.css` and `themes/dark.css`, which map the
+ * primitives above onto role-based names (`--color-bg`,
+ * `--color-text`, …). Components must only ever read semantic
+ * tokens so that a single `data-theme` flip restyles everything.
+ */
+
+:root {
+  /* ---- Primitive: neutral scale -------------------------------- */
+  --gray-0: #ffffff;
+  --gray-50: #f9fafb;
+  --gray-100: #f3f4f6;
+  --gray-150: #eef0f3;
+  --gray-200: #e5e7eb;
+  --gray-300: #d1d5db;
+  --gray-400: #9ca3af;
+  --gray-500: #6b7280;
+  --gray-600: #4b5563;
+  --gray-700: #374151;
+  --gray-800: #1f2937;
+  --gray-900: #111827;
+  --gray-950: #0b1020;
+
+  /* ---- Primitive: brand / accent (blue) ------------------------ */
+  --blue-50: #eff6ff;
+  --blue-100: #dbeafe;
+  --blue-200: #bfdbfe;
+  --blue-300: #93c5fd;
+  --blue-400: #60a5fa;
+  --blue-500: #3b82f6;
+  --blue-600: #2563eb;
+  --blue-700: #1d4ed8;
+  --blue-800: #1e40af;
+
+  /* ---- Primitive: status palettes ------------------------------ */
+  --green-100: #dcfce7;
+  --green-500: #22c55e;
+  --green-600: #16a34a;
+  --green-700: #15803d;
+
+  --amber-100: #fef3c7;
+  --amber-500: #f59e0b;
+  --amber-600: #d97706;
+  --amber-700: #b45309;
+  --amber-900: #92400e;
+
+  --red-100: #fee2e2;
+  --red-500: #ef4444;
+  --red-600: #dc2626;
+  --red-700: #b91c1c;
+
+  /* ---- Spacing scale (4px base) -------------------------------- */
+  --space-0: 0;
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.25rem;
+  --space-6: 1.5rem;
+  --space-8: 2rem;
+  --space-10: 2.5rem;
+  --space-12: 3rem;
+  --space-16: 4rem;
+
+  /* ---- Typography ---------------------------------------------- */
+  --font-sans:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial,
+    "Apple Color Emoji", "Segoe UI Emoji", sans-serif;
+  --font-mono:
+    ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono",
+    monospace;
+
+  --font-size-xs: 0.75rem;
+  --font-size-sm: 0.85rem;
+  --font-size-md: 0.95rem;
+  --font-size-lg: 1.1rem;
+  --font-size-xl: 1.35rem;
+  --font-size-2xl: 1.75rem;
+
+  --font-weight-normal: 400;
+  --font-weight-medium: 500;
+  --font-weight-semibold: 600;
+  --font-weight-bold: 700;
+
+  --line-height-tight: 1.25;
+  --line-height-normal: 1.5;
+
+  /* ---- Border radius ------------------------------------------- */
+  --radius-sm: 0.25rem;
+  --radius-md: 0.375rem;
+  --radius-lg: 0.5rem;
+  --radius-xl: 0.75rem;
+  --radius-pill: 999px;
+
+  /* ---- Border widths ------------------------------------------- */
+  --border-width: 1px;
+
+  /* ---- Z-index scale ------------------------------------------- */
+  --z-base: 0;
+  --z-sticky: 100;
+  --z-header: 200;
+  --z-drawer: 300;
+  --z-dropdown: 400;
+  --z-modal: 500;
+  --z-toast: 600;
+  --z-tooltip: 700;
+
+  /* ---- Motion -------------------------------------------------- */
+  --transition-fast: 120ms ease;
+  --transition-base: 180ms ease;
+
+  /* ---- Responsive breakpoints (referenced in JS + comments) ----
+   * --bp-sm   : phones / small tablets boundary
+   * --bp-md   : tablet boundary (sidebar collapses below this)
+   * --bp-lg   : desktop boundary
+   * These are documented as custom properties so the values are
+   * discoverable, but media queries must use literal px values
+   * because CSS `@media` cannot read custom properties. Keep the
+   * literals in sync with `BREAKPOINTS` in `hooks/useMediaQuery`.
+   */
+  --bp-sm: 640px;
+  --bp-md: 900px;
+  --bp-lg: 1200px;
+
+  /* ---- Layout sizing ------------------------------------------- */
+  --header-height: 3.5rem;
+  --sidebar-width: 16rem;
+  --sidebar-width-collapsed: 4rem;
+
+  /* ---- Minimum touch target (WCAG 2.1 AA / 2.5.5) -------------- */
+  --touch-target-min: 44px;
+}
