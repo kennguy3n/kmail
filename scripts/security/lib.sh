@@ -31,11 +31,24 @@ sec_curl_status() {
 	curl -k -s -o /dev/null -w '%{http_code}' -X "$method" "$@" "$url" 2>/dev/null || echo "000"
 }
 
-# sec_curl_body METHOD URL [extra curl args...] -> prints response body.
-sec_curl_body() {
-	local method="$1" url="$2"
+# sec_curl_full METHOD URL [extra curl args...] -> prints the response
+# body followed by a final line "SEC_HTTP_STATUS:<code>", captured from
+# a SINGLE request so the body and status are guaranteed to describe the
+# same response (issuing two requests can race — rate limiting, a
+# transient 5xx, or recovery between calls would correlate a body with
+# the wrong status). A connection failure yields status 000 with an
+# empty body. Callers split with:
+#   resp="$(sec_curl_full GET "$url" ...)"
+#   code="${resp##*SEC_HTTP_STATUS:}"
+#   body="${resp%$'\n'SEC_HTTP_STATUS:*}"
+sec_curl_full() {
+	local method="$1" url="$2" out
 	shift 2
-	curl -k -s -X "$method" "$@" "$url" 2>/dev/null || true
+	# -w appends the status after the body in the SAME request. On a
+	# connection failure curl exits non-zero; normalise to a single
+	# 000 marker so the output always has exactly one status marker.
+	out="$(curl -k -s -w $'\nSEC_HTTP_STATUS:%{http_code}' -X "$method" "$@" "$url" 2>/dev/null)" || out=$'\nSEC_HTTP_STATUS:000'
+	printf '%s' "$out"
 }
 
 # sec_pass / sec_fail / sec_skip — uniform result lines + counters.

@@ -59,8 +59,11 @@ echo "SQLi scan against ${TARGET} (${#PAYLOADS[@]} payloads/endpoint)"
 while IFS= read -r ep; do
 	for payload in "${PAYLOADS[@]}"; do
 		url="${TARGET}$(inject_path "$ep" "$payload")"
-		body="$(sec_curl_body GET "$url" "${AUTH[@]}")"
-		code="$(sec_curl_status GET "$url" "${AUTH[@]}")"
+		# Single request so the body and status describe the same
+		# response (see sec_curl_full in lib.sh).
+		resp="$(sec_curl_full GET "$url" "${AUTH[@]}")"
+		code="${resp##*SEC_HTTP_STATUS:}"
+		body="${resp%$'\n'SEC_HTTP_STATUS:*}"
 		if [ "$code" = "500" ]; then
 			sec_fail "${ep} payload[${payload}] -> 500"
 		elif echo "$body" | grep -qiE "$LEAK_MARKERS"; then

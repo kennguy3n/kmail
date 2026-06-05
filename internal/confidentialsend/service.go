@@ -182,6 +182,14 @@ func (s *Service) RekeyConfidentialMessage(ctx context.Context, tenantID, linkID
 // without telling the caller.
 var ErrMLSPartialRequest = errors.New("confidentialsend: MLS send requires both sender_leaf_key and recipients")
 
+// ErrMLSDeriveFailed wraps a server-side failure to derive the MLS
+// wrapping key (MLS endpoint down / 5xx / network error). The create
+// request itself was well-formed, so the HTTP layer maps this to 502
+// (upstream failure) rather than 400 — mirroring the mlsWrap/mlsRekey
+// handlers. It does NOT cover ErrMLSPartialRequest or ErrMLSDisabled,
+// which are client/config conditions handled separately.
+var ErrMLSDeriveFailed = errors.New("confidentialsend: MLS wrapping-key derivation failed")
+
 // wrapResult carries the MLS material resolved for a new link.
 type wrapResult struct {
 	wrapped      bool
@@ -219,7 +227,10 @@ func (s *Service) resolveCreateWrapping(ctx context.Context, req CreateRequest) 
 	// full slice is retained as the participant set for rekey.
 	key, err := s.mls.DeriveWrappingKey(ctx, req.SenderLeafKey, req.Recipients[0])
 	if err != nil {
-		return wrapResult{}, fmt.Errorf("confidentialsend: derive MLS wrapping key: %w", err)
+		// Tag with ErrMLSDeriveFailed so the HTTP layer can return
+		// 502 (upstream failure) rather than 400 — the request was
+		// valid, the MLS service failed.
+		return wrapResult{}, fmt.Errorf("%w: %w", ErrMLSDeriveFailed, err)
 	}
 	return wrapResult{
 		wrapped:      true,

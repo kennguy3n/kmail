@@ -120,12 +120,25 @@ func TestResolveCreateWrapping_DerivesKey(t *testing.T) {
 }
 
 func TestResolveCreateWrapping_DeriveErrorPropagates(t *testing.T) {
-	s := enabledMockService(&mockDeriver{err: errors.New("mls boom")})
+	boom := errors.New("mls boom")
+	s := enabledMockService(&mockDeriver{err: boom})
 	_, err := s.resolveCreateWrapping(context.Background(), CreateRequest{
 		SenderLeafKey: "leaf", Recipients: []string{"bob@x.test"},
 	})
 	if err == nil {
 		t.Fatal("expected derive error to propagate")
+	}
+	// A server-side derive failure must be tagged ErrMLSDeriveFailed so
+	// the HTTP layer returns 502 (not 400), while still preserving the
+	// underlying cause for logging.
+	if !errors.Is(err, ErrMLSDeriveFailed) {
+		t.Fatalf("expected ErrMLSDeriveFailed, got %v", err)
+	}
+	if !errors.Is(err, boom) {
+		t.Fatalf("underlying cause must be preserved, got %v", err)
+	}
+	if errors.Is(err, ErrMLSPartialRequest) {
+		t.Fatal("a derive failure must not be conflated with a partial request")
 	}
 }
 

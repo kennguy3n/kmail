@@ -132,11 +132,18 @@ func (h *Handlers) create(w http.ResponseWriter, r *http.Request) {
 		SenderLeafKey:    in.SenderLeafKey,
 		Recipients:       in.Recipients,
 	})
-	if errors.Is(err, ErrMLSDisabled) {
+	switch {
+	case errors.Is(err, ErrMLSDisabled):
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 		return
-	}
-	if err != nil {
+	case errors.Is(err, ErrMLSDeriveFailed):
+		// The request was valid but the upstream MLS service failed
+		// — surface 502, consistent with mlsWrap/mlsRekey, instead
+		// of blaming the client with a 400.
+		h.logger.Printf("confidential-send: MLS derive failed for tenant %s: %v", tenantID, err)
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		return
+	case err != nil:
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
