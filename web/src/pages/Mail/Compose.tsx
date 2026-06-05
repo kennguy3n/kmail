@@ -16,6 +16,7 @@ import {
 import {
   getFrequentContacts,
   getCoRecipients,
+  recordSend,
   type FrequentContact,
   type CoRecipientSuggestion,
 } from "../../api/smart";
@@ -349,6 +350,23 @@ export default function Compose() {
         scheduleAt: scheduleAtDate ?? undefined,
       });
       setSavedDraftId(null);
+
+      // WS7: feed the frequent-contacts / co-recipient suggestion
+      // tracker. Fire-and-forget and best-effort so a Valkey hiccup
+      // can never fail or delay the send the user just confirmed.
+      // Placed here (before the per-mode branches) so it covers every
+      // successful path: immediate, scheduled, confidential, and
+      // undo-send.
+      const sentRecipients = [
+        ...(draft.to ?? []),
+        ...(draft.cc ?? []),
+        ...(draft.bcc ?? []),
+      ].map((a) => a.email);
+      if (sentRecipients.length > 0) {
+        recordSend(sentRecipients).catch(() => {
+          /* suggestions are non-critical; ignore */
+        });
+      }
 
       if (sendResult.scheduledSendId && sendResult.scheduledSendAt) {
         // BFF persisted the submission to Postgres; the worker
@@ -885,16 +903,23 @@ interface ComposeSeed {
   quotedBody?: string;
   quotedFrom?: EmailAddress[] | null;
   quotedDate?: string | null;
+  /**
+   * Non-quoted text to pre-fill at the top of the body (e.g. a
+   * smart-reply suggestion). Rendered above any quoted reply so the
+   * user starts with the suggested sentence and can edit from there.
+   */
+  prefillBody?: string;
 }
 
 function initialBody(seed: ComposeSeed | null): string {
-  if (!seed || !seed.quotedBody) return "";
+  const prefill = seed?.prefillBody ?? "";
+  if (!seed || !seed.quotedBody) return prefill;
   const header = buildQuoteHeader(seed);
   const quoted = seed.quotedBody
     .split("\n")
     .map((line) => `> ${line}`)
     .join("\n");
-  return `\n\n${header}\n${quoted}\n`;
+  return `${prefill}\n\n${header}\n${quoted}\n`;
 }
 
 function buildQuoteHeader(seed: ComposeSeed): string {

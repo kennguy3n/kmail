@@ -11,7 +11,7 @@ import {
   type UnsubscribeInfoResponse,
 } from "../../api/smart";
 import SnoozePicker from "./SnoozePicker";
-import type { Email, EmailBodyPart } from "../../types";
+import type { Email, EmailAddress, EmailBodyPart } from "../../types";
 
 /**
  * MessageView is the single-message reading pane.
@@ -91,14 +91,20 @@ export default function MessageView() {
   const bodyText = useMemo(() => resolveBody(email), [email]);
   const attachments = useMemo(() => resolveAttachments(email), [email]);
 
+  // Prefer the Reply-To header when present (mailing lists, shared
+  // inboxes, newsletters) over the From address. Shared by the
+  // Reply buttons and the smart-reply chips so both target the same
+  // address.
+  const replyTarget = useMemo<EmailAddress[]>(
+    () =>
+      email?.replyTo && email.replyTo.length > 0
+        ? email.replyTo
+        : (email?.from ?? []),
+    [email],
+  );
+
   const handleReply = (replyAll: boolean) => {
     if (!email) return;
-    // Prefer the Reply-To header when present (mailing lists,
-    // shared inboxes, newsletters) over the From address.
-    const replyTarget =
-      email.replyTo && email.replyTo.length > 0
-        ? email.replyTo
-        : (email.from ?? []);
     // For Reply-All, dedupe the CC list against the reply target so
     // the same address doesn't end up in both To and Cc. Compose
     // does a second pass to strip the sender's own identity, which
@@ -303,10 +309,12 @@ export default function MessageView() {
                   state: {
                     mode: "reply",
                     sourceEmailId: email.id,
-                    subject: email.subject?.startsWith("Re:")
-                      ? email.subject
-                      : `Re: ${email.subject ?? ""}`,
+                    to: replyTarget,
+                    subject: withPrefix(email.subject, "Re:"),
                     prefillBody: s.text,
+                    quotedBody: bodyText,
+                    quotedFrom: email.from,
+                    quotedDate: email.receivedAt,
                   },
                 })
               }
