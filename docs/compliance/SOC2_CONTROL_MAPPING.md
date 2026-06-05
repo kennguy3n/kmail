@@ -118,5 +118,54 @@ runbook.
 
 * CI logs: GitHub Actions `Build` workflow per PR
 * Audit chain verification: `internal/audit/audit.go` `VerifyChain`
-* Penetration test summary: shared on request under NDA
+* Penetration test summary: shared on request under NDA — see [`../SECURITY_TESTING.md`](../SECURITY_TESTING.md)
 * Sub-processor changes: in-product changelog + email
+
+## Evidence Collection Procedures
+
+A SOC 2 Type II audit covers an *observation window* (typically 6–12
+months), so each control needs **periodic, dated evidence** rather
+than a one-time snapshot. The table below is the collection plan;
+`scripts/compliance/generate-evidence.sh` automates the machine-
+collectable rows into a single timestamped bundle.
+
+| Control | Evidence artifact | Cadence | Owner | Automated by |
+|---------|-------------------|---------|-------|--------------|
+| CC4.2 / CC6.3 | Audit-log hash-chain verification output | Monthly | Security | `generate-evidence.sh --audit` |
+| CC6.1 / CC6.2 | Quarterly user access review (per-tenant role dump) | Quarterly | Security + tenant admins | `generate-evidence.sh --access-review` |
+| CC8.1 | Change log: merged PRs with reviewer + CI status | Per release | Eng leads | `generate-evidence.sh --change-log` |
+| CC7.2 | Incident postmortems | Per incident | On-call | [`incident-response.md`](./incident-response.md) |
+| CC9.1 / CC3.2 | Vendor / sub-processor review register | Quarterly | Security | [`vendors.md`](./vendors.md) |
+| A1.3 | DB restore-drill record | Quarterly | SRE | Manual runbook |
+| C1.1 | Encryption-at-rest config snapshot (envelope wired, CMK status) | Per release | Eng | `generate-evidence.sh --change-log` (boot log capture) |
+
+### Continuous control monitoring
+
+The following controls are monitored continuously rather than
+sampled:
+
+* **Access reviews** — the quarterly review is a *point-in-time
+  attestation*, but role grants are continuously audit-logged
+  (`audit_log` chained writes on every admin route), so the
+  quarterly report is a reconciliation, not a discovery.
+* **Change management** — branch protection on `main` requires a PR
+  with at least one approving review and green CI before merge. This
+  is enforced in the platform (GitHub branch protection) and in CI;
+  see "Change management enforcement" below.
+* **Incident response** — see [`incident-response.md`](./incident-response.md).
+* **Vendor management** — see [`vendors.md`](./vendors.md).
+
+### Change management enforcement
+
+CC8.1 ("authorised changes") is enforced, not just documented:
+
+1. **Branch protection** on `main` — no direct pushes; PR + review +
+   passing required status checks before merge.
+2. **CI gate** — the `Build` workflow runs `go build`, `go vet`,
+   `go test -race`, the web lint/typecheck/test suite, and Helm lint.
+3. **CODEOWNERS** — sensitive paths (auth, crypto, migrations) route
+   review to the owning team.
+
+The change-log evidence (merged PRs with reviewer + CI conclusion)
+is exported by `generate-evidence.sh --change-log` using the GitHub
+CLI when available.
