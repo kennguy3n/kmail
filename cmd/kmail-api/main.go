@@ -42,6 +42,7 @@ import (
 	"github.com/kennguy3n/kmail/internal/monitoring"
 	"github.com/kennguy3n/kmail/internal/oauth"
 	"github.com/kennguy3n/kmail/internal/onboarding"
+	"github.com/kennguy3n/kmail/internal/priority"
 	"github.com/kennguy3n/kmail/internal/push"
 	"github.com/kennguy3n/kmail/internal/retention"
 	"github.com/kennguy3n/kmail/internal/scheduledsend"
@@ -49,6 +50,7 @@ import (
 	"github.com/kennguy3n/kmail/internal/search"
 	"github.com/kennguy3n/kmail/internal/sharedinbox"
 	"github.com/kennguy3n/kmail/internal/sieve"
+	"github.com/kennguy3n/kmail/internal/smartfeatures"
 	"github.com/kennguy3n/kmail/internal/snooze"
 	syncsvc "github.com/kennguy3n/kmail/internal/sync"
 	"github.com/kennguy3n/kmail/internal/tenant"
@@ -738,6 +740,62 @@ func main() {
 		go snoozeWorker.Run(ctx)
 	}
 	logger.Printf("snooze: worker wired (interval=%s)", snoozeInterval)
+
+	// Workstream 7 — Smart Features & Intelligence.
+	//
+	// Rule-based smart replies, Gmail-style categorization, the
+	// List-Unsubscribe helper, frequent-contact tracking, and the
+	// Priority Inbox. All read-only/derived: the smart-features
+	// surface reads mail via the JMAP InternalClient and stores its
+	// ephemeral per-user state (contact frequency, unsubscribe
+	// records, priority scores) in Valkey. When Valkey is unavailable
+	// the contact/priority endpoints degrade to 503 rather than
+	// taking down the rest of the API.
+	smartFetcher, err := smartfeatures.NewJMAPFetcher(internalJmap)
+	if err != nil {
+		logger.Fatalf("smartfeatures.NewJMAPFetcher: %v", err)
+	}
+	var (
+		contactTracker *smartfeatures.ContactTracker
+		unsubStore     *smartfeatures.UnsubscribeStore
+		priorityStore  *priority.Store
+		priorityHist   priority.SendHistory
+	)
+	if valkeyClient != nil {
+		if contactTracker, err = smartfeatures.NewContactTracker(valkeyClient, 0); err != nil {
+			logger.Fatalf("smartfeatures.NewContactTracker: %v", err)
+		}
+		if unsubStore, err = smartfeatures.NewUnsubscribeStore(valkeyClient, 0); err != nil {
+			logger.Fatalf("smartfeatures.NewUnsubscribeStore: %v", err)
+		}
+		if priorityStore, err = priority.NewStore(valkeyClient, 0); err != nil {
+			logger.Fatalf("priority.NewStore: %v", err)
+		}
+		priorityHist = contactTracker
+	}
+	smartfeatures.NewHandlers(smartfeatures.HandlersConfig{
+		Fetcher:  smartFetcher,
+		Contacts: contactTracker,
+		Unsub:    unsubStore,
+		OneClick: smartfeatures.NewSafeOneClickUnsubscriber(0),
+		Logger:   logger,
+	}).Register(mux, authMW)
+
+	prioritySource, err := priority.NewJMAPSource(internalJmap)
+	if err != nil {
+		logger.Fatalf("priority.NewJMAPSource: %v", err)
+	}
+	prioritySvc, err := priority.NewService(priority.Config{
+		Source:  prioritySource,
+		History: priorityHist,
+		Store:   priorityStore,
+		Logger:  logger,
+	})
+	if err != nil {
+		logger.Fatalf("priority.NewService: %v", err)
+	}
+	priority.NewHandlers(prioritySvc, priorityStore, logger).Register(mux, authMW)
+	logger.Printf("smartfeatures + priority inbox: handlers wired (valkey=%t)", valkeyClient != nil)
 
 	if chained := jmap.ChainSendInterceptors(sendInterceptors...); chained != nil {
 		proxy.SetSendInterceptor(chained)
