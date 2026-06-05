@@ -286,6 +286,16 @@ func (s *Service) CreateSecureMessage(ctx context.Context, req CreateRequest) (*
 	}
 	expiresAt := s.now().Add(req.ExpiresIn)
 
+	// mls_participants is TEXT[] NOT NULL: a nil slice (every
+	// link-only send, where resolveCreateWrapping returns a zero
+	// wrapResult) would encode as SQL NULL and violate the
+	// constraint. Coerce to an empty array so the link-portal path
+	// inserts cleanly.
+	participants := wrap.participants
+	if participants == nil {
+		participants = []string{}
+	}
+
 	var m SecureMessage
 	err = pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		if err := middleware.SetTenantGUC(ctx, tx, req.TenantID); err != nil {
@@ -302,7 +312,7 @@ func (s *Service) CreateSecureMessage(ctx context.Context, req CreateRequest) (*
 			          revoked, created_at, mls_epoch
 		`, req.TenantID, req.SenderID, token, req.EncryptedBlobRef,
 			passwordHash, expiresAt, req.MaxViews,
-			wrap.wrappingKey, wrap.senderLeaf, wrap.participants,
+			wrap.wrappingKey, wrap.senderLeaf, participants,
 		).Scan(
 			&m.ID, &m.TenantID, &m.SenderID, &m.LinkToken,
 			&m.EncryptedBlobRef, &m.ExpiresAt, &m.MaxViews, &m.ViewCount,
@@ -458,7 +468,8 @@ func (s *Service) ListSentSecureMessages(ctx context.Context, tenantID, senderID
 			rows, err = tx.Query(ctx, `
 				SELECT id::text, tenant_id::text, sender_id, link_token,
 				       password_hash <> '' AS has_password, expires_at,
-				       max_views, view_count, revoked, created_at
+				       max_views, view_count, revoked, created_at,
+				       mls_sender_leaf_key <> '' AS mls_wrapped, mls_epoch
 				FROM confidential_send_links
 				WHERE tenant_id = $1::uuid
 				ORDER BY created_at DESC
@@ -468,7 +479,8 @@ func (s *Service) ListSentSecureMessages(ctx context.Context, tenantID, senderID
 			rows, err = tx.Query(ctx, `
 				SELECT id::text, tenant_id::text, sender_id, link_token,
 				       password_hash <> '' AS has_password, expires_at,
-				       max_views, view_count, revoked, created_at
+				       max_views, view_count, revoked, created_at,
+				       mls_sender_leaf_key <> '' AS mls_wrapped, mls_epoch
 				FROM confidential_send_links
 				WHERE tenant_id = $1::uuid AND sender_id = $2
 				ORDER BY created_at DESC
@@ -484,7 +496,7 @@ func (s *Service) ListSentSecureMessages(ctx context.Context, tenantID, senderID
 			if err := rows.Scan(
 				&m.ID, &m.TenantID, &m.SenderID, &m.LinkToken,
 				&m.HasPassword, &m.ExpiresAt, &m.MaxViews, &m.ViewCount,
-				&m.Revoked, &m.CreatedAt,
+				&m.Revoked, &m.CreatedAt, &m.MLSWrapped, &m.MLSEpoch,
 			); err != nil {
 				return err
 			}
