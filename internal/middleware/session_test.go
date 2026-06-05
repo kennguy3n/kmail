@@ -3,6 +3,7 @@ package middleware
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -119,6 +120,27 @@ func TestMemoryStore_RevokeAndIsRevoked(t *testing.T) {
 	}
 }
 
+func TestMemoryStore_RevokeForeignSessionRejected(t *testing.T) {
+	ctx := context.Background()
+	st := NewMemorySessionStore()
+	now := time.Unix(1_700_000_000, 0)
+	victim := userKey("t1", "victim")
+	attacker := userKey("t1", "attacker")
+	_, _ = st.Touch(ctx, SessionInfo{ID: "victim-sess", UserKey: victim}, time.Hour, 5, now)
+
+	// Attacker revoking the victim's session id under their own key
+	// must be refused and must NOT plant a global tombstone.
+	if err := st.Revoke(ctx, attacker, "victim-sess", time.Hour, now); !errors.Is(err, ErrSessionNotFound) {
+		t.Fatalf("expected ErrSessionNotFound revoking a foreign session, got %v", err)
+	}
+	if r, _ := st.IsRevoked(ctx, "victim-sess", now); r {
+		t.Fatal("foreign revoke must NOT tombstone the victim's session")
+	}
+	if live, _ := st.List(ctx, victim, time.Hour, now); len(live) != 1 {
+		t.Fatalf("victim session must remain live, got %d", len(live))
+	}
+}
+
 func idFor(i int) string { return "id-" + string(rune('0'+i)) }
 
 // --- Manager middleware ---
@@ -147,7 +169,16 @@ func TestSessionManager_RevokedTokenRejected(t *testing.T) {
 	mgr := NewSessionManager(SessionConfig{Store: st, Enabled: true})
 	r := ctxWithIdentity(bearerReq("tok"), "t1", "u1")
 	sid := SessionIDFromRequest(r)
-	_ = st.Revoke(context.Background(), userKey("t1", "u1"), sid, time.Hour, time.Now())
+	uk := userKey("t1", "u1")
+	// A session can only be revoked once it exists in the user's set
+	// (the ownership guard refuses to tombstone unknown ids), so track
+	// it first — mirroring a real revoke of a live session.
+	if _, err := st.Touch(context.Background(), SessionInfo{ID: sid, UserKey: uk}, time.Hour, 5, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Revoke(context.Background(), uk, sid, time.Hour, time.Now()); err != nil {
+		t.Fatalf("revoke of own live session must succeed: %v", err)
+	}
 
 	rec := httptest.NewRecorder()
 	mgr.Wrap(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
@@ -237,6 +268,28 @@ func TestSessionHandlers_ListAndRevoke(t *testing.T) {
 	}
 	if r, _ := st.IsRevoked(context.Background(), curSID, time.Now()); r {
 		t.Fatal("current session must NOT be revoked by all_others")
+	}
+}
+
+func TestSessionHandlers_RevokeForeignSession404(t *testing.T) {
+	st := NewMemorySessionStore()
+	mgr := NewSessionManager(SessionConfig{Store: st, Enabled: true})
+	h := NewSessionHandlers(mgr)
+	// A session owned by a DIFFERENT user.
+	_, _ = st.Touch(context.Background(),
+		SessionInfo{ID: "foreign", UserKey: userKey("t1", "other")},
+		DefaultSessionIdleTimeout, 5, time.Now())
+
+	req := ctxWithIdentity(
+		httptest.NewRequest(http.MethodPost, "/api/v1/sessions/revoke",
+			strings.NewReader(`{"session_id":"foreign"}`)), "t1", "u1")
+	rec := httptest.NewRecorder()
+	h.revoke(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 revoking a foreign session, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if r, _ := st.IsRevoked(context.Background(), "foreign", time.Now()); r {
+		t.Fatal("foreign session must not be tombstoned via the handler")
 	}
 }
 

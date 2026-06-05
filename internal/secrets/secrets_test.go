@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -269,5 +270,68 @@ func TestLoadEnvelope_WithRetiredList(t *testing.T) {
 	}
 	if re.RetiredKeyCount() != 2 {
 		t.Fatalf("expected 2 retired keys, got %d", re.RetiredKeyCount())
+	}
+}
+
+// stubProvider returns a fixed value/error per ref so LoadEnvelope's
+// error handling around the retired-key lookup can be exercised.
+type stubProvider struct {
+	primary      string
+	retiredErr   error
+	retiredValue string
+	retiredIsSet bool
+}
+
+func (p stubProvider) Backend() string { return "stub" }
+
+func (p stubProvider) Resolve(_ context.Context, ref string) (string, error) {
+	switch ref {
+	case "SECRETS_KEY":
+		return p.primary, nil
+	case "SECRETS_KEY_RETIRED":
+		if p.retiredErr != nil {
+			return "", p.retiredErr
+		}
+		if !p.retiredIsSet {
+			return "", fmt.Errorf("%w: %q", ErrSecretNotFound, ref)
+		}
+		return p.retiredValue, nil
+	default:
+		return "", fmt.Errorf("%w: %q", ErrSecretNotFound, ref)
+	}
+}
+
+func TestLoadEnvelope_RetiredNotFoundIsTolerated(t *testing.T) {
+	// A NotFound on the retired key is the normal "not mid-rotation"
+	// case: LoadEnvelope must succeed with a single-key ring.
+	p := stubProvider{primary: key(0x01)}
+	env, err := LoadEnvelope(context.Background(), p)
+	if err != nil {
+		t.Fatalf("NotFound on retired key must be tolerated, got %v", err)
+	}
+	re, ok := env.(*RotatingEnvelope)
+	if !ok {
+		t.Fatalf("expected *RotatingEnvelope, got %T", env)
+	}
+	if re.RetiredKeyCount() != 0 {
+		t.Fatalf("expected 0 retired keys, got %d", re.RetiredKeyCount())
+	}
+}
+
+func TestLoadEnvelope_RetiredTransportErrorFailsHard(t *testing.T) {
+	// A transport error (NOT NotFound) resolving the retired key must
+	// propagate: booting with a partial keyring would silently fail
+	// to decrypt rows still sealed under a retired key.
+	boom := errors.New("vault: connection refused")
+	p := stubProvider{primary: key(0x01), retiredErr: boom}
+	_, err := LoadEnvelope(context.Background(), p)
+	if err == nil {
+		t.Fatal("expected a transport error resolving retired keys to fail LoadEnvelope")
+	}
+	if !errors.Is(err, boom) {
+		t.Fatalf("expected wrapped transport error, got %v", err)
+	}
+	if errors.Is(err, ErrSecretNotFound) {
+		t.Fatal("transport error must not be conflated with ErrSecretNotFound")
 	}
 }

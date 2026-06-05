@@ -141,7 +141,20 @@ func (s *RedisSessionStore) List(ctx context.Context, userKey string, idleTTL ti
 }
 
 // Revoke implements SessionStore.
+//
+// Revocation is authorization-scoped: we only delete the session and
+// write a (globally-keyed) revocation tombstone when sessionID is a
+// member of the caller's own index set. Otherwise a caller could
+// plant a tombstone for any session id they can guess and 401 the
+// victim. A non-owned id is a no-op that returns ErrSessionNotFound.
 func (s *RedisSessionStore) Revoke(ctx context.Context, userKey, sessionID string, ttl time.Duration, _ time.Time) error {
+	owned, err := s.Client.SIsMember(ctx, userSessKey(userKey), sessionID).Result()
+	if err != nil {
+		return fmt.Errorf("session redis: revoke ownership check: %w", err)
+	}
+	if !owned {
+		return ErrSessionNotFound
+	}
 	pipe := s.Client.TxPipeline()
 	pipe.Del(ctx, sessKey(sessionID))
 	pipe.SRem(ctx, userSessKey(userKey), sessionID)

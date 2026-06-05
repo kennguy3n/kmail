@@ -46,6 +46,10 @@ type SecureMessage struct {
 	// caller supplied sender-leaf + recipient material). For a
 	// plain link-portal message these are zero-valued and
 	// MLSWrapped reports false.
+	//
+	// MLSWrappingKey is for server-side bookkeeping (rekey/rotation)
+	// only — GetSecureMessage strips it before returning over the
+	// public portal so it is never handed to a link-token holder.
 	MLSWrapped     bool   `json:"mls_wrapped"`
 	MLSWrappingKey string `json:"mls_wrapping_key,omitempty"`
 	MLSEpoch       int    `json:"mls_epoch"`
@@ -74,9 +78,9 @@ type CreateRequest struct {
 
 // Service is the implementation.
 type Service struct {
-	pool   *pgxpool.Pool
-	now    func() time.Time
-	mls    MLSKeyDeriver
+	pool *pgxpool.Pool
+	now  func() time.Time
+	mls  MLSKeyDeriver
 }
 
 // NewService returns a service.
@@ -386,6 +390,16 @@ func (s *Service) GetSecureMessage(ctx context.Context, token, password string) 
 	}
 	m.HasPassword = passwordHash != ""
 	m.MLSWrapped = m.MLSWrappingKey != ""
+	// The MLS wrapping key is deliberately NOT served over the public
+	// portal. For an MLS-wrapped message the recipient is an MLS group
+	// member and re-derives the wrapping key from group state via the
+	// auth-gated MLS path; emitting it here would hand the key to any
+	// holder of the (unauthenticated) link token and defeat the
+	// confidentiality the MLS wrapping is meant to provide — the BFF
+	// would effectively distribute the unwrap key to portal visitors.
+	// The portal exposes only MLSWrapped + MLSEpoch so the client
+	// knows to take the MLS-derivation path at the correct epoch.
+	m.MLSWrappingKey = ""
 	return &m, nil
 }
 

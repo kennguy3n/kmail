@@ -129,13 +129,24 @@ func LoadEnvelope(ctx context.Context, p Provider) (cmk.SecretsEnvelope, error) 
 	if err != nil {
 		return nil, fmt.Errorf("cmk: KMAIL_SECRETS_KEY not set: %w", err)
 	}
+	// Retired keys are optional: a deployment not mid-rotation has
+	// none. But only ErrSecretNotFound means "legitimately unset" —
+	// any other error (e.g. a Vault transport failure) must NOT be
+	// swallowed, or the BFF could boot with a partial keyring and
+	// silently fail to decrypt rows still sealed under a retired key.
 	var retired []string
-	if raw, rerr := p.Resolve(ctx, "SECRETS_KEY_RETIRED"); rerr == nil {
+	raw, rerr := p.Resolve(ctx, "SECRETS_KEY_RETIRED")
+	switch {
+	case rerr == nil:
 		for _, k := range strings.Split(raw, ",") {
 			if k = strings.TrimSpace(k); k != "" {
 				retired = append(retired, k)
 			}
 		}
+	case errors.Is(rerr, ErrSecretNotFound):
+		// No retired keys configured — fine, single-key envelope.
+	default:
+		return nil, fmt.Errorf("cmk: resolve KMAIL_SECRETS_KEY_RETIRED: %w", rerr)
 	}
 	return NewRotatingEnvelope(primary, retired...)
 }

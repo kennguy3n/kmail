@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"time"
 )
@@ -131,22 +132,36 @@ func (h *SessionHandlers) revoke(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	} else {
-		// Single-session revoke. The store scopes removal to this
-		// user's set, so a caller cannot revoke another user's
-		// session even by guessing its id — the tombstone would be
-		// written but the id is namespaced out of their reach, and
-		// enumeration is impossible.
+		// Single-session revoke. The store enforces ownership: it
+		// only revokes (and writes a tombstone) when the id is in
+		// THIS user's set, returning ErrSessionNotFound otherwise.
+		// So a caller cannot revoke or tombstone another user's
+		// session even by guessing its id.
 		toRevoke = []string{req.SessionID}
 	}
 
 	revoked := make([]string, 0, len(toRevoke))
 	for _, sid := range toRevoke {
-		if err := h.mgr.cfg.Store.Revoke(r.Context(), uk, sid, ttl, now); err != nil {
+		switch err := h.mgr.cfg.Store.Revoke(r.Context(), uk, sid, ttl, now); {
+		case err == nil:
+			revoked = append(revoked, sid)
+		case errors.Is(err, ErrSessionNotFound):
+			// Not the caller's session (or already gone): skip it
+			// rather than 502 the whole request or tombstone an
+			// id we do not own.
+			continue
+		default:
 			h.mgr.logf("session: revoke %s failed: %v", sid, err)
 			http.Error(w, "failed to revoke session", http.StatusBadGateway)
 			return
 		}
-		revoked = append(revoked, sid)
+	}
+	// A single-session revoke that matched nothing the caller owns is
+	// a 404 — distinct from a successful "signed out everywhere else"
+	// that legitimately had no other sessions to revoke.
+	if !req.AllOthers && len(revoked) == 0 {
+		http.Error(w, "session not found", http.StatusNotFound)
+		return
 	}
 	writeJSON(w, http.StatusOK, revokeResponse{Revoked: revoked})
 }

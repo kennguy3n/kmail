@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"log"
 	"net"
 	"net/http"
@@ -12,6 +13,14 @@ import (
 	"sync"
 	"time"
 )
+
+// ErrSessionNotFound is returned by SessionStore.Revoke when the
+// target session id is not in the caller's own session set. It lets a
+// store refuse to revoke (and refuse to plant a globally-scoped
+// revocation tombstone for) a session the caller does not own, while
+// letting the handler distinguish "not yours / already gone" from a
+// genuine store error.
+var ErrSessionNotFound = errors.New("session not found for user")
 
 // Session management layers a server-side session ledger on top of
 // KMail's stateless OIDC bearer auth. The JWT itself remains the
@@ -27,9 +36,11 @@ import (
 //   - Visibility: the "Active sessions" surface lists where a user
 //     is currently signed in.
 //
-// A session is keyed by a salted hash of the bearer token, so the
+// A session is keyed by a SHA-256 hash of the bearer token, so the
 // same token maps to a stable id without the raw token ever being
-// stored. Idle timeout is implemented as a TTL on the session
+// stored. The token's own high entropy (a multi-hundred-char OIDC
+// JWT) is what makes the id non-reversible — no separate salt is
+// applied. Idle timeout is implemented as a TTL on the session
 // record: a session that goes untouched for IdleTimeout drops off
 // the active list and frees its concurrency slot. (It does not by
 // itself invalidate a still-unexpired JWT — revocation does that.)
@@ -318,12 +329,20 @@ func (s *MemorySessionStore) List(_ context.Context, userKey string, idleTTL tim
 }
 
 // Revoke implements SessionStore.
+//
+// Revocation is authorization-scoped: a session is only revoked (and a
+// tombstone only written) when sessionID belongs to userKey's own set.
+// Without this guard a caller could write a globally-scoped tombstone
+// for any session id they can guess and 401 the victim on their next
+// request. When the session is not the caller's, Revoke is a no-op and
+// returns ErrSessionNotFound.
 func (s *MemorySessionStore) Revoke(_ context.Context, userKey, sessionID string, ttl time.Duration, now time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.sessions[userKey] != nil {
-		delete(s.sessions[userKey], sessionID)
+	if _, ok := s.sessions[userKey][sessionID]; !ok {
+		return ErrSessionNotFound
 	}
+	delete(s.sessions[userKey], sessionID)
 	s.revoked[sessionID] = now.Add(ttl)
 	return nil
 }

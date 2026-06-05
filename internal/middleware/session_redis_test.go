@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -105,6 +106,28 @@ func TestRedisSessionStore_RevokeAndIsRevoked(t *testing.T) {
 	}
 	if live, _ := st.List(ctx, uk, time.Hour, now); len(live) != 0 {
 		t.Fatalf("revoked session must leave live set, got %d", len(live))
+	}
+}
+
+func TestRedisSessionStore_RevokeForeignSessionRejected(t *testing.T) {
+	ctx := context.Background()
+	st, _ := newRedisSessionStore(t)
+	now := time.Unix(1_700_000_000, 0)
+	victim := userKey("t1", "victim")
+	attacker := userKey("t1", "attacker")
+	_, _ = st.Touch(ctx, SessionInfo{ID: "victim-sess", UserKey: victim}, time.Hour, 5, now)
+
+	// The attacker's set does not contain the victim's session id, so
+	// the ownership guard must refuse the revoke and skip the
+	// tombstone write entirely.
+	if err := st.Revoke(ctx, attacker, "victim-sess", time.Hour, now); !errors.Is(err, ErrSessionNotFound) {
+		t.Fatalf("expected ErrSessionNotFound, got %v", err)
+	}
+	if r, _ := st.IsRevoked(ctx, "victim-sess", now); r {
+		t.Fatal("foreign revoke must NOT tombstone the victim's session")
+	}
+	if live, _ := st.List(ctx, victim, time.Hour, now); len(live) != 1 {
+		t.Fatalf("victim session must remain live, got %d", len(live))
 	}
 }
 
