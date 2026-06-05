@@ -1,0 +1,71 @@
+/*
+ * Dark theme — semantic colour tokens.
+ *
+ * Mirrors every role defined in `light.css`. Activated when
+ * `useTheme` writes `data-theme="dark"` onto <html>. Contrast
+ * ratios for text-on-surface were checked against WCAG 2.1 AA
+ * (≥ 4.5:1 for body text): gray-100 (#f3f4f6) on gray-900
+ * (#111827) ≈ 16:1, gray-400 (#9ca3af) on gray-900 ≈ 7:1.
+ */
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  /* Surfaces */
+  --color-bg: var(--gray-950);
+  --color-bg-elevated: var(--gray-900);
+  --color-surface: var(--gray-800);
+  --color-surface-muted: var(--gray-900);
+  --color-surface-hover: var(--gray-700);
+  --color-surface-active: rgba(37, 99, 235, 0.32);
+
+  /* Borders */
+  --color-border: var(--gray-700);
+  --color-border-strong: var(--gray-600);
+
+  /* Text */
+  --color-text: var(--gray-100);
+  --color-text-muted: var(--gray-400);
+  --color-text-subtle: var(--gray-500);
+  --color-text-inverse: var(--gray-900);
+
+  /* Brand / accent */
+  --color-primary: var(--blue-500);
+  --color-primary-hover: var(--blue-400);
+  --color-primary-active: var(--blue-300);
+  --color-primary-text: var(--gray-950);
+  --color-primary-subtle: rgba(37, 99, 235, 0.18);
+  --color-on-accent: var(--blue-100);
+
+  /* Focus ring */
+  --color-focus-ring: var(--blue-400);
+
+  /* Status: success */
+  --color-success: var(--green-500);
+  --color-success-bg: rgba(34, 197, 94, 0.18);
+  --color-success-text: var(--green-100);
+
+  /* Status: warning */
+  --color-warning: var(--amber-500);
+  --color-warning-bg: rgba(245, 158, 11, 0.18);
+  --color-warning-text: var(--amber-100);
+
+  /* Status: danger / error */
+  --color-danger: var(--red-500);
+  --color-danger-hover: var(--red-600);
+  --color-danger-bg: rgba(239, 68, 68, 0.2);
+  --color-danger-text: var(--red-100);
+
+  /* Status: info */
+  --color-info: var(--blue-400);
+  --color-info-bg: rgba(59, 130, 246, 0.2);
+  --color-info-text: var(--blue-100);
+
+  /* Overlay / scrim */
+  --color-overlay: rgba(0, 0, 0, 0.6);
+
+  /* Shadows (deeper for dark surfaces) */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.5);
+  --shadow-lg: 0 12px 32px rgba(0, 0, 0, 0.6);
+}

@@ -1,0 +1,198 @@
+/**
+ * Unit tests for the smaller library primitives: Button, Avatar
+ * (initials derivation), Badge, Tabs (keyboard navigation), and
+ * Dropdown (open + select + outside-click close).
+ */
+import { fireEvent, render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { describe, expect, it, vi } from "vitest";
+
+import { Button } from "./Button";
+import { Avatar, initialsFromName } from "./Avatar";
+import { Badge } from "./Badge";
+import { Tabs } from "./Tabs";
+import { Dropdown } from "./Dropdown";
+
+describe("Button", () => {
+  it("defaults to type=button so it never submits a form", () => {
+    render(<Button>Go</Button>);
+    expect(screen.getByRole("button", { name: "Go" })).toHaveAttribute(
+      "type",
+      "button",
+    );
+  });
+
+  it("is disabled and busy while loading", () => {
+    render(<Button loading>Save</Button>);
+    const btn = screen.getByRole("button");
+    expect(btn).toBeDisabled();
+    expect(btn).toHaveAttribute("aria-busy", "true");
+  });
+});
+
+describe("initialsFromName", () => {
+  it("derives two initials from a full name", () => {
+    expect(initialsFromName("Ada Lovelace")).toBe("AL");
+  });
+
+  it("uses the email local part", () => {
+    expect(initialsFromName("alan.turing@example.com")).toBe("AT");
+  });
+
+  it("falls back for a single token", () => {
+    expect(initialsFromName("Madonna")).toBe("MA");
+  });
+
+  it("handles empty input", () => {
+    expect(initialsFromName("   ")).toBe("?");
+  });
+});
+
+describe("Avatar", () => {
+  it("exposes the name as an accessible label", () => {
+    render(<Avatar name="Grace Hopper" />);
+    expect(screen.getByRole("img", { name: "Grace Hopper" })).toBeInTheDocument();
+  });
+
+  it("retries the image when src changes after a load failure", () => {
+    const { container, rerender } = render(
+      <Avatar name="Grace Hopper" src="https://example.com/broken.png" />,
+    );
+    // Initially the <img> is rendered.
+    const img = container.querySelector("img");
+    expect(img).not.toBeNull();
+
+    // Simulate the image failing to load -> falls back to initials.
+    fireEvent.error(img as HTMLImageElement);
+    expect(container.querySelector("img")).toBeNull();
+    expect(screen.getByText("GH")).toBeInTheDocument();
+
+    // A new src should get a fresh chance to render rather than staying
+    // stuck on initials.
+    rerender(
+      <Avatar name="Grace Hopper" src="https://example.com/valid.png" />,
+    );
+    const retried = container.querySelector("img");
+    expect(retried).not.toBeNull();
+    expect(retried).toHaveAttribute("src", "https://example.com/valid.png");
+  });
+});
+
+describe("Badge", () => {
+  it("renders its content", () => {
+    render(<Badge variant="success">Active</Badge>);
+    expect(screen.getByText("Active")).toBeInTheDocument();
+  });
+});
+
+describe("Tabs", () => {
+  it("renders the first tab panel by default", () => {
+    render(
+      <Tabs
+        ariaLabel="t"
+        items={[
+          { id: "a", label: "A", content: "Panel A" },
+          { id: "b", label: "B", content: "Panel B" },
+        ]}
+      />,
+    );
+    expect(screen.getByText("Panel A")).toBeInTheDocument();
+    expect(screen.queryByText("Panel B")).not.toBeInTheDocument();
+  });
+
+  it("moves selection with arrow keys", async () => {
+    render(
+      <Tabs
+        ariaLabel="t"
+        items={[
+          { id: "a", label: "A", content: "Panel A" },
+          { id: "b", label: "B", content: "Panel B" },
+        ]}
+      />,
+    );
+    screen.getByRole("tab", { name: "A" }).focus();
+    await userEvent.keyboard("{ArrowRight}");
+    expect(screen.getByRole("tab", { name: "B" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(screen.getByText("Panel B")).toBeInTheDocument();
+  });
+});
+
+describe("Dropdown", () => {
+  it("opens on trigger click and invokes onSelect", async () => {
+    const onSelect = vi.fn();
+    render(
+      <Dropdown
+        ariaLabel="menu"
+        trigger={<button>Open menu</button>}
+        items={[{ id: "edit", label: "Edit", onSelect }]}
+      />,
+    );
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Open menu" }));
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("menuitem", { name: "Edit" }));
+    expect(onSelect).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+  });
+
+  it("focuses the first item on open but keeps focus when items prop identity changes", async () => {
+    // A fresh `items` array on every render simulates a parent that
+    // builds the menu inline (the common case, e.g. Layout's account
+    // menu). Re-rendering must NOT yank focus back to the first item.
+    function Harness(_props: { tick: number }): JSX.Element {
+      const items = [
+        { id: "a", label: "Alpha", onSelect: () => {} },
+        { id: "b", label: "Beta", onSelect: () => {} },
+      ];
+      return (
+        <Dropdown
+          ariaLabel="menu"
+          trigger={<button>Open menu</button>}
+          items={items}
+        />
+      );
+    }
+
+    const { rerender } = render(<Harness tick={0} />);
+    await userEvent.click(screen.getByRole("button", { name: "Open menu" }));
+
+    const itemsOnOpen = screen.getAllByRole("menuitem");
+    expect(itemsOnOpen[0]).toHaveFocus();
+
+    // Move focus to the second item, then force a parent re-render
+    // (new `items` identity) while the menu stays open.
+    itemsOnOpen[1].focus();
+    expect(itemsOnOpen[1]).toHaveFocus();
+    rerender(<Harness tick={1} />);
+
+    expect(screen.getAllByRole("menuitem")[1]).toHaveFocus();
+  });
+
+  it("stops keydowns from reaching window-level shortcut listeners while open", async () => {
+    // The global keyboard-shortcut engine listens on `window`. An open
+    // menu must own the keyboard so pressing a shortcut key inside it
+    // can't fire a global handler (and navigate away) underneath.
+    const windowHandler = vi.fn();
+    window.addEventListener("keydown", windowHandler);
+    try {
+      render(
+        <Dropdown
+          ariaLabel="menu"
+          trigger={<button>Open menu</button>}
+          items={[{ id: "edit", label: "Edit", onSelect: () => {} }]}
+        />,
+      );
+      await userEvent.click(screen.getByRole("button", { name: "Open menu" }));
+      expect(screen.getByRole("menuitem", { name: "Edit" })).toHaveFocus();
+
+      windowHandler.mockClear();
+      await userEvent.keyboard("c");
+      expect(windowHandler).not.toHaveBeenCalled();
+    } finally {
+      window.removeEventListener("keydown", windowHandler);
+    }
+  });
+});
