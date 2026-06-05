@@ -309,15 +309,16 @@ export default function Inbox() {
   // Single source of truth for "this row behaves as if it lives in
   // trash". Used both for the row label (Trash vs Delete) and the
   // handler's delete-vs-move branch so they can't drift. In search
-  // mode, results can come from any mailbox so the decision is
-  // per-email; outside search mode, the user is viewing a specific
-  // mailbox and the old sidebar-based rule applies (so a message
-  // cross-labelled Inbox+Trash still moves when the user clicks
-  // Trash from Inbox, matching the pre-search-feature behaviour).
+  // mode or under an (account-wide) label filter, results can come
+  // from any mailbox so the decision is per-email; otherwise the
+  // user is viewing a specific mailbox and the old sidebar-based
+  // rule applies (so a message cross-labelled Inbox+Trash still
+  // moves when the user clicks Trash from Inbox, matching the
+  // pre-search-feature behaviour).
   const isEmailInTrash = useCallback(
     (email: Email): boolean => {
       if (trashMailboxId === null) return false;
-      if (inSearchMode) {
+      if (inSearchMode || labelFilter !== null) {
         return Object.prototype.hasOwnProperty.call(
           email.mailboxIds,
           trashMailboxId,
@@ -325,7 +326,7 @@ export default function Inbox() {
       }
       return selectedMailbox === trashMailboxId;
     },
-    [inSearchMode, selectedMailbox, trashMailboxId],
+    [inSearchMode, labelFilter, selectedMailbox, trashMailboxId],
   );
 
   // Mirror of isEmailInTrash for the Junk mailbox. Drives the
@@ -334,7 +335,7 @@ export default function Inbox() {
   const isEmailInJunk = useCallback(
     (email: Email): boolean => {
       if (junkMailboxId === null) return false;
-      if (inSearchMode) {
+      if (inSearchMode || labelFilter !== null) {
         return Object.prototype.hasOwnProperty.call(
           email.mailboxIds,
           junkMailboxId,
@@ -342,7 +343,7 @@ export default function Inbox() {
       }
       return selectedMailbox === junkMailboxId;
     },
-    [inSearchMode, junkMailboxId, selectedMailbox],
+    [inSearchMode, junkMailboxId, labelFilter, selectedMailbox],
   );
 
   // Bump both refetch nonces after a successful write. The
@@ -1070,20 +1071,11 @@ export default function Inbox() {
           <ul style={layoutStyles.emailList}>
             {displayRows.map(({ head, emails: groupEmails }) => {
               const email = head;
-              const rowInTrash = inSearchMode
-                ? trashMailboxId !== null &&
-                  Object.prototype.hasOwnProperty.call(
-                    email.mailboxIds,
-                    trashMailboxId,
-                  )
-                : inTrashView;
-              const rowInJunk = inSearchMode
-                ? junkMailboxId !== null &&
-                  Object.prototype.hasOwnProperty.call(
-                    email.mailboxIds,
-                    junkMailboxId,
-                  )
-                : selectedMailbox === junkMailboxId;
+              // Reuse the single-source-of-truth helpers (which now
+              // also treat an active label filter as account-wide) so
+              // the row label and the move handler can't disagree.
+              const rowInTrash = isEmailInTrash(email);
+              const rowInJunk = isEmailInJunk(email);
               const threadCount = groupEmails.length;
               return (
                 <EmailRow

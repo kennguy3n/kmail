@@ -750,7 +750,14 @@ export class JMAPClient {
       const patch: Record<string, boolean | null> = {
         [`mailboxIds/${toMailbox}`]: true,
       };
-      if (fromMailbox) patch[`mailboxIds/${fromMailbox}`] = null;
+      // Only remove the source when it's a real, different mailbox.
+      // If `fromMailbox === toMailbox`, skipping the removal keeps the
+      // `true` add (a safe no-op) instead of emitting a remove-only
+      // patch that leaves the email in zero mailboxes — which RFC 8621
+      // rejects. This mirrors `moveEmail`'s effective behaviour.
+      if (fromMailbox && fromMailbox !== toMailbox) {
+        patch[`mailboxIds/${fromMailbox}`] = null;
+      }
       update[id] = patch;
     }
     const response = await this.request([
