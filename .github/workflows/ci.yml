@@ -200,6 +200,24 @@ jobs:
       - name: make test
         run: make test
 
+      # WS4 Task 4 — backward-compatibility gate for new migrations.
+      # Fetches the PR base branch so the diff can be scoped to newly
+      # added migration files only.
+      - name: Migration backward-compatibility check
+        run: |
+          git fetch --no-tags --depth=50 origin "${BASE_BRANCH}:refs/remotes/origin/${BASE_BRANCH}" || true
+          BASE_REF="origin/${BASE_BRANCH}" ./scripts/check-migration-compat.sh
+        env:
+          BASE_BRANCH: ${{ github.base_ref || 'main' }}
+
+      # WS4 Task 5 — coverage gate. Floor is just below the current
+      # measured baseline (~35%) and is meant to ratchet UP toward
+      # 60%→80% as the suite grows, never down.
+      - name: Test coverage gate
+        run: make cover
+        env:
+          MIN_COVERAGE: "30"
+
   sdk:
     name: SDK
     needs: changes

@@ -149,10 +149,16 @@ type Service struct {
 	logger *log.Logger
 	ttl    time.Duration
 
-	mu       sync.RWMutex
-	snap     *snapshot
-	plans    map[string]planEntry // tenantID -> cached plan
-	loadingT time.Time            // guards against concurrent reloads
+	mu    sync.RWMutex
+	snap  *snapshot
+	plans map[string]planEntry // tenantID -> cached plan
+
+	// loadMu serialises snapshot reloads so a burst of concurrent
+	// requests that all observe a stale cache triggers a single
+	// Postgres load (single-flight) rather than one load per
+	// goroutine (a thundering herd against the store). It is held
+	// only around the reload, never while serving a fresh snapshot.
+	loadMu sync.Mutex
 }
 
 type planEntry struct {
@@ -258,11 +264,25 @@ func buildSnapshot(flags []Flag, overrides []Override) *snapshot {
 
 // getSnapshot returns a fresh-enough snapshot, loading lazily if the
 // cache is empty or stale. Concurrent callers that find a stale cache
-// serialise on the mutex; only one reload runs at a time.
+// serialise on loadMu and re-check, so only ONE of them actually
+// reloads from Postgres (single-flight); the rest return the snapshot
+// that reload produced.
 func (s *Service) getSnapshot(ctx context.Context) (*snapshot, error) {
 	s.mu.RLock()
 	snap := s.snap
 	ttl := s.ttl
+	s.mu.RUnlock()
+	if snap != nil && time.Since(snap.loaded) < ttl {
+		return snap, nil
+	}
+
+	// Stale/empty: take the reload lock, then re-check — a sibling
+	// goroutine may have refreshed while we waited, in which case we
+	// skip the redundant store hit.
+	s.loadMu.Lock()
+	defer s.loadMu.Unlock()
+	s.mu.RLock()
+	snap = s.snap
 	s.mu.RUnlock()
 	if snap != nil && time.Since(snap.loaded) < ttl {
 		return snap, nil

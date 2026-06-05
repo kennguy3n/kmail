@@ -2,6 +2,8 @@ package tenant
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
@@ -115,7 +117,7 @@ func (s *ShardService) AutoProvisionShard(ctx context.Context, threshold float64
 	if s.provisioner == nil {
 		return nil, ErrNoProvisioner
 	}
-	name := fmt.Sprintf("shard-auto-%d", time.Now().UTC().Unix())
+	name := autoShardName()
 	provisioned, err := s.provisioner.Provision(ctx, name)
 	if err != nil {
 		return nil, fmt.Errorf("auto-provision: provision %q: %w", name, err)
@@ -131,6 +133,22 @@ func (s *ShardService) AutoProvisionShard(ctx context.Context, threshold float64
 	}
 	s.Logger.Printf("auto-provisioned shard %s (%s) at >=%.0f%% cluster utilisation", registered.ID, registered.Name, threshold*100)
 	return registered, nil
+}
+
+// autoShardName generates a unique name for an auto-provisioned shard.
+// The Unix-second prefix keeps names roughly sortable/readable while a
+// short random suffix prevents collisions when two worker pods race to
+// provision within the same second (the provisioner contract is
+// idempotent on name, so two identical names would otherwise converge
+// onto one shard or trip the unique constraint).
+func autoShardName() string {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// crypto/rand failure is effectively impossible; fall back to
+		// the nanosecond clock so we still avoid same-second clashes.
+		return fmt.Sprintf("shard-auto-%d", time.Now().UTC().UnixNano())
+	}
+	return fmt.Sprintf("shard-auto-%d-%s", time.Now().UTC().Unix(), hex.EncodeToString(b[:]))
 }
 
 // CapacityReport summarises cluster capacity for the shard-health

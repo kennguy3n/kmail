@@ -132,6 +132,19 @@ func (h *Handlers) put(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Invalidate the resolver snapshot if ANY write lands, even when a
+	// later op fails partway through. Otherwise a partial write would
+	// leave the in-memory snapshot reflecting pre-write state until the
+	// TTL elapsed — surprising for an operator who just made a change
+	// and got an error. The deferred call runs on every return path
+	// below once `mutated` is set.
+	var mutated bool
+	defer func() {
+		if mutated {
+			h.invalidate()
+		}
+	}()
+
 	if _, err := h.store.UpsertFlag(r.Context(), Flag{
 		Key:            in.Key,
 		Description:    in.Description,
@@ -140,6 +153,7 @@ func (h *Handlers) put(w http.ResponseWriter, r *http.Request) {
 		h.writeStoreErr(w, err)
 		return
 	}
+	mutated = true
 
 	for _, op := range in.Overrides {
 		if op.Delete {
@@ -159,8 +173,6 @@ func (h *Handlers) put(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-
-	h.invalidate()
 
 	// Return the resulting view for the flag so the admin UI can render
 	// the post-write state without a follow-up GET.

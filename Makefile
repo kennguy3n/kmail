@@ -1,4 +1,4 @@
-.PHONY: build test lint fmt vet tidy docker-build clean help migrate bench e2e scim-test helm-lint loadtest chaos screenshots
+.PHONY: build test cover lint fmt vet tidy docker-build clean help migrate bench e2e scim-test helm-lint loadtest chaos screenshots
 
 # ---------------------------------------------------------------
 # KMail Go control plane — developer Makefile.
@@ -34,6 +34,11 @@ build:
 
 test:
 	$(GO) test $(GOFLAGS) -race $(PKG)
+
+# WS4 Task 5 — coverage gate. Runs the suite with a coverage profile
+# and fails below MIN_COVERAGE (default 30, ratchets up over time).
+cover:
+	./scripts/check-coverage.sh
 
 lint:
 	golangci-lint run $(PKG)

@@ -18,16 +18,23 @@ type fakeSource struct {
 	plans     map[string]string
 	loadCalls int
 	loadErr   error
+	loadDelay time.Duration // simulated store latency for race tests
 }
 
 func (f *fakeSource) loadAll(context.Context) ([]Flag, []Override, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.loadCalls++
-	if f.loadErr != nil {
-		return nil, nil, f.loadErr
+	delay := f.loadDelay
+	err := f.loadErr
+	flags, overrides := f.flags, f.overrides
+	f.mu.Unlock()
+	if delay > 0 {
+		time.Sleep(delay)
 	}
-	return f.flags, f.overrides, nil
+	if err != nil {
+		return nil, nil, err
+	}
+	return flags, overrides, nil
 }
 
 func (f *fakeSource) tenantPlan(_ context.Context, tenantID string) (string, error) {
@@ -109,6 +116,34 @@ func TestIsEnabledResolvesPlanFromContext(t *testing.T) {
 	ctx2 := middleware.WithTenantID(context.Background(), "tenant-2")
 	if svc.IsEnabled(ctx2, "beta") {
 		t.Fatal("core-plan tenant should not have beta enabled")
+	}
+}
+
+// TestGetSnapshotSingleFlight verifies the thundering-herd guard: when
+// many goroutines hit a cold cache at once, only ONE reload runs
+// against the store, not one per goroutine.
+func TestGetSnapshotSingleFlight(t *testing.T) {
+	src := &fakeSource{
+		flags:     []Flag{{Key: "f", DefaultEnabled: true}},
+		loadDelay: 30 * time.Millisecond, // hold the lock long enough to herd
+	}
+	svc := newService(src, nil)
+
+	const n = 16
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			if !svc.EvaluateSubject(context.Background(), "f", Subject{}) {
+				t.Errorf("flag f should resolve true")
+			}
+		}()
+	}
+	wg.Wait()
+
+	if got := src.calls(); got != 1 {
+		t.Fatalf("loadAll called %d times under concurrent cold-cache access, want 1 (single-flight)", got)
 	}
 }
 
