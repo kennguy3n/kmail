@@ -389,7 +389,10 @@ function NavTreeNode({
         type="button"
         className={cx(styles.groupHeader, depth > 0 && styles.groupHeaderSub)}
         aria-expanded={expanded}
-        aria-controls={sectionId}
+        // Only reference the sub-list while it's actually in the DOM
+        // (it's unmounted when collapsed), so aria-controls never
+        // points at a missing element.
+        aria-controls={expanded ? sectionId : undefined}
         onClick={() => onToggle(node.id)}
         style={{ paddingLeft: `calc(var(--space-4) + ${depth} * 0.75rem)` }}
       >
