@@ -4,6 +4,14 @@ import { Link, useNavigate, useParams } from "react-router-dom";
 import { jmapClient } from "../../api/jmap";
 import { snoozeEmail } from "../../api/snooze";
 import SnoozePicker from "./SnoozePicker";
+import AttachmentPanel from "./AttachmentPanel";
+import {
+  fileAttachments,
+  htmlBodyPart,
+  HtmlMessageBody,
+  useInlineImageUrls,
+} from "./messageContent";
+import ReadReceiptPrompt from "./ReadReceiptPrompt";
 import type { Email, EmailBodyPart } from "../../types";
 
 /**
@@ -67,7 +75,12 @@ export default function MessageView() {
   }, [emailId]);
 
   const bodyText = useMemo(() => resolveBody(email), [email]);
-  const attachments = useMemo(() => resolveAttachments(email), [email]);
+  const htmlPart = useMemo(() => (email ? htmlBodyPart(email) : null), [email]);
+  const attachments = useMemo(
+    () => (email ? fileAttachments(email) : []),
+    [email],
+  );
+  const cidUrls = useInlineImageUrls(email);
 
   const handleReply = (replyAll: boolean) => {
     if (!email) return;
@@ -235,35 +248,20 @@ export default function MessageView() {
               )}
             </dl>
           </header>
+          <ReadReceiptPrompt email={email} />
           <div style={viewStyles.body}>
-            {bodyText ? (
+            {htmlPart && email.bodyValues?.[htmlPart.partId!] ? (
+              <HtmlMessageBody
+                html={email.bodyValues[htmlPart.partId!].value}
+                cidUrls={cidUrls}
+              />
+            ) : bodyText ? (
               <pre style={viewStyles.bodyPre}>{bodyText}</pre>
             ) : (
               <p style={viewStyles.muted}>(empty message body)</p>
             )}
           </div>
-          {attachments.length > 0 && (
-            <section style={viewStyles.attachmentsBox}>
-              <h2 style={viewStyles.attachmentsTitle}>
-                Attachments ({attachments.length})
-              </h2>
-              <ul style={viewStyles.attachmentsList}>
-                {attachments.map((a, i) => (
-                  <li key={a.partId ?? a.blobId ?? a.name ?? `att-${i}`}>
-                    <span style={viewStyles.attachmentName}>
-                      {a.name ?? "(unnamed)"}
-                    </span>
-                    <span style={viewStyles.attachmentMeta}>
-                      {formatType(a.type)}
-                      {typeof a.size === "number"
-                        ? ` · ${formatBytes(a.size)}`
-                        : ""}
-                    </span>
-                  </li>
-                ))}
-              </ul>
-            </section>
-          )}
+          <AttachmentPanel attachments={attachments} />
         </article>
       )}
     </section>
@@ -290,18 +288,6 @@ function resolveBody(email: Email | null): string {
   return "";
 }
 
-/**
- * Return the parts of an email that should be listed as
- * attachments. `attachments` is the canonical JMAP field (RFC 8621
- * §4.1.4) and is the only property we request from the server — if
- * a future backend stops populating it, extend `getEmail` to also
- * request `bodyStructure` rather than carrying a dead fallback.
- */
-function resolveAttachments(email: Email | null): EmailBodyPart[] {
-  if (!email) return [];
-  return email.attachments ?? [];
-}
-
 function withPrefix(
   subject: string | null | undefined,
   prefix: string,
@@ -312,17 +298,6 @@ function withPrefix(
     return trimmed;
   }
   return `${prefix} ${trimmed}`;
-}
-
-function formatType(type: string | null | undefined): string {
-  if (!type) return "application/octet-stream";
-  return type;
-}
-
-function formatBytes(n: number): string {
-  if (n < 1024) return `${n} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function isPart(part: EmailBodyPart): boolean {

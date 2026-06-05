@@ -22,6 +22,11 @@ export default function Layout() {
           <li><Link to="/mail/protected-folders">Protected folders</Link></li>
           <li><Link to="/mail/scheduled">Scheduled</Link></li>
           <li><Link to="/mail/snoozed">Snoozed</Link></li>
+          <li><Link to="/mail/labels">Labels</Link></li>
+          <li><Link to="/mail/signatures">Signatures</Link></li>
+          <li><Link to="/mail/templates">Templates</Link></li>
+          <li><Link to="/mail/out-of-office">Out of Office</Link></li>
+          <li><Link to="/mail/delegation">Delegation</Link></li>
           <li><Link to="/calendar">Calendar</Link></li>
           <li><Link to="/calendar/new">New event</Link></li>
           <li><Link to="/calendar/shared">Shared calendars</Link></li>

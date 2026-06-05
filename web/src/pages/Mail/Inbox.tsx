@@ -3,8 +3,9 @@ import { Link, useNavigate, useParams } from "react-router-dom";
 
 import { jmapClient } from "../../api/jmap";
 import { snoozeEmail } from "../../api/snooze";
+import { labelsForKeywords, listLabels } from "../../api/labels";
 import SnoozePicker from "./SnoozePicker";
-import type { Email, Mailbox } from "../../types";
+import type { Email, Label, Mailbox } from "../../types";
 
 /**
  * Inbox is the primary Mail list view.
@@ -252,6 +253,39 @@ export default function Inbox() {
   const [snoozeOpenFor, setSnoozeOpenFor] = useState<string | null>(null);
   const [snoozeBusy, setSnoozeBusy] = useState(false);
 
+  // Bulk-selection (WS2). Holds the ids of checked rows; the bulk
+  // toolbar acts on this set. Cleared whenever the listing changes
+  // (mailbox switch, search, refetch) so stale ids never linger.
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [bulkBusy, setBulkBusy] = useState(false);
+  // Group consecutive messages that share a `threadId` into a single
+  // conversation row with a count badge (WS2). Toggleable so users
+  // can fall back to the flat list.
+  const [groupThreads, setGroupThreads] = useState(true);
+  // Client-side label registry + the active label filter (keyword).
+  const [labels, setLabels] = useState<Label[]>(() => listLabels());
+  const [labelFilter, setLabelFilter] = useState<string | null>(null);
+  // Drag-and-drop: the email id currently being dragged and the drop
+  // target (mailbox id or `label:<keyword>`) under the cursor.
+  const [dragEmailId, setDragEmailId] = useState<string | null>(null);
+  const [dropTarget, setDropTarget] = useState<string | null>(null);
+
+  // Clear the bulk selection whenever the underlying listing
+  // changes so the toolbar never acts on ids that are no longer
+  // visible.
+  useEffect(() => {
+    setSelectedIds(new Set());
+  }, [selectedMailbox, submittedQuery, reloadNonce, searchReloadNonce]);
+
+  // Labels are edited on a separate page; refresh the registry when
+  // the window regains focus so newly-created labels appear without
+  // a full reload.
+  useEffect(() => {
+    const refresh = () => setLabels(listLabels());
+    window.addEventListener("focus", refresh);
+    return () => window.removeEventListener("focus", refresh);
+  }, []);
+
   // Single source of truth for "this row behaves as if it lives in
   // trash". Used both for the row label (Trash vs Delete) and the
   // handler's delete-vs-move branch so they can't drift. In search
@@ -444,6 +478,118 @@ export default function Inbox() {
   const inTrashView =
     selectedMailbox !== null && selectedMailbox === trashMailboxId;
 
+  const archiveMailboxId = useMemo(
+    () => (mailboxes ?? []).find((m) => m.role === "archive")?.id ?? null,
+    [mailboxes],
+  );
+
+  // The emails currently in scope (search hits or the mailbox
+  // listing), narrowed by the active label filter.
+  const baseList = useMemo(
+    () => (inSearchMode ? (searchResults ?? []) : (emails ?? [])),
+    [inSearchMode, searchResults, emails],
+  );
+  const filteredList = useMemo(
+    () =>
+      labelFilter
+        ? baseList.filter((e) => e.keywords[labelFilter] === true)
+        : baseList,
+    [baseList, labelFilter],
+  );
+
+  // Group by threadId for the conversation view. Each group keeps
+  // its first-seen email as the representative row and a count.
+  const threadGroups = useMemo(() => {
+    const groups = new Map<string, { head: Email; emails: Email[] }>();
+    for (const email of filteredList) {
+      const key = email.threadId ?? email.id;
+      const existing = groups.get(key);
+      if (existing) existing.emails.push(email);
+      else groups.set(key, { head: email, emails: [email] });
+    }
+    return [...groups.values()];
+  }, [filteredList]);
+
+  const toggleSelected = useCallback((id: string) => {
+    setSelectedIds((cur) => {
+      const next = new Set(cur);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
+
+  const selectAllVisible = useCallback(() => {
+    setSelectedIds(new Set(filteredList.map((e) => e.id)));
+  }, [filteredList]);
+
+  const clearSelection = useCallback(() => setSelectedIds(new Set()), []);
+
+  const selectedIdList = useMemo(() => [...selectedIds], [selectedIds]);
+
+  const runBulk = useCallback(
+    async (fn: (ids: string[]) => Promise<void>) => {
+      const ids = [...selectedIds];
+      if (ids.length === 0) return;
+      setBulkBusy(true);
+      try {
+        await fn(ids);
+        setSelectedIds(new Set());
+        bumpAfterWrite();
+      } catch (err: unknown) {
+        setError(errorMessage(err));
+      } finally {
+        setBulkBusy(false);
+      }
+    },
+    [bumpAfterWrite, selectedIds],
+  );
+
+  // Apply a label (keyword) to one or many emails. Used by the bulk
+  // toolbar's label menu and the drag-onto-label flow.
+  const applyLabelTo = useCallback(
+    async (keyword: string, ids: string[]) => {
+      if (ids.length === 0) return;
+      setBulkBusy(true);
+      try {
+        await jmapClient.bulkSetKeyword(ids, keyword, true);
+        bumpAfterWrite();
+      } catch (err: unknown) {
+        setError(errorMessage(err));
+      } finally {
+        setBulkBusy(false);
+      }
+    },
+    [bumpAfterWrite],
+  );
+
+  // Drop an email onto a sidebar target. A mailbox id moves the
+  // email there; a `label:<keyword>` target applies that label.
+  const handleDropOnTarget = useCallback(
+    (target: string) => {
+      const emailId = dragEmailId;
+      setDragEmailId(null);
+      setDropTarget(null);
+      if (!emailId) return;
+      if (target.startsWith("label:")) {
+        void applyLabelTo(target.slice("label:".length), [emailId]);
+        return;
+      }
+      const email = baseList.find((e) => e.id === emailId);
+      const source = email ? Object.keys(email.mailboxIds)[0] : selectedMailbox;
+      if (!source || source === target) return;
+      setBulkBusy(true);
+      jmapClient
+        .moveEmail(emailId, source, target)
+        .then(() => bumpAfterWrite())
+        .catch((err: unknown) => setError(errorMessage(err)))
+        .finally(() => setBulkBusy(false));
+    },
+    [applyLabelTo, baseList, bumpAfterWrite, dragEmailId, selectedMailbox],
+  );
+
+  const selectedCount = selectedIds.size;
+
   return (
     <section style={layoutStyles.root}>
       <aside style={layoutStyles.sidebar}>
@@ -465,10 +611,26 @@ export default function Inbox() {
                   <button
                     type="button"
                     onClick={() => setSelectedMailbox(mb.id)}
+                    onDragOver={(e) => {
+                      if (dragEmailId) {
+                        e.preventDefault();
+                        setDropTarget(mb.id);
+                      }
+                    }}
+                    onDragLeave={() =>
+                      setDropTarget((t) => (t === mb.id ? null : t))
+                    }
+                    onDrop={(e) => {
+                      e.preventDefault();
+                      handleDropOnTarget(mb.id);
+                    }}
                     style={{
                       ...layoutStyles.mailboxItem,
                       ...(isSelected ? layoutStyles.mailboxItemActive : {}),
                       ...(isJunk ? layoutStyles.mailboxItemJunk : {}),
+                      ...(dropTarget === mb.id
+                        ? layoutStyles.dropTargetActive
+                        : {}),
                     }}
                     title={isJunk ? "Spam / junk mail" : mb.name}
                   >
@@ -491,6 +653,79 @@ export default function Inbox() {
             })}
           </ul>
         )}
+        <div style={layoutStyles.labelSection}>
+          <div style={layoutStyles.labelSectionHeader}>
+            <span style={layoutStyles.labelSectionTitle}>Labels</span>
+            <Link to="/mail/labels" style={layoutStyles.labelManageLink}>
+              Manage
+            </Link>
+          </div>
+          {labels.length === 0 ? (
+            <p style={layoutStyles.muted}>No labels yet.</p>
+          ) : (
+            <ul style={layoutStyles.mailboxList}>
+              {labelFilter && (
+                <li>
+                  <button
+                    type="button"
+                    onClick={() => setLabelFilter(null)}
+                    style={layoutStyles.labelClear}
+                  >
+                    Clear label filter
+                  </button>
+                </li>
+              )}
+              {labels.map((label) => {
+                const target = `label:${label.keyword}`;
+                const active = labelFilter === label.keyword;
+                return (
+                  <li key={label.id}>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setLabelFilter((cur) =>
+                          cur === label.keyword ? null : label.keyword,
+                        )
+                      }
+                      onDragOver={(e) => {
+                        if (dragEmailId) {
+                          e.preventDefault();
+                          setDropTarget(target);
+                        }
+                      }}
+                      onDragLeave={() =>
+                        setDropTarget((t) => (t === target ? null : t))
+                      }
+                      onDrop={(e) => {
+                        e.preventDefault();
+                        handleDropOnTarget(target);
+                      }}
+                      style={{
+                        ...layoutStyles.mailboxItem,
+                        ...(active ? layoutStyles.mailboxItemActive : {}),
+                        ...(dropTarget === target
+                          ? layoutStyles.dropTargetActive
+                          : {}),
+                      }}
+                      title={`Filter by ${label.name} (drag an email here to apply)`}
+                    >
+                      <span style={layoutStyles.labelNameWrap}>
+                        <span
+                          aria-hidden="true"
+                          style={{
+                            ...layoutStyles.labelDot,
+                            background: label.color,
+                          }}
+                        />
+                        {label.name}
+                      </span>
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </div>
       </aside>
       <main style={layoutStyles.main}>
         <form style={layoutStyles.searchBar} onSubmit={handleSubmitSearch}>
@@ -566,53 +801,192 @@ export default function Inbox() {
           searchResults.length === 0 && (
             <p style={layoutStyles.muted}>No matching messages.</p>
           )}
-        {(() => {
-          const list = inSearchMode ? (searchResults ?? []) : (emails ?? []);
-          if (list.length === 0) return null;
-          return (
-            <ul style={layoutStyles.emailList}>
-              {list.map((email) => {
-                // In search mode the sidebar mailbox is not
-                // authoritative, so compute per-email whether the
-                // hit already lives in trash (which is what
-                // handleMoveToTrash keys off). Outside search mode
-                // the sidebar flag is correct and cheaper.
-                const rowInTrash = inSearchMode
-                  ? trashMailboxId !== null &&
-                    Object.prototype.hasOwnProperty.call(
-                      email.mailboxIds,
-                      trashMailboxId,
-                    )
-                  : inTrashView;
-                const rowInJunk = inSearchMode
-                  ? junkMailboxId !== null &&
-                    Object.prototype.hasOwnProperty.call(
-                      email.mailboxIds,
-                      junkMailboxId,
-                    )
-                  : selectedMailbox === junkMailboxId;
-                return (
-                  <EmailRow
-                    key={email.id}
-                    email={email}
-                    inTrashView={rowInTrash}
-                    inJunkView={rowInJunk}
-                    hasJunkMailbox={junkMailboxId !== null}
-                    snoozeOpen={snoozeOpenFor === email.id}
-                    snoozeBusy={snoozeBusy && snoozeOpenFor === email.id}
-                    onOpen={() => handleOpenEmail(email.id)}
-                    onToggleRead={() => handleToggleRead(email)}
-                    onMoveToTrash={() => handleMoveToTrash(email)}
-                    onToggleSpam={() => handleToggleSpam(email)}
-                    onOpenSnooze={() => setSnoozeOpenFor(email.id)}
-                    onCancelSnooze={() => setSnoozeOpenFor(null)}
-                    onPickSnooze={(until) => handleSnooze(email, until)}
-                  />
-                );
-              })}
-            </ul>
-          );
-        })()}
+        {filteredList.length > 0 && (
+          <div style={layoutStyles.listControls}>
+            <label style={layoutStyles.controlToggle}>
+              <input
+                type="checkbox"
+                checked={
+                  selectedCount > 0 && selectedCount === filteredList.length
+                }
+                ref={(el) => {
+                  if (el)
+                    el.indeterminate =
+                      selectedCount > 0 &&
+                      selectedCount < filteredList.length;
+                }}
+                onChange={(e) =>
+                  e.target.checked ? selectAllVisible() : clearSelection()
+                }
+                aria-label="Select all messages"
+              />
+              {selectedCount > 0 ? `${selectedCount} selected` : "Select all"}
+            </label>
+            <label style={layoutStyles.controlToggle}>
+              <input
+                type="checkbox"
+                checked={groupThreads}
+                onChange={(e) => setGroupThreads(e.target.checked)}
+              />
+              Group by conversation
+            </label>
+            {labelFilter && (
+              <span style={layoutStyles.filterPill}>
+                {labelsForKeywords({ [labelFilter]: true })[0]?.name ??
+                  "Label"}
+                <button
+                  type="button"
+                  onClick={() => setLabelFilter(null)}
+                  style={layoutStyles.filterPillClear}
+                  aria-label="Clear label filter"
+                >
+                  ×
+                </button>
+              </span>
+            )}
+          </div>
+        )}
+        {selectedCount > 0 && (
+          <div style={layoutStyles.bulkBar}>
+            <span style={layoutStyles.bulkCount}>{selectedCount} selected</span>
+            <button
+              type="button"
+              disabled={bulkBusy}
+              onClick={() =>
+                void runBulk((ids) => jmapClient.bulkSetSeen(ids, true))
+              }
+              style={layoutStyles.bulkButton}
+            >
+              Mark read
+            </button>
+            <button
+              type="button"
+              disabled={bulkBusy}
+              onClick={() =>
+                void runBulk((ids) => jmapClient.bulkSetSeen(ids, false))
+              }
+              style={layoutStyles.bulkButton}
+            >
+              Mark unread
+            </button>
+            {archiveMailboxId && (
+              <button
+                type="button"
+                disabled={bulkBusy}
+                onClick={() =>
+                  void runBulk((ids) =>
+                    jmapClient.bulkMove(ids, selectedMailbox, archiveMailboxId),
+                  )
+                }
+                style={layoutStyles.bulkButton}
+              >
+                Archive
+              </button>
+            )}
+            {trashMailboxId && (
+              <button
+                type="button"
+                disabled={bulkBusy}
+                onClick={() =>
+                  void runBulk((ids) =>
+                    inTrashView
+                      ? jmapClient.bulkDelete(ids)
+                      : jmapClient.bulkMove(ids, selectedMailbox, trashMailboxId),
+                  )
+                }
+                style={layoutStyles.bulkButton}
+              >
+                {inTrashView ? "Delete" : "Trash"}
+              </button>
+            )}
+            {labels.length > 0 && (
+              <select
+                disabled={bulkBusy}
+                value=""
+                onChange={(e) => {
+                  const kw = e.target.value;
+                  if (!kw) return;
+                  void applyLabelTo(kw, selectedIdList).then(() =>
+                    setSelectedIds(new Set()),
+                  );
+                  e.target.value = "";
+                }}
+                style={layoutStyles.bulkSelect}
+                aria-label="Apply label to selected"
+              >
+                <option value="">Apply label…</option>
+                {labels.map((l) => (
+                  <option key={l.id} value={l.keyword}>
+                    {l.name}
+                  </option>
+                ))}
+              </select>
+            )}
+            <button
+              type="button"
+              onClick={clearSelection}
+              style={layoutStyles.bulkButton}
+            >
+              Clear
+            </button>
+          </div>
+        )}
+        {filteredList.length > 0 && (
+          <ul style={layoutStyles.emailList}>
+            {(groupThreads
+              ? threadGroups
+              : filteredList.map((e) => ({ head: e, emails: [e] }))
+            ).map(({ head, emails: groupEmails }) => {
+              const email = head;
+              const rowInTrash = inSearchMode
+                ? trashMailboxId !== null &&
+                  Object.prototype.hasOwnProperty.call(
+                    email.mailboxIds,
+                    trashMailboxId,
+                  )
+                : inTrashView;
+              const rowInJunk = inSearchMode
+                ? junkMailboxId !== null &&
+                  Object.prototype.hasOwnProperty.call(
+                    email.mailboxIds,
+                    junkMailboxId,
+                  )
+                : selectedMailbox === junkMailboxId;
+              const threadCount = groupEmails.length;
+              return (
+                <EmailRow
+                  key={email.threadId ?? email.id}
+                  email={email}
+                  threadCount={threadCount}
+                  rowLabels={labelsForKeywords(email.keywords)}
+                  selected={selectedIds.has(email.id)}
+                  onToggleSelected={() => toggleSelected(email.id)}
+                  onDragStart={() => setDragEmailId(email.id)}
+                  onDragEnd={() => {
+                    setDragEmailId(null);
+                    setDropTarget(null);
+                  }}
+                  inTrashView={rowInTrash}
+                  inJunkView={rowInJunk}
+                  hasJunkMailbox={junkMailboxId !== null}
+                  snoozeOpen={snoozeOpenFor === email.id}
+                  snoozeBusy={snoozeBusy && snoozeOpenFor === email.id}
+                  onOpen={() =>
+                    threadCount > 1 && email.threadId
+                      ? navigate(`/mail/thread/${email.threadId}`)
+                      : handleOpenEmail(email.id)
+                  }
+                  onToggleRead={() => handleToggleRead(email)}
+                  onMoveToTrash={() => handleMoveToTrash(email)}
+                  onToggleSpam={() => handleToggleSpam(email)}
+                  onOpenSnooze={() => setSnoozeOpenFor(email.id)}
+                  onCancelSnooze={() => setSnoozeOpenFor(null)}
+                  onPickSnooze={(until) => handleSnooze(email, until)}
+                />
+              );
+            })}
+          </ul>
+        )}
       </main>
     </section>
   );
@@ -620,6 +994,12 @@ export default function Inbox() {
 
 interface EmailRowProps {
   email: Email;
+  threadCount: number;
+  rowLabels: Label[];
+  selected: boolean;
+  onToggleSelected: () => void;
+  onDragStart: () => void;
+  onDragEnd: () => void;
   inTrashView: boolean;
   inJunkView: boolean;
   hasJunkMailbox: boolean;
@@ -636,6 +1016,12 @@ interface EmailRowProps {
 
 function EmailRow({
   email,
+  threadCount,
+  rowLabels,
+  selected,
+  onToggleSelected,
+  onDragStart,
+  onDragEnd,
   inTrashView,
   inJunkView,
   hasJunkMailbox,
@@ -657,12 +1043,28 @@ function EmailRow({
   return (
     <li>
       <div
+        draggable
+        onDragStart={(e) => {
+          e.dataTransfer.effectAllowed = "move";
+          e.dataTransfer.setData("text/plain", email.id);
+          onDragStart();
+        }}
+        onDragEnd={onDragEnd}
         style={{
           ...layoutStyles.emailRow,
           ...(isUnread ? layoutStyles.emailRowUnread : {}),
           ...(inJunkView ? layoutStyles.emailRowJunk : {}),
+          ...(selected ? layoutStyles.emailRowSelected : {}),
         }}
       >
+        <input
+          type="checkbox"
+          checked={selected}
+          onClick={(e) => e.stopPropagation()}
+          onChange={onToggleSelected}
+          style={layoutStyles.rowCheckbox}
+          aria-label={`Select message from ${sender}`}
+        />
         {inJunkView && (
           <span
             style={layoutStyles.junkRowBadge}
@@ -677,8 +1079,25 @@ function EmailRow({
           onClick={onOpen}
           style={layoutStyles.emailRowMain}
         >
-          <span style={layoutStyles.emailSender}>{sender}</span>
-          <span style={layoutStyles.emailSubject}>{subject}</span>
+          <span style={layoutStyles.emailSender}>
+            {sender}
+            {threadCount > 1 && (
+              <span style={layoutStyles.threadBadge} title={`${threadCount} messages in this conversation`}>
+                {threadCount}
+              </span>
+            )}
+          </span>
+          <span style={layoutStyles.emailSubjectWrap}>
+            <span style={layoutStyles.emailSubject}>{subject}</span>
+            {rowLabels.map((l) => (
+              <span
+                key={l.id}
+                style={{ ...layoutStyles.rowLabelChip, background: l.color }}
+              >
+                {l.name}
+              </span>
+            ))}
+          </span>
           <span style={layoutStyles.emailDate}>{dateLabel}</span>
         </button>
         <div style={layoutStyles.emailActions}>
@@ -988,5 +1407,155 @@ const layoutStyles: Record<string, React.CSSProperties> = {
     textAlign: "right",
     color: "#6b7280",
     fontSize: "0.8rem",
+  },
+  dropTargetActive: {
+    outline: "2px dashed #2563eb",
+    background: "#eff6ff",
+  },
+  labelSection: {
+    marginTop: "1rem",
+    paddingTop: "0.75rem",
+    borderTop: "1px solid #e5e7eb",
+  },
+  labelSectionHeader: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: "0.5rem",
+  },
+  labelSectionTitle: {
+    fontSize: "0.75rem",
+    fontWeight: 700,
+    textTransform: "uppercase",
+    letterSpacing: "0.05em",
+    color: "#6b7280",
+  },
+  labelManageLink: {
+    fontSize: "0.75rem",
+    color: "#2563eb",
+    textDecoration: "none",
+  },
+  labelClear: {
+    width: "100%",
+    padding: "0.25rem 0.5rem",
+    fontSize: "0.78rem",
+    background: "transparent",
+    border: "none",
+    textAlign: "left",
+    cursor: "pointer",
+    color: "#6b7280",
+  },
+  labelNameWrap: {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: "0.4rem",
+  },
+  labelDot: {
+    width: "0.7rem",
+    height: "0.7rem",
+    borderRadius: "999px",
+    flexShrink: 0,
+  },
+  listControls: {
+    display: "flex",
+    alignItems: "center",
+    gap: "1rem",
+    flexWrap: "wrap",
+    padding: "0.25rem 0",
+    marginBottom: "0.25rem",
+  },
+  controlToggle: {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: "0.35rem",
+    fontSize: "0.82rem",
+    color: "#374151",
+    cursor: "pointer",
+  },
+  filterPill: {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: "0.35rem",
+    fontSize: "0.78rem",
+    background: "#e0e7ff",
+    color: "#3730a3",
+    padding: "0.1rem 0.5rem",
+    borderRadius: "999px",
+  },
+  filterPillClear: {
+    border: "none",
+    background: "none",
+    color: "#3730a3",
+    cursor: "pointer",
+    fontSize: "0.9rem",
+    lineHeight: 1,
+  },
+  bulkBar: {
+    display: "flex",
+    alignItems: "center",
+    gap: "0.5rem",
+    flexWrap: "wrap",
+    padding: "0.5rem 0.6rem",
+    background: "#f3f4f6",
+    border: "1px solid #e5e7eb",
+    borderRadius: "0.25rem",
+    marginBottom: "0.5rem",
+  },
+  bulkCount: {
+    fontSize: "0.82rem",
+    fontWeight: 600,
+    color: "#374151",
+  },
+  bulkButton: {
+    padding: "0.3rem 0.6rem",
+    fontSize: "0.78rem",
+    background: "#fff",
+    border: "1px solid #d1d5db",
+    borderRadius: "0.25rem",
+    cursor: "pointer",
+    color: "#374151",
+  },
+  bulkSelect: {
+    padding: "0.3rem 0.5rem",
+    fontSize: "0.78rem",
+    background: "#fff",
+    border: "1px solid #d1d5db",
+    borderRadius: "0.25rem",
+  },
+  emailRowSelected: {
+    background: "#eef2ff",
+  },
+  rowCheckbox: {
+    flexShrink: 0,
+    cursor: "pointer",
+  },
+  threadBadge: {
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    minWidth: "1.1rem",
+    height: "1.1rem",
+    marginLeft: "0.4rem",
+    padding: "0 0.3rem",
+    fontSize: "0.7rem",
+    fontWeight: 700,
+    background: "#9ca3af",
+    color: "#fff",
+    borderRadius: "999px",
+  },
+  emailSubjectWrap: {
+    display: "flex",
+    alignItems: "center",
+    gap: "0.4rem",
+    overflow: "hidden",
+  },
+  rowLabelChip: {
+    flexShrink: 0,
+    fontSize: "0.65rem",
+    fontWeight: 600,
+    color: "#fff",
+    padding: "0.05rem 0.4rem",
+    borderRadius: "999px",
+    whiteSpace: "nowrap",
   },
 };
