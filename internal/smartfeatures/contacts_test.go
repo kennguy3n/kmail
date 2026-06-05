@@ -50,6 +50,78 @@ func TestContactTracker_RecordAndTop(t *testing.T) {
 	}
 }
 
+func TestContactTracker_CapturesDisplayNames(t *testing.T) {
+	ctx := context.Background()
+	tr, err := NewContactTracker(newTestRedis(t), time.Hour)
+	if err != nil {
+		t.Fatalf("NewContactTracker: %v", err)
+	}
+
+	// Recipients arrive in the `Name <email>` / quoted form the compose
+	// field produces. The frequency ZSET keys on the bare email; the
+	// display name is captured separately and surfaced on read.
+	if err := tr.RecordSend(ctx, "t1", "u1", []string{
+		"Alice Smith <alice@example.com>",
+		`"Bob, Jr." <bob@example.com>`,
+		"carol@example.com", // no display name
+	}); err != nil {
+		t.Fatalf("RecordSend: %v", err)
+	}
+
+	top, err := tr.TopContacts(ctx, "t1", "u1", 10)
+	if err != nil {
+		t.Fatalf("TopContacts: %v", err)
+	}
+	byEmail := map[string]Contact{}
+	for _, c := range top {
+		byEmail[c.Email] = c
+	}
+	if got := byEmail["alice@example.com"].Name; got != "Alice Smith" {
+		t.Errorf("alice name = %q, want %q", got, "Alice Smith")
+	}
+	if got := byEmail["bob@example.com"].Name; got != "Bob, Jr." {
+		t.Errorf("bob name = %q, want %q (quoted name should be unquoted)", got, "Bob, Jr.")
+	}
+	if got := byEmail["carol@example.com"].Name; got != "" {
+		t.Errorf("carol name = %q, want empty (no display name sent)", got)
+	}
+
+	// A later send with a different display name overwrites the prior one.
+	if err := tr.RecordSend(ctx, "t1", "u1", []string{"Alice S. <alice@example.com>"}); err != nil {
+		t.Fatalf("RecordSend (rename): %v", err)
+	}
+	top, _ = tr.TopContacts(ctx, "t1", "u1", 10)
+	for _, c := range top {
+		if c.Email == "alice@example.com" && c.Name != "Alice S." {
+			t.Errorf("alice name after rename = %q, want %q", c.Name, "Alice S.")
+		}
+	}
+}
+
+func TestContactTracker_SuggestCoRecipientsCarriesNames(t *testing.T) {
+	ctx := context.Background()
+	tr, _ := NewContactTracker(newTestRedis(t), time.Hour)
+	// Email alice + bob together a few times so bob is a co-recipient of alice.
+	for i := 0; i < 2; i++ {
+		if err := tr.RecordSend(ctx, "t1", "u1", []string{
+			"Alice <alice@example.com>",
+			"Bob B <bob@example.com>",
+		}); err != nil {
+			t.Fatalf("RecordSend: %v", err)
+		}
+	}
+	sug, err := tr.SuggestCoRecipients(ctx, "t1", "u1", "alice@example.com", nil, 5)
+	if err != nil {
+		t.Fatalf("SuggestCoRecipients: %v", err)
+	}
+	if len(sug) != 1 || sug[0].Email != "bob@example.com" {
+		t.Fatalf("unexpected suggestions: %#v", sug)
+	}
+	if sug[0].Name != "Bob B" {
+		t.Errorf("co-recipient name = %q, want %q", sug[0].Name, "Bob B")
+	}
+}
+
 func TestContactTracker_TenantIsolation(t *testing.T) {
 	ctx := context.Background()
 	tr, _ := NewContactTracker(newTestRedis(t), time.Hour)

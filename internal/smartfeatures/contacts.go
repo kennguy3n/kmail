@@ -21,6 +21,7 @@ import (
 //
 //	kmail:freq_contacts:<tenant>:<user>          ZSET  score=send count, member=email
 //	kmail:co_recipients:<tenant>:<user>:<email>  ZSET  score=co-send count, member=co-recipient email
+//	kmail:contact_names:<tenant>:<user>          HASH  field=email, value=last-seen display name
 //
 // A TTL is applied so a user who stops sending mail eventually
 // ages out of the cache — these are convenience signals, not a
@@ -36,9 +37,13 @@ type ContactTracker struct {
 // correspondent warm while letting one-off recipients lapse.
 const DefaultContactTTL = 180 * 24 * time.Hour
 
-// Contact is a frequent-contact entry returned to the UI.
+// Contact is a frequent-contact entry returned to the UI. Name is
+// the last-seen display name for the address (omitted when none was
+// ever recorded) so the compose chips can render "Alice" rather than
+// a bare email.
 type Contact struct {
 	Email string  `json:"email"`
+	Name  string  `json:"name,omitempty"`
 	Count float64 `json:"count"`
 }
 
@@ -60,6 +65,10 @@ func freqKey(tenantID, userID string) string {
 
 func coKey(tenantID, userID, email string) string {
 	return fmt.Sprintf("kmail:co_recipients:%s:%s:%s", tenantID, userID, email)
+}
+
+func nameKey(tenantID, userID string) string {
+	return fmt.Sprintf("kmail:contact_names:%s:%s", tenantID, userID)
 }
 
 // RecordSend increments the send counters for every recipient of a
@@ -84,6 +93,19 @@ func (t *ContactTracker) RecordSend(ctx context.Context, tenantID, userID string
 		pipe.ZIncrBy(ctx, fk, 1, addr)
 	}
 	pipe.Expire(ctx, fk, t.ttl)
+
+	// Capture last-seen display names (e.g. "Alice <a@b>" → a@b: Alice)
+	// so the suggestion chips can show a name instead of a bare email.
+	// Keyed on the bare email, so a later send with a different name
+	// simply overwrites it. Only addresses that actually carried a
+	// name are written.
+	if names := displayNames(recipients); len(names) > 0 {
+		nk := nameKey(tenantID, userID)
+		for email, name := range names {
+			pipe.HSet(ctx, nk, email, name)
+		}
+		pipe.Expire(ctx, nk, t.ttl)
+	}
 
 	// Co-recipient graph: for each recipient, bump every *other*
 	// recipient on the same message. The relation is symmetric, so
@@ -121,6 +143,7 @@ func (t *ContactTracker) TopContacts(ctx context.Context, tenantID, userID strin
 		member, _ := z.Member.(string)
 		out = append(out, Contact{Email: member, Count: z.Score})
 	}
+	t.resolveNames(ctx, tenantID, userID, out)
 	return out, nil
 }
 
@@ -181,6 +204,7 @@ func (t *ContactTracker) SuggestCoRecipients(ctx context.Context, tenantID, user
 			break
 		}
 	}
+	t.resolveNames(ctx, tenantID, userID, out)
 	return out, nil
 }
 
@@ -203,6 +227,81 @@ func normalizeAddress(s string) string {
 		return ""
 	}
 	return s
+}
+
+// splitAddress separates an address into its display name (may be "")
+// and canonical bare email. It accepts both `user@host` and the
+// RFC 5322 `Display Name <user@host>` / `"Last, First" <user@host>`
+// forms the compose field produces, unquoting a quoted display name.
+// Returns ("", "") when the input isn't a usable address.
+func splitAddress(s string) (name, email string) {
+	s = strings.TrimSpace(s)
+	if lt := strings.LastIndex(s, "<"); lt != -1 {
+		if gt := strings.Index(s[lt+1:], ">"); gt != -1 {
+			email = normalizeAddress(s[lt+1 : lt+1+gt])
+			name = unquoteName(strings.TrimSpace(s[:lt]))
+			if email == "" {
+				return "", ""
+			}
+			return name, email
+		}
+	}
+	email = normalizeAddress(s)
+	if email == "" {
+		return "", ""
+	}
+	return "", email
+}
+
+// unquoteName strips the surrounding quotes (and unescapes \" / \\)
+// from an RFC 5322 quoted display name, leaving bare names untouched.
+func unquoteName(s string) string {
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		inner := s[1 : len(s)-1]
+		inner = strings.ReplaceAll(inner, "\\\"", "\"")
+		inner = strings.ReplaceAll(inner, "\\\\", "\\")
+		return strings.TrimSpace(inner)
+	}
+	return s
+}
+
+// displayNames maps each recipient's bare email to its last-seen
+// non-empty display name. When the same email appears more than once
+// with different names, the last occurrence wins (matching the
+// "last send overwrites" semantics of the stored hash).
+func displayNames(in []string) map[string]string {
+	out := map[string]string{}
+	for _, r := range in {
+		name, email := splitAddress(r)
+		if email == "" || name == "" {
+			continue
+		}
+		out[email] = name
+	}
+	return out
+}
+
+// resolveNames fills in the Name field of each contact from the
+// per-user name hash. A missing hash, missing fields, or a Valkey
+// error are non-fatal: names are a cosmetic enhancement, so contacts
+// are returned name-less rather than failing the whole lookup.
+func (t *ContactTracker) resolveNames(ctx context.Context, tenantID, userID string, contacts []Contact) {
+	if len(contacts) == 0 {
+		return
+	}
+	emails := make([]string, len(contacts))
+	for i, c := range contacts {
+		emails[i] = c.Email
+	}
+	vals, err := t.client.HMGet(ctx, nameKey(tenantID, userID), emails...).Result()
+	if err != nil || len(vals) != len(contacts) {
+		return
+	}
+	for i, v := range vals {
+		if name, ok := v.(string); ok && name != "" {
+			contacts[i].Name = name
+		}
+	}
 }
 
 // normalizeRecipients canonicalizes each address (see normalizeAddress),

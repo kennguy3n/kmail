@@ -363,8 +363,11 @@ export default function Compose() {
       // recording a blind-copied address could later surface it as a
       // "you usually CC X" suggestion and leak the hidden Bcc
       // relationship to anyone composing on this account.
+      // Send the full `Name <email>` form (not the bare email) so the
+      // tracker can capture the display name for the suggestion chips;
+      // the BFF parses the address and keys on the bare email.
       const sentRecipients = [...(draft.to ?? []), ...(draft.cc ?? [])].map(
-        (a) => a.email,
+        (a) => formatAddress(a),
       );
       if (sentRecipients.length > 0) {
         recordSend(sentRecipients).catch(() => {
