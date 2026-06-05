@@ -16,6 +16,7 @@ export default function Layout() {
         <h1>KMail</h1>
         <ul>
           <li><Link to="/mail">Mail</Link></li>
+          <li><Link to="/mail?view=priority">Priority</Link></li>
           <li><Link to="/mail/compose">Compose</Link></li>
           <li><Link to="/mail/shared">Shared inboxes</Link></li>
           <li><Link to="/mail/vault">Zero-Access Vault</Link></li>
@@ -51,6 +52,7 @@ export default function Layout() {
           <li><Link to="/admin/dkim">DKIM keys</Link></li>
           <li><Link to="/admin/sieve">Sieve rules</Link></li>
           <li><Link to="/admin/security">Security keys</Link></li>
+          <li><Link to="/admin/email-analytics">Email analytics</Link></li>
           <li><Link to="/contacts">Contacts</Link></li>
         </ul>
       </nav>

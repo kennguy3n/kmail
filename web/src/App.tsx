@@ -39,6 +39,7 @@ import SearchAdmin from "./pages/Admin/SearchAdmin";
 import DkimAdmin from "./pages/Admin/DkimAdmin";
 import SieveAdmin from "./pages/Admin/SieveAdmin";
 import SecuritySettings from "./pages/Admin/SecuritySettings";
+import EmailAnalytics from "./pages/Admin/EmailAnalytics";
 import ContactsView from "./pages/Mail/ContactsView";
 import Signup from "./pages/Signup";
 
@@ -106,6 +107,7 @@ export default function App() {
         <Route path="admin/dkim" element={<DkimAdmin />} />
         <Route path="admin/sieve" element={<SieveAdmin />} />
         <Route path="admin/security" element={<SecuritySettings />} />
+        <Route path="admin/email-analytics" element={<EmailAnalytics />} />
         <Route path="contacts" element={<ContactsView />} />
 
         <Route path="*" element={<Navigate to="/mail" replace />} />

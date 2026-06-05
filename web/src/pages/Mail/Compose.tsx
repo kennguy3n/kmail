@@ -13,6 +13,12 @@ import {
   uploadLargeAttachment,
   type AttachmentLinkResponse,
 } from "../../api/jmap";
+import {
+  getFrequentContacts,
+  getCoRecipients,
+  type FrequentContact,
+  type CoRecipientSuggestion,
+} from "../../api/smart";
 import { createSecureMessage } from "../../api/confidentialSend";
 import { cancelPendingSend } from "../../api/undoSend";
 import { useTenantSelection } from "../Admin/useTenantSelection";
@@ -113,6 +119,28 @@ export default function Compose() {
     useState<{ id: string; deadline: Date } | null>(null);
   const [remainingMs, setRemainingMs] = useState(0);
   const [isCancelling, setCancelling] = useState(false);
+
+  // WS7: frequent contacts + co-recipient suggestions
+  const [frequentContacts, setFrequentContacts] = useState<FrequentContact[]>([]);
+  const [coRecipients, setCoRecipients] = useState<CoRecipientSuggestion[]>([]);
+
+  useEffect(() => {
+    getFrequentContacts(8)
+      .then((r) => setFrequentContacts(r.contacts ?? []))
+      .catch(() => { /* best-effort */ });
+  }, []);
+
+  useEffect(() => {
+    const first = to.split(",").map((s) => s.trim()).filter(Boolean)[0];
+    if (!first || !first.includes("@")) {
+      setCoRecipients([]);
+      return;
+    }
+    const existing = to.split(",").map((s) => s.trim()).filter(Boolean);
+    getCoRecipients(first, existing)
+      .then((r) => setCoRecipients(r.suggestions ?? []))
+      .catch(() => setCoRecipients([]));
+  }, [to]);
 
   // Scheduled Send (WS4) state. `sendMode` toggles the Send
   // button between immediate dispatch and the schedule picker.
@@ -543,6 +571,60 @@ export default function Compose() {
             style={styles.input}
           />
         </div>
+        {/* WS7: frequent contacts + co-recipient suggestions */}
+        {(frequentContacts.length > 0 || coRecipients.length > 0) && (
+          <div style={{ ...styles.row, flexWrap: "wrap", gap: 4 }}>
+            <span style={{ ...styles.label, alignSelf: "flex-start", marginTop: 4 }}>
+              Suggestions
+            </span>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 4, flex: 1 }}>
+              {frequentContacts.map((c) => (
+                <button
+                  key={c.email}
+                  type="button"
+                  style={{
+                    padding: "2px 10px",
+                    fontSize: "0.8rem",
+                    border: "1px solid #c2d9fd",
+                    borderRadius: 12,
+                    background: "#e8f0fe",
+                    color: "#1a73e8",
+                    cursor: "pointer",
+                    whiteSpace: "nowrap",
+                  }}
+                  onClick={() => {
+                    const cur = to.trim();
+                    setTo(cur ? `${cur}, ${c.email}` : c.email);
+                  }}
+                >
+                  {c.name ? `${c.name} <${c.email}>` : c.email}
+                </button>
+              ))}
+              {coRecipients.map((c) => (
+                <button
+                  key={c.email}
+                  type="button"
+                  style={{
+                    padding: "2px 10px",
+                    fontSize: "0.8rem",
+                    border: "1px solid #d4edda",
+                    borderRadius: 12,
+                    background: "#e8f5e9",
+                    color: "#2e7d32",
+                    cursor: "pointer",
+                    whiteSpace: "nowrap",
+                  }}
+                  onClick={() => {
+                    const cur = cc.trim();
+                    setCc(cur ? `${cur}, ${c.email}` : c.email);
+                  }}
+                >
+                  + CC {c.name ? `${c.name} <${c.email}>` : c.email}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
         <div style={styles.row}>
           <label htmlFor="compose-subject" style={styles.label}>
             Subject

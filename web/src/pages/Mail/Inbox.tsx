@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Link, useNavigate, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 
 import { jmapClient } from "../../api/jmap";
 import { snoozeEmail } from "../../api/snooze";
+import { categorize, getPriorityInbox, type EmailCategory, type PriorityItem } from "../../api/smart";
 import SnoozePicker from "./SnoozePicker";
 import type { Email, Mailbox } from "../../types";
 
@@ -15,8 +16,43 @@ import type { Email, Mailbox } from "../../types";
  * are deferred to Phase 3 — state changes come from user
  * navigation for now.
  */
+/** WS7: Category tab labels and their API enum values. */
+const CATEGORY_TABS: { label: string; value: EmailCategory | "all" }[] = [
+  { label: "All", value: "all" },
+  { label: "Primary", value: "primary" },
+  { label: "Social", value: "social" },
+  { label: "Promotions", value: "promotions" },
+  { label: "Updates", value: "updates" },
+  { label: "Forums", value: "forums" },
+];
+
+const CATEGORY_TAB_STYLE: React.CSSProperties = {
+  display: "flex",
+  gap: 0,
+  borderBottom: "2px solid #ddd",
+  marginBottom: 8,
+  padding: "0 8px",
+};
+
+function categoryTabBtn(
+  active: boolean,
+): React.CSSProperties {
+  return {
+    padding: "6px 14px",
+    cursor: "pointer",
+    border: "none",
+    background: "none",
+    borderBottom: active ? "2px solid #4c8bf5" : "2px solid transparent",
+    fontWeight: active ? 600 : 400,
+    color: active ? "#4c8bf5" : "#555",
+    marginBottom: -2,
+  };
+}
+
 export default function Inbox() {
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  const isPriorityView = searchParams.get("view") === "priority";
   const { mailboxId: selectedFromRoute } = useParams<{ mailboxId?: string }>();
 
   const [mailboxes, setMailboxes] = useState<Mailbox[] | null>(null);
@@ -58,6 +94,29 @@ export default function Inbox() {
   // state. `reloadNonce` still drives the mailbox-mode refetch.
   const [searchReloadNonce, setSearchReloadNonce] = useState(0);
   const inSearchMode = submittedQuery.trim().length > 0;
+
+  // ── WS7: category filter + priority view ──────────────────
+  const [activeCategory, setActiveCategory] = useState<EmailCategory | "all">("all");
+  const [emailCategories, setEmailCategories] = useState<Record<string, EmailCategory>>({});
+  const [priorityItems, setPriorityItems] = useState<PriorityItem[]>([]);
+  const [isPriorityLoading, setIsPriorityLoading] = useState(false);
+
+  useEffect(() => {
+    if (!emails || emails.length === 0) return;
+    const ids = emails.map((e) => e.id);
+    categorize(ids)
+      .then((res) => setEmailCategories(res.categories))
+      .catch(() => { /* categorization is best-effort */ });
+  }, [emails]);
+
+  useEffect(() => {
+    if (!isPriorityView) return;
+    setIsPriorityLoading(true);
+    getPriorityInbox({ limit: 50 })
+      .then((res) => setPriorityItems(res.items))
+      .catch(() => { /* priority fetch is best-effort */ })
+      .finally(() => setIsPriorityLoading(false));
+  }, [isPriorityView]);
 
   useEffect(() => {
     let cancelled = false;
@@ -566,11 +625,66 @@ export default function Inbox() {
           searchResults.length === 0 && (
             <p style={layoutStyles.muted}>No matching messages.</p>
           )}
-        {(() => {
-          const list = inSearchMode ? (searchResults ?? []) : (emails ?? []);
+        {/* WS7: category tabs — shown when viewing normal inbox */}
+        {!inSearchMode && !isPriorityView && (
+          <div style={CATEGORY_TAB_STYLE}>
+            {CATEGORY_TABS.map((tab) => (
+              <button
+                key={tab.value}
+                type="button"
+                style={categoryTabBtn(activeCategory === tab.value)}
+                onClick={() => setActiveCategory(tab.value)}
+              >
+                {tab.label}
+              </button>
+            ))}
+          </div>
+        )}
+        {/* WS7: priority view */}
+        {isPriorityView && (
+          <div>
+            <h3 style={{ margin: "0 0 8px" }}>Priority Inbox</h3>
+            {isPriorityLoading && <p style={{ color: "#888" }}>Loading…</p>}
+            {!isPriorityLoading && priorityItems.length === 0 && (
+              <p style={{ color: "#888" }}>No priority messages.</p>
+            )}
+            {!isPriorityLoading && priorityItems.length > 0 && (
+              <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
+                {priorityItems.map((item) => (
+                  <li
+                    key={item.email_id}
+                    style={{
+                      padding: "8px 12px",
+                      borderBottom: "1px solid #eee",
+                      cursor: "pointer",
+                    }}
+                  >
+                    <div style={{ fontWeight: 500 }}>
+                      {item.subject || "(no subject)"}
+                    </div>
+                    <div style={{ fontSize: "0.85rem", color: "#666" }}>
+                      {item.from} — score {item.score}
+                    </div>
+                    <div style={{ fontSize: "0.8rem", color: "#999" }}>
+                      {item.preview?.slice(0, 120)}
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        )}
+        {!isPriorityView && (() => {
+          let list = inSearchMode ? (searchResults ?? []) : (emails ?? []);
+          // WS7: apply category filter when active.
+          if (activeCategory !== "all" && !inSearchMode) {
+            list = list.filter(
+              (e) => emailCategories[e.id] === activeCategory,
+            );
+          }
           if (list.length === 0) return null;
           return (
-            <ul style={layoutStyles.emailList}>
+            <ul style={layoutStyles.emailList} data-testid="email-list">
               {list.map((email) => {
                 // In search mode the sidebar mailbox is not
                 // authoritative, so compute per-email whether the
