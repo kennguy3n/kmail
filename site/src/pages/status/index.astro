@@ -12,6 +12,7 @@ import {
 const series = buildUptimeSeries(90);
 const uptime = overallUptime(series);
 const overall = overallStatus(COMPONENTS);
+const feedUrl = new URL("/status/feed.xml", Astro.site ?? Astro.url).href;
 
 const statusLabel: Record<string, string> = {
   operational: "All systems operational",
@@ -103,23 +104,20 @@ const fmtDate = (iso: string) =>
       <div class="card" style="margin-top:1.5rem">
         <h2 style="margin-top:0">Get status updates</h2>
         <p class="muted">
-          Subscribe to incident notifications. We'll only email you when an
-          incident opens, updates, or resolves.
+          Subscribe to the incident feed to be notified whenever an incident
+          opens, updates, or resolves. The feed updates the moment we publish a
+          new incident — point any RSS reader (most support email digests) at:
         </p>
-        <form class="subscribe" action="/api/v1/status/subscribe" method="post">
-          <label class="visually-hidden" for="status-email">Email address</label>
+        <div class="subscribe">
           <input
-            id="status-email"
-            type="email"
-            name="email"
-            placeholder="you@company.com"
-            required
+            class="subscribe__url"
+            type="text"
+            readonly
+            value={feedUrl}
+            aria-label="Status incident feed URL"
           />
-          <button class="btn btn--primary" type="submit">Subscribe</button>
-        </form>
-        <p class="muted" style="font-size:0.85rem">
-          Prefer a reader? Use the <a href="/status/feed.xml">RSS feed</a>.
-        </p>
+          <a class="btn btn--primary" href="/status/feed.xml">Open RSS feed</a>
+        </div>
       </div>
 
       <!-- Incident history -->
@@ -130,7 +128,7 @@ const fmtDate = (iso: string) =>
         ) : (
           <div class="incidents">
             {INCIDENTS.map((inc) => (
-              <article class="card incident">
+              <article class="card incident" id={inc.id}>
                 <header class="incident__head">
                   <h3 style="margin:0">{inc.title}</h3>
                   <span class:list={["pill", inc.resolved ? "ok" : "warn"]}>
