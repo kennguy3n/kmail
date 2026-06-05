@@ -443,36 +443,46 @@ func mailboxGet(ctx context.Context, c *http.Client, tenantID string) error {
 }
 
 func fetchShards(c *http.Client) ([]shardInfo, error) {
+	b, err := getBody(c, "/api/v1/admin/shards")
+	if err != nil {
+		return nil, err
+	}
+	// The handler returns {"shards":[...]}; some deployments return a
+	// bare array. Read the body once and try the wrapped form first,
+	// falling back to the bare array — no second HTTP request.
+	var wrap struct {
+		Shards []shardInfo `json:"shards"`
+	}
+	if err := json.Unmarshal(b, &wrap); err == nil && wrap.Shards != nil {
+		return wrap.Shards, nil
+	}
 	var shards []shardInfo
-	if err := getJSON(c, "/api/v1/admin/shards", &shards); err != nil {
-		// Some deployments wrap the list: {"shards":[...]}.
-		var wrap struct {
-			Shards []shardInfo `json:"shards"`
-		}
-		if err2 := getJSON(c, "/api/v1/admin/shards", &wrap); err2 != nil {
-			return nil, err
-		}
-		shards = wrap.Shards
+	if err := json.Unmarshal(b, &shards); err != nil {
+		return nil, fmt.Errorf("decode shards: %w", err)
 	}
 	return shards, nil
 }
 
+type tenantRow struct {
+	ID      string `json:"id"`
+	ShardID string `json:"shard_id"`
+}
+
 func fetchTenants(c *http.Client) ([]tenant, error) {
-	var raw []struct {
-		ID      string `json:"id"`
-		ShardID string `json:"shard_id"`
+	b, err := getBody(c, "/api/v1/tenants")
+	if err != nil {
+		return nil, err
 	}
-	if err := getJSON(c, "/api/v1/tenants", &raw); err != nil {
-		var wrap struct {
-			Tenants []struct {
-				ID      string `json:"id"`
-				ShardID string `json:"shard_id"`
-			} `json:"tenants"`
-		}
-		if err2 := getJSON(c, "/api/v1/tenants", &wrap); err2 != nil {
-			return nil, err
-		}
+	// As with shards: try the wrapped {"tenants":[...]} form first, then
+	// the bare array, parsing the single response body twice locally.
+	var raw []tenantRow
+	var wrap struct {
+		Tenants []tenantRow `json:"tenants"`
+	}
+	if err := json.Unmarshal(b, &wrap); err == nil && wrap.Tenants != nil {
 		raw = wrap.Tenants
+	} else if err := json.Unmarshal(b, &raw); err != nil {
+		return nil, fmt.Errorf("decode tenants: %w", err)
 	}
 	var out []tenant
 	for _, r := range raw {
@@ -481,20 +491,30 @@ func fetchTenants(c *http.Client) ([]tenant, error) {
 	return out, nil
 }
 
-func getJSON(c *http.Client, path string, v any) error {
+// getBody performs a single authenticated GET and returns the response
+// body, so callers can attempt multiple JSON shapes without re-fetching.
+func getBody(c *http.Client, path string) ([]byte, error) {
 	req, err := http.NewRequest(http.MethodGet, *apiURL+path, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+*authToken)
 	resp, err := c.Do(req)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<22))
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("GET %s -> %d: %s", path, resp.StatusCode, strings.TrimSpace(string(b)))
+		return nil, fmt.Errorf("GET %s -> %d: %s", path, resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	return b, nil
+}
+
+func getJSON(c *http.Client, path string, v any) error {
+	b, err := getBody(c, path)
+	if err != nil {
+		return err
 	}
 	return json.Unmarshal(b, v)
 }

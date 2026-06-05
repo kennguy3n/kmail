@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"log"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // DefaultProvisionThreshold is the cluster-utilisation fraction at or
@@ -16,6 +18,19 @@ import (
 // which (at the 60s health/provision tick) comfortably covers tenant
 // growth between ticks without flapping.
 const DefaultProvisionThreshold = 0.80
+
+// provisionLockKey is the Postgres advisory-lock key that serialises
+// AutoProvisionShard across worker replicas. Multiple kmail-worker pods
+// each run the AutoProvisionWorker on a timer; without coordination two
+// pods can independently observe "over threshold", each mint a distinct
+// shard name, and provision two shards for one capacity event (the
+// idempotent-on-name provisioner contract does NOT help because the
+// names differ). A single advisory lock turns the decide-then-provision
+// sequence into a critical section: the holder re-reads capacity under
+// the lock and provisions at most one shard; contenders skip the tick
+// and converge on the next one. The constant is derived from
+// "kmail.shard_provision" and must stay stable across releases.
+const provisionLockKey int64 = 0x6b6d61696c5f7370 // "kmail_sp"
 
 // ErrNoProvisioner is returned by AutoProvisionShard when capacity is
 // exhausted but no ShardProvisioner has been configured — the operator
@@ -103,10 +118,23 @@ func needsProvision(shards []Shard, threshold float64) bool {
 // A non-positive threshold falls back to DefaultProvisionThreshold.
 // When provisioning is required but no ShardProvisioner is configured,
 // it returns ErrNoProvisioner.
+//
+// Concurrency: the decide-then-provision body runs under a Postgres
+// advisory lock (provisionLockKey) so that when several kmail-worker
+// replicas tick at once, exactly one provisions per capacity event.
+// The lock is taken non-blocking (pg_try_advisory_lock): a replica that
+// loses the race returns (nil, nil) immediately rather than queuing
+// behind a multi-minute Terraform run, and re-evaluates on its next
+// tick — by which point the winner's new shard is visible and the
+// threshold check is satisfied. Capacity is re-read INSIDE the lock so
+// the cheap pre-check race (TOCTOU between the lock-free pre-check and
+// acquiring the lock) cannot double-provision.
 func (s *ShardService) AutoProvisionShard(ctx context.Context, threshold float64) (*Shard, error) {
 	if threshold <= 0 {
 		threshold = DefaultProvisionThreshold
 	}
+	// Lock-free pre-check: the common case is "spare capacity remains",
+	// so avoid taking a connection + advisory lock on every tick.
 	shards, err := s.ListShards(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("auto-provision: list shards: %w", err)
@@ -114,25 +142,81 @@ func (s *ShardService) AutoProvisionShard(ctx context.Context, threshold float64
 	if !needsProvision(shards, threshold) {
 		return nil, nil
 	}
+	// provisioner is set once at construction (SetProvisioner) before
+	// any worker goroutine starts and is identical across replicas, so
+	// it is safe to short-circuit before contending for the lock.
 	if s.provisioner == nil {
 		return nil, ErrNoProvisioner
 	}
-	name := autoShardName()
-	provisioned, err := s.provisioner.Provision(ctx, name)
+
+	var registered *Shard
+	err = s.withProvisionLock(ctx, func(conn *pgxpool.Conn) error {
+		// Re-read under the lock: another replica may have provisioned
+		// between our pre-check and acquiring the lock, in which case
+		// the cluster is no longer over threshold and we must not add a
+		// second shard for the same capacity event.
+		shards, err := s.ListShards(ctx)
+		if err != nil {
+			return fmt.Errorf("auto-provision: re-list shards: %w", err)
+		}
+		if !needsProvision(shards, threshold) {
+			return nil
+		}
+		name := autoShardName()
+		provisioned, err := s.provisioner.Provision(ctx, name)
+		if err != nil {
+			return fmt.Errorf("auto-provision: provision %q: %w", name, err)
+		}
+		// Default the name from our generated one if the provisioner
+		// left it blank, so RegisterShard's required-field check passes.
+		if provisioned.Name == "" {
+			provisioned.Name = name
+		}
+		reg, err := s.RegisterShard(ctx, provisioned)
+		if err != nil {
+			return fmt.Errorf("auto-provision: register %q: %w", provisioned.Name, err)
+		}
+		s.Logger.Printf("auto-provisioned shard %s (%s) at >=%.0f%% cluster utilisation", reg.ID, reg.Name, threshold*100)
+		registered = reg
+		return nil
+	})
 	if err != nil {
-		return nil, fmt.Errorf("auto-provision: provision %q: %w", name, err)
+		return nil, err
 	}
-	// Default the name from our generated one if the provisioner left
-	// it blank, so RegisterShard's required-field check passes.
-	if provisioned.Name == "" {
-		provisioned.Name = name
-	}
-	registered, err := s.RegisterShard(ctx, provisioned)
-	if err != nil {
-		return nil, fmt.Errorf("auto-provision: register %q: %w", provisioned.Name, err)
-	}
-	s.Logger.Printf("auto-provisioned shard %s (%s) at >=%.0f%% cluster utilisation", registered.ID, registered.Name, threshold*100)
 	return registered, nil
+}
+
+// withProvisionLock runs fn while holding the provision advisory lock on
+// a dedicated connection. It uses the non-blocking pg_try_advisory_lock:
+// if another replica already holds the lock (i.e. is mid-provision), fn
+// is skipped and (nil) is returned so the caller no-ops this tick. When
+// s.Pool is nil (unit tests that drive provisioning directly) fn runs
+// without locking so the policy stays testable without a database.
+func (s *ShardService) withProvisionLock(ctx context.Context, fn func(conn *pgxpool.Conn) error) error {
+	if s.Pool == nil {
+		return fn(nil)
+	}
+	conn, err := s.Pool.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("auto-provision: acquire conn: %w", err)
+	}
+	defer conn.Release()
+
+	var locked bool
+	if err := conn.QueryRow(ctx, "SELECT pg_try_advisory_lock($1)", provisionLockKey).Scan(&locked); err != nil {
+		return fmt.Errorf("auto-provision: acquire advisory lock: %w", err)
+	}
+	if !locked {
+		// Another replica is provisioning right now; back off and let
+		// the next tick re-evaluate once its shard is committed.
+		return nil
+	}
+	defer func() {
+		if _, uerr := conn.Exec(context.Background(), "SELECT pg_advisory_unlock($1)", provisionLockKey); uerr != nil {
+			s.Logger.Printf("auto-provision: advisory unlock: %v", uerr)
+		}
+	}()
+	return fn(conn)
 }
 
 // autoShardName generates a unique name for an auto-provisioned shard.

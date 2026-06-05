@@ -39,8 +39,15 @@ import (
 // is derived from "kmail.schema_migrations" and must stay stable.
 const advisoryLockKey int64 = 0x6b6d61696c5f6d67 // "kmail_mg"
 
-// upRe matches an up migration: NNN_description.sql but NOT .down.sql.
+// upRe matches an up migration: NNN_description.sql. RE2 has no
+// lookbehind, so it can't express "…but not .down.sql" on its own;
+// Discover pre-filters `.down.sql` names before testing it.
 var upRe = regexp.MustCompile(`^(\d+)_.*\.sql$`)
+
+// downRe extracts the version prefix from a `.down.sql` companion. It
+// is compiled once at package scope (mirroring upRe) rather than per
+// directory entry inside Discover's pairing loop.
+var downRe = regexp.MustCompile(`^(\d+)_`)
 
 // Migration is one discovered migration and its optional down file.
 type Migration struct {
@@ -106,7 +113,7 @@ func Discover(dir string) ([]Migration, error) {
 		if !strings.HasSuffix(name, ".down.sql") {
 			continue
 		}
-		dm := regexp.MustCompile(`^(\d+)_`).FindStringSubmatch(name)
+		dm := downRe.FindStringSubmatch(name)
 		if dm == nil {
 			continue
 		}
@@ -191,11 +198,17 @@ func execFile(ctx context.Context, conn *pgxpool.Conn, path string) error {
 		return fmt.Errorf("schemamigrate: read %s: %w", filepath.Base(path), err)
 	}
 	mrr := conn.Conn().PgConn().Exec(ctx, string(sqlBytes))
-	if _, err := mrr.ReadAll(); err != nil {
-		return fmt.Errorf("schemamigrate: exec %s: %w", filepath.Base(path), err)
+	_, readErr := mrr.ReadAll()
+	// Always Close to drain the multi-result reader and return the
+	// connection to a clean state, even when ReadAll failed — otherwise
+	// the pgconn is left with unread results and pgxpool destroys it
+	// rather than recycling it.
+	closeErr := mrr.Close()
+	if readErr != nil {
+		return fmt.Errorf("schemamigrate: exec %s: %w", filepath.Base(path), readErr)
 	}
-	if err := mrr.Close(); err != nil {
-		return fmt.Errorf("schemamigrate: close %s: %w", filepath.Base(path), err)
+	if closeErr != nil {
+		return fmt.Errorf("schemamigrate: close %s: %w", filepath.Base(path), closeErr)
 	}
 	return nil
 }
