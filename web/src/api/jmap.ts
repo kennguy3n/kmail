@@ -426,6 +426,10 @@ export class JMAPClient {
             "attachments",
             "bodyValues",
             "privacyMode",
+            // Read-receipt (RFC 8098) request headers + Message-ID,
+            // surfaced so MessageView can offer to send an MDN.
+            "header:Disposition-Notification-To:asText",
+            "header:Message-ID:asText",
           ],
           fetchTextBodyValues: true,
           fetchHTMLBodyValues: true,
@@ -439,6 +443,440 @@ export class JMAPClient {
       throw new Error(`kmail-web: email ${emailId} not found`);
     }
     return list[0] as Email;
+  }
+
+  /**
+   * Send a Message Disposition Notification (RFC 8098) for an email
+   * the user just read, to the address the sender named in the
+   * `Disposition-Notification-To` header.
+   *
+   * The MDN is a `multipart/report; report-type=disposition-notification`
+   * message with two parts: a human-readable explanation and the
+   * machine-readable `message/disposition-notification` part. We
+   * build the structure explicitly (rather than via
+   * `buildEmailCreate`, which only emits text/html bodies) and
+   * submit it in the same `Email/set` + `EmailSubmission/set`
+   * round-trip used by `sendEmail`.
+   */
+  async sendReadReceipt(params: {
+    to: string;
+    fromIdentity: Identity;
+    originalMessageId: string | null;
+    originalSubject: string | null;
+    originalRecipient: string;
+  }): Promise<void> {
+    const accountId = await this.getAccountId();
+    const { to, fromIdentity, originalMessageId, originalSubject } = params;
+    // RFC 8621 §4.1: a created Email MUST belong to at least one
+    // mailbox. The MDN is transient (destroyed via
+    // `onSuccessDestroyEmail` once submitted), so any real mailbox
+    // works as its momentary home — prefer Drafts, then Sent, then
+    // whatever mailbox exists. An empty `mailboxIds` is rejected by
+    // spec-compliant servers and the receipt would never send.
+    const mailboxes = await this.getMailboxes();
+    const homeMailboxId =
+      mailboxes.find((m) => m.role === "drafts")?.id ??
+      mailboxes.find((m) => m.role === "sent")?.id ??
+      mailboxes[0]?.id;
+    if (!homeMailboxId) {
+      throw new Error(
+        "kmail-web: cannot send read receipt: no mailbox available",
+      );
+    }
+    const human =
+      `Your message${originalSubject ? ` "${originalSubject}"` : ""} ` +
+      `was displayed by ${params.originalRecipient}. This is an automatic ` +
+      `read-receipt confirmation; no further action is required.`;
+    // RFC 8098 §3.1 fields. `manual-action/MDN-sent-manually` reflects
+    // that the user explicitly chose to send the receipt.
+    const mdnFields =
+      `Reporting-UA: kmail; KMail Web\r\n` +
+      `Final-Recipient: rfc822; ${params.originalRecipient}\r\n` +
+      (originalMessageId
+        ? `Original-Message-ID: ${originalMessageId}\r\n`
+        : "") +
+      `Disposition: manual-action/MDN-sent-manually; displayed\r\n`;
+
+    const create: Record<string, unknown> = {
+      mailboxIds: { [homeMailboxId]: true },
+      from: [{ name: fromIdentity.name || null, email: fromIdentity.email }],
+      to: [{ name: null, email: to }],
+      subject: `Read: ${originalSubject ?? "(no subject)"}`,
+      "header:Content-Type:asText":
+        'multipart/report; report-type=disposition-notification',
+      bodyStructure: {
+        type: "multipart/report",
+        subParts: [
+          { partId: "human", type: "text/plain" },
+          { partId: "mdn", type: "message/disposition-notification" },
+        ],
+      },
+      bodyValues: {
+        human: { value: human },
+        mdn: { value: mdnFields },
+      },
+    };
+
+    const response = await this.request([
+      [
+        "Email/set",
+        { accountId, create: { mdn: create } },
+        "0",
+      ],
+      [
+        "EmailSubmission/set",
+        {
+          accountId,
+          create: {
+            sub: {
+              identityId: fromIdentity.id,
+              emailId: "#mdn",
+            },
+          },
+          onSuccessDestroyEmail: ["#sub"],
+        },
+        "1",
+      ],
+    ]);
+    const setResult = expectResult(response, "Email/set", "0");
+    const notCreated = setResult.notCreated as
+      | Record<string, { type?: string; description?: string }>
+      | undefined;
+    if (notCreated && notCreated.mdn) {
+      const e = notCreated.mdn;
+      throw new Error(
+        `kmail-web: failed to build read receipt: ${e.type ?? "unknown"}${e.description ? `: ${e.description}` : ""}`,
+      );
+    }
+    const subResult = expectResult(response, "EmailSubmission/set", "1");
+    const subNotCreated = subResult.notCreated as
+      | Record<string, { type?: string; description?: string }>
+      | undefined;
+    if (subNotCreated && subNotCreated.sub) {
+      const e = subNotCreated.sub;
+      throw new Error(
+        `kmail-web: failed to send read receipt: ${e.type ?? "unknown"}${e.description ? `: ${e.description}` : ""}`,
+      );
+    }
+  }
+
+  /**
+   * Fetch every Email in a thread, hydrated with the full body
+   * property set, in the server's conversation order (RFC 8621
+   * §3.2 orders `Thread.emailIds` by receivedAt ascending). Used by
+   * the conversation view to render every message in a thread.
+   *
+   * Resolves `Thread/get` → `Email/get` in a single batch via a
+   * back-reference (`#ids`) so the two calls share one round-trip,
+   * matching the pattern used by `getEmails()`.
+   */
+  async getThread(threadId: string): Promise<Email[]> {
+    const accountId = await this.getAccountId();
+    const response = await this.request([
+      ["Thread/get", { accountId, ids: [threadId] }, "0"],
+      [
+        "Email/get",
+        {
+          accountId,
+          "#ids": {
+            resultOf: "0",
+            name: "Thread/get",
+            path: "/list/*/emailIds",
+          },
+          properties: [
+            "id",
+            "blobId",
+            "threadId",
+            "mailboxIds",
+            "keywords",
+            "size",
+            "from",
+            "to",
+            "cc",
+            "bcc",
+            "replyTo",
+            "subject",
+            "receivedAt",
+            "sentAt",
+            "hasAttachment",
+            "preview",
+            "textBody",
+            "htmlBody",
+            "attachments",
+            "bodyValues",
+            "privacyMode",
+          ],
+          fetchTextBodyValues: true,
+          fetchHTMLBodyValues: true,
+        },
+        "1",
+      ],
+    ]);
+    const result = expectResult(response, "Email/get", "1");
+    const list = result.list;
+    if (!Array.isArray(list)) {
+      throw new Error("kmail-web: Thread Email/get returned no list");
+    }
+    return list as Email[];
+  }
+
+  /**
+   * Fetch a page of emails carrying `keyword` (used by the label
+   * filter in the sidebar). Mirrors `getEmails()` but filters on
+   * `hasKeyword` (RFC 8621 §4.4.1) instead of `inMailbox`.
+   */
+  async getEmailsByKeyword(
+    keyword: string,
+    options: GetEmailsOptions = {},
+  ): Promise<Email[]> {
+    const accountId = await this.getAccountId();
+    const {
+      limit = 50,
+      position = 0,
+      sort = [{ property: "receivedAt", isAscending: false }],
+    } = options;
+    const response = await this.request([
+      [
+        "Email/query",
+        {
+          accountId,
+          filter: { hasKeyword: keyword },
+          sort,
+          position,
+          limit,
+          calculateTotal: true,
+        },
+        "0",
+      ],
+      [
+        "Email/get",
+        {
+          accountId,
+          "#ids": { resultOf: "0", name: "Email/query", path: "/ids" },
+          properties: [
+            "id",
+            "threadId",
+            "mailboxIds",
+            "keywords",
+            "from",
+            "to",
+            "subject",
+            "receivedAt",
+            "sentAt",
+            "size",
+            "preview",
+            "hasAttachment",
+            "privacyMode",
+          ],
+        },
+        "1",
+      ],
+    ]);
+    const result = expectResult(response, "Email/get", "1");
+    const list = result.list;
+    if (!Array.isArray(list)) {
+      throw new Error("kmail-web: Email/get returned no list");
+    }
+    return list as Email[];
+  }
+
+  /**
+   * Toggle a single keyword (RFC 8621 §4.1.1) on one email. Used to
+   * apply/remove a label. `on=false` clears the keyword by setting
+   * it to `null` (JMAP patch semantics).
+   */
+  async setKeyword(
+    emailId: string,
+    keyword: string,
+    on: boolean,
+  ): Promise<void> {
+    await this.bulkSetKeyword([emailId], keyword, on);
+  }
+
+  /**
+   * Set or clear a keyword on many emails in a single `Email/set`
+   * batch. Used by bulk operations and the drag-onto-label flow.
+   * Throws if the server reports any id under `notUpdated`.
+   */
+  async bulkSetKeyword(
+    emailIds: string[],
+    keyword: string,
+    on: boolean,
+  ): Promise<void> {
+    if (emailIds.length === 0) return;
+    const accountId = await this.getAccountId();
+    const update: Record<string, Record<string, boolean | null>> = {};
+    for (const id of emailIds) {
+      update[id] = { [`keywords/${keyword}`]: on ? true : null };
+    }
+    const response = await this.request([
+      ["Email/set", { accountId, update }, "0"],
+    ]);
+    assertAllUpdated(response, emailIds, `set keyword ${keyword}`);
+  }
+
+  /**
+   * Mark many emails read/unread in a single batch. Mirrors
+   * `markRead` for the bulk toolbar.
+   */
+  async bulkSetSeen(emailIds: string[], read: boolean): Promise<void> {
+    if (emailIds.length === 0) return;
+    const accountId = await this.getAccountId();
+    const update: Record<string, Record<string, boolean | null>> = {};
+    for (const id of emailIds) {
+      update[id] = { "keywords/$seen": read ? true : null };
+    }
+    const response = await this.request([
+      ["Email/set", { accountId, update }, "0"],
+    ]);
+    assertAllUpdated(response, emailIds, "set $seen");
+  }
+
+  /**
+   * Move many emails to `toMailbox` in a single batch. When
+   * `fromMailbox` is given, each email is removed from it; otherwise
+   * the email keeps any other mailbox memberships (additive move,
+   * used by "Archive"/"Apply"). Mirrors `moveEmail`.
+   */
+  async bulkMove(
+    emailIds: string[],
+    fromMailbox: string | null,
+    toMailbox: string,
+  ): Promise<void> {
+    if (emailIds.length === 0) return;
+    const accountId = await this.getAccountId();
+    const update: Record<string, Record<string, boolean | null>> = {};
+    for (const id of emailIds) {
+      const patch: Record<string, boolean | null> = {
+        [`mailboxIds/${toMailbox}`]: true,
+      };
+      // Only remove the source when it's a real, different mailbox.
+      // If `fromMailbox === toMailbox`, skipping the removal keeps the
+      // `true` add (a safe no-op) instead of emitting a remove-only
+      // patch that leaves the email in zero mailboxes — which RFC 8621
+      // rejects. This mirrors `moveEmail`'s effective behaviour.
+      if (fromMailbox && fromMailbox !== toMailbox) {
+        patch[`mailboxIds/${fromMailbox}`] = null;
+      }
+      update[id] = patch;
+    }
+    const response = await this.request([
+      ["Email/set", { accountId, update }, "0"],
+    ]);
+    assertAllUpdated(response, emailIds, "move");
+  }
+
+  /** Destroy many emails in a single batch (bulk delete). */
+  async bulkDelete(emailIds: string[]): Promise<void> {
+    if (emailIds.length === 0) return;
+    const accountId = await this.getAccountId();
+    const response = await this.request([
+      ["Email/set", { accountId, destroy: emailIds }, "0"],
+    ]);
+    const result = expectResult(response, "Email/set", "0");
+    const destroyed = (result.destroyed as string[] | undefined) ?? [];
+    const missing = emailIds.filter((id) => !destroyed.includes(id));
+    if (missing.length > 0) {
+      throw new Error(
+        `kmail-web: ${missing.length} email(s) were not destroyed`,
+      );
+    }
+  }
+
+  /**
+   * Upload a binary blob to the JMAP blob store (RFC 8620 §6.1) and
+   * return the server-assigned blob id. Used for inline-image paste
+   * and real MIME attachments in Compose. The `uploadUrl` template
+   * carries an `{accountId}` placeholder per the session object.
+   */
+  async uploadBlob(
+    file: Blob,
+    filename?: string,
+  ): Promise<{ blobId: string; type: string; size: number }> {
+    const session = await this.getSession();
+    const accountId = await this.getAccountId();
+    const url = session.uploadUrl.replace(
+      "{accountId}",
+      encodeURIComponent(accountId),
+    );
+    // RFC 6266 quoted-string: strip control characters (which would
+    // otherwise corrupt or inject HTTP headers) and escape backslashes
+    // and double quotes so a filename like `a"b.txt` can't terminate
+    // the quoted value early.
+    const safeFilename = filename
+      ?.replace(/[\u0000-\u001f\u007f]/g, "")
+      .replace(/\\/g, "\\\\")
+      .replace(/"/g, '\\"');
+    const res = await fetch(url, {
+      method: "POST",
+      credentials: "include",
+      headers: authHeaders({
+        "Content-Type": file.type || "application/octet-stream",
+        ...(safeFilename
+          ? { "Content-Disposition": `attachment; filename="${safeFilename}"` }
+          : {}),
+      }),
+      body: file,
+    });
+    if (!res.ok) {
+      throw new Error(
+        `kmail-web: blob upload failed: ${res.status} ${res.statusText}`,
+      );
+    }
+    const body = (await res.json()) as {
+      blobId: string;
+      type?: string;
+      size?: number;
+    };
+    return {
+      blobId: body.blobId,
+      type: body.type ?? file.type ?? "application/octet-stream",
+      size: body.size ?? (file instanceof File ? file.size : 0),
+    };
+  }
+
+  /**
+   * Build a download URL for a blob from the session `downloadUrl`
+   * template (RFC 8620 §6.2). Used to render inline images and to
+   * preview/download attachments. The returned URL still needs the
+   * `Authorization` header, so callers that embed it in an `<img>`
+   * tag should fetch via {@link downloadBlob} and use an object URL.
+   */
+  async buildDownloadUrl(
+    blobId: string,
+    name: string,
+    type = "application/octet-stream",
+  ): Promise<string> {
+    const session = await this.getSession();
+    const accountId = await this.getAccountId();
+    return session.downloadUrl
+      .replace("{accountId}", encodeURIComponent(accountId))
+      .replace("{blobId}", encodeURIComponent(blobId))
+      .replace("{name}", encodeURIComponent(name))
+      .replace("{type}", encodeURIComponent(type));
+  }
+
+  /**
+   * Fetch a blob's bytes with the auth header attached. Returns a
+   * `Blob` the caller can turn into an object URL for inline image
+   * rendering or a download anchor.
+   */
+  async downloadBlob(
+    blobId: string,
+    name: string,
+    type = "application/octet-stream",
+  ): Promise<Blob> {
+    const url = await this.buildDownloadUrl(blobId, name, type);
+    const res = await fetch(url, {
+      credentials: "include",
+      headers: authHeaders(),
+    });
+    if (!res.ok) {
+      throw new Error(
+        `kmail-web: blob download failed: ${res.status} ${res.statusText}`,
+      );
+    }
+    return res.blob();
   }
 
   /**
@@ -727,20 +1165,19 @@ export class JMAPClient {
     toMailbox: string,
   ): Promise<void> {
     const accountId = await this.getAccountId();
+    // Only remove the source when it's a different mailbox. If
+    // `fromMailbox === toMailbox` this degrades to an add-only no-op
+    // rather than relying on object-literal last-write-wins, and never
+    // emits a remove-only patch (zero mailboxes, rejected by RFC 8621).
+    // Mirrors `bulkMove`.
+    const patch: Record<string, boolean | null> = {
+      [`mailboxIds/${toMailbox}`]: true,
+    };
+    if (fromMailbox !== toMailbox) {
+      patch[`mailboxIds/${fromMailbox}`] = null;
+    }
     const response = await this.request([
-      [
-        "Email/set",
-        {
-          accountId,
-          update: {
-            [emailId]: {
-              [`mailboxIds/${fromMailbox}`]: null,
-              [`mailboxIds/${toMailbox}`]: true,
-            },
-          },
-        },
-        "0",
-      ],
+      ["Email/set", { accountId, update: { [emailId]: patch } }, "0"],
     ]);
     const result = expectResult(response, "Email/set", "0");
     const notUpdated = result.notUpdated as
@@ -1251,6 +1688,32 @@ function expectResult(
 }
 
 /**
+ * Assert that an `Email/set` batch updated every id it was asked
+ * to. Used by the bulk-operation helpers, which patch many ids in
+ * one call — a partial `notUpdated` would otherwise silently drop
+ * some emails from the operation.
+ */
+function assertAllUpdated(
+  response: JmapResponse,
+  emailIds: string[],
+  action: string,
+): void {
+  const result = expectResult(response, "Email/set", "0");
+  const notUpdated = result.notUpdated as
+    | Record<string, unknown>
+    | undefined;
+  if (!notUpdated) return;
+  const failed = emailIds.filter((id) => notUpdated[id]);
+  if (failed.length > 0) {
+    throw new Error(
+      `kmail-web: failed to ${action} ${failed.length} email(s): ${JSON.stringify(
+        failed.map((id) => notUpdated[id]),
+      )}`,
+    );
+  }
+}
+
+/**
  * Convenience alias for callers that still want the functional
  * invoke() signature from the Phase 1 scaffold. Delegates to the
  * singleton client.
@@ -1293,6 +1756,31 @@ function buildEmailCreate(draft: EmailDraft): Record<string, unknown> {
   };
   if (draft.privacyMode) {
     create.privacyMode = draft.privacyMode;
+  }
+  // Read receipt (RFC 8098 §2): the sender requests a Message
+  // Disposition Notification by stamping the recipient-visible
+  // notification headers. We set the JMAP `header:*:asText`
+  // pseudo-properties (RFC 8621 §4.1.3) so Stalwart emits real
+  // RFC 5322 headers rather than us hand-rolling the MIME.
+  if (draft.readReceiptTo) {
+    create["header:Disposition-Notification-To:asText"] = draft.readReceiptTo;
+    create["header:Return-Receipt-To:asText"] = draft.readReceiptTo;
+  }
+  // Real MIME attachments referenced by blob id (RFC 8621 §4.1.4).
+  // Inline parts (cid: images) are emitted with `disposition:
+  // "inline"` and a `cid` so the HTML body can reference them.
+  if (draft.attachments && draft.attachments.length > 0) {
+    create.attachments = draft.attachments.map((a) => {
+      const part: Record<string, unknown> = {
+        blobId: a.blobId,
+        type: a.type,
+        name: a.name,
+        disposition: a.inline ? "inline" : "attachment",
+      };
+      if (a.cid) part.cid = a.cid;
+      if (typeof a.size === "number") part.size = a.size;
+      return part;
+    });
   }
   return create;
 }

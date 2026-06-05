@@ -129,6 +129,51 @@ describe("JMAPClient.getSession", () => {
   });
 });
 
+describe("JMAPClient.uploadBlob", () => {
+  it("posts to the account upload URL and returns the blob id", async () => {
+    const fetchMock = mockFetch(
+      jsonResponse(buildSession()),
+      jsonResponse({ blobId: "blob-1", type: "text/plain", size: 3 }),
+    );
+    const client = new JMAPClient();
+
+    const result = await client.uploadBlob(
+      new Blob(["abc"], { type: "text/plain" }),
+      "notes.txt",
+    );
+
+    expect(result).toEqual({ blobId: "blob-1", type: "text/plain", size: 3 });
+    const [url, init] = fetchMock.mock.calls[1] as [string, RequestInit];
+    expect(url).toBe("/jmap/upload/acct-1");
+    expect(init.method).toBe("POST");
+    const headers = new Headers(init.headers);
+    expect(headers.get("Content-Disposition")).toBe(
+      'attachment; filename="notes.txt"',
+    );
+  });
+
+  it("escapes quotes/backslashes and strips control chars in the filename header", async () => {
+    const fetchMock = mockFetch(
+      jsonResponse(buildSession()),
+      jsonResponse({ blobId: "blob-2" }),
+    );
+    const client = new JMAPClient();
+
+    // A filename containing a double quote, a backslash and a CRLF —
+    // all of which would otherwise break or inject the HTTP header.
+    await client.uploadBlob(
+      new Blob(["x"]),
+      'a"b\\c\r\ninjected: yes.txt',
+    );
+
+    const [, init] = fetchMock.mock.calls[1] as [string, RequestInit];
+    const headers = new Headers(init.headers);
+    expect(headers.get("Content-Disposition")).toBe(
+      'attachment; filename="a\\"b\\\\cinjected: yes.txt"',
+    );
+  });
+});
+
 describe("JMAPClient.getAccountId", () => {
   it("returns the primary Mail accountId", async () => {
     mockFetch(jsonResponse(buildSession()));
@@ -462,6 +507,100 @@ describe("JMAPClient.resolveOrCreateSnoozedMailbox", () => {
     await expect(client.resolveOrCreateSnoozedMailbox()).rejects.toThrow(
       /quota exceeded/,
     );
+  });
+});
+
+function emailSetResp(ids: string[]): JmapResponse {
+  const updated: Record<string, null> = {};
+  for (const id of ids) updated[id] = null;
+  return {
+    sessionState: "00",
+    methodResponses: [["Email/set", { updated }, "0"]],
+  };
+}
+
+describe("JMAPClient.moveEmail", () => {
+  it("removes the source mailbox when from and to differ", async () => {
+    const fetchMock = mockFetch(
+      jsonResponse(buildSession()),
+      jsonResponse(emailSetResp(["e1"])),
+    );
+    const client = new JMAPClient();
+
+    await client.moveEmail("e1", "mb-from", "mb-to");
+
+    const [, init] = fetchMock.mock.calls[1] as [string, RequestInit];
+    const body = JSON.parse(init.body as string) as {
+      methodCalls: [string, { update: Record<string, Record<string, unknown>> }, string][];
+    };
+    expect(body.methodCalls[0][1].update.e1).toEqual({
+      "mailboxIds/mb-to": true,
+      "mailboxIds/mb-from": null,
+    });
+  });
+
+  it("emits an add-only patch (no remove) when from === to", async () => {
+    const fetchMock = mockFetch(
+      jsonResponse(buildSession()),
+      jsonResponse(emailSetResp(["e1"])),
+    );
+    const client = new JMAPClient();
+
+    await client.moveEmail("e1", "mb-x", "mb-x");
+
+    const [, init] = fetchMock.mock.calls[1] as [string, RequestInit];
+    const body = JSON.parse(init.body as string) as {
+      methodCalls: [string, { update: Record<string, Record<string, unknown>> }, string][];
+    };
+    expect(body.methodCalls[0][1].update.e1).toEqual({
+      "mailboxIds/mb-x": true,
+    });
+  });
+});
+
+describe("JMAPClient.bulkMove", () => {
+  function setResp(ids: string[]): JmapResponse {
+    return emailSetResp(ids);
+  }
+
+  it("removes the source mailbox when from and to differ", async () => {
+    const fetchMock = mockFetch(
+      jsonResponse(buildSession()),
+      jsonResponse(setResp(["e1"])),
+    );
+    const client = new JMAPClient();
+
+    await client.bulkMove(["e1"], "mb-from", "mb-to");
+
+    const [, init] = fetchMock.mock.calls[1] as [string, RequestInit];
+    const body = JSON.parse(init.body as string) as {
+      methodCalls: [string, { update: Record<string, Record<string, unknown>> }, string][];
+    };
+    expect(body.methodCalls[0][0]).toBe("Email/set");
+    expect(body.methodCalls[0][1].update.e1).toEqual({
+      "mailboxIds/mb-to": true,
+      "mailboxIds/mb-from": null,
+    });
+  });
+
+  it("emits an add-only patch (no remove) when from === to", async () => {
+    const fetchMock = mockFetch(
+      jsonResponse(buildSession()),
+      jsonResponse(setResp(["e1"])),
+    );
+    const client = new JMAPClient();
+
+    await client.bulkMove(["e1"], "mb-x", "mb-x");
+
+    const [, init] = fetchMock.mock.calls[1] as [string, RequestInit];
+    const body = JSON.parse(init.body as string) as {
+      methodCalls: [string, { update: Record<string, Record<string, unknown>> }, string][];
+    };
+    // Must NOT contain a `mailboxIds/mb-x: null` removal — that would
+    // leave the email in zero mailboxes (rejected by RFC 8621).
+    expect(body.methodCalls[0][1].update.e1).toEqual({
+      "mailboxIds/mb-x": true,
+    });
   });
 });
 
