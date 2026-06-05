@@ -3,6 +3,16 @@ import ReactDOM from "react-dom/client";
 import { BrowserRouter } from "react-router-dom";
 
 import App from "./App";
+import { ToastProvider } from "./components/ToastProvider";
+import { initTheme } from "./hooks/useTheme";
+
+// Global design-system stylesheet (tokens + themes + reset). Imported
+// once here so every component can read the CSS custom properties.
+import "./styles/global.css";
+
+// Resolve and apply the persisted/system theme before first paint so
+// there is no flash of the wrong colour scheme.
+initTheme();
 
 /**
  * When `VITE_MOCK_API=true` is set, lazy-load MSW and start the
@@ -34,7 +44,9 @@ void prepare().finally(() => {
   ReactDOM.createRoot(rootElement).render(
     <React.StrictMode>
       <BrowserRouter>
-        <App />
+        <ToastProvider>
+          <App />
+        </ToastProvider>
       </BrowserRouter>
     </React.StrictMode>,
   );
