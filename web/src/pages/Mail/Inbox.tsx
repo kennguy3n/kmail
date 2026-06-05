@@ -504,11 +504,13 @@ export default function Inbox() {
     [baseList, labelFilter],
   );
 
-  // The rows actually rendered: one per thread (its first-seen
-  // message is the representative `head`) when grouping is on, or
-  // one per email otherwise. Selection and "select all" key off the
-  // head ids so the header checkbox and per-row checkboxes always
-  // agree on the same set.
+  // The rows actually rendered: one per thread (its newest message is
+  // the representative `head`) when grouping is on, or one per email
+  // otherwise. Selection and "select all" key off the head ids so the
+  // header checkbox and per-row checkboxes always agree on the same
+  // set. The head is chosen by `receivedAt` rather than first-seen so
+  // the representative row is correct regardless of the server's sort
+  // direction.
   const displayRows = useMemo(() => {
     if (!groupThreads) {
       return filteredList.map((email) => ({ head: email, emails: [email] }));
@@ -517,8 +519,14 @@ export default function Inbox() {
     for (const email of filteredList) {
       const key = email.threadId ?? email.id;
       const existing = groups.get(key);
-      if (existing) existing.emails.push(email);
-      else groups.set(key, { head: email, emails: [email] });
+      if (existing) {
+        existing.emails.push(email);
+        if ((email.receivedAt ?? "") > (existing.head.receivedAt ?? "")) {
+          existing.head = email;
+        }
+      } else {
+        groups.set(key, { head: email, emails: [email] });
+      }
     }
     return [...groups.values()];
   }, [filteredList, groupThreads]);
