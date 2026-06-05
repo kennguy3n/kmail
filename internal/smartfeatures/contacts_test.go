@@ -111,6 +111,43 @@ func TestContactTracker_CoRecipients(t *testing.T) {
 	}
 }
 
+// TestContactTracker_CoRecipientsDisplayNameForm pins that a
+// `Display Name <email>` anchor/exclude (what the compose To field
+// yields) is canonicalized to the bare email, so it matches the
+// stored recipients instead of leaking an already-added contact.
+func TestContactTracker_CoRecipientsDisplayNameForm(t *testing.T) {
+	ctx := context.Background()
+	tr, _ := NewContactTracker(newTestRedis(t), time.Hour)
+	_ = tr.RecordSend(ctx, "t1", "u1", []string{"alice@example.com", "bob@example.com"})
+	_ = tr.RecordSend(ctx, "t1", "u1", []string{"alice@example.com", "carol@example.com"})
+
+	// Anchor carries a display name; bob is already on the draft, also
+	// with a display name. Both must normalize to bare emails.
+	sug, err := tr.SuggestCoRecipients(ctx, "t1", "u1",
+		"Alice <alice@example.com>", []string{"Bob <bob@example.com>"}, 5)
+	if err != nil {
+		t.Fatalf("SuggestCoRecipients: %v", err)
+	}
+	if len(sug) != 1 || sug[0].Email != "carol@example.com" {
+		t.Fatalf("display-name anchor/exclude not normalized: %#v", sug)
+	}
+}
+
+func TestNormalizeAddress(t *testing.T) {
+	cases := map[string]string{
+		"  Alice <Alice@Example.com> ": "alice@example.com",
+		"BOB@example.com":              "bob@example.com",
+		"no-at-sign":                   "",
+		"":                             "",
+		"<carol@x.io>":                 "carol@x.io",
+	}
+	for in, want := range cases {
+		if got := normalizeAddress(in); got != want {
+			t.Errorf("normalizeAddress(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 func TestContactTracker_RecordValidations(t *testing.T) {
 	ctx := context.Background()
 	tr, _ := NewContactTracker(newTestRedis(t), time.Hour)

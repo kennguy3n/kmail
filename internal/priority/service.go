@@ -141,6 +141,11 @@ func (s *Service) signalsFor(ctx context.Context, tenantID, userID string, m sma
 	return sig
 }
 
+// minMentionLocal is the shortest local-part we'll treat as an
+// "@handle" mention. Very short local parts (e.g. "jo") match far too
+// many unrelated words ("@johnson", "@joseph") to be a useful signal.
+const minMentionLocal = 3
+
 // mentionsUser reports whether the user is named in the subject or
 // preview — either their full address or, as a softer signal, the
 // "@local-part" mention form common in chat-style notifications.
@@ -149,10 +154,44 @@ func mentionsUser(m smartfeatures.Message, userAddr, userLocal string) bool {
 	if userAddr != "" && strings.Contains(hay, userAddr) {
 		return true
 	}
-	if userLocal != "" && strings.Contains(hay, "@"+userLocal) {
+	if len(userLocal) >= minMentionLocal && containsMention(hay, userLocal) {
 		return true
 	}
 	return false
+}
+
+// containsMention reports whether hay contains "@local" as a whole
+// handle — i.e. the character immediately after the local part is a
+// word boundary (end of string or a non-handle rune). This stops a
+// short local part like "ada" from matching "@adam"/"@adams".
+func containsMention(hay, local string) bool {
+	needle := "@" + local
+	from := 0
+	for {
+		i := strings.Index(hay[from:], needle)
+		if i < 0 {
+			return false
+		}
+		end := from + i + len(needle)
+		if end >= len(hay) || !isHandleByte(hay[end]) {
+			return true
+		}
+		from += i + 1
+	}
+}
+
+// isHandleByte reports whether b can be part of an email local part
+// for boundary purposes (letters, digits, and the common local-part
+// punctuation . _ + -). hay is already lower-cased.
+func isHandleByte(b byte) bool {
+	switch {
+	case b >= 'a' && b <= 'z', b >= '0' && b <= '9':
+		return true
+	case b == '.' || b == '_' || b == '+' || b == '-':
+		return true
+	default:
+		return false
+	}
 }
 
 // senderWindowCounts tallies how many messages each sender

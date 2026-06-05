@@ -153,13 +153,15 @@ func (t *ContactTracker) SuggestCoRecipients(ctx context.Context, tenantID, user
 	if n <= 0 {
 		return []Contact{}, nil
 	}
-	anchor = strings.ToLower(strings.TrimSpace(anchor))
+	anchor = normalizeAddress(anchor)
 	if anchor == "" {
 		return []Contact{}, nil
 	}
 	exclude := map[string]bool{anchor: true}
 	for _, a := range alreadyAdded {
-		exclude[strings.ToLower(strings.TrimSpace(a))] = true
+		if na := normalizeAddress(a); na != "" {
+			exclude[na] = true
+		}
 	}
 
 	// Over-fetch so we can drop excluded members and still return n.
@@ -182,18 +184,37 @@ func (t *ContactTracker) SuggestCoRecipients(ctx context.Context, tenantID, user
 	return out, nil
 }
 
-// normalizeRecipients lower-cases, trims, drops blanks/non-address
-// values, and de-duplicates while preserving first-seen order so
-// the co-recipient pairing is deterministic.
+// normalizeAddress reduces an address to its canonical key: the bare
+// lower-cased email. It accepts both a plain `user@host` and the
+// RFC 5322 `Display Name <user@host>` form the compose field produces,
+// so the record path (which stores recipients) and the suggest path
+// (which excludes anchor/already-added) agree on keys regardless of
+// whether a display name was present. Returns "" for non-addresses.
+func normalizeAddress(s string) string {
+	s = strings.TrimSpace(s)
+	// Pull the part inside angle brackets, e.g. `Alice <a@b.com>` → `a@b.com`.
+	if lt := strings.LastIndex(s, "<"); lt != -1 {
+		if gt := strings.Index(s[lt+1:], ">"); gt != -1 {
+			s = s[lt+1 : lt+1+gt]
+		}
+	}
+	s = strings.ToLower(strings.TrimSpace(s))
+	if s == "" || !strings.Contains(s, "@") {
+		return ""
+	}
+	return s
+}
+
+// normalizeRecipients canonicalizes each address (see normalizeAddress),
+// drops blanks/non-addresses, and de-duplicates. The result is sorted
+// so the co-recipient pairing is deterministic regardless of header
+// order.
 func normalizeRecipients(in []string) []string {
 	seen := map[string]bool{}
 	out := make([]string, 0, len(in))
 	for _, r := range in {
-		r = strings.ToLower(strings.TrimSpace(r))
-		if r == "" || !strings.Contains(r, "@") {
-			continue
-		}
-		if seen[r] {
+		r = normalizeAddress(r)
+		if r == "" || seen[r] {
 			continue
 		}
 		seen[r] = true

@@ -3,6 +3,7 @@ package smartfeatures
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -91,6 +92,9 @@ func (s *SafeOneClickUnsubscriber) Post(ctx context.Context, rawurl string) erro
 		return fmt.Errorf("smartfeatures: one-click unsubscribe: %w", err)
 	}
 	defer resp.Body.Close()
+	// Drain the (small, ignored) body so the transport can return the
+	// connection to its pool for keep-alive reuse instead of closing it.
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
 	if resp.StatusCode >= 400 {
 		return fmt.Errorf("smartfeatures: one-click unsubscribe returned %d", resp.StatusCode)
 	}

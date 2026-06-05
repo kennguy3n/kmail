@@ -1567,9 +1567,9 @@ export const handlers = [
     HttpResponse.json({
       email_id: "demo",
       suggestions: [
-        { text: "Yes, I can do that.", tone: "affirm" },
-        { text: "Let me check and get back to you.", tone: "defer" },
-        { text: "Thanks for the update!", tone: "ack" },
+        { text: "Yes, I can do that.", kind: "affirm" },
+        { text: "Let me check and get back to you.", kind: "defer" },
+        { text: "Thanks for the update!", kind: "ack" },
       ],
     }),
   ),

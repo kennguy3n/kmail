@@ -83,6 +83,35 @@ func TestService_Compute_Mention(t *testing.T) {
 	}
 }
 
+func TestContainsMention_Boundary(t *testing.T) {
+	cases := []struct {
+		hay, local string
+		want       bool
+	}{
+		{"ping @ada about it", "ada", true},   // standalone handle
+		{"cc @ada, please", "ada", true},      // trailing punctuation is a boundary
+		{"talk to @adam tomorrow", "ada", false}, // @adam must not match @ada
+		{"@adams reported", "ada", false},
+		{"no mention here", "ada", false},
+		{"ends with @ada", "ada", true}, // end-of-string boundary
+	}
+	for _, c := range cases {
+		if got := containsMention(c.hay, c.local); got != c.want {
+			t.Errorf("containsMention(%q, %q) = %v, want %v", c.hay, c.local, got, c.want)
+		}
+	}
+}
+
+// TestMentionsUser_ShortLocalIgnored pins that a sub-threshold local
+// part is not treated as an @handle (only the full-address signal
+// can fire for it).
+func TestMentionsUser_ShortLocalIgnored(t *testing.T) {
+	m := smartfeatures.Message{Subject: "hey @jo and @joseph", Preview: ""}
+	if mentionsUser(m, "jo@acme.com", "jo") {
+		t.Fatalf("short local part @jo should not count as a mention")
+	}
+}
+
 func TestService_Compute_DeterministicTieBreak(t *testing.T) {
 	ctx := context.Background()
 	ts := time.Now()

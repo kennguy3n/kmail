@@ -137,8 +137,12 @@ export async function getPriorityInbox(
 
 export interface SmartReplySuggestion {
   text: string;
-  /** Coarse intent bucket: "affirm" | "decline" | "defer" | "ack". */
-  tone: string;
+  /**
+   * Coarse intent bucket. Mirrors `smartfeatures.ReplyKind`, which the
+   * Go handler serializes as `kind` (not `tone`):
+   * "affirm" | "decline" | "defer" | "ack" | "attend".
+   */
+  kind: string;
 }
 
 export interface SmartRepliesResponse {

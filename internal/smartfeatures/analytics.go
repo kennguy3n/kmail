@@ -78,10 +78,18 @@ func Aggregate(sent, received []Message, loc *time.Location, now time.Time) Anal
 		return dc
 	}
 
+	// Totals count only messages with a usable timestamp, matching
+	// the daily breakdown below (which skips zero-time messages). Using
+	// len(sent)/len(received) here would let the KPI totals exceed the
+	// sum of the daily bars whenever Stalwart hands back a message with
+	// an unparseable receivedAt.
+	var totalSent, totalReceived int
+
 	for _, msg := range sent {
 		if msg.ReceivedAt.IsZero() {
 			continue
 		}
+		totalSent++
 		local := msg.ReceivedAt.In(loc)
 		bump(daily, local.Format("2006-01-02")).Sent++
 		for _, addr := range append(append([]Address{}, msg.To...), msg.Cc...) {
@@ -93,6 +101,7 @@ func Aggregate(sent, received []Message, loc *time.Location, now time.Time) Anal
 		if msg.ReceivedAt.IsZero() {
 			continue
 		}
+		totalReceived++
 		local := msg.ReceivedAt.In(loc)
 		bump(daily, local.Format("2006-01-02")).Received++
 		hours[local.Hour()]++
@@ -106,8 +115,8 @@ func Aggregate(sent, received []Message, loc *time.Location, now time.Time) Anal
 	return Analytics{
 		RangeStart:         rangeStart(sent, received, loc),
 		RangeEnd:           now.In(loc).Format("2006-01-02"),
-		TotalSent:          len(sent),
-		TotalReceived:      len(received),
+		TotalSent:          totalSent,
+		TotalReceived:      totalReceived,
 		Daily:              sortedDaily(daily),
 		TopRecipients:      topNamed(recipients),
 		TopSenders:         topNamed(senders),

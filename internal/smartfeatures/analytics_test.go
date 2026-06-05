@@ -107,6 +107,35 @@ func TestAggregate_Empty(t *testing.T) {
 	}
 }
 
+// TestAggregate_TotalsExcludeZeroTimestamps pins that the KPI totals
+// count only messages with a usable timestamp, so they always equal
+// the sum of the daily breakdown even when a message has a zero
+// ReceivedAt (e.g. an unparseable receivedAt from Stalwart).
+func TestAggregate_TotalsExcludeZeroTimestamps(t *testing.T) {
+	now := at("2026-01-10T12:00:00Z")
+	sent := []Message{
+		{ID: "s1", ReceivedAt: at("2026-01-01T09:00:00Z"), To: []Address{{Email: "a@b.com"}}},
+		{ID: "s2"}, // zero ReceivedAt — must not be counted
+	}
+	received := []Message{
+		{ID: "r1", ReceivedAt: at("2026-01-01T08:00:00Z"), From: []Address{{Email: "c@d.com"}}},
+		{ID: "r2"}, // zero ReceivedAt — must not be counted
+	}
+	a := Aggregate(sent, received, time.UTC, now)
+	if a.TotalSent != 1 || a.TotalReceived != 1 {
+		t.Fatalf("totals should skip zero-time msgs, got sent=%d received=%d", a.TotalSent, a.TotalReceived)
+	}
+	var daySent, dayReceived int
+	for _, d := range a.Daily {
+		daySent += d.Sent
+		dayReceived += d.Received
+	}
+	if daySent != a.TotalSent || dayReceived != a.TotalReceived {
+		t.Fatalf("totals must equal daily sums: total(%d,%d) daily(%d,%d)",
+			a.TotalSent, a.TotalReceived, daySent, dayReceived)
+	}
+}
+
 // fakeAnalyticsSource serves canned windows.
 type fakeAnalyticsSource struct {
 	sent, received []Message
