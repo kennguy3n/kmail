@@ -116,6 +116,18 @@ func TestGetUnsubscribeHandler(t *testing.T) {
 	if out["already_done"] != false {
 		t.Fatalf("expected already_done=false, got %v", out)
 	}
+	// The wire shape is flat (matches web/src/api/smart.ts): the
+	// preferred http target and list_id are top-level scalars, not
+	// nested under an "info" object with array fields.
+	if _, nested := out["info"]; nested {
+		t.Fatalf("response must not nest an 'info' object, got %v", out)
+	}
+	if out["http"] != "https://list.example/u/abc" {
+		t.Fatalf("expected top-level http target, got %v", out["http"])
+	}
+	if out["list_id"] != "promo.example.com" {
+		t.Fatalf("expected top-level list_id, got %v", out["list_id"])
+	}
 }
 
 func TestPostUnsubscribe_OneClick(t *testing.T) {

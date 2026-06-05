@@ -158,7 +158,20 @@ func (h *Handlers) getUnsubscribe(w http.ResponseWriter, r *http.Request) {
 		"already_done": false,
 	}
 	if hasUnsub {
-		resp["info"] = info
+		// Flatten to the scalar contract the web client consumes
+		// (see web/src/api/smart.ts UnsubscribeInfoResponse): the UI
+		// only ever acts on a single preferred URL per scheme, so we
+		// expose the preferred http/mailto target rather than the raw
+		// arrays. Keeping the wire shape flat also keeps the MSW mock
+		// and smart.test.ts honest against the real handler.
+		resp["one_click"] = info.OneClick
+		resp["list_id"] = info.ListID
+		if httpURL, ok := info.PreferredHTTP(); ok {
+			resp["http"] = httpURL
+		}
+		if mailto, ok := info.PreferredMailto(); ok {
+			resp["mailto"] = mailto
+		}
 		if h.unsub != nil {
 			done, err := h.unsub.IsUnsubscribed(r.Context(), tenantID, userID, info.ListID)
 			if err != nil {

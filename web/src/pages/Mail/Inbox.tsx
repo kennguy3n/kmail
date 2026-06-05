@@ -321,6 +321,18 @@ export default function Inbox() {
     [mailboxes],
   );
 
+  // Priority items are ranked from the inbox window and carry only an
+  // email id, so open them against the inbox mailbox (falling back to
+  // the current selection) to build a valid MessageView URL.
+  const handleOpenPriority = useCallback(
+    (emailId: string) => {
+      const mailboxId = inboxMailboxId ?? selectedMailbox;
+      if (!mailboxId) return;
+      navigate(`/mail/${mailboxId}/${emailId}`);
+    },
+    [inboxMailboxId, navigate, selectedMailbox],
+  );
+
   // Open snooze picker state — one at a time, keyed by email id.
   // Closing == setting to null. The actual handler lives below
   // bumpAfterWrite (state shape here, behaviour after writes).
@@ -669,6 +681,15 @@ export default function Inbox() {
                 {priorityItems.map((item) => (
                   <li
                     key={item.email_id}
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => handleOpenPriority(item.email_id)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        handleOpenPriority(item.email_id);
+                      }
+                    }}
                     style={{
                       padding: "8px 12px",
                       borderBottom: "1px solid #eee",
