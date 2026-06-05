@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -262,6 +263,27 @@ func buildWorkers(ctx context.Context, d workerDeps) ([]workerRegistration, erro
 		Logger:   logger,
 	}
 	regs = append(regs, workerRegistration{name: "shard-health", run: shardHealth.Run})
+
+	// --- automated shard lifecycle (WS4 Task 3) ---
+	// Provisions a new shard when active capacity crosses the
+	// utilisation threshold. Gated on KMAIL_SHARD_AUTOPROVISION_CMD:
+	// without a provisioning command there is nothing to run (manual
+	// RegisterShard remains the path), so the worker is only
+	// registered when an operator opts in by pointing the var at
+	// e.g. scripts/provision-shard.sh.
+	if cmd := os.Getenv("KMAIL_SHARD_AUTOPROVISION_CMD"); cmd != "" {
+		shardSvc.SetProvisioner(&tenant.ExecShardProvisioner{
+			Command: cmd,
+			Timeout: getenvDuration("KMAIL_SHARD_AUTOPROVISION_TIMEOUT", 15*time.Minute),
+		})
+		autoProvision := &tenant.AutoProvisionWorker{
+			Service:   shardSvc,
+			Interval:  getenvDuration("KMAIL_SHARD_AUTOPROVISION_INTERVAL", 5*time.Minute),
+			Threshold: getenvFloat("KMAIL_SHARD_AUTOPROVISION_THRESHOLD", tenant.DefaultProvisionThreshold),
+			Logger:    logger,
+		}
+		regs = append(regs, workerRegistration{name: "shard-autoprovision", run: autoProvision.Run})
+	}
 
 	// --- retention enforcement ---
 	retentionSvc := retention.NewService(pool)
@@ -554,4 +576,19 @@ func getenvDuration(key string, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	return d
+}
+
+// getenvFloat reads a float64 env var with a fallback. Used for the
+// shard auto-provision utilisation threshold (e.g.
+// KMAIL_SHARD_AUTOPROVISION_THRESHOLD=0.85).
+func getenvFloat(key string, fallback float64) float64 {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		return fallback
+	}
+	return f
 }

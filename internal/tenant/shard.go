@@ -85,6 +85,12 @@ type ShardService struct {
 	// which clears BOTH caches atomically against the same
 	// tenantID.
 	idCache *lru.LRU[string, string]
+
+	// provisioner, when set, lets AutoProvisionShard stand up new
+	// shard infrastructure once active capacity crosses the
+	// utilisation threshold. nil means auto-provisioning is
+	// disabled (manual RegisterShard only).
+	provisioner ShardProvisioner
 }
 
 // NewShardService builds a ShardService with sensible defaults.
