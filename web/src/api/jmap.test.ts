@@ -510,14 +510,57 @@ describe("JMAPClient.resolveOrCreateSnoozedMailbox", () => {
   });
 });
 
+function emailSetResp(ids: string[]): JmapResponse {
+  const updated: Record<string, null> = {};
+  for (const id of ids) updated[id] = null;
+  return {
+    sessionState: "00",
+    methodResponses: [["Email/set", { updated }, "0"]],
+  };
+}
+
+describe("JMAPClient.moveEmail", () => {
+  it("removes the source mailbox when from and to differ", async () => {
+    const fetchMock = mockFetch(
+      jsonResponse(buildSession()),
+      jsonResponse(emailSetResp(["e1"])),
+    );
+    const client = new JMAPClient();
+
+    await client.moveEmail("e1", "mb-from", "mb-to");
+
+    const [, init] = fetchMock.mock.calls[1] as [string, RequestInit];
+    const body = JSON.parse(init.body as string) as {
+      methodCalls: [string, { update: Record<string, Record<string, unknown>> }, string][];
+    };
+    expect(body.methodCalls[0][1].update.e1).toEqual({
+      "mailboxIds/mb-to": true,
+      "mailboxIds/mb-from": null,
+    });
+  });
+
+  it("emits an add-only patch (no remove) when from === to", async () => {
+    const fetchMock = mockFetch(
+      jsonResponse(buildSession()),
+      jsonResponse(emailSetResp(["e1"])),
+    );
+    const client = new JMAPClient();
+
+    await client.moveEmail("e1", "mb-x", "mb-x");
+
+    const [, init] = fetchMock.mock.calls[1] as [string, RequestInit];
+    const body = JSON.parse(init.body as string) as {
+      methodCalls: [string, { update: Record<string, Record<string, unknown>> }, string][];
+    };
+    expect(body.methodCalls[0][1].update.e1).toEqual({
+      "mailboxIds/mb-x": true,
+    });
+  });
+});
+
 describe("JMAPClient.bulkMove", () => {
   function setResp(ids: string[]): JmapResponse {
-    const updated: Record<string, null> = {};
-    for (const id of ids) updated[id] = null;
-    return {
-      sessionState: "00",
-      methodResponses: [["Email/set", { updated }, "0"]],
-    };
+    return emailSetResp(ids);
   }
 
   it("removes the source mailbox when from and to differ", async () => {

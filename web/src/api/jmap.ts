@@ -1165,20 +1165,19 @@ export class JMAPClient {
     toMailbox: string,
   ): Promise<void> {
     const accountId = await this.getAccountId();
+    // Only remove the source when it's a different mailbox. If
+    // `fromMailbox === toMailbox` this degrades to an add-only no-op
+    // rather than relying on object-literal last-write-wins, and never
+    // emits a remove-only patch (zero mailboxes, rejected by RFC 8621).
+    // Mirrors `bulkMove`.
+    const patch: Record<string, boolean | null> = {
+      [`mailboxIds/${toMailbox}`]: true,
+    };
+    if (fromMailbox !== toMailbox) {
+      patch[`mailboxIds/${fromMailbox}`] = null;
+    }
     const response = await this.request([
-      [
-        "Email/set",
-        {
-          accountId,
-          update: {
-            [emailId]: {
-              [`mailboxIds/${fromMailbox}`]: null,
-              [`mailboxIds/${toMailbox}`]: true,
-            },
-          },
-        },
-        "0",
-      ],
+      ["Email/set", { accountId, update: { [emailId]: patch } }, "0"],
     ]);
     const result = expectResult(response, "Email/set", "0");
     const notUpdated = result.notUpdated as
