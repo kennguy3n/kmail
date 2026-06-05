@@ -16,13 +16,20 @@ import type { Email, Identity } from "../../types";
  */
 const RESPONDED_KEY = "mdn.responded";
 
+// Cap the remembered-id list so it can't grow without bound over a
+// long-lived session; only the most recently responded-to ids are
+// kept (older receipts won't be re-prompted in practice because the
+// messages have long since scrolled out of view).
+const MAX_RESPONDED = 500;
+
 function loadResponded(): string[] {
   return readJSON<string[]>(RESPONDED_KEY, []);
 }
 
 function markResponded(emailId: string): void {
   const list = loadResponded();
-  if (!list.includes(emailId)) writeJSON(RESPONDED_KEY, [...list, emailId]);
+  if (list.includes(emailId)) return;
+  writeJSON(RESPONDED_KEY, [...list, emailId].slice(-MAX_RESPONDED));
 }
 
 /** Extract the bare address from an RFC 5322 `Name <addr>` header. */

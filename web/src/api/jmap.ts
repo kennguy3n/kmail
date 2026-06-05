@@ -776,13 +776,21 @@ export class JMAPClient {
       "{accountId}",
       encodeURIComponent(accountId),
     );
+    // RFC 6266 quoted-string: strip control characters (which would
+    // otherwise corrupt or inject HTTP headers) and escape backslashes
+    // and double quotes so a filename like `a"b.txt` can't terminate
+    // the quoted value early.
+    const safeFilename = filename
+      ?.replace(/[\u0000-\u001f\u007f]/g, "")
+      .replace(/\\/g, "\\\\")
+      .replace(/"/g, '\\"');
     const res = await fetch(url, {
       method: "POST",
       credentials: "include",
       headers: authHeaders({
         "Content-Type": file.type || "application/octet-stream",
-        ...(filename
-          ? { "Content-Disposition": `attachment; filename="${filename}"` }
+        ...(safeFilename
+          ? { "Content-Disposition": `attachment; filename="${safeFilename}"` }
           : {}),
       }),
       body: file,

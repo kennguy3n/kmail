@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { jmapClient } from "../../api/jmap";
 import type { Email, EmailBodyPart } from "../../types";
@@ -8,11 +8,12 @@ import type { Email, EmailBodyPart } from "../../types";
  * used by both {@link MessageView} and the conversation
  * {@link ThreadView} so the two render messages identically.
  *
- * The HTML body is rendered inside a sandboxed iframe (no scripts,
- * no same-origin) so untrusted remote markup can never touch the
- * KMail DOM, cookies, or storage. Inline `cid:` images are resolved
- * to object URLs by downloading the referenced blobs and rewriting
- * the HTML before it reaches the iframe.
+ * The HTML body is rendered inside a sandboxed iframe whose sandbox
+ * grants `allow-same-origin` but deliberately NOT `allow-scripts`, so
+ * scripts embedded in the message never execute while the parent can
+ * still read the document to size the frame. Inline `cid:` images are
+ * resolved to object URLs by downloading the referenced blobs and
+ * rewriting the HTML before it reaches the iframe.
  */
 
 /** The first renderable HTML body part, or null. */
@@ -146,10 +147,17 @@ export function resolveCidReferences(
 }
 
 /**
- * Render an email's HTML body inside a sandboxed iframe. The iframe
- * has no `allow-scripts` / `allow-same-origin`, so scripts in the
- * message never run and can't reach KMail's origin. Height is
- * auto-sized to the content after load.
+ * Render an email's HTML body inside a sandboxed iframe and auto-size
+ * its height to the content.
+ *
+ * The sandbox grants `allow-same-origin` so the parent can read the
+ * framed document's `scrollHeight`, but withholds `allow-scripts` so
+ * scripts embedded in the message never execute — the two MUST NOT be
+ * combined here, as that would let untrusted message markup escape the
+ * sandbox. Because no script runs inside the frame, height is measured
+ * from the parent with a `ResizeObserver`, which also catches late
+ * growth as inline `cid:` images (object URLs) finish decoding after
+ * the initial load.
  */
 export function HtmlMessageBody({
   html,
@@ -159,6 +167,7 @@ export function HtmlMessageBody({
   cidUrls: Record<string, string>;
 }) {
   const [height, setHeight] = useState(120);
+  const observerRef = useRef<ResizeObserver | null>(null);
   const resolved = resolveCidReferences(html, cidUrls);
   const srcDoc = `<!doctype html><html><head><meta charset="utf-8">
 <base target="_blank">
@@ -169,10 +178,24 @@ export function HtmlMessageBody({
   blockquote{margin:0 0 0 0.8rem;padding-left:0.8rem;border-left:2px solid #e5e7eb;color:#6b7280;}
 </style></head><body>${resolved}</body></html>`;
 
+  useEffect(
+    () => () => {
+      observerRef.current?.disconnect();
+      observerRef.current = null;
+    },
+    [],
+  );
+
+  const measure = (doc: Document) => {
+    const h = doc.body?.scrollHeight ?? 0;
+    // +8px guards against a scrollbar from sub-pixel rounding.
+    if (h > 0) setHeight(h + 8);
+  };
+
   return (
     <iframe
       title="Message content"
-      sandbox="allow-popups allow-popups-to-escape-sandbox"
+      sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox"
       srcDoc={srcDoc}
       style={{
         width: "100%",
@@ -181,10 +204,12 @@ export function HtmlMessageBody({
       }}
       onLoad={(e) => {
         const doc = e.currentTarget.contentDocument;
-        if (doc?.body) {
-          // +8px guards against a scrollbar from sub-pixel rounding.
-          setHeight(doc.body.scrollHeight + 8);
-        }
+        if (!doc?.body) return;
+        measure(doc);
+        observerRef.current?.disconnect();
+        const observer = new ResizeObserver(() => measure(doc));
+        observer.observe(doc.body);
+        observerRef.current = observer;
       }}
     />
   );

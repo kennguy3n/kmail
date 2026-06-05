@@ -24,6 +24,7 @@ import { listTemplates } from "../../api/templates";
 import RichTextEditor from "./RichTextEditor";
 import ContactPicker from "./ContactPicker";
 import TemplatePicker from "./TemplatePicker";
+import { formatBytes } from "./messageContent";
 import {
   htmlToPlainText,
   isHtmlEmpty,
@@ -1122,13 +1123,6 @@ function rewriteInlineCids(html: string, map: Map<string, string>): string {
 /** Append a signature, separated by the standard `-- ` delimiter. */
 function appendHtmlSignature(html: string, signatureHtml: string): string {
   return `${html}<br><div class="kmail-signature">-- <br>${signatureHtml}</div>`;
-}
-
-/** Human-readable byte size for the attachment list. */
-function formatBytes(n: number): string {
-  if (n < 1024) return `${n} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 /**

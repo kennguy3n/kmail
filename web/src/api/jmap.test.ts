@@ -129,6 +129,51 @@ describe("JMAPClient.getSession", () => {
   });
 });
 
+describe("JMAPClient.uploadBlob", () => {
+  it("posts to the account upload URL and returns the blob id", async () => {
+    const fetchMock = mockFetch(
+      jsonResponse(buildSession()),
+      jsonResponse({ blobId: "blob-1", type: "text/plain", size: 3 }),
+    );
+    const client = new JMAPClient();
+
+    const result = await client.uploadBlob(
+      new Blob(["abc"], { type: "text/plain" }),
+      "notes.txt",
+    );
+
+    expect(result).toEqual({ blobId: "blob-1", type: "text/plain", size: 3 });
+    const [url, init] = fetchMock.mock.calls[1] as [string, RequestInit];
+    expect(url).toBe("/jmap/upload/acct-1");
+    expect(init.method).toBe("POST");
+    const headers = new Headers(init.headers);
+    expect(headers.get("Content-Disposition")).toBe(
+      'attachment; filename="notes.txt"',
+    );
+  });
+
+  it("escapes quotes/backslashes and strips control chars in the filename header", async () => {
+    const fetchMock = mockFetch(
+      jsonResponse(buildSession()),
+      jsonResponse({ blobId: "blob-2" }),
+    );
+    const client = new JMAPClient();
+
+    // A filename containing a double quote, a backslash and a CRLF —
+    // all of which would otherwise break or inject the HTTP header.
+    await client.uploadBlob(
+      new Blob(["x"]),
+      'a"b\\c\r\ninjected: yes.txt',
+    );
+
+    const [, init] = fetchMock.mock.calls[1] as [string, RequestInit];
+    const headers = new Headers(init.headers);
+    expect(headers.get("Content-Disposition")).toBe(
+      'attachment; filename="a\\"b\\\\cinjected: yes.txt"',
+    );
+  });
+});
+
 describe("JMAPClient.getAccountId", () => {
   it("returns the primary Mail accountId", async () => {
     mockFetch(jsonResponse(buildSession()));

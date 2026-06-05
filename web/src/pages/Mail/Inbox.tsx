@@ -563,6 +563,53 @@ export default function Inbox() {
     [bumpAfterWrite, selectedIds],
   );
 
+  // Move many emails to `target`, resolving each email's source
+  // mailbox the same way the single-email handlers do. Outside search
+  // mode every row belongs to the sidebar mailbox, so one batched move
+  // suffices. In search mode the selection can span mailboxes, so we
+  // group by actual source and issue one move per source — otherwise
+  // the `mailboxIds/<selectedMailbox>: null` patch is a no-op on an
+  // email that doesn't live there and it gets added to the target
+  // without being removed from its real location (RFC 8621 §5.3).
+  const bulkMoveResolvingSource = useCallback(
+    async (ids: string[], target: string) => {
+      if (!inSearchMode) {
+        await jmapClient.bulkMove(ids, selectedMailbox, target);
+        return;
+      }
+      const bySource = new Map<string | null, string[]>();
+      for (const id of ids) {
+        const email = baseList.find((e) => e.id === id);
+        const source = email ? (Object.keys(email.mailboxIds)[0] ?? null) : null;
+        const group = bySource.get(source);
+        if (group) group.push(id);
+        else bySource.set(source, [id]);
+      }
+      for (const [source, groupIds] of bySource) {
+        await jmapClient.bulkMove(groupIds, source, target);
+      }
+    },
+    [baseList, inSearchMode, selectedMailbox],
+  );
+
+  // Bulk equivalent of handleMoveToTrash: emails already in Trash are
+  // destroyed, the rest are moved to Trash from their real source.
+  const bulkTrash = useCallback(
+    async (ids: string[]) => {
+      if (!trashMailboxId) return;
+      const toDelete: string[] = [];
+      const toMove: string[] = [];
+      for (const id of ids) {
+        const email = baseList.find((e) => e.id === id);
+        if (email && isEmailInTrash(email)) toDelete.push(id);
+        else toMove.push(id);
+      }
+      await bulkMoveResolvingSource(toMove, trashMailboxId);
+      if (toDelete.length > 0) await jmapClient.bulkDelete(toDelete);
+    },
+    [baseList, bulkMoveResolvingSource, isEmailInTrash, trashMailboxId],
+  );
+
   // Apply a label (keyword) to one or many emails. Used by the bulk
   // toolbar's label menu and the drag-onto-label flow.
   const applyLabelTo = useCallback(
@@ -893,7 +940,7 @@ export default function Inbox() {
                 disabled={bulkBusy}
                 onClick={() =>
                   void runBulk((ids) =>
-                    jmapClient.bulkMove(ids, selectedMailbox, archiveMailboxId),
+                    bulkMoveResolvingSource(ids, archiveMailboxId),
                   )
                 }
                 style={layoutStyles.bulkButton}
@@ -905,13 +952,7 @@ export default function Inbox() {
               <button
                 type="button"
                 disabled={bulkBusy}
-                onClick={() =>
-                  void runBulk((ids) =>
-                    inTrashView
-                      ? jmapClient.bulkDelete(ids)
-                      : jmapClient.bulkMove(ids, selectedMailbox, trashMailboxId),
-                  )
-                }
+                onClick={() => void runBulk((ids) => bulkTrash(ids))}
                 style={layoutStyles.bulkButton}
               >
                 {inTrashView ? "Delete" : "Trash"}
