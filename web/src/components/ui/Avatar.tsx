@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 
 import styles from "./Avatar.module.css";
 
@@ -48,6 +48,15 @@ export function Avatar({
   className,
 }: AvatarProps): JSX.Element {
   const [imgFailed, setImgFailed] = useState(false);
+  // Reset the failure flag when `src` changes so a new (possibly valid)
+  // image gets a chance to load instead of being stuck on initials
+  // after the first broken URL. This is the React-recommended
+  // adjust-state-during-render pattern (no effect needed).
+  const prevSrc = useRef(src);
+  if (prevSrc.current !== src) {
+    prevSrc.current = src;
+    if (imgFailed) setImgFailed(false);
+  }
   const showImage = src && !imgFailed;
   const hue = hueFromString(name);
 

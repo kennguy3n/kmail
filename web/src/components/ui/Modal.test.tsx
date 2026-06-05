@@ -76,4 +76,29 @@ describe("Modal", () => {
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     expect(openBtn).toHaveFocus();
   });
+
+  it("keeps the body scroll-locked until the last stacked modal closes", () => {
+    document.body.style.overflow = "";
+    const two = (aOpen: boolean, bOpen: boolean): JSX.Element => (
+      <>
+        <Modal open={aOpen} onClose={vi.fn()} title="A">
+          a
+        </Modal>
+        <Modal open={bOpen} onClose={vi.fn()} title="B">
+          b
+        </Modal>
+      </>
+    );
+
+    const { rerender } = render(two(true, true));
+    expect(document.body.style.overflow).toBe("hidden");
+
+    // Close the first-opened modal out of order; the second is still up.
+    rerender(two(false, true));
+    expect(document.body.style.overflow).toBe("hidden");
+
+    // Only when the last modal closes is the original overflow restored.
+    rerender(two(false, false));
+    expect(document.body.style.overflow).toBe("");
+  });
 });

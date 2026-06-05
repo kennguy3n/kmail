@@ -24,6 +24,32 @@ export interface ModalProps {
 const FOCUSABLE =
   'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])';
 
+// Ref-counted body scroll lock shared across all Modal instances. A
+// per-modal capture/restore breaks with two open modals: when the
+// first closes it would restore `overflow` to what it captured (already
+// "hidden"), and a misordered close could leave the body stuck. Counting
+// open modals and only touching `body.style.overflow` on the 0<->1
+// transitions makes it order-independent.
+let scrollLockCount = 0;
+let restoreOverflow = "";
+
+function lockBodyScroll(): void {
+  if (typeof document === "undefined") return;
+  if (scrollLockCount === 0) {
+    restoreOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+  }
+  scrollLockCount += 1;
+}
+
+function unlockBodyScroll(): void {
+  if (typeof document === "undefined") return;
+  scrollLockCount = Math.max(0, scrollLockCount - 1);
+  if (scrollLockCount === 0) {
+    document.body.style.overflow = restoreOverflow;
+  }
+}
+
 /**
  * Modal — an accessible dialog rendered through a portal.
  *
@@ -88,9 +114,9 @@ export function Modal({
         ? document.activeElement
         : null;
 
-    // Lock body scroll while the modal owns the viewport.
-    const previousOverflow = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
+    // Lock body scroll while the modal owns the viewport (ref-counted
+    // so stacked modals don't fight over `body.style.overflow`).
+    lockBodyScroll();
 
     // Move focus into the dialog (title first, else first focusable).
     const dialog = dialogRef.current;
@@ -99,7 +125,7 @@ export function Modal({
     target?.focus();
 
     return () => {
-      document.body.style.overflow = previousOverflow;
+      unlockBodyScroll();
       previouslyFocused.current?.focus?.();
     };
   }, [open]);

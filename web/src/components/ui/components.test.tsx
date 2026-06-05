@@ -3,7 +3,7 @@
  * (initials derivation), Badge, Tabs (keyboard navigation), and
  * Dropdown (open + select + outside-click close).
  */
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 
@@ -52,6 +52,29 @@ describe("Avatar", () => {
   it("exposes the name as an accessible label", () => {
     render(<Avatar name="Grace Hopper" />);
     expect(screen.getByRole("img", { name: "Grace Hopper" })).toBeInTheDocument();
+  });
+
+  it("retries the image when src changes after a load failure", () => {
+    const { container, rerender } = render(
+      <Avatar name="Grace Hopper" src="https://example.com/broken.png" />,
+    );
+    // Initially the <img> is rendered.
+    const img = container.querySelector("img");
+    expect(img).not.toBeNull();
+
+    // Simulate the image failing to load -> falls back to initials.
+    fireEvent.error(img as HTMLImageElement);
+    expect(container.querySelector("img")).toBeNull();
+    expect(screen.getByText("GH")).toBeInTheDocument();
+
+    // A new src should get a fresh chance to render rather than staying
+    // stuck on initials.
+    rerender(
+      <Avatar name="Grace Hopper" src="https://example.com/valid.png" />,
+    );
+    const retried = container.querySelector("img");
+    expect(retried).not.toBeNull();
+    expect(retried).toHaveAttribute("src", "https://example.com/valid.png");
   });
 });
 

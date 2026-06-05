@@ -97,6 +97,9 @@ export function Dropdown({
       close(true);
       return;
     }
+    // Nothing focusable: don't swallow the key (avoids NaN index math
+    // and lets the keypress behave normally for an all-disabled menu).
+    if (enabledIndexes.length === 0) return;
     const focusedIndex = itemRefs.current.findIndex(
       (el) => el === document.activeElement,
     );
