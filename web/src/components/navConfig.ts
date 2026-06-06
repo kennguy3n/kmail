@@ -34,6 +34,12 @@ export const NAV_TREE: NavNode[] = [
     icon: "✉",
     children: [
       { type: "link", label: "Inbox", to: "/mail", icon: "📥" },
+      {
+        type: "link",
+        label: "Priority",
+        to: "/mail/priority",
+        icon: "⭐",
+      },
       { type: "link", label: "Compose", to: "/mail/compose", icon: "✏" },
       { type: "link", label: "Shared inboxes", to: "/mail/shared", icon: "👥" },
       { type: "link", label: "Zero-Access Vault", to: "/mail/vault", icon: "🔒" },
@@ -153,6 +159,11 @@ export const NAV_TREE: NavNode[] = [
           { type: "link", label: "Webhooks", to: "/admin/webhooks" },
           { type: "link", label: "Onboarding", to: "/admin/onboarding" },
           { type: "link", label: "Search backend", to: "/admin/search" },
+          {
+            type: "link",
+            label: "Email analytics",
+            to: "/admin/email-analytics",
+          },
         ],
       },
     ],

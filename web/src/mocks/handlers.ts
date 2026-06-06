@@ -1552,6 +1552,109 @@ export const handlers = [
   ),
 
   // ─── Catch-all admin GETs ──────────────────────────────────────────
+  // ─── WS7: Smart Features & Intelligence ──────────────────────────
+  http.get("/api/v1/priority-inbox", () =>
+    HttpResponse.json({
+      cached: false,
+      items: [
+        { email_id: "E-p1", thread_id: "T-p1", score: 95, subject: "Q4 budget review — action needed", preview: "Hi team, please review the attached budget proposal and share your feedback by Friday.", from: [{ name: "CFO Office", email: "cfo@acme.corp" }], received_at: relPast(600) },
+        { email_id: "E-p2", thread_id: "T-p2", score: 82, subject: "Re: Project Zephyr launch timeline", preview: "Looks good to me. I've updated the Gantt chart with the revised milestones.", from: [{ name: "PM Lead", email: "pm@acme.corp" }], received_at: relPast(1800) },
+        { email_id: "E-p3", thread_id: "T-p3", score: 70, subject: "Onboarding checklist for new hire", preview: "Welcome aboard! Here's the checklist for your first week at Acme Corp.", from: [{ name: "HR Team", email: "hr@acme.corp" }], received_at: relPast(3600) },
+      ],
+    }),
+  ),
+  http.get("/api/v1/emails/:id/smart-replies", () =>
+    HttpResponse.json({
+      email_id: "demo",
+      suggestions: [
+        { text: "Yes, I can do that.", kind: "affirm" },
+        { text: "Let me check and get back to you.", kind: "defer" },
+        { text: "Thanks for the update!", kind: "ack" },
+      ],
+    }),
+  ),
+  http.get("/api/v1/emails/:id/unsubscribe", () =>
+    HttpResponse.json({
+      email_id: "demo",
+      unsubscribe: true,
+      already_done: false,
+      one_click: true,
+      http: "https://list.example/u/demo",
+      list_id: "promo.example.com",
+    }),
+  ),
+  http.post("/api/v1/emails/:id/unsubscribe", () =>
+    HttpResponse.json({ email_id: "demo", method: "one-click" }),
+  ),
+  http.post("/api/v1/emails/categories", () =>
+    HttpResponse.json({
+      categories: {
+        "E1": "primary",
+        "E2": "social",
+        "E3": "promotions",
+        "E4": "updates",
+        "E5": "forums",
+      },
+    }),
+  ),
+  http.get("/api/v1/contacts/frequent", () =>
+    HttpResponse.json({
+      contacts: [
+        { email: "alice@acme.corp", name: "Alice Chen", count: 47 },
+        { email: "bob@acme.corp", name: "Bob Torres", count: 32 },
+        { email: "carol@acme.corp", name: "Carol Nguyen", count: 18 },
+      ],
+    }),
+  ),
+  http.get("/api/v1/contacts/suggestions", () =>
+    HttpResponse.json({
+      anchor: "alice@acme.corp",
+      suggestions: [
+        { email: "bob@acme.corp", name: "Bob Torres", count: 12 },
+      ],
+    }),
+  ),
+  http.post("/api/v1/contacts/record", () =>
+    HttpResponse.json({ ok: true }),
+  ),
+  http.get("/api/v1/email-analytics", () => {
+    const daily = Array.from({ length: 14 }, (_, i) => {
+      const d = new Date(NOW);
+      d.setUTCDate(d.getUTCDate() - 13 + i);
+      return {
+        date: d.toISOString().slice(0, 10),
+        sent: 3 + Math.floor(Math.random() * 12),
+        received: 8 + Math.floor(Math.random() * 25),
+      };
+    });
+    return HttpResponse.json({
+      range_start: daily[0].date,
+      range_end: daily[daily.length - 1].date,
+      total_sent: daily.reduce((s, d) => s + d.sent, 0),
+      total_received: daily.reduce((s, d) => s + d.received, 0),
+      daily,
+      top_recipients: [
+        { email: "alice@acme.corp", name: "Alice Chen", count: 47 },
+        { email: "bob@acme.corp", name: "Bob Torres", count: 32 },
+        { email: "carol@acme.corp", name: "Carol Nguyen", count: 18 },
+        { email: "dave@partner.co", name: "Dave Kim", count: 15 },
+        { email: "eve@vendor.io", name: "Eve Patel", count: 11 },
+      ],
+      top_senders: [
+        { email: "notifications@github.com", name: "GitHub", count: 63 },
+        { email: "cfo@acme.corp", name: "CFO Office", count: 28 },
+        { email: "hr@acme.corp", name: "HR Team", count: 19 },
+        { email: "pm@acme.corp", name: "PM Lead", count: 14 },
+      ],
+      busiest_hours: Array.from({ length: 24 }, (_, h) => ({
+        hour: h,
+        count: h >= 8 && h <= 18 ? 5 + Math.floor(Math.random() * 20) : Math.floor(Math.random() * 3),
+      })),
+      avg_response_seconds: 4320,
+      response_sample_size: 42,
+    });
+  }),
+
   // Anything unmocked above returns an empty success so the UI shows
   // "no data" rather than a "failed to fetch" banner.
   http.get("/api/v1/*", () => HttpResponse.json({})),

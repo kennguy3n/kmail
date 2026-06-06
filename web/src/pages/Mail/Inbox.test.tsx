@@ -93,11 +93,12 @@ vi.mock("../../api/jmap", () => ({
   },
 }));
 
-function renderInbox() {
+function renderInbox(initialPath = "/mail") {
   return render(
-    <MemoryRouter initialEntries={["/mail"]}>
+    <MemoryRouter initialEntries={[initialPath]}>
       <Routes>
         <Route path="/mail" element={<Inbox />} />
+        <Route path="/mail/priority" element={<Inbox />} />
         <Route path="/mail/:mailboxId" element={<Inbox />} />
         <Route path="/mail/message/:emailId" element={<div>message</div>} />
         <Route path="/mail/compose" element={<div>compose</div>} />
@@ -136,6 +137,15 @@ describe("<Inbox />", () => {
     renderInbox();
 
     expect(await screen.findByText(/boom/i)).toBeInTheDocument();
+  });
+
+  it("renders the Priority Inbox on the /mail/priority route", async () => {
+    getMailboxes.mockResolvedValueOnce(mailboxes);
+    getEmails.mockResolvedValueOnce(emails);
+
+    renderInbox("/mail/priority");
+
+    expect(await screen.findByText("Priority Inbox")).toBeInTheDocument();
   });
 });
 

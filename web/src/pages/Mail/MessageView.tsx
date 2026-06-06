@@ -3,6 +3,13 @@ import { Link, useNavigate, useParams } from "react-router-dom";
 
 import { jmapClient } from "../../api/jmap";
 import { snoozeEmail } from "../../api/snooze";
+import {
+  getSmartReplies,
+  getUnsubscribe,
+  postUnsubscribe,
+  type SmartReplySuggestion,
+  type UnsubscribeInfoResponse,
+} from "../../api/smart";
 import SnoozePicker from "./SnoozePicker";
 import AttachmentPanel from "./AttachmentPanel";
 import {
@@ -12,7 +19,7 @@ import {
   useInlineImageUrls,
 } from "./messageContent";
 import ReadReceiptPrompt from "./ReadReceiptPrompt";
-import type { Email, EmailBodyPart } from "../../types";
+import type { Email, EmailAddress, EmailBodyPart } from "../../types";
 
 /**
  * MessageView is the single-message reading pane.
@@ -36,6 +43,21 @@ export default function MessageView() {
   const [snoozeConfirmation, setSnoozeConfirmation] = useState<string | null>(
     null,
   );
+
+  // WS7: smart reply suggestions
+  const [smartReplies, setSmartReplies] = useState<SmartReplySuggestion[]>([]);
+  const [unsubInfo, setUnsubInfo] = useState<UnsubscribeInfoResponse | null>(null);
+  const [unsubBusy, setUnsubBusy] = useState(false);
+
+  useEffect(() => {
+    if (!emailId) return;
+    getSmartReplies(emailId)
+      .then((r) => setSmartReplies(r.suggestions ?? []))
+      .catch(() => { /* best-effort */ });
+    getUnsubscribe(emailId)
+      .then(setUnsubInfo)
+      .catch(() => { /* best-effort */ });
+  }, [emailId]);
 
   useEffect(() => {
     if (!emailId) {
@@ -82,14 +104,20 @@ export default function MessageView() {
   );
   const cidUrls = useInlineImageUrls(email);
 
+  // Prefer the Reply-To header when present (mailing lists, shared
+  // inboxes, newsletters) over the From address. Shared by the
+  // Reply buttons and the smart-reply chips so both target the same
+  // address.
+  const replyTarget = useMemo<EmailAddress[]>(
+    () =>
+      email?.replyTo && email.replyTo.length > 0
+        ? email.replyTo
+        : (email?.from ?? []),
+    [email],
+  );
+
   const handleReply = (replyAll: boolean) => {
     if (!email) return;
-    // Prefer the Reply-To header when present (mailing lists,
-    // shared inboxes, newsletters) over the From address.
-    const replyTarget =
-      email.replyTo && email.replyTo.length > 0
-        ? email.replyTo
-        : (email.from ?? []);
     // For Reply-All, dedupe the CC list against the reply target so
     // the same address doesn't end up in both To and Cc. Compose
     // does a second pass to strip the sender's own identity, which
@@ -263,6 +291,62 @@ export default function MessageView() {
           </div>
           <AttachmentPanel attachments={attachments} />
         </article>
+      )}
+
+      {/* WS7: smart reply chips */}
+      {email && smartReplies.length > 0 && (
+        <div style={viewStyles.smartReplies}>
+          <span style={{ fontSize: "0.8rem", color: "#888", marginRight: 8 }}>Quick reply:</span>
+          {smartReplies.map((s, i) => (
+            <button
+              key={i}
+              type="button"
+              style={viewStyles.smartReplyChip}
+              onClick={() =>
+                navigate("/mail/compose", {
+                  state: {
+                    mode: "reply",
+                    sourceEmailId: email.id,
+                    to: replyTarget,
+                    subject: withPrefix(email.subject, "Re:"),
+                    prefillBody: s.text,
+                    quotedBody: bodyText,
+                    quotedFrom: email.from,
+                    quotedDate: email.receivedAt,
+                  },
+                })
+              }
+            >
+              {s.text}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {/* WS7: unsubscribe helper */}
+      {email && unsubInfo && unsubInfo.unsubscribe && !unsubInfo.already_done && (
+        <div style={{ padding: "8px 16px", background: "#fff8e1", borderRadius: 6, margin: "8px 0" }}>
+          <span style={{ marginRight: 8 }}>This looks like a mailing list.</span>
+          <button
+            type="button"
+            disabled={unsubBusy}
+            style={{ padding: "4px 12px", borderRadius: 4, border: "1px solid #ddd", cursor: "pointer" }}
+            onClick={() => {
+              setUnsubBusy(true);
+              postUnsubscribe(email.id)
+                .then(() => setUnsubInfo((prev) => prev ? { ...prev, already_done: true } : prev))
+                .catch(() => { /* best-effort */ })
+                .finally(() => setUnsubBusy(false));
+            }}
+          >
+            {unsubBusy ? "Unsubscribing…" : "Unsubscribe"}
+          </button>
+        </div>
+      )}
+      {email && unsubInfo?.already_done && (
+        <div style={{ padding: "8px 16px", background: "#e8f5e9", borderRadius: 6, margin: "8px 0", color: "#2e7d32" }}>
+          You have unsubscribed from this list.
+        </div>
       )}
     </section>
   );
@@ -463,5 +547,22 @@ const viewStyles: Record<string, React.CSSProperties> = {
   muted: {
     color: "#6b7280",
     fontStyle: "italic",
+  },
+  smartReplies: {
+    display: "flex",
+    flexWrap: "wrap",
+    alignItems: "center",
+    gap: "0.5rem",
+    padding: "0.75rem 0",
+  },
+  smartReplyChip: {
+    padding: "6px 14px",
+    fontSize: "0.85rem",
+    background: "#e8f0fe",
+    color: "#1a73e8",
+    border: "1px solid #c2d9fd",
+    borderRadius: "16px",
+    cursor: "pointer",
+    whiteSpace: "nowrap",
   },
 };

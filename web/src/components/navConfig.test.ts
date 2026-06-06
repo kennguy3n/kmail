@@ -33,6 +33,15 @@ describe("breadcrumbsForPath", () => {
     ]);
   });
 
+  it("resolves the Priority Inbox to its own crumb (not Inbox)", () => {
+    // Priority is a dedicated `/mail/priority` route so pathname-based
+    // breadcrumb matching surfaces it instead of collapsing to Inbox.
+    expect(breadcrumbsForPath("/mail/priority")).toEqual([
+      { label: "Mail" },
+      { label: "Priority", to: "/mail/priority" },
+    ]);
+  });
+
   it("returns an empty trail for unknown routes", () => {
     expect(breadcrumbsForPath("/totally-unknown")).toEqual([]);
   });
@@ -47,5 +56,9 @@ describe("expandedGroupIdsForPath", () => {
 
   it("returns the single top-level group for a shallow route", () => {
     expect(expandedGroupIdsForPath("/calendar")).toEqual(["calendar"]);
+  });
+
+  it("expands the Mail group for the Priority Inbox route", () => {
+    expect(expandedGroupIdsForPath("/mail/priority")).toEqual(["mail"]);
   });
 });

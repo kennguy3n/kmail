@@ -13,6 +13,13 @@ import {
   uploadLargeAttachment,
   type AttachmentLinkResponse,
 } from "../../api/jmap";
+import {
+  getFrequentContacts,
+  getCoRecipients,
+  recordSend,
+  type FrequentContact,
+  type CoRecipientSuggestion,
+} from "../../api/smart";
 import { createSecureMessage } from "../../api/confidentialSend";
 import { cancelPendingSend } from "../../api/undoSend";
 import { useTenantSelection } from "../Admin/useTenantSelection";
@@ -128,9 +135,57 @@ export default function Compose() {
   // the banner clears and Compose navigates the user to the
   // inbox (Stalwart has accepted the submission at that point).
   const [pendingSend, setPendingSend] =
-    useState<{ id: string; deadline: Date } | null>(null);
+    useState<{ id: string; deadline: Date; recipients: string[] } | null>(
+      null,
+    );
   const [remainingMs, setRemainingMs] = useState(0);
   const [isCancelling, setCancelling] = useState(false);
+  // Guards the undo-send commit path so the held send's recipients are
+  // recorded at most once when the hold window elapses (the deadline
+  // timer can fire more than once before the cleared state propagates).
+  const recordedPendingRef = useRef<string | null>(null);
+
+  // WS7: frequent contacts + co-recipient suggestions
+  const [frequentContacts, setFrequentContacts] = useState<FrequentContact[]>([]);
+  const [coRecipients, setCoRecipients] = useState<CoRecipientSuggestion[]>([]);
+
+  useEffect(() => {
+    getFrequentContacts(8)
+      .then((r) => setFrequentContacts(r.contacts ?? []))
+      .catch(() => { /* best-effort */ });
+  }, []);
+
+  useEffect(() => {
+    // Parse with the same RFC 5322-aware splitter used for sending, so a
+    // quoted display name containing a comma (e.g. `"Smith, John" <j@x>`)
+    // isn't shredded into a non-address fragment. We key on the bare
+    // emails: the anchor + exclude list the backend expects.
+    const existing = parseAddresses(to)
+      .map((a) => a.email.trim())
+      .filter(Boolean);
+    const first = existing[0];
+    if (!first || !first.includes("@")) {
+      setCoRecipients([]);
+      return;
+    }
+    // Debounce so a burst of keystrokes fires a single request, and
+    // guard against out-of-order responses: a stale in-flight reply
+    // (resolved after a newer `to` value) must not overwrite state.
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      getCoRecipients(first, existing)
+        .then((r) => {
+          if (!cancelled) setCoRecipients(r.suggestions ?? []);
+        })
+        .catch(() => {
+          if (!cancelled) setCoRecipients([]);
+        });
+    }, 250);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [to]);
 
   // Scheduled Send (WS4) state. `sendMode` toggles the Send
   // button between immediate dispatch and the schedule picker.
@@ -198,7 +253,15 @@ export default function Compose() {
       setRemainingMs(Math.max(0, ms));
       if (ms <= 0) {
         // Deadline passed — Stalwart will have accepted the
-        // submission. Clear state and route to /mail.
+        // submission, so the send is now irrevocable. This is the
+        // commit point for an undo-send: only now do we feed the
+        // recipients to the frequent-contacts / co-recipient tracker,
+        // so a send the user cancelled during the hold never pollutes
+        // the suggestion graph. Guarded by a ref to record once.
+        if (recordedPendingRef.current !== pendingSend.id) {
+          recordedPendingRef.current = pendingSend.id;
+          recordRecipients(pendingSend.recipients);
+        }
         setPendingSend(null);
         setSuccessMessage("Message sent.");
         setSending(false);
@@ -400,11 +463,21 @@ export default function Compose() {
       });
       setSavedDraftId(null);
 
+      // WS7: the visible recipients we may feed to the frequent-contacts
+      // / co-recipient tracker. Computed once; *when* we record depends
+      // on the send mode (see recordRecipients calls below) so a send
+      // the user can still cancel never pollutes the suggestion graph.
+      const sentRecipients = recipientsToRecord(draft);
+
       if (sendResult.scheduledSendId && sendResult.scheduledSendAt) {
         // BFF persisted the submission to Postgres; the worker
         // will dispatch it at send_at. Render a confirmation
         // toast that links the user to the Scheduled Sends page
         // where they can cancel/inspect the row.
+        // A scheduled send is committed to Postgres and will be
+        // dispatched by the worker; record now (parity with the
+        // reviewer-confirmed immediate/confidential commit points).
+        recordRecipients(sentRecipients);
         setScheduledConfirm({
           id: sendResult.scheduledSendId,
           sendAt: sendResult.scheduledSendAt,
@@ -418,6 +491,9 @@ export default function Compose() {
       }
 
       if (privacyMode === "confidential-send") {
+        // Confidential Send never opts into undo-send, so the JMAP
+        // submission already committed above — record now.
+        recordRecipients(sentRecipients);
         // For Confidential Send we *additionally* mint a one-time
         // portal link. The encrypted blob ref is the JMAP message
         // id — the actual ciphertext envelope still lives in
@@ -448,14 +524,21 @@ export default function Compose() {
         // BFF intercepted the submission and is holding it in
         // Valkey. Render the undo banner; the deadline-timer
         // effect handles navigation after the hold elapses.
+        // Recipients are deliberately NOT recorded here — the send is
+        // still cancellable. We stash them on the pending state and
+        // record only once the hold elapses (see the timer effect).
+        recordedPendingRef.current = null;
         setPendingSend({
           id: sendResult.pendingSendId,
           deadline: sendResult.undoDeadline,
+          recipients: sentRecipients,
         });
         setSuccessMessage(null);
         return;
       }
 
+      // Immediate send: irrevocable once sendEmail resolved.
+      recordRecipients(sentRecipients);
       setSuccessMessage("Message sent.");
       // Give the user a brief moment to see the success confirmation
       // before we navigate them back to the inbox. We deliberately
@@ -740,6 +823,60 @@ export default function Compose() {
             inputStyle={styles.input}
           />
         </div>
+        {/* WS7: frequent contacts + co-recipient suggestions */}
+        {(frequentContacts.length > 0 || coRecipients.length > 0) && (
+          <div style={{ ...styles.row, flexWrap: "wrap", gap: 4 }}>
+            <span style={{ ...styles.label, alignSelf: "flex-start", marginTop: 4 }}>
+              Suggestions
+            </span>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 4, flex: 1 }}>
+              {frequentContacts.map((c) => (
+                <button
+                  key={c.email}
+                  type="button"
+                  style={{
+                    padding: "2px 10px",
+                    fontSize: "0.8rem",
+                    border: "1px solid #c2d9fd",
+                    borderRadius: 12,
+                    background: "#e8f0fe",
+                    color: "#1a73e8",
+                    cursor: "pointer",
+                    whiteSpace: "nowrap",
+                  }}
+                  onClick={() => {
+                    const cur = to.trim();
+                    setTo(cur ? `${cur}, ${c.email}` : c.email);
+                  }}
+                >
+                  {c.name ? `${c.name} <${c.email}>` : c.email}
+                </button>
+              ))}
+              {coRecipients.map((c) => (
+                <button
+                  key={c.email}
+                  type="button"
+                  style={{
+                    padding: "2px 10px",
+                    fontSize: "0.8rem",
+                    border: "1px solid #d4edda",
+                    borderRadius: 12,
+                    background: "#e8f5e9",
+                    color: "#2e7d32",
+                    cursor: "pointer",
+                    whiteSpace: "nowrap",
+                  }}
+                  onClick={() => {
+                    const cur = cc.trim();
+                    setCc(cur ? `${cur}, ${c.email}` : c.email);
+                  }}
+                >
+                  + CC {c.name ? `${c.name} <${c.email}>` : c.email}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
         <div style={styles.row}>
           <label htmlFor="compose-subject" style={styles.label}>
             Subject
@@ -1105,16 +1242,23 @@ interface ComposeSeed {
   quotedBody?: string;
   quotedFrom?: EmailAddress[] | null;
   quotedDate?: string | null;
+  /**
+   * Non-quoted text to pre-fill at the top of the body (e.g. a
+   * smart-reply suggestion). Rendered above any quoted reply so the
+   * user starts with the suggested sentence and can edit from there.
+   */
+  prefillBody?: string;
 }
 
 function initialBody(seed: ComposeSeed | null): string {
-  if (!seed || !seed.quotedBody) return "";
+  const prefill = seed?.prefillBody ?? "";
+  if (!seed || !seed.quotedBody) return prefill;
   const header = buildQuoteHeader(seed);
   const quoted = seed.quotedBody
     .split("\n")
     .map((line) => `> ${line}`)
     .join("\n");
-  return `\n\n${header}\n${quoted}\n`;
+  return `${prefill}\n\n${header}\n${quoted}\n`;
 }
 
 function buildQuoteHeader(seed: ComposeSeed): string {
@@ -1168,6 +1312,36 @@ function formatAddress(a: EmailAddress): string {
     ? `"${a.name.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`
     : a.name;
   return `${name} <${a.email}>`;
+}
+
+/**
+ * WS7: the recipients we feed to the frequent-contacts / co-recipient
+ * tracker after a send commits.
+ *
+ * Only the *visible* recipients (To + Cc) are recorded. Bcc is
+ * deliberately excluded: it builds the co-recipient graph, so recording
+ * a blind-copied address could later surface it as a "you usually CC X"
+ * suggestion and leak the hidden Bcc relationship to anyone composing on
+ * this account. The full `Name <email>` form is sent (not the bare
+ * email) so the tracker can capture the display name for the chips; the
+ * BFF parses the address and keys on the bare email.
+ */
+function recipientsToRecord(draft: EmailDraft): string[] {
+  return [...(draft.to ?? []), ...(draft.cc ?? [])].map((a) => formatAddress(a));
+}
+
+/**
+ * Fire-and-forget the send record. Best-effort so a Valkey hiccup can
+ * never fail or delay the send the user just confirmed; suggestions are
+ * non-critical. Callers invoke this only once a send is irrevocable
+ * (immediate/scheduled/confidential at submit, undo-send once the hold
+ * elapses) so a cancelled send never pollutes the suggestion graph.
+ */
+function recordRecipients(recipients: string[]): void {
+  if (recipients.length === 0) return;
+  recordSend(recipients).catch(() => {
+    /* suggestions are non-critical; ignore */
+  });
 }
 
 /**

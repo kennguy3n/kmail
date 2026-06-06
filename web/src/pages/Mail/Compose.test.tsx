@@ -88,6 +88,20 @@ vi.mock("../../api/undoSend", () => ({
   cancelPendingSend: (id: string) => cancelPendingSend(id),
 }));
 
+const recordSend = vi.fn();
+const getCoRecipients = vi.fn();
+vi.mock("../../api/smart", () => ({
+  getFrequentContacts: () => Promise.resolve({ contacts: [] }),
+  getCoRecipients: (anchor: string, exclude: string[]) => {
+    getCoRecipients(anchor, exclude);
+    return Promise.resolve({ anchor, suggestions: [] });
+  },
+  recordSend: (recipients: string[]) => {
+    recordSend(recipients);
+    return Promise.resolve();
+  },
+}));
+
 vi.mock("../Admin/useTenantSelection", () => ({
   useTenantSelection: () => ({ selectedTenantId: null, setSelectedTenantId: vi.fn() }),
 }));
@@ -170,6 +184,58 @@ describe("<Compose />", () => {
     });
   });
 
+  it("records only the visible recipients (To + Cc, never Bcc) after a successful send", async () => {
+    getMailboxes.mockResolvedValueOnce(mailboxes);
+    getIdentities.mockResolvedValueOnce(identities);
+    sendEmail.mockResolvedValueOnce({
+      emailId: "e-sent-rec",
+      pendingSendId: null,
+      undoDeadline: null,
+      scheduledSendId: null,
+      scheduledSendAt: null,
+    });
+    recordSend.mockClear();
+
+    const user = userEvent.setup();
+    renderCompose();
+
+    await screen.findByRole("button", { name: /^send$/i });
+    await user.type(screen.getByLabelText(/^to/i), "alice@example.com");
+    await user.type(screen.getByLabelText(/^cc/i), "carol@example.com");
+    await user.type(screen.getByLabelText(/^bcc/i), "secret@example.com");
+    await user.click(screen.getByRole("button", { name: /^send$/i }));
+
+    await waitFor(() => expect(recordSend).toHaveBeenCalledTimes(1));
+    // Bcc must never feed the co-recipient graph (privacy).
+    expect(recordSend).toHaveBeenCalledWith([
+      "alice@example.com",
+      "carol@example.com",
+    ]);
+  });
+
+  it("derives the co-recipient anchor from a quoted display name with a comma", async () => {
+    getMailboxes.mockResolvedValueOnce(mailboxes);
+    getIdentities.mockResolvedValueOnce(identities);
+    getCoRecipients.mockClear();
+
+    const user = userEvent.setup();
+    renderCompose();
+
+    await screen.findByRole("button", { name: /^send$/i });
+    // A naive `to.split(",")` would shred this into `"Smith` (no @) and
+    // suppress the lookup entirely. The anchor must be the parsed email.
+    await user.type(
+      screen.getByLabelText(/^to/i),
+      '"Smith, John" <john@example.com>',
+    );
+
+    await waitFor(() =>
+      expect(getCoRecipients).toHaveBeenCalledWith("john@example.com", [
+        "john@example.com",
+      ]),
+    );
+  });
+
   it("renders the Undo banner and clears it after the deadline elapses", async () => {
     getMailboxes.mockResolvedValueOnce(mailboxes);
     getIdentities.mockResolvedValueOnce(identities);
@@ -182,6 +248,7 @@ describe("<Compose />", () => {
       scheduledSendId: null,
       scheduledSendAt: null,
     });
+    recordSend.mockClear();
 
     const user = userEvent.setup();
     renderCompose();
@@ -191,6 +258,9 @@ describe("<Compose />", () => {
 
     const undoBtn = await screen.findByTestId("undo-send-cancel");
     expect(undoBtn).toBeEnabled();
+    // While the hold is live the recipients must NOT be recorded yet —
+    // the send is still cancellable.
+    expect(recordSend).not.toHaveBeenCalled();
     // Deadline expires within the timeout: banner disappears,
     // success toast appears, and the route navigates to /mail.
     await waitFor(
@@ -198,6 +268,10 @@ describe("<Compose />", () => {
       { timeout: 3000 },
     );
     await screen.findByText(/back to mail/i);
+    // Now that the hold elapsed the send is irrevocable, so the
+    // recipients are recorded exactly once.
+    await waitFor(() => expect(recordSend).toHaveBeenCalledTimes(1));
+    expect(recordSend).toHaveBeenCalledWith(["alice@example.com"]);
   });
 
   it("cancels the pending send when the Undo button is clicked", async () => {
@@ -211,6 +285,7 @@ describe("<Compose />", () => {
       scheduledSendAt: null,
     });
     cancelPendingSend.mockResolvedValueOnce({ cancelled: true });
+    recordSend.mockClear();
 
     const user = userEvent.setup();
     renderCompose();
@@ -227,6 +302,9 @@ describe("<Compose />", () => {
     expect(
       await screen.findByText(/send cancelled\. edit the message/i),
     ).toBeInTheDocument();
+    // The send was cancelled during the hold, so its recipients must
+    // never enter the frequent-contacts / co-recipient graph.
+    expect(recordSend).not.toHaveBeenCalled();
   });
 
   it("sends the X-KMail-Schedule-At opt-in when the user picks 'Schedule for later'", async () => {

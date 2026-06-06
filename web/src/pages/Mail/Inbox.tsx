@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Link, useNavigate, useParams } from "react-router-dom";
+import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
 
 import { jmapClient } from "../../api/jmap";
 import { snoozeEmail } from "../../api/snooze";
+import { categorize, formatAddresses, getPriorityInbox, type EmailCategory, type PriorityItem } from "../../api/smart";
 import { labelsForKeywords, listLabels } from "../../api/labels";
 import SnoozePicker from "./SnoozePicker";
 import type { Email, Label, Mailbox } from "../../types";
@@ -16,8 +17,47 @@ import type { Email, Label, Mailbox } from "../../types";
  * are deferred to Phase 3 — state changes come from user
  * navigation for now.
  */
+/** WS7: Category tab labels and their API enum values. */
+const CATEGORY_TABS: { label: string; value: EmailCategory | "all" }[] = [
+  { label: "All", value: "all" },
+  { label: "Primary", value: "primary" },
+  { label: "Social", value: "social" },
+  { label: "Promotions", value: "promotions" },
+  { label: "Updates", value: "updates" },
+  { label: "Forums", value: "forums" },
+];
+
+const CATEGORY_TAB_STYLE: React.CSSProperties = {
+  display: "flex",
+  gap: 0,
+  borderBottom: "2px solid #ddd",
+  marginBottom: 8,
+  padding: "0 8px",
+};
+
+function categoryTabBtn(
+  active: boolean,
+): React.CSSProperties {
+  return {
+    padding: "6px 14px",
+    cursor: "pointer",
+    border: "none",
+    background: "none",
+    borderBottom: active ? "2px solid #4c8bf5" : "2px solid transparent",
+    fontWeight: active ? 600 : 400,
+    color: active ? "#4c8bf5" : "#555",
+    marginBottom: -2,
+  };
+}
+
 export default function Inbox() {
   const navigate = useNavigate();
+  // Priority Inbox is its own route (`/mail/priority`) rather than a
+  // `?view=priority` query param so the WS1 sidebar/breadcrumb model —
+  // which matches on `pathname` only — highlights the active link and
+  // builds the right crumb trail.
+  const { pathname } = useLocation();
+  const isPriorityView = pathname === "/mail/priority";
   const { mailboxId: selectedFromRoute } = useParams<{ mailboxId?: string }>();
 
   const [mailboxes, setMailboxes] = useState<Mailbox[] | null>(null);
@@ -63,6 +103,45 @@ export default function Inbox() {
   // state. `reloadNonce` still drives the mailbox-mode refetch.
   const [searchReloadNonce, setSearchReloadNonce] = useState(0);
   const inSearchMode = submittedQuery.trim().length > 0;
+
+  // ── WS7: category filter + priority view ──────────────────
+  const [activeCategory, setActiveCategory] = useState<EmailCategory | "all">("all");
+  const [emailCategories, setEmailCategories] = useState<Record<string, EmailCategory>>({});
+  const [priorityItems, setPriorityItems] = useState<PriorityItem[]>([]);
+  const [isPriorityLoading, setIsPriorityLoading] = useState(false);
+
+  // Only categorize messages we haven't seen yet, then merge the
+  // result into the existing map. This avoids re-fetching the whole
+  // window every time the list reloads (e.g. after a mark-read or a
+  // category-tab switch), which the previous "categorize all on each
+  // change" effect did. `categorizedRef` tracks known ids without
+  // adding `emailCategories` to the dependency list (which would loop).
+  const categorizedRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    if (!emails || emails.length === 0) return;
+    const unknown = emails
+      .map((e) => e.id)
+      .filter((id) => !categorizedRef.current.has(id));
+    if (unknown.length === 0) return;
+    let cancelled = false;
+    categorize(unknown)
+      .then((res) => {
+        if (cancelled) return;
+        for (const id of unknown) categorizedRef.current.add(id);
+        setEmailCategories((prev) => ({ ...prev, ...res.categories }));
+      })
+      .catch(() => { /* categorization is best-effort */ });
+    return () => { cancelled = true; };
+  }, [emails]);
+
+  useEffect(() => {
+    if (!isPriorityView) return;
+    setIsPriorityLoading(true);
+    getPriorityInbox({ limit: 50 })
+      .then((res) => setPriorityItems(res.items))
+      .catch(() => { /* priority fetch is best-effort */ })
+      .finally(() => setIsPriorityLoading(false));
+  }, [isPriorityView]);
 
   useEffect(() => {
     let cancelled = false;
@@ -257,6 +336,18 @@ export default function Inbox() {
   const inboxMailboxId = useMemo(
     () => (mailboxes ?? []).find((m) => m.role === "inbox")?.id ?? null,
     [mailboxes],
+  );
+
+  // Priority items are ranked from the inbox window and carry only an
+  // email id, so open them against the inbox mailbox (falling back to
+  // the current selection) to build a valid MessageView URL.
+  const handleOpenPriority = useCallback(
+    (emailId: string) => {
+      const mailboxId = inboxMailboxId ?? selectedMailbox;
+      if (!mailboxId) return;
+      navigate(`/mail/${mailboxId}/${emailId}`);
+    },
+    [inboxMailboxId, navigate, selectedMailbox],
   );
 
   // Open snooze picker state — one at a time, keyed by email id.
@@ -519,13 +610,19 @@ export default function Inbox() {
     () => (inSearchMode ? (searchResults ?? []) : (emails ?? [])),
     [inSearchMode, searchResults, emails],
   );
-  const filteredList = useMemo(
-    () =>
-      labelFilter
-        ? baseList.filter((e) => e.keywords[labelFilter] === true)
-        : baseList,
-    [baseList, labelFilter],
-  );
+  const filteredList = useMemo(() => {
+    const byLabel = labelFilter
+      ? baseList.filter((e) => e.keywords[labelFilter] === true)
+      : baseList;
+    // WS7: narrow to the active category tab. Folded in here (rather
+    // than at render time) so thread grouping, selection, and bulk
+    // actions all key off the same visible set. Search hits aren't
+    // categorized, so the filter is skipped in search mode.
+    if (activeCategory !== "all" && !inSearchMode) {
+      return byLabel.filter((e) => emailCategories[e.id] === activeCategory);
+    }
+    return byLabel;
+  }, [baseList, labelFilter, activeCategory, emailCategories, inSearchMode]);
 
   // The rows actually rendered: one per thread (its newest message is
   // the representative `head`) when grouping is on, or one per email
@@ -958,7 +1055,65 @@ export default function Inbox() {
           searchResults.length === 0 && (
             <p style={layoutStyles.muted}>No matching messages.</p>
           )}
-        {filteredList.length > 0 && (
+        {/* WS7: category tabs — shown when viewing the normal inbox. */}
+        {!inSearchMode && !isPriorityView && (
+          <div style={CATEGORY_TAB_STYLE}>
+            {CATEGORY_TABS.map((tab) => (
+              <button
+                key={tab.value}
+                type="button"
+                style={categoryTabBtn(activeCategory === tab.value)}
+                onClick={() => setActiveCategory(tab.value)}
+              >
+                {tab.label}
+              </button>
+            ))}
+          </div>
+        )}
+        {/* WS7: priority view replaces the standard list when active. */}
+        {isPriorityView && (
+          <div>
+            <h3 style={{ margin: "0 0 8px" }}>Priority Inbox</h3>
+            {isPriorityLoading && <p style={{ color: "#888" }}>Loading…</p>}
+            {!isPriorityLoading && priorityItems.length === 0 && (
+              <p style={{ color: "#888" }}>No priority messages.</p>
+            )}
+            {!isPriorityLoading && priorityItems.length > 0 && (
+              <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
+                {priorityItems.map((item) => (
+                  <li
+                    key={item.email_id}
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => handleOpenPriority(item.email_id)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        handleOpenPriority(item.email_id);
+                      }
+                    }}
+                    style={{
+                      padding: "8px 12px",
+                      borderBottom: "1px solid #eee",
+                      cursor: "pointer",
+                    }}
+                  >
+                    <div style={{ fontWeight: 500 }}>
+                      {item.subject || "(no subject)"}
+                    </div>
+                    <div style={{ fontSize: "0.85rem", color: "#666" }}>
+                      {formatAddresses(item.from)} — score {item.score}
+                    </div>
+                    <div style={{ fontSize: "0.8rem", color: "#999" }}>
+                      {item.preview?.slice(0, 120)}
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        )}
+        {!isPriorityView && filteredList.length > 0 && (
           <div style={layoutStyles.listControls}>
             <label style={layoutStyles.controlToggle}>
               <input
@@ -1003,7 +1158,7 @@ export default function Inbox() {
             )}
           </div>
         )}
-        {selectedCount > 0 && (
+        {!isPriorityView && selectedCount > 0 && (
           <div style={layoutStyles.bulkBar}>
             <span style={layoutStyles.bulkCount}>{selectedCount} selected</span>
             <button
@@ -1084,8 +1239,8 @@ export default function Inbox() {
             </button>
           </div>
         )}
-        {filteredList.length > 0 && (
-          <ul style={layoutStyles.emailList}>
+        {!isPriorityView && filteredList.length > 0 && (
+          <ul style={layoutStyles.emailList} data-testid="email-list">
             {displayRows.map(({ head, emails: groupEmails }) => {
               const email = head;
               // Reuse the single-source-of-truth helpers (which now
