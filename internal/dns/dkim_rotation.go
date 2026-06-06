@@ -230,7 +230,7 @@ func (s *DKIMRotationService) RotateKey(ctx context.Context, tenantID, domainID 
 			if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
 				return err
 			}
-			if err := tx.QueryRow(ctx, `SELECT name FROM domains WHERE tenant_id = $1::uuid AND id = $2::uuid`,
+			if err := tx.QueryRow(ctx, `SELECT domain FROM domains WHERE tenant_id = $1::uuid AND id = $2::uuid`,
 				tenantID, domainID).Scan(&domainName); err != nil {
 				return fmt.Errorf("lookup domain: %w", err)
 			}
