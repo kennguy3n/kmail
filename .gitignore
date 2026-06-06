@@ -23,3 +23,14 @@ target/
 .env.prod.local
 # Local TLS material bind-mounted by docker-compose.prod.yml
 /deploy/tls/
+
+# Terraform
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+crash.log
+*.tfvars
+!*.tfvars.example
+override.tf
+override.tf.json
