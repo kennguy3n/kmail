@@ -37,10 +37,19 @@ const calendars: Calendar[] = [
 ];
 
 function eventInWindow(): CalendarEvent[] {
-  // The CalendarView fetches events for the current week. Anchor a
-  // sample event two hours from now so it always lands inside the
-  // requested range regardless of when the test runs.
-  const start = new Date(Date.now() + 2 * 60 * 60 * 1000);
+  // CalendarView defaults to a Sunday-start week view whose grid only
+  // renders the seven days of the *current* week. The sample event must
+  // therefore fall on a day inside that week. Anchor it at local noon
+  // today: the current day is always inside the current week, and noon
+  // can't spill into an adjacent day under any timezone offset.
+  //
+  // The previous anchor (`Date.now() + 2h`) was off-by-a-week near the
+  // Saturday->Sunday boundary: run late on a Saturday, +2h crosses into
+  // the next week's Sunday, which has no column in the rendered grid, so
+  // the chip silently disappeared and the assertion failed depending on
+  // the wall-clock day/time the suite happened to run.
+  const start = new Date();
+  start.setHours(12, 0, 0, 0);
   const end = new Date(start.getTime() + 60 * 60 * 1000);
   return [
     {
