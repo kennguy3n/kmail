@@ -79,12 +79,13 @@ scripts/loadtest/load-smtp.sh 25 60   # 25 TPS for 60 seconds
 | Script                    | Failure injected     | Expected behaviour |
 |---------------------------|----------------------|--------------------|
 | `chaos-shard.sh`          | Stalwart shard kill  | Circuit breaker opens, secondary shard takes over within the 99.95 % SLO window. |
-| `chaos-postgres.sh`       | Postgres pause       | Graceful-degradation middleware serves cached responses; report-only by default — set `KMAIL_CHAOS_PG_MIN_SUCCESS_PCT=50` to enforce the ≥ 50 % SLO once the middleware is wired in. |
+| `chaos-postgres.sh`       | Postgres pause       | Control-plane reads fail fast (retryable `503` within `KMAIL_FLAGS_READ_TIMEOUT`, default 5 s) instead of hanging — bounded liveness enforced at 100 % by default. Served ratio is report-only (no cached fallback yet); set `KMAIL_CHAOS_PG_MIN_SUCCESS_PCT=50` to enforce an availability SLO once one is added. |
 | `chaos-valkey.sh`         | Valkey kill          | Rate-limit middleware fails open; success rate stays ≥ 95 %. |
 
-Each script sets a non-zero exit code if its SLO target is missed
-(`chaos-postgres.sh` is report-only by default — see the known-gap note
-below). Run them inside the compose stack:
+Each script sets a non-zero exit code if its SLO target is missed.
+`chaos-postgres.sh` enforces **bounded liveness** (no hang) by default
+but treats the **served** ratio as report-only — see the note below.
+Run them inside the compose stack:
 
 ```bash
 docker compose up -d
@@ -101,18 +102,24 @@ The chaos scripts probe `/api/v1/admin/feature-flags` and the
   off in dev), so start the BFF with
   `KMAIL_RATELIMIT_ENABLED=true KMAIL_RATELIMIT_FAIL_CLOSED=false`
   for the fail-open assertion to be meaningful.
-- **`chaos-postgres.sh`** currently surfaces a gap rather than a
-  pass: control-plane reads have no cached fallback / DB timeout, so
-  a Postgres outage hangs them (now bounded by `--max-time`). The
-  graceful-degradation middleware (`internal/middleware/degradation.go`)
-  is implemented but not wired into `cmd/kmail-api`, and it targets
-  the `/jmap` + Stalwart-health path, not control-plane Postgres
-  reads. See `docs/BENCHMARKS.md` → "Session 7" for the full finding.
-  Because of this gap the script is **report-only by default** (it
-  prints the served ratio but exits 0); set
-  `KMAIL_CHAOS_PG_MIN_SUCCESS_PCT=50` to make it enforce the ≥ 50 %
-  resilience SLO (exit non-zero on a miss) once the middleware is wired
-  into `cmd/kmail-api`.
+- **`chaos-postgres.sh`** measures two properties under a paused DB:
+  - **bounded** — the read returns a real HTTP status within the
+    probe ceiling rather than hanging. This is now guaranteed:
+    `featureflags.Store` applies a per-read deadline
+    (`KMAIL_FLAGS_READ_TIMEOUT`, default 5 s) and the admin handler
+    maps the timeout to `503 + Retry-After`. The harness enforces
+    `KMAIL_CHAOS_PG_MIN_BOUNDED_PCT` (default 100 %), so a build that
+    regresses to hanging reads fails. Keep the probe's `--max-time`
+    (default 8 s) above the server read timeout so it observes the
+    server's `503`, not its own client cutoff.
+  - **served** — the read returned 2xx/3xx. This stays ~0 % during a
+    full outage because control-plane reads have **no cached
+    fallback** (flag *evaluation* stays up via the resolver's
+    in-memory snapshot, but the admin *read* has nothing to fall back
+    to). It is therefore report-only; set
+    `KMAIL_CHAOS_PG_MIN_SUCCESS_PCT=50` to enforce an availability SLO
+    once a cached-read fallback is added. See `docs/BENCHMARKS.md` →
+    "Session 7" for the full finding.
 - **`chaos-shard.sh`** needs a provisioned Stalwart mailbox for the
   authenticated principal; otherwise the BFF returns `404
   accountNotFound` before reaching a shard. Seed a mailbox (or inject
@@ -131,10 +138,13 @@ Container names default to the compose `container_name:` values
   (`KMAIL_CHAOS_ITERATIONS`) exposes more than your shard
   topology can absorb. Genuine regressions look like 503s lasting
   past the breaker recovery window.
-- **Postgres chaos failure** — the graceful-degradation middleware
-  (`internal/middleware/degradation.go`) must be wired into the
-  affected route for cached responses to be served; it currently is
-  not (see the gap note above). Cache misses count as failures.
+- **Postgres chaos failure** — a *bounded* failure (the harness
+  reports `< 100 % bounded`, i.e. `000` client timeouts) means the
+  server stopped enforcing its read deadline: confirm the control-plane
+  read timeout is in effect (`KMAIL_FLAGS_READ_TIMEOUT` not set to `0`)
+  and that the probe's `--max-time` is above it. A *served* shortfall
+  (the report-only metric) is expected until a cached-read fallback is
+  added — fast `503`s are correct-but-unavailable, not a regression.
 - **Valkey chaos failure** — the rate limiter is the suspect.
   Confirm the middleware logs the Valkey error and admits the
   request.

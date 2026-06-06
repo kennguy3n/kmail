@@ -4,10 +4,23 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// defaultReadTimeout bounds how long a control-plane read (the admin
+// GET and the resolver's background refresh) may block on Postgres.
+// Without it, a frozen or unreachable database hangs the read
+// indefinitely — the request only unblocks when the client gives up
+// (e.g. curl --max-time), and the chaos-postgres harness measured this
+// as a hard hang with no DB-side ceiling. 5s is comfortably above a
+// healthy two-query read (single-digit ms) yet fails fast enough that a
+// degraded DB surfaces as a retryable 503 instead of a stuck request.
+// The flag evaluation path stays available regardless: the Service
+// serves its last in-memory snapshot when a refresh times out.
+const defaultReadTimeout = 5 * time.Second
 
 // Store is the pgx-backed persistence layer over the `feature_flags`
 // and `feature_flag_overrides` tables (migration 006). It implements
@@ -18,14 +31,36 @@ import (
 // Store queries the pool directly without setting the app.tenant_id
 // GUC, mirroring tenant.ShardService.
 type Store struct {
-	pool *pgxpool.Pool
+	pool        *pgxpool.Pool
+	readTimeout time.Duration
 }
 
 // NewStore builds a Store. A nil pool yields a Store whose reads return
 // empty sets and whose writes error — matching the stub behaviour the
 // rest of the codebase uses so a binary without Postgres still boots.
 func NewStore(pool *pgxpool.Pool) *Store {
-	return &Store{pool: pool}
+	return &Store{pool: pool, readTimeout: defaultReadTimeout}
+}
+
+// WithReadTimeout overrides the per-read deadline applied to the
+// control-plane read paths. A non-positive duration disables the
+// deadline (reads block on the caller's context only) — use this to
+// opt out, e.g. when the pool already enforces a statement_timeout.
+// Returns the receiver for chaining.
+func (s *Store) WithReadTimeout(d time.Duration) *Store {
+	s.readTimeout = d
+	return s
+}
+
+// readContext derives the context used for a read query. When a
+// readTimeout is configured it bounds the read so a stalled Postgres
+// fails fast instead of hanging; otherwise it returns the caller's
+// context unchanged. The returned cancel func must always be called.
+func (s *Store) readContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if s.readTimeout > 0 {
+		return context.WithTimeout(ctx, s.readTimeout)
+	}
+	return ctx, func() {}
 }
 
 // ErrNoPool is returned by write operations when the Store has no pool.
@@ -37,6 +72,10 @@ func (s *Store) loadAll(ctx context.Context) ([]Flag, []Override, error) {
 	if s.pool == nil {
 		return nil, nil, nil
 	}
+	// One deadline covers both reads: the admin GET and the resolver
+	// refresh must complete within the read budget or fail fast.
+	ctx, cancel := s.readContext(ctx)
+	defer cancel()
 	flags, err := s.listFlags(ctx)
 	if err != nil {
 		return nil, nil, err
@@ -110,6 +149,8 @@ func (s *Store) tenantPlan(ctx context.Context, tenantID string) (string, error)
 	if s.pool == nil || tenantID == "" {
 		return "", nil
 	}
+	ctx, cancel := s.readContext(ctx)
+	defer cancel()
 	var plan string
 	err := s.pool.QueryRow(ctx, `
 		SELECT plan FROM tenants WHERE id = $1::uuid

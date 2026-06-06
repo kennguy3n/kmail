@@ -211,7 +211,7 @@ re-run. Findings:
 | Failure mode | compose-local result | Notes |
 | --- | --- | --- |
 | Valkey eviction/kill (`chaos-valkey.sh`) | **100 % open** (30/30, 100/100) | Rate limiter fails open: with Valkey down and `KMAIL_RATELIMIT_FAIL_CLOSED=false`, requests are admitted. Each request pays ~2 s while the redis client exhausts its dial retries — fail-open works but is **slow** under a hard-down Valkey. |
-| Postgres pause (`chaos-postgres.sh`) | **0 % served** (0/5) — *finding* | Control-plane reads have **no cached fallback and no DB-side timeout**, so they hang until Postgres returns (bounded only by the new `--max-time`). The graceful-degradation middleware (`internal/middleware/degradation.go`) is implemented + unit-tested but **not wired into `cmd/kmail-api`**, and it targets the `/jmap` + Stalwart-health path, not control-plane Postgres reads. |
+| Postgres pause (`chaos-postgres.sh`) | **100 % bounded, 0 % served** — *fixed + remaining gap* | A frozen Postgres now fails the control-plane read **fast** (a retryable `503` within the read timeout) instead of hanging: `featureflags.Store` applies a per-read deadline (`KMAIL_FLAGS_READ_TIMEOUT`, default 5 s) and the admin handler maps the timeout to `503 + Retry-After`. Served is still ~0 % because these reads have **no cached fallback** — flag *evaluation* stays available (the resolver serves its in-memory snapshot), but the admin *read* has nothing to fall back to. The harness enforces the bounded-liveness guarantee unconditionally; the served ratio is opt-in pending a cached-read fallback. |
 | Shard failure (`chaos-shard.sh`) | **prerequisite-blocked** | The JMAP probe needs a provisioned Stalwart mailbox; with the dev token and no seeded mailbox the BFF returns `404 accountNotFound` *before* reaching a shard, so the circuit-breaker path is never exercised. |
 | Meilisearch corruption / zk-object-fabric outage | **not yet scripted** | No harness exists for these two modes; documented here as a gap. `internal/search` has no automatic fallback (search calls return the backend error when Meilisearch is unavailable — there is no Postgres `ILIKE` degrade path); zk-fabric outage affects blob read/write only. |
 
@@ -229,8 +229,13 @@ Chaos-harness bugs fixed (`chaos-shard.sh`, `chaos-postgres.sh`,
   now probe `/api/v1/admin/feature-flags` (a real authed,
   Postgres-backed route mounted behind the rate limiter), and success
   counts only genuine 2xx/3xx.
-- **No request timeout**: a paused Postgres made `curl` hang
-  indefinitely. Added `--max-time` everywhere.
+- **No request timeout (server-side)**: a paused Postgres made the
+  control-plane read hang until the client gave up — the server itself
+  imposed no ceiling. Fixed at the source: `featureflags.Store` now
+  bounds its reads with a deadline (`KMAIL_FLAGS_READ_TIMEOUT`, default
+  5 s) so a stalled DB returns a fast, retryable `503`. `--max-time` on
+  the probe is now just a backstop, kept above the server timeout so the
+  harness observes the server's `503` rather than its own client cutoff.
 - **`set -e` abort**: `code=$(curl …)` aborted the whole script when
   curl exited non-zero (timeout/connect error). Guarded with `|| true`
   plus a `code=${code:-000}` fallback — `curl -w "%{http_code}"` already
@@ -240,12 +245,20 @@ Chaos-harness bugs fixed (`chaos-shard.sh`, `chaos-postgres.sh`,
   killed container down. Added `trap … EXIT` restart guards to
   `chaos-valkey` and `chaos-shard` (`chaos-postgres` already had one).
 
-**Real-infra prerequisites / recommended long-term fixes:** wire the
-graceful-degradation middleware (or per-request DB context timeouts)
-into the BFF read path so a Postgres outage fails fast / serves cached
-rather than hanging; provision Stalwart principals so the shard
-circuit-breaker can be exercised; add Meilisearch-corruption and
-zk-fabric-outage chaos scripts.
+**Fixed in this PR:** the BFF control-plane read path now fails fast
+under a Postgres outage — `featureflags.Store` bounds reads with a
+deadline and the admin handler returns `503 + Retry-After` instead of
+hanging. `chaos-postgres.sh` enforces this bounded-liveness guarantee
+(`KMAIL_CHAOS_PG_MIN_BOUNDED_PCT`, default 100 %).
+
+**Remaining long-term fixes:** add a cached-read fallback for
+control-plane reads (so a Postgres outage *serves* stale-but-usable
+data, lifting served % above 0 — then `KMAIL_CHAOS_PG_MIN_SUCCESS_PCT`
+can enforce an availability SLO); wire the `/jmap` graceful-degradation
+middleware (`internal/middleware/degradation.go`) into the proxy path;
+provision Stalwart principals so the shard circuit-breaker can be
+exercised; add Meilisearch-corruption and zk-fabric-outage chaos
+scripts.
 
 ### Step 3 — storage cost validation (`make storage-cost`)
 

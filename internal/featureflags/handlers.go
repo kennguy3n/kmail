@@ -56,8 +56,7 @@ func (h *Handlers) Register(mux *http.ServeMux, authMW *middleware.OIDC) {
 func (h *Handlers) list(w http.ResponseWriter, r *http.Request) {
 	views, err := h.store.loadViews(r.Context())
 	if err != nil {
-		h.logger.Printf("featureflags: list: %v", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		h.writeStoreErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"flags": views})
@@ -199,11 +198,24 @@ func (h *Handlers) invalidate() {
 }
 
 func (h *Handlers) writeStoreErr(w http.ResponseWriter, err error) {
-	if errors.Is(err, ErrNoPool) {
+	// A missing pool, a read that hit its deadline, or a cancelled
+	// request all mean the control plane is momentarily unavailable
+	// rather than the request being malformed — surface them as a
+	// retryable 503 (with Retry-After) instead of a 500 so callers and
+	// the chaos harness see a fast, honest "try again", not a hang.
+	if errors.Is(err, ErrNoPool) ||
+		errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, context.Canceled) {
+		if h.logger != nil {
+			h.logger.Printf("featureflags: store unavailable: %v", err)
+		}
+		w.Header().Set("Retry-After", "1")
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 		return
 	}
-	h.logger.Printf("featureflags: store error: %v", err)
+	if h.logger != nil {
+		h.logger.Printf("featureflags: store error: %v", err)
+	}
 	writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 }
 
