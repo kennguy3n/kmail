@@ -4153,8 +4153,7 @@
           "404": {
             "$ref": "#/components/responses/NotFound"
           }
-        },
-        "security": []
+        }
       }
     },
     "/api/v1/send/{id}/cancel": {
@@ -4205,8 +4204,7 @@
               }
             }
           }
-        },
-        "security": []
+        }
       }
     },
     "/api/v1/sessions": {

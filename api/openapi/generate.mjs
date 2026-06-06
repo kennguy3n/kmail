@@ -116,7 +116,12 @@ function isPublic(method, p) {
   if (p === "/api/v1/signup" && method === "POST") return true;
   if (p.startsWith("/api/v1/signup/")) return true; // status polling
   if (p.startsWith("/api/v1/secure/")) return true; // recipient portal token
-  if (p.startsWith("/api/v1/send/")) return true; // tracking pixel/link
+  // NOTE: do NOT treat "/api/v1/send/" as public. The only routes under
+  // that prefix are the undo-send endpoints (POST /api/v1/send/{id}/cancel
+  // and GET /api/v1/send/{id}), both wrapped with authMW.Wrap in
+  // internal/undosend/handlers.go — they require an OIDC bearer token. A
+  // broad prefix match here previously emitted `security: []` for them,
+  // telling clients no auth was needed (causing spurious 401s).
   return false;
 }
 
