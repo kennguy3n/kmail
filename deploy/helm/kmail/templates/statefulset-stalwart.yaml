@@ -55,6 +55,10 @@ spec:
       # <pod-name>.<service>.<namespace>.svc.cluster.local. The
       # BFF resolves a tenant's primary shard to that hostname.
       subdomain: {{ .Values.stalwart.service.headlessName }}
+      {{- with .Values.stalwart.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: stalwart
           image: "{{ .Values.stalwart.image.repository }}:{{ .Values.stalwart.image.tag }}"

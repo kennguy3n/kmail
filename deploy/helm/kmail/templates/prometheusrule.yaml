@@ -1,0 +1,251 @@
+{{- /*
+  Prometheus Operator PrometheusRule.
+
+  Gated on `prometheusRule.enabled` (needs the monitoring.coreos.com/v1
+  CRDs). Ships the SAME alert family as deploy/prometheus/alerts.yml so
+  operator and non-operator clusters fire identical alerts, PLUS a set
+  of multi-window multi-burn-rate SLO error-budget alerts and the
+  recording rules they depend on.
+
+  Every expression below references only metrics the code actually
+  exports (internal/middleware/metrics.go, cmd/kmail-worker/supervise.go,
+  and the per-feature job counters). Keep this in sync with
+  deploy/prometheus/alerts.yml when metric names change.
+*/ -}}
+{{- if .Values.prometheusRule.enabled }}
+{{- $target := .Values.prometheusRule.slo.availabilityTarget }}
+{{- $budget := subf 1.0 $target }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "kmail.fullname" . }}
+  labels:
+    {{- include "kmail.labels" . | nindent 4 }}
+    {{- with .Values.prometheusRule.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    # --------------------------------------------------------------
+    # Recording rules: rolling 5xx error ratios at the windows the
+    # multi-burn-rate alerts compare against. Computing them once
+    # keeps the alert expressions readable and the evaluation cheap.
+    # --------------------------------------------------------------
+    - name: kmail.slo.recording
+      rules:
+        {{- range $w := list "5m" "30m" "1h" "2h" "6h" "1d" "3d" }}
+        - record: kmail:http_error_ratio:rate{{ $w }}
+          expr: |
+            sum(rate(kmail_http_requests_total{status=~"5.."}[{{ $w }}]))
+            /
+            sum(rate(kmail_http_requests_total[{{ $w }}]))
+        {{- end }}
+
+    # --------------------------------------------------------------
+    # Multi-window, multi-burn-rate SLO alerts (Google SRE workbook).
+    # availabilityTarget={{ $target }} => error budget {{ printf "%.4f" $budget }}.
+    # A burn rate of N means the budget would be exhausted in
+    # (period / N); the short+long window pair suppresses flapping.
+    # --------------------------------------------------------------
+    - name: kmail.slo.burnrate
+      rules:
+        - alert: KmailErrorBudgetBurnFast
+          # 14.4x burn: exhausts a 30d budget in ~2 days. Page.
+          expr: |
+            kmail:http_error_ratio:rate5m > {{ printf "%.6f" (mulf 14.4 $budget) }}
+            and
+            kmail:http_error_ratio:rate1h > {{ printf "%.6f" (mulf 14.4 $budget) }}
+          for: 2m
+          labels:
+            severity: page
+            slo: availability
+          annotations:
+            summary: "KMail availability error budget burning FAST (14.4x)"
+            description: "5m and 1h 5xx ratios both exceed 14.4x the {{ printf "%.2f" (mulf 100.0 $budget) }}% budget; the 30d budget will be exhausted in ~2d at this rate."
+
+        - alert: KmailErrorBudgetBurnMedium
+          # 6x burn: exhausts a 30d budget in ~5 days. Page.
+          expr: |
+            kmail:http_error_ratio:rate30m > {{ printf "%.6f" (mulf 6.0 $budget) }}
+            and
+            kmail:http_error_ratio:rate6h > {{ printf "%.6f" (mulf 6.0 $budget) }}
+          for: 15m
+          labels:
+            severity: page
+            slo: availability
+          annotations:
+            summary: "KMail availability error budget burning (6x)"
+            description: "30m and 6h 5xx ratios both exceed 6x the {{ printf "%.2f" (mulf 100.0 $budget) }}% budget."
+
+        - alert: KmailErrorBudgetBurnSlow
+          # 3x burn: exhausts a 30d budget in ~10 days. Ticket.
+          expr: |
+            kmail:http_error_ratio:rate2h > {{ printf "%.6f" (mulf 3.0 $budget) }}
+            and
+            kmail:http_error_ratio:rate1d > {{ printf "%.6f" (mulf 3.0 $budget) }}
+          for: 1h
+          labels:
+            severity: ticket
+            slo: availability
+          annotations:
+            summary: "KMail availability error budget burning slowly (3x)"
+            description: "2h and 1d 5xx ratios both exceed 3x the {{ printf "%.2f" (mulf 100.0 $budget) }}% budget."
+
+        - alert: KmailErrorBudgetBurnVerySlow
+          # 1x burn: on track to exactly exhaust the budget. Ticket.
+          expr: |
+            kmail:http_error_ratio:rate6h > {{ printf "%.6f" $budget }}
+            and
+            kmail:http_error_ratio:rate3d > {{ printf "%.6f" $budget }}
+          for: 3h
+          labels:
+            severity: ticket
+            slo: availability
+          annotations:
+            summary: "KMail availability error budget on track to exhaust (1x)"
+            description: "6h and 3d 5xx ratios both exceed the {{ printf "%.2f" (mulf 100.0 $budget) }}% budget; investigate before the budget is gone."
+
+    # --------------------------------------------------------------
+    # Scrape-target liveness (mirrors deploy/prometheus/alerts.yml).
+    # --------------------------------------------------------------
+    - name: kmail.targets
+      rules:
+        - alert: KmailTargetDown
+          expr: up{job=~"kmail-.*"} == 0
+          for: 2m
+          labels:
+            severity: page
+          annotations:
+            summary: "KMail target {{`{{ $labels.job }}`}} is down"
+            description: "Prometheus has been unable to scrape {{`{{ $labels.job }}`}} ({{`{{ $labels.instance }}`}}) for >2m."
+
+    # --------------------------------------------------------------
+    # API request health (mirrors deploy/prometheus/alerts.yml).
+    # --------------------------------------------------------------
+    - name: kmail.api
+      rules:
+        - alert: KmailApiHighErrorRate
+          expr: |
+            (
+              sum(rate(kmail_http_requests_total{status=~"5.."}[5m]))
+              /
+              sum(rate(kmail_http_requests_total[5m]))
+            ) > 0.05
+            and
+            sum(rate(kmail_http_requests_total[5m])) > 1
+          for: 5m
+          labels:
+            severity: page
+          annotations:
+            summary: "KMail API 5xx error rate >5%"
+            description: "{{`{{ $value | humanizePercentage }}`}} of API requests are 5xx over the last 5m."
+
+        - alert: KmailApiHighLatencyP99
+          expr: |
+            histogram_quantile(
+              0.99,
+              sum(rate(kmail_http_request_duration_seconds_bucket[5m])) by (le)
+            ) > 1
+          for: 10m
+          labels:
+            severity: ticket
+          annotations:
+            summary: "KMail API p99 latency >1s"
+            description: "p99 request latency is {{`{{ $value | humanizeDuration }}`}} over the last 5m."
+
+        - alert: KmailJmapProxyHighLatencyP99
+          expr: |
+            histogram_quantile(
+              0.99,
+              sum(rate(kmail_jmap_proxy_duration_seconds_bucket[5m])) by (le)
+            ) > 2
+          for: 10m
+          labels:
+            severity: ticket
+          annotations:
+            summary: "KMail JMAP proxy p99 latency >2s"
+            description: "p99 JMAP proxy latency is {{`{{ $value | humanizeDuration }}`}} over the last 5m."
+
+    # --------------------------------------------------------------
+    # Background-worker health (mirrors deploy/prometheus/alerts.yml).
+    # --------------------------------------------------------------
+    - name: kmail.workers
+      rules:
+        - alert: KmailWorkerDown
+          expr: kmail_worker_up == 0
+          for: 5m
+          labels:
+            severity: page
+          annotations:
+            summary: "KMail worker {{`{{ $labels.worker }}`}} is down"
+            description: "Worker {{`{{ $labels.worker }}`}} has reported up=0 for >5m on {{`{{ $labels.instance }}`}}."
+
+        - alert: KmailWorkerCrashLooping
+          expr: rate(kmail_worker_restarts_total[5m]) > 0.1
+          for: 10m
+          labels:
+            severity: page
+          annotations:
+            summary: "KMail worker {{`{{ $labels.worker }}`}} is crash-looping"
+            description: "Worker {{`{{ $labels.worker }}`}} is restarting >0.1/s (sustained 10m); it is likely failing on every run."
+
+        - alert: KmailWorkerPanicking
+          expr: increase(kmail_worker_panics_total[15m]) > 0
+          labels:
+            severity: ticket
+          annotations:
+            summary: "KMail worker {{`{{ $labels.worker }}`}} panicked"
+            description: "Worker {{`{{ $labels.worker }}`}} recovered {{`{{ $value }}`}} panic(s) in the last 15m."
+
+    # --------------------------------------------------------------
+    # Per-feature job health (mirrors deploy/prometheus/alerts.yml).
+    # --------------------------------------------------------------
+    - name: kmail.jobs
+      rules:
+        - alert: KmailRetentionErrors
+          expr: increase(kmail_retention_errors_total[15m]) > 0
+          for: 15m
+          labels:
+            severity: ticket
+          annotations:
+            summary: "KMail retention worker is erroring"
+            description: "{{`{{ $value }}`}} retention errors in the last 15m — policy enforcement may be stalled."
+
+        - alert: KmailExportJobsFailing
+          expr: increase(kmail_export_jobs_failed_total[30m]) > 0
+          for: 15m
+          labels:
+            severity: ticket
+          annotations:
+            summary: "KMail export jobs are failing"
+            description: "{{`{{ $value }}`}} export jobs failed in the last 30m."
+
+        - alert: KmailSearchCutoverFailing
+          expr: increase(kmail_search_cutover_failed_total[30m]) > 0
+          labels:
+            severity: ticket
+          annotations:
+            summary: "KMail search cutover failures"
+            description: "{{`{{ $value }}`}} search index cutovers failed in the last 30m."
+
+        - alert: KmailStorageReconcileErrors
+          expr: increase(kmail_storage_event_reconcile_errors_total[30m]) > 0
+          for: 15m
+          labels:
+            severity: ticket
+          annotations:
+            summary: "KMail storage reconciliation is erroring"
+            description: "{{`{{ $value }}`}} storage reconcile errors in the last 30m; tenant usage/billing may drift."
+
+        - alert: KmailSignupFailureSpike
+          expr: |
+            increase(kmail_signup_failed_total[15m])
+              > increase(kmail_signup_completed_total[15m])
+            and increase(kmail_signup_initiated_total[15m]) > 5
+          for: 15m
+          labels:
+            severity: page
+          annotations:
+            summary: "KMail self-service signup failing for most users"
+            description: "Failed signups exceed completions over the last 15m — onboarding is broken."
+{{- end }}

@@ -71,7 +71,26 @@ kmailApi:
   # Spread pods across availability zones (and, when multi-region
   # is on, regions) so a single AZ / region outage doesn't take
   # down every BFF replica.
-  topologySpreadConstraints: []
+  #
+  # The default below is a real cross-AZ anti-affinity rule:
+  # `maxSkew: 1` keeps the API replicas within one pod of an even
+  # split across `topology.kubernetes.io/zone`, so a single-AZ
+  # outage never removes more than ceil(replicas/zones) pods.
+  # `whenUnsatisfiable: ScheduleAnyway` is deliberate — it keeps
+  # the constraint a *preference*, so the chart still schedules on
+  # single-AZ clusters (kind/minikube/dev) instead of wedging pods
+  # in Pending. Flip to DoNotSchedule in a values override for a
+  # hard guarantee on a known multi-AZ cluster. The multi-region
+  # overlay (values-multiregion.yaml) tightens both the selector
+  # and the HPA ceiling for failover-target regions.
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels:
+          app.kubernetes.io/name: kmail
+          app.kubernetes.io/component: api
   service:
     type: ClusterIP
     port: 80
@@ -192,6 +211,18 @@ kmailWorker:
   # Distinct from the API's 8080 so a single-binary dev pod could
   # in principle run both without a port clash.
   metricsPort: 8090
+  # Even at replicaCount: 1 this is a no-op, but it means scaling
+  # the worker up (when a queue backs up) automatically spreads the
+  # new replicas across AZs instead of stacking them in one zone.
+  # Same ScheduleAnyway rationale as the API spread above.
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels:
+          app.kubernetes.io/name: kmail
+          app.kubernetes.io/component: worker
   resources:
     limits:
       cpu: 500m
@@ -222,9 +253,53 @@ stalwart:
     tag: v0.16.0
   service:
     headlessName: kmail-stalwart
+  # Spread mail nodes across AZs. Stalwart is a StatefulSet, so each
+  # replica owns a stable identity AND a per-pod PVC; an AZ outage
+  # that took out two co-located mail nodes would drop two shards'
+  # worth of mailboxes at once. `whenUnsatisfiable: ScheduleAnyway`
+  # keeps single-AZ dev clusters working. NOTE: a pod's PVC is bound
+  # to the AZ it first scheduled in (topology-aware volume
+  # provisioning), so after the initial spread Kubernetes keeps each
+  # replica pinned to its zone across restarts.
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels:
+          app.kubernetes.io/name: kmail
+          app.kubernetes.io/component: stalwart
   storage:
     storageClass: ""
+    # --- Stalwart StatefulSet volume sizing (per pod) ---------------
+    # Each Stalwart replica is one mailbox shard and gets its OWN PVC
+    # of this size (volumeClaimTemplates). The blob store (message
+    # bodies + attachments) lives in zk-object-fabric / S3, NOT on
+    # this volume — so this PVC holds Stalwart's metadata store, FTS
+    # index, queue spool, and per-node working set, which is roughly
+    # 5–10% of raw mail volume.
+    #
+    # Sizing rule of thumb (see docs/runbooks/capacity-planning.md and
+    # docs/STALWART_UPGRADE.md):
+    #
+    #   per_pod_GiB ≈ mailboxes_per_shard
+    #                 * avg_msgs_per_mailbox
+    #                 * index_overhead_bytes (~2 KiB/msg)
+    #                 / 1Gi
+    #               + queue_headroom (≥10 GiB)
+    #
+    # For the 5K-tenant / 10-shard target (~500 mailboxes/shard,
+    # ~20k msgs/mailbox) that is ~20 GiB index + spool; 50Gi gives
+    # ~2x headroom for FTS rebuilds and queue spikes. Bump for shards
+    # that host heavy tenants. Use an SSD-backed, topology-aware
+    # `storageClass` with `allowVolumeExpansion: true` so this can be
+    # grown online (resize the PVCs, then `helm upgrade` the size).
     size: 50Gi
+  # Defaults are tuned for the 5K-tenant / 10-shard target (≈500
+  # mailboxes per shard). Stalwart is memory-sensitive (FTS + RocksDB
+  # page cache); see docs/runbooks/capacity-planning.md before
+  # resizing. Requests are deliberately well below limits so a shard
+  # bin-packs efficiently but can burst during FTS rebuilds.
   resources:
     limits:
       cpu: 2000m
@@ -288,3 +363,114 @@ mtls:
   # KMAIL_STALWART_URL goes through a pod-local sidecar or
   # otherwise diverges from the cert DNSName.
   serverName: ""
+
+# ---------------------------------------------------------------------
+# NetworkPolicy — zero-trust pod-to-pod network segmentation.
+# ---------------------------------------------------------------------
+# Renders one NetworkPolicy per component (api / worker / stalwart),
+# each with a default-deny baseline and explicit allow rules. Disabled
+# by default because NetworkPolicy is a no-op on CNIs that don't enforce
+# it (so it gives false confidence) but a HARD OUTAGE on CNIs that do if
+# the allow-list is wrong for your cluster's namespace labels. Turn it
+# on deliberately, after confirming (a) your CNI enforces NetworkPolicy
+# (Calico, Cilium, etc.) and (b) the namespace selectors below match
+# your ingress-controller and monitoring namespaces.
+networkPolicy:
+  enabled: false
+  # Namespace hosting the ingress controller that fronts kmail-api.
+  # The default matches a standard `ingress-nginx` install (the
+  # `kubernetes.io/metadata.name` label is auto-added by Kubernetes
+  # >=1.21). Adjust if your controller lives elsewhere.
+  ingressControllerNamespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: ingress-nginx
+  # Namespace hosting Prometheus / the scraping stack. Used to allow
+  # /metrics scrapes of the api and worker pods.
+  monitoringNamespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: monitoring
+  # Allow Stalwart to receive mail from OUTSIDE the cluster (SMTP 25,
+  # submission 465/587, IMAP 143/993). Required for inbound mail when
+  # a LoadBalancer/NodePort forwards directly to the Stalwart pods.
+  # Set false if all inbound mail is proxied through an in-cluster
+  # gateway you'd rather allow-list explicitly.
+  allowInboundMail: true
+  # Egress posture. Restricting egress is the most common cause of
+  # self-inflicted outages (a missed dependency silently times out),
+  # so it is OFF by default: when false, only the ingress rules above
+  # are enforced and all egress is permitted. Flip to true to also
+  # render egress allow-lists (DNS + the CIDRs / ports below).
+  restrictEgress: false
+  # When restrictEgress=true, CIDR blocks of the managed data services
+  # (Postgres, Valkey, S3/Wasabi, OpenSearch) the api + worker need to
+  # reach. Empty means "allow egress to anywhere on dataServicePorts".
+  dataServiceCIDRs: []
+  # Ports the api/worker egress to managed data services on. Used only
+  # when restrictEgress=true.
+  dataServicePorts:
+    - 5432   # Postgres
+    - 6379   # Valkey / Redis
+    - 443    # S3 / Wasabi / OpenSearch over TLS, OIDC JWKS, Stripe
+    - 9200   # OpenSearch (plaintext, in-VPC)
+  # When restrictEgress=true, still allow DNS resolution (kube-dns).
+  # Effectively mandatory — leave true unless you pin DNS another way.
+  allowDNS: true
+
+# ---------------------------------------------------------------------
+# ServiceMonitor — Prometheus Operator scrape config for api + worker.
+# ---------------------------------------------------------------------
+# Requires the Prometheus Operator CRDs (monitoring.coreos.com/v1) to
+# be installed (kube-prometheus-stack). Disabled by default so the
+# chart still installs on clusters without the operator; the
+# docker-compose dev stack and the static deploy/prometheus/*.yml
+# scrape configs cover non-operator setups.
+serviceMonitor:
+  enabled: false
+  # Scrape interval / timeout. 30s matches the dashboards' rate()
+  # windows; tighten to 15s for higher-resolution SLO burn-rate math.
+  interval: 30s
+  scrapeTimeout: 10s
+  # Extra labels on the ServiceMonitor object. Most kube-prometheus
+  # installs select ServiceMonitors by a `release: <prom-release>`
+  # label — set it here so the operator actually picks this up.
+  labels: {}
+  # Relabelings applied to every scraped series (optional).
+  relabelings: []
+  metricRelabelings: []
+
+# ---------------------------------------------------------------------
+# PrometheusRule — alerting + recording rules as an operator CRD.
+# ---------------------------------------------------------------------
+# Ships the same alert family as deploy/prometheus/alerts.yml PLUS
+# multi-window multi-burn-rate SLO error-budget alerts, as a
+# Prometheus Operator PrometheusRule. Disabled by default (needs the
+# operator CRDs); enable alongside serviceMonitor on an operator
+# cluster.
+prometheusRule:
+  enabled: false
+  labels: {}
+  # Availability SLO target for the error-budget burn-rate alerts.
+  # 0.999 = 99.9% => 0.1% error budget. The burn-rate thresholds
+  # (14.4 / 6 / 3 / 1) are the standard Google SRE multi-window
+  # values scaled to this budget.
+  slo:
+    availabilityTarget: 0.999
+
+# ---------------------------------------------------------------------
+# Grafana dashboards — auto-import via the Grafana sidecar.
+# ---------------------------------------------------------------------
+# Renders the JSON dashboards under deploy/grafana/dashboards/ into a
+# ConfigMap labeled for the Grafana dashboard sidecar
+# (`grafana_dashboard: "1"`), so a kube-prometheus-stack / Grafana
+# Helm install auto-loads them with no manual import. Disabled by
+# default; the compose stack mounts the same JSON directly.
+grafanaDashboards:
+  enabled: false
+  # Label the Grafana dashboard sidecar watches for. Must match your
+  # Grafana install's `sidecar.dashboards.label` (default is
+  # `grafana_dashboard`).
+  sidecarLabel: grafana_dashboard
+  sidecarLabelValue: "1"
+  # Optional: the Grafana folder annotation the sidecar files the
+  # dashboards under.
+  folderAnnotation: "KMail"

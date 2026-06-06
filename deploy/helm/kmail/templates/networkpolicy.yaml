@@ -1,0 +1,206 @@
+{{- /*
+  NetworkPolicy — per-component network segmentation.
+
+  Gated on `networkPolicy.enabled`. Renders:
+    1. a default-deny baseline over every chart pod (ingress always;
+       egress only when restrictEgress=true);
+    2. an allow policy for kmail-api ingress (ingress controller +
+       monitoring scrape);
+    3. an allow policy for kmail-worker ingress (monitoring scrape
+       only — it serves no tenant traffic);
+    4. an allow policy for Stalwart ingress (api + worker over JMAP,
+       plus inbound mail from outside the cluster when allowInboundMail);
+    5. optional egress allow-lists (DNS + managed data services + the
+       in-cluster Stalwart hop) when restrictEgress=true.
+
+  NetworkPolicies are additive within a namespace, so the default-deny
+  baseline + the allow policies compose into the intended posture.
+  Port numbers below are kept in lock-step with the container ports in
+  deployment-api.yaml / worker-deployment.yaml / statefulset-stalwart.yaml.
+*/ -}}
+{{- if .Values.networkPolicy.enabled }}
+{{- $np := .Values.networkPolicy }}
+{{- $apiPort := .Values.kmailApi.service.targetPort }}
+{{- $workerPort := .Values.kmailWorker.metricsPort }}
+# 1. Default-deny baseline for every pod managed by this chart.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "kmail.fullname" . }}-default-deny
+  labels:
+    {{- include "kmail.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "kmail.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    {{- if $np.restrictEgress }}
+    - Egress
+    {{- end }}
+---
+# 2. kmail-api ingress: ingress controller (tenant traffic) + the
+#    monitoring namespace (/metrics scrape), both on the BFF's port.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "kmail.fullname" . }}-api-ingress
+  labels:
+    {{- include "kmail.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "kmail.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: api
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            {{- toYaml $np.ingressControllerNamespaceSelector | nindent 12 }}
+        - namespaceSelector:
+            {{- toYaml $np.monitoringNamespaceSelector | nindent 12 }}
+      ports:
+        - protocol: TCP
+          port: {{ $apiPort }}
+---
+# 3. kmail-worker ingress: monitoring namespace /metrics scrape only.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "kmail.fullname" . }}-worker-ingress
+  labels:
+    {{- include "kmail.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "kmail.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: worker
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            {{- toYaml $np.monitoringNamespaceSelector | nindent 12 }}
+      ports:
+        - protocol: TCP
+          port: {{ $workerPort }}
+---
+# 4. Stalwart ingress: JMAP from api + worker, plus inbound mail.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "kmail.fullname" . }}-stalwart-ingress
+  labels:
+    {{- include "kmail.labels" . | nindent 4 }}
+    app.kubernetes.io/component: stalwart
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "kmail.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: stalwart
+  policyTypes:
+    - Ingress
+  ingress:
+    # JMAP from the BFF and the dispatch workers.
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "kmail.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: api
+        - podSelector:
+            matchLabels:
+              {{- include "kmail.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: worker
+      ports:
+        - protocol: TCP
+          port: 8080
+        {{- if .Values.mtls.enabled }}
+        - protocol: TCP
+          port: 8443
+        {{- end }}
+    {{- if $np.allowInboundMail }}
+    # Inbound mail from outside the cluster (SMTP + IMAP). These map
+    # to the container ports declared in statefulset-stalwart.yaml.
+    - ports:
+        - protocol: TCP
+          port: 25
+        - protocol: TCP
+          port: 143
+    {{- end }}
+{{- if $np.restrictEgress }}
+---
+# 5a. DNS egress for every chart pod (kube-dns).
+{{- if $np.allowDNS }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "kmail.fullname" . }}-allow-dns
+  labels:
+    {{- include "kmail.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "kmail.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Egress
+  egress:
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+{{- end }}
+# 5b. api + worker egress: in-cluster Stalwart + managed data services.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "kmail.fullname" . }}-app-egress
+  labels:
+    {{- include "kmail.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/component
+        operator: In
+        values: ["api", "worker"]
+      - key: app.kubernetes.io/name
+        operator: In
+        values: [{{ include "kmail.name" . | quote }}]
+  policyTypes:
+    - Egress
+  egress:
+    # In-cluster hop to Stalwart (JMAP).
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "kmail.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: stalwart
+      ports:
+        - protocol: TCP
+          port: 8080
+        {{- if .Values.mtls.enabled }}
+        - protocol: TCP
+          port: 8443
+        {{- end }}
+    # Managed data services (Postgres / Valkey / S3 / OpenSearch).
+    - to:
+        {{- if $np.dataServiceCIDRs }}
+        {{- range $cidr := $np.dataServiceCIDRs }}
+        - ipBlock:
+            cidr: {{ $cidr | quote }}
+        {{- end }}
+        {{- else }}
+        - ipBlock:
+            cidr: 0.0.0.0/0
+        {{- end }}
+      ports:
+        {{- range $port := $np.dataServicePorts }}
+        - protocol: TCP
+          port: {{ $port }}
+        {{- end }}
+{{- end }}
+{{- end }}

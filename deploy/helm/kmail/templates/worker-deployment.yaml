@@ -42,6 +42,10 @@ spec:
       {{- end }}
     spec:
       serviceAccountName: {{ include "kmail.serviceAccountName" . }}
+      {{- with .Values.kmailWorker.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: kmail-worker
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
