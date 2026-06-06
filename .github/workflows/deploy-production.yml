@@ -34,7 +34,28 @@ permissions:
   packages: write
 
 jobs:
+  # Fail fast on a malformed partition before spending runner time on a
+  # build. `workflow_dispatch` has no integer input type, so the value
+  # arrives as a free-form string; Kubernetes would otherwise reject a
+  # non-integer partition only at `helm upgrade --atomic` time (after the
+  # build + render). It also keeps the value well-formed before it flows
+  # into `extra_args` (defence-in-depth alongside the env-var hardening
+  # in _helm-deploy.yml).
+  validate:
+    name: Validate inputs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check stalwart_partition is a non-negative integer
+        env:
+          STALWART_PARTITION: ${{ inputs.stalwart_partition }}
+        run: |
+          if ! [[ "$STALWART_PARTITION" =~ ^[0-9]+$ ]]; then
+            echo "::error::stalwart_partition must be a non-negative integer (got '$STALWART_PARTITION')."
+            exit 1
+          fi
+
   build:
+    needs: validate
     uses: ./.github/workflows/_build-and-push.yml
     with:
       image_tag: ${{ inputs.image_tag != '' && inputs.image_tag || github.sha }}
@@ -43,7 +64,7 @@ jobs:
       packages: write
 
   deploy:
-    needs: build
+    needs: [validate, build]
     uses: ./.github/workflows/_helm-deploy.yml
     with:
       environment: production

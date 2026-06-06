@@ -68,7 +68,7 @@ spec:
       subdomain: {{ .Values.stalwart.service.headlessName }}
       {{- with .Values.stalwart.topologySpreadConstraints }}
       topologySpreadConstraints:
-        {{- toYaml . | nindent 8 }}
+        {{- include "kmail.topologySpreadConstraints" (dict "root" $ "component" "stalwart" "constraints" .) | nindent 8 }}
       {{- end }}
       containers:
         - name: stalwart

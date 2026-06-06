@@ -30,7 +30,7 @@ spec:
       serviceAccountName: {{ include "kmail.serviceAccountName" . }}
       {{- with .Values.kmailApi.topologySpreadConstraints }}
       topologySpreadConstraints:
-        {{- toYaml . | nindent 8 }}
+        {{- include "kmail.topologySpreadConstraints" (dict "root" $ "component" "api" "constraints" .) | nindent 8 }}
       {{- end }}
       containers:
         - name: kmail-api
@@ -103,7 +103,9 @@ spec:
             - name: KMAIL_DISABLE_WORKERS
               value: "true"
             {{- if .Values.mtls.enabled }}
-            # When mTLS is enabled the BFF MUST speak HTTPS on
+            {{- if .Values.stalwart.enabled }}
+            # When mTLS is enabled AND this release owns its own
+            # Stalwart StatefulSet, the BFF MUST speak HTTPS on
             # Stalwart's `jmap-tls` listener (port 8443), and the
             # hostname MUST be one of the SANs cert-manager baked
             # into the server certificate (see stalwart-mtls.yaml).
@@ -113,6 +115,17 @@ spec:
             # value carried in envFrom.
             - name: KMAIL_STALWART_URL
               value: {{ printf "https://%s-stalwart-0.%s.%s.svc.cluster.local:8443" (include "kmail.fullname" .) .Values.stalwart.service.headlessName .Release.Namespace | quote }}
+            {{- else }}
+            # stalwart.enabled=false (e.g. the canary): this release
+            # does NOT render a Stalwart StatefulSet, so synthesizing
+            # `https://<thisRelease>-stalwart-0...` would point at a
+            # pod that never exists. We deliberately do NOT emit a
+            # KMAIL_STALWART_URL env override here and instead let the
+            # value flow from the ConfigMap (kmailApi.config), which
+            # the operator MUST point at the EXISTING Stalwart fleet
+            # (and set mtls.serverName / a SAN-covered host so the TLS
+            # handshake against that fleet's server cert verifies).
+            {{- end }}
             - name: KMAIL_STALWART_TLS_CERT
               value: /etc/kmail/tls/stalwart-client/tls.crt
             - name: KMAIL_STALWART_TLS_KEY

@@ -17,6 +17,22 @@ kmailApi:
   replicaCount: 1
   hpa:
     enabled: false
+  config:
+    # The canary runs with stalwart.enabled=false, so the deployment
+    # templates do NOT synthesize an in-chart Stalwart URL (which would
+    # resolve to a non-existent `kmail-canary-kmail-stalwart-0` pod).
+    # We therefore point the canary at the EXISTING production Stalwart
+    # fleet explicitly. This MUST match the production release: the
+    # production deploy uses release `kmail` in namespace `kmail`
+    # (see .github/workflows/deploy-production.yml), so its StatefulSet
+    # pods are `kmail-kmail-stalwart-{0..N}` fronted by the headless
+    # service `kmail-stalwart`. The `.svc.cluster.local` FQDN on the
+    # `jmap-tls` port (8443) is one of the SANs cert-manager bakes into
+    # the production server certificate (see stalwart-mtls.yaml), so the
+    # canary's client cert (issued by the same kmail-internal-ca) can
+    # complete the mTLS handshake. Adjust if your production release
+    # name / namespace differ.
+    KMAIL_STALWART_URL: "https://kmail-kmail-stalwart-0.kmail-stalwart.kmail.svc.cluster.local:8443"
 
 # Canary does not own mailbox storage; it exercises the BFF/control
 # plane against the EXISTING production Stalwart fleet. Disabling the

@@ -41,6 +41,42 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 
 {{/*
+kmail.topologySpreadConstraints renders a list of TopologySpreadConstraint
+entries, injecting a chart-correct `labelSelector` into any entry that does
+not already define one.
+
+WHY: `values.yaml` cannot call template functions, so a hand-written
+`labelSelector.matchLabels` there has to hard-code `app.kubernetes.io/name:
+kmail`. If an operator sets `nameOverride`/`fullnameOverride`, that literal
+no longer matches the labels the chart actually stamps on the pods
+(`kmail.selectorLabels`), so the spread silently selects nothing. By
+defaulting the selector here from `kmail.selectorLabels` + the component, the
+constraint always targets THIS release's pods of THIS component regardless of
+any name override. An operator who supplies their own `labelSelector` in
+values still wins (we only fill it in when absent).
+
+Args (a dict):
+  root        - the root context ($) so we can resolve selectorLabels
+  component   - the app.kubernetes.io/component value to target
+  constraints - the list from values (e.g. .Values.kmailApi.topologySpreadConstraints)
+*/}}
+{{- define "kmail.topologySpreadConstraints" -}}
+{{- $root := .root -}}
+{{- $component := .component -}}
+{{- $out := list -}}
+{{- range .constraints -}}
+{{- $c := deepCopy . -}}
+{{- if not $c.labelSelector -}}
+{{- $labels := fromYaml (include "kmail.selectorLabels" $root) -}}
+{{- $_ := set $labels "app.kubernetes.io/component" $component -}}
+{{- $c = set $c "labelSelector" (dict "matchLabels" $labels) -}}
+{{- end -}}
+{{- $out = append $out $c -}}
+{{- end -}}
+{{- toYaml $out -}}
+{{- end -}}
+
+{{/*
 kmail.multiregionIngressAnnotations renders provider-specific
 ExternalDNS annotations so a single chart install can publish both
 the regional hostname (mail-<region>.<domain>) AND participate in

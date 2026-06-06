@@ -30,6 +30,14 @@ spec:
     # Recording rules: rolling 5xx error ratios at the windows the
     # multi-burn-rate alerts compare against. Computing them once
     # keeps the alert expressions readable and the evaluation cheap.
+    #
+    # The denominator is `clamp_min(..., 1)` so an idle window (zero
+    # request rate) records a 0 ratio instead of NaN (0/0). The
+    # burn-rate alerts behave identically either way (NaN > x and
+    # 0 > x are both false), but keeping the recorded series numeric
+    # matches the Grafana error-budget dashboard (which clamps the
+    # same way) and keeps any future query built on these rules from
+    # inheriting NaN during quiet periods.
     # --------------------------------------------------------------
     - name: kmail.slo.recording
       rules:
@@ -38,7 +46,7 @@ spec:
           expr: |
             sum(rate(kmail_http_requests_total{status=~"5.."}[{{ $w }}]))
             /
-            sum(rate(kmail_http_requests_total[{{ $w }}]))
+            clamp_min(sum(rate(kmail_http_requests_total[{{ $w }}])), 1)
         {{- end }}
 
     # --------------------------------------------------------------

@@ -83,14 +83,18 @@ kmailApi:
   # hard guarantee on a known multi-AZ cluster. The multi-region
   # overlay (values-multiregion.yaml) tightens both the selector
   # and the HPA ceiling for failover-target regions.
+  #
+  # NOTE: no `labelSelector` is set here on purpose. values.yaml can't
+  # call template helpers, so a literal selector would have to hard-code
+  # `app.kubernetes.io/name: kmail` and would break under
+  # nameOverride/fullnameOverride. The chart injects the correct
+  # selector (kmail.selectorLabels + component) at render time via the
+  # `kmail.topologySpreadConstraints` helper. Supply your own
+  # `labelSelector` here to override that default.
   topologySpreadConstraints:
     - maxSkew: 1
       topologyKey: topology.kubernetes.io/zone
       whenUnsatisfiable: ScheduleAnyway
-      labelSelector:
-        matchLabels:
-          app.kubernetes.io/name: kmail
-          app.kubernetes.io/component: api
   service:
     type: ClusterIP
     port: 80
@@ -214,15 +218,13 @@ kmailWorker:
   # Even at replicaCount: 1 this is a no-op, but it means scaling
   # the worker up (when a queue backs up) automatically spreads the
   # new replicas across AZs instead of stacking them in one zone.
-  # Same ScheduleAnyway rationale as the API spread above.
+  # Same ScheduleAnyway rationale as the API spread above. The chart
+  # injects the labelSelector (kmail.selectorLabels + component) at
+  # render time, so this stays correct under nameOverride.
   topologySpreadConstraints:
     - maxSkew: 1
       topologyKey: topology.kubernetes.io/zone
       whenUnsatisfiable: ScheduleAnyway
-      labelSelector:
-        matchLabels:
-          app.kubernetes.io/name: kmail
-          app.kubernetes.io/component: worker
   resources:
     limits:
       cpu: 500m
@@ -274,15 +276,13 @@ stalwart:
   # keeps single-AZ dev clusters working. NOTE: a pod's PVC is bound
   # to the AZ it first scheduled in (topology-aware volume
   # provisioning), so after the initial spread Kubernetes keeps each
-  # replica pinned to its zone across restarts.
+  # replica pinned to its zone across restarts. The chart injects the
+  # labelSelector (kmail.selectorLabels + component) at render time, so
+  # this stays correct under nameOverride.
   topologySpreadConstraints:
     - maxSkew: 1
       topologyKey: topology.kubernetes.io/zone
       whenUnsatisfiable: ScheduleAnyway
-      labelSelector:
-        matchLabels:
-          app.kubernetes.io/name: kmail
-          app.kubernetes.io/component: stalwart
   storage:
     storageClass: ""
     # --- Stalwart StatefulSet volume sizing (per pod) ---------------

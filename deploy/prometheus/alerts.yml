@@ -181,43 +181,47 @@ groups:
   # cheap and readable. severity=page burns route to PagerDuty per
   # alertmanager.tmpl.yml.
   # ------------------------------------------------------------------
+  # The denominator is clamp_min(..., 1) so idle windows record a 0
+  # ratio instead of NaN (0/0). Burn-rate alerts behave the same either
+  # way, but this keeps the recorded series numeric and consistent with
+  # the Grafana error-budget dashboard. Mirror of the chart PrometheusRule.
   - name: kmail-slo-recording
     rules:
       - record: kmail:http_error_ratio:rate5m
         expr: |
           sum(rate(kmail_http_requests_total{status=~"5.."}[5m]))
           /
-          sum(rate(kmail_http_requests_total[5m]))
+          clamp_min(sum(rate(kmail_http_requests_total[5m])), 1)
       - record: kmail:http_error_ratio:rate30m
         expr: |
           sum(rate(kmail_http_requests_total{status=~"5.."}[30m]))
           /
-          sum(rate(kmail_http_requests_total[30m]))
+          clamp_min(sum(rate(kmail_http_requests_total[30m])), 1)
       - record: kmail:http_error_ratio:rate1h
         expr: |
           sum(rate(kmail_http_requests_total{status=~"5.."}[1h]))
           /
-          sum(rate(kmail_http_requests_total[1h]))
+          clamp_min(sum(rate(kmail_http_requests_total[1h])), 1)
       - record: kmail:http_error_ratio:rate2h
         expr: |
           sum(rate(kmail_http_requests_total{status=~"5.."}[2h]))
           /
-          sum(rate(kmail_http_requests_total[2h]))
+          clamp_min(sum(rate(kmail_http_requests_total[2h])), 1)
       - record: kmail:http_error_ratio:rate6h
         expr: |
           sum(rate(kmail_http_requests_total{status=~"5.."}[6h]))
           /
-          sum(rate(kmail_http_requests_total[6h]))
+          clamp_min(sum(rate(kmail_http_requests_total[6h])), 1)
       - record: kmail:http_error_ratio:rate1d
         expr: |
           sum(rate(kmail_http_requests_total{status=~"5.."}[1d]))
           /
-          sum(rate(kmail_http_requests_total[1d]))
+          clamp_min(sum(rate(kmail_http_requests_total[1d])), 1)
       - record: kmail:http_error_ratio:rate3d
         expr: |
           sum(rate(kmail_http_requests_total{status=~"5.."}[3d]))
           /
-          sum(rate(kmail_http_requests_total[3d]))
+          clamp_min(sum(rate(kmail_http_requests_total[3d])), 1)
 
   - name: kmail-slo-burnrate
     rules:

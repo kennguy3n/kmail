@@ -44,7 +44,7 @@ spec:
       serviceAccountName: {{ include "kmail.serviceAccountName" . }}
       {{- with .Values.kmailWorker.topologySpreadConstraints }}
       topologySpreadConstraints:
-        {{- toYaml . | nindent 8 }}
+        {{- include "kmail.topologySpreadConstraints" (dict "root" $ "component" "worker" "constraints" .) | nindent 8 }}
       {{- end }}
       containers:
         - name: kmail-worker
@@ -88,8 +88,16 @@ spec:
             - name: KMAIL_DISABLE_WORKERS
               value: "true"
             {{- if .Values.mtls.enabled }}
+            {{- if .Values.stalwart.enabled }}
+            # See deployment-api.yaml for the full rationale: only
+            # synthesize the in-chart Stalwart FQDN when this release
+            # actually owns the StatefulSet. When stalwart.enabled=false
+            # (the canary) we fall through to the ConfigMap value so the
+            # dispatch workers reach the EXISTING Stalwart fleet instead
+            # of a non-existent <thisRelease>-stalwart-0 pod.
             - name: KMAIL_STALWART_URL
               value: {{ printf "https://%s-stalwart-0.%s.%s.svc.cluster.local:8443" (include "kmail.fullname" .) .Values.stalwart.service.headlessName .Release.Namespace | quote }}
+            {{- end }}
             - name: KMAIL_STALWART_TLS_CERT
               value: /etc/kmail/tls/stalwart-client/tls.crt
             - name: KMAIL_STALWART_TLS_KEY

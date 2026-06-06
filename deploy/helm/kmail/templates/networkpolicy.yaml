@@ -9,7 +9,10 @@
     3. an allow policy for kmail-worker ingress (monitoring scrape
        only — it serves no tenant traffic);
     4. an allow policy for Stalwart ingress (api + worker over JMAP,
-       plus inbound mail from outside the cluster when allowInboundMail);
+       plus inbound mail from outside the cluster when allowInboundMail)
+       — only when this release owns its Stalwart fleet
+       (`stalwart.enabled`); a control-plane-only release like the
+       canary has no stalwart pods for it to select;
     5. optional egress allow-lists (DNS + managed data services + the
        in-cluster Stalwart hop) when restrictEgress=true.
 
@@ -87,8 +90,13 @@ spec:
       ports:
         - protocol: TCP
           port: {{ $workerPort }}
+{{- if .Values.stalwart.enabled }}
 ---
 # 4. Stalwart ingress: JMAP from api + worker, plus inbound mail.
+#    Gated on `stalwart.enabled` so a control-plane-only release (the
+#    canary) doesn't emit a policy selecting stalwart pods that this
+#    release never renders — mirroring the StatefulSet, headless
+#    Service, and server-cert gating.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -130,6 +138,7 @@ spec:
         - protocol: TCP
           port: 143
     {{- end }}
+{{- end }}
 {{- if $np.restrictEgress }}
 ---
 # 5a. DNS egress for every chart pod (kube-dns).
