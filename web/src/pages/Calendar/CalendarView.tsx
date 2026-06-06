@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 
+import { cn } from "../../lib/cn";
+
 import { jmapClient } from "../../api/jmap";
 import type {
   Calendar,
@@ -221,43 +223,41 @@ export default function CalendarView() {
   }, []);
 
   return (
-    <section style={styles.root}>
-      <aside style={styles.sidebar}>
-        <div style={styles.sidebarHeader}>
-          <h2 style={styles.sidebarTitle}>Calendar</h2>
+    <section className={styles.root}>
+      <aside className={styles.sidebar}>
+        <div className={styles.sidebarHeader}>
+          <h2 className={styles.sidebarTitle}>Calendar</h2>
           <button
             type="button"
             onClick={() => navigate("/calendar/new")}
-            style={styles.newEventButton}
+            className={styles.newEventButton}
           >
             New event
           </button>
         </div>
         {isLoadingCalendars ? (
-          <p style={styles.muted}>Loading calendars…</p>
+          <p className={styles.muted}>Loading calendars…</p>
         ) : (calendars ?? []).length === 0 ? (
-          <p style={styles.muted}>No calendars.</p>
+          <p className={styles.muted}>No calendars.</p>
         ) : (
-          <ul style={styles.calendarList}>
+          <ul className={styles.calendarList}>
             {(calendars ?? []).map((c) => {
               const checked = visibility[c.id] ?? c.isVisible;
               return (
-                <li key={c.id} style={styles.calendarItem}>
-                  <label style={styles.calendarLabel}>
+                <li key={c.id} className={styles.calendarItem}>
+                  <label className={styles.calendarLabel}>
                     <input
                       type="checkbox"
                       checked={checked}
                       onChange={() => handleToggleCalendar(c.id)}
                     />
                     <span
-                      style={{
-                        ...styles.colorSwatch,
-                        background: c.color || "#6366f1",
-                      }}
+                      className={styles.colorSwatch}
+                      style={{ background: c.color || "#6366f1" }}
                     />
                     <span>{c.name}</span>
                     {c.isDefault && (
-                      <span style={styles.defaultBadge}>default</span>
+                      <span className={styles.defaultBadge}>default</span>
                     )}
                   </label>
                 </li>
@@ -266,23 +266,23 @@ export default function CalendarView() {
           </ul>
         )}
       </aside>
-      <main style={styles.main}>
-        <header style={styles.toolbar}>
-          <div style={styles.toolbarLeft}>
-            <button type="button" onClick={goPrev} style={styles.navButton}>
+      <main className={styles.main}>
+        <header className={styles.toolbar}>
+          <div className={styles.toolbarLeft}>
+            <button type="button" onClick={goPrev} className={styles.navButton}>
               ‹
             </button>
-            <button type="button" onClick={goToday} style={styles.todayButton}>
+            <button type="button" onClick={goToday} className={styles.todayButton}>
               Today
             </button>
-            <button type="button" onClick={goNext} style={styles.navButton}>
+            <button type="button" onClick={goNext} className={styles.navButton}>
               ›
             </button>
-            <span style={styles.rangeLabel}>
+            <span className={styles.rangeLabel}>
               {formatRange(viewMode, anchor, range)}
             </span>
           </div>
-          <div style={styles.viewToggle} role="tablist" aria-label="View mode">
+          <div className={styles.viewToggle} role="tablist" aria-label="View mode">
             {(["day", "week", "month"] as const).map((mode) => (
               <button
                 key={mode}
@@ -290,10 +290,10 @@ export default function CalendarView() {
                 role="tab"
                 aria-selected={viewMode === mode}
                 onClick={() => setViewMode(mode)}
-                style={{
-                  ...styles.viewToggleButton,
-                  ...(viewMode === mode ? styles.viewToggleButtonActive : {}),
-                }}
+                className={cn(
+                  styles.viewToggleButton,
+                  viewMode === mode && styles.viewToggleButtonActive,
+                )}
               >
                 {mode[0].toUpperCase() + mode.slice(1)}
               </button>
@@ -301,19 +301,19 @@ export default function CalendarView() {
           </div>
         </header>
         {error && (
-          <div style={styles.error} role="alert">
+          <div className={styles.error} role="alert">
             <span>{error}</span>
             <button
               type="button"
               onClick={() => setError(null)}
-              style={styles.errorDismiss}
+              className={styles.errorDismiss}
               aria-label="Dismiss error"
             >
               ×
             </button>
           </div>
         )}
-        {isLoadingEvents && <p style={styles.muted}>Loading events…</p>}
+        {isLoadingEvents && <p className={styles.muted}>Loading events…</p>}
         {viewMode === "month" ? (
           <MonthGrid
             anchor={anchor}
@@ -386,18 +386,16 @@ function TimeGrid({
 
   return (
     <div
-      style={{
-        ...styles.timeGrid,
-        gridTemplateColumns: `60px repeat(${days.length}, 1fr)`,
-      }}
+      className={styles.timeGrid}
+      style={{ gridTemplateColumns: `60px repeat(${days.length}, 1fr)` }}
     >
-      <div style={styles.timeGutterHeader} />
+      <div className={styles.timeGutterHeader} />
       {days.map((d) => (
-        <div key={dayKey(d)} style={styles.dayHeader}>
-          <div style={styles.dayHeaderDow}>
+        <div key={dayKey(d)} className={styles.dayHeader}>
+          <div className={styles.dayHeaderDow}>
             {d.toLocaleDateString(undefined, { weekday: "short" })}
           </div>
-          <div style={styles.dayHeaderDom}>{d.getDate()}</div>
+          <div className={styles.dayHeaderDom}>{d.getDate()}</div>
         </div>
       ))}
       {hours.map((h) => (
@@ -434,7 +432,7 @@ function Row({
 }: RowProps) {
   return (
     <>
-      <div style={styles.timeGutter}>{formatHour(hour)}</div>
+      <div className={styles.timeGutter}>{formatHour(hour)}</div>
       {days.map((d) => {
         const slotStart = new Date(d);
         slotStart.setHours(hour, 0, 0, 0);
@@ -448,7 +446,7 @@ function Row({
             key={`${dayKey(d)}-${hour}`}
             type="button"
             onClick={() => onSlotClick(slotStart)}
-            style={styles.timeSlot}
+            className={styles.timeSlot}
             aria-label={`Create event at ${slotStart.toLocaleString()}`}
           >
             {hits.map((ev) => (
@@ -489,13 +487,11 @@ function EventChip({ event, color, onClick }: EventChipProps) {
           onClick(e as unknown as React.MouseEvent);
         }
       }}
-      style={{
-        ...styles.eventChip,
-        background: color ?? "#6366f1",
-      }}
+      className={styles.eventChip}
+      style={{ background: color ?? "#6366f1" }}
     >
-      <span style={styles.eventChipTitle}>{event.title}</span>
-      <span style={styles.eventChipTime}>
+      <span className={styles.eventChipTitle}>{event.title}</span>
+      <span className={styles.eventChipTime}>
         {formatTime(start)}–{formatTime(end)}
       </span>
     </span>
@@ -550,9 +546,9 @@ function MonthGrid({
   }, []);
   const monthIndex = anchor.getMonth();
   return (
-    <div style={styles.monthGrid}>
+    <div className={styles.monthGrid}>
       {weekdays.map((w) => (
-        <div key={w} style={styles.monthHeader}>
+        <div key={w} className={styles.monthHeader}>
           {w}
         </div>
       ))}
@@ -564,13 +560,10 @@ function MonthGrid({
             key={d.toISOString()}
             type="button"
             onClick={() => onDayClick(startOfDay(d))}
-            style={{
-              ...styles.monthCell,
-              ...(inMonth ? {} : styles.monthCellOut),
-            }}
+            className={cn(styles.monthCell, !inMonth && styles.monthCellOut)}
           >
-            <span style={styles.monthDom}>{d.getDate()}</span>
-            <span style={styles.monthEvents}>
+            <span className={styles.monthDom}>{d.getDate()}</span>
+            <span className={styles.monthEvents}>
               {hits.slice(0, 3).map((ev) => (
                 <span
                   key={ev.id}
@@ -587,8 +580,8 @@ function MonthGrid({
                       onEventClick(ev);
                     }
                   }}
+                  className={styles.monthEventChip}
                   style={{
-                    ...styles.monthEventChip,
                     background: colorByCalendar.get(ev.calendarId) ?? "#6366f1",
                   }}
                 >
@@ -596,7 +589,7 @@ function MonthGrid({
                 </span>
               ))}
               {hits.length > 3 && (
-                <span style={styles.monthMore}>+{hits.length - 3} more</span>
+                <span className={styles.monthMore}>+{hits.length - 3} more</span>
               )}
             </span>
           </button>
@@ -626,87 +619,85 @@ function EventDetailsPanel({
   const start = new Date(event.start);
   const end = new Date(event.end);
   return (
-    <aside style={styles.detailsPanel} aria-label="Event details">
-      <div style={styles.detailsHeader}>
-        <h3 style={styles.detailsTitle}>{event.title}</h3>
+    <aside className={styles.detailsPanel} aria-label="Event details">
+      <div className={styles.detailsHeader}>
+        <h3 className={styles.detailsTitle}>{event.title}</h3>
         <button
           type="button"
           onClick={onClose}
-          style={styles.detailsClose}
+          className={styles.detailsClose}
           aria-label="Close event details"
         >
           ×
         </button>
       </div>
-      <p style={styles.detailsRow}>
+      <p className={styles.detailsRow}>
         <strong>When: </strong>
         {start.toLocaleString()} – {end.toLocaleString()}
       </p>
       {calendar && (
-        <p style={styles.detailsRow}>
+        <p className={styles.detailsRow}>
           <strong>Calendar: </strong>
           <span
-            style={{
-              ...styles.colorSwatch,
-              background: calendar.color || "#6366f1",
-            }}
+            className={styles.colorSwatch}
+            style={{ background: calendar.color || "#6366f1" }}
           />
           {calendar.name}
         </p>
       )}
       {event.location && (
-        <p style={styles.detailsRow}>
+        <p className={styles.detailsRow}>
           <strong>Location: </strong>
           {event.location}
         </p>
       )}
       {event.description && (
-        <p style={styles.detailsRow}>
+        <p className={styles.detailsRow}>
           <strong>Description: </strong>
           {event.description}
         </p>
       )}
       {event.participants && event.participants.length > 0 && (
-        <div style={styles.detailsRow}>
+        <div className={styles.detailsRow}>
           <strong>Participants:</strong>
-          <ul style={styles.participantList}>
+          <ul className={styles.participantList}>
             {event.participants.map((p) => (
               <li key={p.email}>
                 {p.name ? `${p.name} <${p.email}>` : p.email}
-                {p.rsvp && <span style={styles.rsvpBadge}> — {p.rsvp}</span>}
+                {p.rsvp && <span className={styles.rsvpBadge}> — {p.rsvp}</span>}
               </li>
             ))}
           </ul>
         </div>
       )}
-      <div style={styles.detailsActions}>
+      <div className={styles.detailsActions}>
         <button
           type="button"
           onClick={() => onRsvp("accepted")}
-          style={styles.rsvpAccept}
+          className={styles.rsvpAccept}
         >
           Accept
         </button>
         <button
           type="button"
           onClick={() => onRsvp("tentative")}
-          style={styles.rsvpTentative}
+          className={styles.rsvpTentative}
         >
           Tentative
         </button>
         <button
           type="button"
           onClick={() => onRsvp("declined")}
-          style={styles.rsvpDecline}
+          className={styles.rsvpDecline}
         >
           Decline
         </button>
       </div>
-      <div style={styles.detailsActions}>
-        <button type="button" onClick={onEdit} style={styles.editButton}>
+      <div className={styles.detailsActions}>
+        <button type="button" onClick={onEdit} className={styles.editButton}>
           Edit
         </button>
-        <button type="button" onClick={onDelete} style={styles.deleteButton}>
+        <button type="button" onClick={onDelete} className={styles.deleteButton}>
           Delete
         </button>
       </div>
@@ -807,372 +798,82 @@ function errorMessage(err: unknown): string {
   return "Unknown error";
 }
 
-const styles: Record<string, React.CSSProperties> = {
-  root: {
-    display: "grid",
-    gridTemplateColumns: "220px 1fr",
-    minHeight: "calc(100vh - 4rem)",
-    gap: "1rem",
-    position: "relative",
-  },
-  sidebar: {
-    borderRight: "1px solid #e5e7eb",
-    padding: "1rem",
-    background: "#f9fafb",
-  },
-  sidebarHeader: {
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "space-between",
-    marginBottom: "0.75rem",
-  },
-  sidebarTitle: {
-    margin: 0,
-    fontSize: "1.1rem",
-  },
-  newEventButton: {
-    padding: "0.25rem 0.5rem",
-    fontSize: "0.85rem",
-    background: "#2563eb",
-    color: "#fff",
-    border: "none",
-    borderRadius: "0.25rem",
-    cursor: "pointer",
-  },
-  calendarList: {
-    listStyle: "none",
-    margin: 0,
-    padding: 0,
-    display: "flex",
-    flexDirection: "column",
-    gap: "0.25rem",
-  },
-  calendarItem: {
-    padding: "0.25rem 0",
-  },
-  calendarLabel: {
-    display: "flex",
-    alignItems: "center",
-    gap: "0.4rem",
-    fontSize: "0.9rem",
-    cursor: "pointer",
-  },
-  colorSwatch: {
-    display: "inline-block",
-    width: "0.75rem",
-    height: "0.75rem",
-    borderRadius: "0.15rem",
-    verticalAlign: "middle",
-    marginRight: "0.25rem",
-  },
-  defaultBadge: {
-    fontSize: "0.7rem",
-    color: "#6b7280",
-    marginLeft: "auto",
-  },
-  main: {
-    padding: "1rem",
-    minWidth: 0,
-  },
-  toolbar: {
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "space-between",
-    marginBottom: "0.75rem",
-    gap: "0.75rem",
-    flexWrap: "wrap",
-  },
-  toolbarLeft: {
-    display: "flex",
-    alignItems: "center",
-    gap: "0.5rem",
-  },
-  navButton: {
-    padding: "0.25rem 0.5rem",
-    fontSize: "1rem",
-    background: "#fff",
-    border: "1px solid #d1d5db",
-    borderRadius: "0.25rem",
-    cursor: "pointer",
-    lineHeight: 1,
-  },
-  todayButton: {
-    padding: "0.3rem 0.75rem",
-    fontSize: "0.85rem",
-    background: "#fff",
-    border: "1px solid #d1d5db",
-    borderRadius: "0.25rem",
-    cursor: "pointer",
-  },
-  rangeLabel: {
-    marginLeft: "0.5rem",
-    fontSize: "1rem",
-    fontWeight: 600,
-    color: "#111827",
-  },
-  viewToggle: {
-    display: "inline-flex",
-    border: "1px solid #d1d5db",
-    borderRadius: "0.25rem",
-    overflow: "hidden",
-  },
-  viewToggleButton: {
-    padding: "0.3rem 0.75rem",
-    fontSize: "0.85rem",
-    background: "#fff",
-    border: "none",
-    cursor: "pointer",
-    borderRight: "1px solid #d1d5db",
-  },
-  viewToggleButtonActive: {
-    background: "#dbeafe",
-    fontWeight: 600,
-  },
-  error: {
-    padding: "0.5rem 0.75rem",
-    background: "#fee2e2",
-    color: "#991b1b",
-    borderRadius: "0.25rem",
-    marginBottom: "0.75rem",
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "space-between",
-    gap: "0.5rem",
-  },
-  errorDismiss: {
-    background: "transparent",
-    border: "none",
-    color: "#991b1b",
-    fontSize: "1.1rem",
-    cursor: "pointer",
-    lineHeight: 1,
-    padding: "0 0.25rem",
-  },
-  muted: {
-    color: "#6b7280",
-    fontStyle: "italic",
-  },
-  timeGrid: {
-    display: "grid",
-    border: "1px solid #e5e7eb",
-    borderRadius: "0.25rem",
-    overflow: "hidden",
-    background: "#fff",
-  },
-  timeGutterHeader: {
-    borderBottom: "1px solid #e5e7eb",
-    background: "#f9fafb",
-  },
-  dayHeader: {
-    padding: "0.4rem",
-    textAlign: "center",
-    borderBottom: "1px solid #e5e7eb",
-    borderLeft: "1px solid #e5e7eb",
-    background: "#f9fafb",
-  },
-  dayHeaderDow: {
-    fontSize: "0.75rem",
-    color: "#6b7280",
-    textTransform: "uppercase",
-  },
-  dayHeaderDom: {
-    fontSize: "1rem",
-    fontWeight: 600,
-  },
-  timeGutter: {
-    padding: "0.25rem 0.4rem",
-    fontSize: "0.7rem",
-    color: "#6b7280",
-    textAlign: "right",
-    borderBottom: "1px solid #f3f4f6",
-    borderRight: "1px solid #e5e7eb",
-  },
-  timeSlot: {
-    minHeight: "2.5rem",
-    borderLeft: "1px solid #e5e7eb",
-    borderBottom: "1px solid #f3f4f6",
-    padding: "0.2rem",
-    background: "#fff",
-    textAlign: "left",
-    cursor: "pointer",
-    font: "inherit",
-    position: "relative",
-    display: "flex",
-    flexDirection: "column",
-    gap: "0.15rem",
-  },
-  eventChip: {
-    display: "flex",
-    flexDirection: "column",
-    padding: "0.2rem 0.35rem",
-    borderRadius: "0.2rem",
-    color: "#fff",
-    fontSize: "0.75rem",
-    cursor: "pointer",
-    lineHeight: 1.2,
-  },
-  eventChipTitle: {
-    fontWeight: 600,
-    overflow: "hidden",
-    textOverflow: "ellipsis",
-    whiteSpace: "nowrap",
-  },
-  eventChipTime: {
-    fontSize: "0.65rem",
-    opacity: 0.9,
-  },
-  monthGrid: {
-    display: "grid",
-    gridTemplateColumns: "repeat(7, 1fr)",
-    gridAutoRows: "minmax(5rem, 1fr)",
-    border: "1px solid #e5e7eb",
-    borderRadius: "0.25rem",
-    overflow: "hidden",
-    background: "#fff",
-  },
-  monthHeader: {
-    padding: "0.4rem",
-    fontSize: "0.75rem",
-    color: "#6b7280",
-    textTransform: "uppercase",
-    textAlign: "center",
-    background: "#f9fafb",
-    borderBottom: "1px solid #e5e7eb",
-    borderLeft: "1px solid #e5e7eb",
-  },
-  monthCell: {
-    padding: "0.25rem",
-    borderLeft: "1px solid #e5e7eb",
-    borderTop: "1px solid #f3f4f6",
-    background: "#fff",
-    textAlign: "left",
-    cursor: "pointer",
-    font: "inherit",
-    display: "flex",
-    flexDirection: "column",
-    gap: "0.15rem",
-  },
-  monthCellOut: {
-    background: "#f9fafb",
-    color: "#9ca3af",
-  },
-  monthDom: {
-    fontSize: "0.85rem",
-    fontWeight: 600,
-  },
-  monthEvents: {
-    display: "flex",
-    flexDirection: "column",
-    gap: "0.15rem",
-  },
-  monthEventChip: {
-    fontSize: "0.7rem",
-    color: "#fff",
-    padding: "0.1rem 0.3rem",
-    borderRadius: "0.2rem",
-    overflow: "hidden",
-    textOverflow: "ellipsis",
-    whiteSpace: "nowrap",
-    cursor: "pointer",
-  },
-  monthMore: {
-    fontSize: "0.7rem",
-    color: "#6b7280",
-  },
-  detailsPanel: {
-    position: "fixed",
-    right: "1rem",
-    top: "5rem",
-    width: "320px",
-    maxHeight: "calc(100vh - 6rem)",
-    overflowY: "auto",
-    background: "#fff",
-    border: "1px solid #e5e7eb",
-    borderRadius: "0.5rem",
-    boxShadow: "0 10px 25px rgba(0,0,0,0.1)",
-    padding: "1rem",
-    zIndex: 50,
-  },
-  detailsHeader: {
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "space-between",
-    marginBottom: "0.5rem",
-  },
-  detailsTitle: {
-    margin: 0,
-    fontSize: "1.1rem",
-  },
-  detailsClose: {
-    background: "transparent",
-    border: "none",
-    fontSize: "1.25rem",
-    cursor: "pointer",
-    lineHeight: 1,
-  },
-  detailsRow: {
-    fontSize: "0.85rem",
-    margin: "0.25rem 0",
-  },
-  participantList: {
-    listStyle: "none",
-    margin: "0.25rem 0 0",
-    padding: 0,
-    fontSize: "0.85rem",
-  },
-  rsvpBadge: {
-    fontSize: "0.75rem",
-    color: "#6b7280",
-    fontStyle: "italic",
-  },
-  detailsActions: {
-    display: "flex",
-    gap: "0.4rem",
-    marginTop: "0.75rem",
-  },
-  rsvpAccept: {
-    padding: "0.3rem 0.6rem",
-    fontSize: "0.8rem",
-    background: "#16a34a",
-    color: "#fff",
-    border: "none",
-    borderRadius: "0.25rem",
-    cursor: "pointer",
-  },
-  rsvpTentative: {
-    padding: "0.3rem 0.6rem",
-    fontSize: "0.8rem",
-    background: "#f59e0b",
-    color: "#fff",
-    border: "none",
-    borderRadius: "0.25rem",
-    cursor: "pointer",
-  },
-  rsvpDecline: {
-    padding: "0.3rem 0.6rem",
-    fontSize: "0.8rem",
-    background: "#dc2626",
-    color: "#fff",
-    border: "none",
-    borderRadius: "0.25rem",
-    cursor: "pointer",
-  },
-  editButton: {
-    padding: "0.3rem 0.6rem",
-    fontSize: "0.8rem",
-    background: "#2563eb",
-    color: "#fff",
-    border: "none",
-    borderRadius: "0.25rem",
-    cursor: "pointer",
-  },
-  deleteButton: {
-    padding: "0.3rem 0.6rem",
-    fontSize: "0.8rem",
-    background: "#fff",
-    color: "#991b1b",
-    border: "1px solid #fecaca",
-    borderRadius: "0.25rem",
-    cursor: "pointer",
-  },
+/** Theme-aware Tailwind class recipes for the calendar view. */
+const styles: Record<string, string> = {
+  root: "relative grid min-h-[calc(100vh-4rem)] grid-cols-[220px_1fr] gap-4",
+  sidebar: "border-r border-border bg-surface-muted p-4",
+  sidebarHeader: "mb-3 flex items-center justify-between",
+  sidebarTitle: "m-0 text-lg font-semibold",
+  newEventButton:
+    "cursor-pointer rounded-md border-0 bg-primary px-2 py-1 text-sm font-medium text-primary-fg transition-colors hover:bg-primary-hover",
+  calendarList: "m-0 flex list-none flex-col gap-1 p-0",
+  calendarItem: "py-1",
+  calendarLabel: "flex cursor-pointer items-center gap-1.5 text-sm",
+  colorSwatch: "mr-1 inline-block size-3 rounded-sm align-middle",
+  defaultBadge: "ml-auto text-xs text-fg-muted",
+  main: "min-w-0 p-4",
+  toolbar: "mb-3 flex flex-wrap items-center justify-between gap-3",
+  toolbarLeft: "flex items-center gap-2",
+  navButton:
+    "cursor-pointer rounded-md border border-border bg-surface px-2 py-1 leading-none transition-colors hover:bg-surface-hover",
+  todayButton:
+    "cursor-pointer rounded-md border border-border bg-surface px-3 py-1.5 text-sm transition-colors hover:bg-surface-hover",
+  rangeLabel: "ml-2 text-base font-semibold text-fg",
+  viewToggle:
+    "inline-flex overflow-hidden rounded-md border border-border",
+  viewToggleButton:
+    "cursor-pointer border-0 border-r border-border bg-surface px-3 py-1.5 text-sm transition-colors last:border-r-0 hover:bg-surface-hover",
+  viewToggleButtonActive: "bg-primary-subtle font-semibold text-primary",
+  error:
+    "mb-3 flex items-center justify-between gap-2 rounded-md bg-danger-bg px-3 py-2 text-danger-fg",
+  errorDismiss:
+    "cursor-pointer border-0 bg-transparent px-1 text-lg leading-none text-danger-fg",
+  muted: "italic text-fg-muted",
+  timeGrid:
+    "grid overflow-hidden rounded-md border border-border bg-surface",
+  timeGutterHeader: "border-b border-border bg-surface-muted",
+  dayHeader:
+    "border-b border-l border-border bg-surface-muted p-1.5 text-center",
+  dayHeaderDow: "text-xs uppercase text-fg-muted",
+  dayHeaderDom: "text-base font-semibold",
+  timeGutter:
+    "border-b border-r border-border px-1.5 py-1 text-right text-xs text-fg-muted",
+  timeSlot:
+    "relative flex min-h-10 cursor-pointer flex-col gap-0.5 border-b border-l border-border bg-surface p-1 text-left font-[inherit] transition-colors hover:bg-surface-hover",
+  eventChip:
+    "flex cursor-pointer flex-col rounded-sm px-1.5 py-1 text-xs leading-tight text-white",
+  eventChipTitle: "overflow-hidden text-ellipsis whitespace-nowrap font-semibold",
+  eventChipTime: "text-[0.65rem] opacity-90",
+  monthGrid:
+    "grid auto-rows-[minmax(5rem,1fr)] grid-cols-7 overflow-hidden rounded-md border border-border bg-surface",
+  monthHeader:
+    "border-b border-l border-border bg-surface-muted p-1.5 text-center text-xs uppercase text-fg-muted",
+  monthCell:
+    "flex cursor-pointer flex-col gap-0.5 border-l border-t border-border bg-surface p-1 text-left font-[inherit] transition-colors hover:bg-surface-hover",
+  monthCellOut: "bg-surface-muted text-fg-subtle",
+  monthDom: "text-sm font-semibold",
+  monthEvents: "flex flex-col gap-0.5",
+  monthEventChip:
+    "cursor-pointer overflow-hidden text-ellipsis whitespace-nowrap rounded-sm px-1.5 py-0.5 text-xs text-white",
+  monthMore: "text-xs text-fg-muted",
+  detailsPanel:
+    "fixed right-4 top-20 z-modal max-h-[calc(100vh-6rem)] w-80 overflow-y-auto rounded-lg border border-border bg-elevated p-4 shadow-lg",
+  detailsHeader: "mb-2 flex items-center justify-between",
+  detailsTitle: "m-0 text-lg font-semibold",
+  detailsClose:
+    "cursor-pointer border-0 bg-transparent text-xl leading-none text-fg-muted hover:text-fg",
+  detailsRow: "my-1 text-sm",
+  participantList: "m-0 mt-1 list-none p-0 text-sm",
+  rsvpBadge: "text-xs italic text-fg-muted",
+  detailsActions: "mt-3 flex gap-1.5",
+  rsvpAccept:
+    "cursor-pointer rounded-md border-0 bg-success px-2.5 py-1 text-xs text-white transition-opacity hover:opacity-90",
+  rsvpTentative:
+    "cursor-pointer rounded-md border-0 bg-warning px-2.5 py-1 text-xs text-white transition-opacity hover:opacity-90",
+  rsvpDecline:
+    "cursor-pointer rounded-md border-0 bg-danger px-2.5 py-1 text-xs text-white transition-opacity hover:opacity-90",
+  editButton:
+    "cursor-pointer rounded-md border-0 bg-primary px-2.5 py-1 text-xs font-medium text-primary-fg transition-colors hover:bg-primary-hover",
+  deleteButton:
+    "cursor-pointer rounded-md border border-danger/40 bg-surface px-2.5 py-1 text-xs text-danger-fg transition-colors hover:bg-danger-bg",
 };
