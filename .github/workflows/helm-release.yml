@@ -57,15 +57,21 @@ jobs:
 
       - name: Log in to GHCR
         if: ${{ github.event_name != 'workflow_dispatch' || !inputs.dry_run }}
+        env:
+          HELM_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HELM_USER: ${{ github.actor }}
         run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" \
-            | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
+          echo "$HELM_TOKEN" \
+            | helm registry login ghcr.io -u "$HELM_USER" --password-stdin
 
       - name: Push chart to GHCR
         if: ${{ github.event_name != 'workflow_dispatch' || !inputs.dry_run }}
+        env:
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+          CHART_PACKAGE: ${{ steps.pkg.outputs.package }}
         run: |
-          owner="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
-          helm push "${{ steps.pkg.outputs.package }}" "oci://ghcr.io/${owner}/charts"
+          owner="$(echo "$REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
+          helm push "$CHART_PACKAGE" "oci://ghcr.io/${owner}/charts"
 
       - name: Upload chart artifact
         uses: actions/upload-artifact@v4

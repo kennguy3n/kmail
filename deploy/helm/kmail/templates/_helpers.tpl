@@ -70,7 +70,14 @@ Three cases:
 {{- $fullname := required "stalwart.external.fullname is required when stalwart.external.enabled=true (the kmail.fullname of the release that owns the Stalwart fleet, e.g. release `kmail` => `kmail-kmail`)" $s.external.fullname -}}
 {{- $svc := $s.external.headlessName | default $s.service.headlessName -}}
 {{- $ns := $s.external.namespace | default .Release.Namespace -}}
-{{- $ordinal := $s.external.ordinal | default 0 -}}
+{{- /* hasKey, not `| default 0`: `default` treats the int zero-value as
+       absent, so an explicit `ordinal: 0` would silently re-take the default.
+       That's harmless while the default IS 0, but fragile if it ever changes,
+       so resolve presence explicitly (mirrors the multiregion dnsWeight helper). */ -}}
+{{- $ordinal := 0 -}}
+{{- if hasKey $s.external "ordinal" -}}
+{{- $ordinal = $s.external.ordinal -}}
+{{- end -}}
 {{- printf "https://%s-stalwart-%v.%s.%s.svc.cluster.local:8443" $fullname $ordinal $svc $ns -}}
 {{- end -}}
 {{- end -}}

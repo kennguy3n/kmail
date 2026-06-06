@@ -223,6 +223,13 @@ spec:
           port: 8443
         {{- end }}
     # Managed data services (Postgres / Valkey / S3 / OpenSearch).
+    # Gated on a non-empty dataServicePorts: a k8s egress rule whose `ports`
+    # list is empty means "all ports", so emitting this rule with
+    # dataServicePorts=[] would silently widen egress to EVERY port on the
+    # (default 0.0.0.0/0) destination — the opposite of the restrictEgress
+    # intent. When an operator clears the port list we therefore drop the rule
+    # entirely and fail CLOSED (no data-service egress) rather than fail open.
+    {{- if $np.dataServicePorts }}
     - to:
         {{- if $np.dataServiceCIDRs }}
         {{- range $cidr := $np.dataServiceCIDRs }}
@@ -238,5 +245,6 @@ spec:
         - protocol: TCP
           port: {{ $port }}
         {{- end }}
+    {{- end }}
 {{- end }}
 {{- end }}
