@@ -68,6 +68,66 @@ func TestTenantCRUDLifecycleDB(t *testing.T) {
 	}
 }
 
+func TestTenantAliasesDB(t *testing.T) {
+	pool := testsupport.Pool(t)
+	svc := NewService(pool)
+	ctx := context.Background()
+	u := uniq()
+
+	tn, err := svc.CreateTenant(ctx, CreateTenantInput{Name: "Al " + u, Slug: "al-" + u, Plan: "pro"})
+	if err != nil {
+		t.Fatalf("CreateTenant: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM tenants WHERE id=$1::uuid`, tn.ID)
+	})
+	usr, err := svc.CreateUser(ctx, tn.ID, CreateUserInput{
+		KChatUserID: "kc-" + u, StalwartAccountID: "sw-" + u,
+		Email: "owner-" + u + "@example.com", DisplayName: "Owner",
+	})
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+
+	// invalid alias address rejected
+	if _, err := svc.CreateAlias(ctx, tn.ID, CreateAliasInput{UserID: usr.ID, AliasEmail: "not-an-email"}); !errors.Is(err, ErrInvalidInput) {
+		t.Errorf("bad alias: want ErrInvalidInput got %v", err)
+	}
+	// unknown user rejected
+	if _, err := svc.CreateAlias(ctx, tn.ID, CreateAliasInput{
+		UserID: "00000000-0000-0000-0000-000000000000", AliasEmail: "x-" + u + "@example.com",
+	}); !errors.Is(err, ErrNotFound) {
+		t.Errorf("unknown user: want ErrNotFound got %v", err)
+	}
+
+	a, err := svc.CreateAlias(ctx, tn.ID, CreateAliasInput{UserID: usr.ID, AliasEmail: "Alias-" + u + "@Example.com"})
+	if err != nil {
+		t.Fatalf("CreateAlias: %v", err)
+	}
+	if a.AliasEmail != "alias-"+u+"@example.com" {
+		t.Errorf("alias not normalized: %q", a.AliasEmail)
+	}
+
+	// duplicate alias rejected
+	if _, err := svc.CreateAlias(ctx, tn.ID, CreateAliasInput{UserID: usr.ID, AliasEmail: "alias-" + u + "@example.com"}); !errors.Is(err, ErrAliasInUse) {
+		t.Errorf("dup alias: want ErrAliasInUse got %v", err)
+	}
+
+	if all, err := svc.ListAliases(ctx, tn.ID); err != nil || len(all) != 1 {
+		t.Fatalf("ListAliases=%d err=%v", len(all), err)
+	}
+	if mine, err := svc.ListUserAliases(ctx, tn.ID, usr.ID); err != nil || len(mine) != 1 {
+		t.Fatalf("ListUserAliases=%d err=%v", len(mine), err)
+	}
+
+	if err := svc.DeleteAlias(ctx, tn.ID, a.ID); err != nil {
+		t.Fatalf("DeleteAlias: %v", err)
+	}
+	if err := svc.DeleteAlias(ctx, tn.ID, a.ID); !errors.Is(err, ErrNotFound) {
+		t.Errorf("DeleteAlias twice: want ErrNotFound got %v", err)
+	}
+}
+
 func TestTenantUsersDomainsInboxesDB(t *testing.T) {
 	pool := testsupport.Pool(t)
 	svc := NewService(pool)
