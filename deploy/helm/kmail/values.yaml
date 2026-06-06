@@ -251,6 +251,14 @@ stalwart:
   image:
     repository: stalwartlabs/stalwart
     tag: v0.16.0
+  # StatefulSet update strategy. RollingUpdate + a `partition` powers the
+  # progressive, ordinal-by-ordinal fleet upgrade in
+  # docs/runbooks/stalwart-upgrade.md: set `partition` to N so only pods
+  # with ordinal >= N are rolled, canary the highest ordinal, then walk
+  # `partition` down to 0. partition: 0 (default) rolls every pod.
+  updateStrategy:
+    type: RollingUpdate
+    partition: 0
   service:
     headlessName: kmail-stalwart
   # Spread mail nodes across AZs. Stalwart is a StatefulSet, so each

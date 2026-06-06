@@ -32,6 +32,16 @@ metadata:
 spec:
   serviceName: {{ .Values.stalwart.service.headlessName }}
   replicas: {{ .Values.stalwart.replicaCount }}
+  # RollingUpdate with a configurable partition drives the progressive,
+  # ordinal-by-ordinal shard upgrade in docs/runbooks/stalwart-upgrade.md:
+  # only pods with ordinal >= updatePartition are rolled, so an operator
+  # can canary a single shard then walk the partition down to 0.
+  updateStrategy:
+    type: {{ .Values.stalwart.updateStrategy.type }}
+    {{- if eq .Values.stalwart.updateStrategy.type "RollingUpdate" }}
+    rollingUpdate:
+      partition: {{ .Values.stalwart.updateStrategy.partition }}
+    {{- end }}
   selector:
     matchLabels:
       {{- include "kmail.selectorLabels" . | nindent 6 }}
