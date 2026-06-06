@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
+import { cn } from "../../lib/cn";
 import { searchGlobalAddressList } from "../../api/contacts";
 import type { GalEntry } from "../../types";
 import { useDebouncedValue } from "./useDebouncedValue";
@@ -28,7 +29,8 @@ export interface ContactPickerProps {
   placeholder?: string;
   required?: boolean;
   ariaLabel?: string;
-  inputStyle?: React.CSSProperties;
+  /** Extra Tailwind classes merged onto the text input. */
+  inputClassName?: string;
 }
 
 /** Split the field into the committed prefix and the active token. */
@@ -62,7 +64,7 @@ export default function ContactPicker({
   placeholder,
   required,
   ariaLabel,
-  inputStyle,
+  inputClassName,
 }: ContactPickerProps) {
   const [open, setOpen] = useState(false);
   const [suggestions, setSuggestions] = useState<GalEntry[]>([]);
@@ -144,7 +146,7 @@ export default function ContactPicker({
   };
 
   return (
-    <div ref={containerRef} style={styles.wrap}>
+    <div ref={containerRef} className="relative flex-1">
       <input
         id={id}
         type="text"
@@ -159,10 +161,16 @@ export default function ContactPicker({
         role="combobox"
         aria-expanded={open}
         aria-autocomplete="list"
-        style={{ ...styles.input, ...inputStyle }}
+        className={cn(
+          "box-border w-full rounded-md border border-border bg-surface px-2.5 py-1.5 text-sm text-fg outline-none focus-visible:border-primary focus-visible:ring-2 focus-visible:ring-primary-subtle",
+          inputClassName,
+        )}
       />
       {open && suggestions.length > 0 && (
-        <ul style={styles.dropdown} role="listbox">
+        <ul
+          className="absolute inset-x-0 top-full z-dropdown m-0 mt-0.5 max-h-[260px] list-none overflow-y-auto rounded-lg border border-border bg-elevated p-1 shadow-lg"
+          role="listbox"
+        >
           {suggestions.map((entry, i) => (
             <li key={entry.email} role="option" aria-selected={i === activeIndex}>
               <button
@@ -173,20 +181,25 @@ export default function ContactPicker({
                   e.preventDefault();
                   choose(entry);
                 }}
-                style={{
-                  ...styles.option,
-                  ...(i === activeIndex ? styles.optionActive : {}),
-                }}
+                className={cn(
+                  "flex w-full cursor-pointer items-center gap-2 rounded-md border-0 bg-transparent px-2 py-1.5 text-left transition-colors hover:bg-surface-hover",
+                  i === activeIndex && "bg-surface-hover",
+                )}
               >
-                <span style={styles.avatar} aria-hidden="true">
+                <span
+                  className="inline-flex size-7 shrink-0 items-center justify-center rounded-pill bg-primary text-[0.7rem] font-bold text-primary-fg"
+                  aria-hidden="true"
+                >
                   {initials(entry)}
                 </span>
-                <span style={styles.optionText}>
-                  <span style={styles.optionName}>
+                <span className="flex flex-col overflow-hidden">
+                  <span className="truncate text-sm text-fg">
                     {entry.display_name || entry.email}
                   </span>
                   {entry.display_name && (
-                    <span style={styles.optionEmail}>{entry.email}</span>
+                    <span className="truncate text-xs text-fg-muted">
+                      {entry.email}
+                    </span>
                   )}
                 </span>
               </button>
@@ -194,83 +207,10 @@ export default function ContactPicker({
           ))}
         </ul>
       )}
-      {loading && <span style={styles.loading}>…</span>}
+      {loading && (
+        <span className="absolute right-2 top-1.5 text-sm text-fg-subtle">…</span>
+      )}
     </div>
   );
 }
 
-const styles: Record<string, React.CSSProperties> = {
-  wrap: { position: "relative", flex: 1 },
-  input: {
-    width: "100%",
-    padding: "0.4rem 0.6rem",
-    fontSize: "0.9rem",
-    border: "1px solid #d1d5db",
-    borderRadius: "0.25rem",
-    boxSizing: "border-box",
-  },
-  dropdown: {
-    position: "absolute",
-    zIndex: 20,
-    top: "100%",
-    left: 0,
-    right: 0,
-    margin: "0.15rem 0 0",
-    padding: "0.25rem",
-    listStyle: "none",
-    background: "#fff",
-    border: "1px solid #d1d5db",
-    borderRadius: "0.375rem",
-    boxShadow: "0 6px 18px rgba(0,0,0,0.12)",
-    maxHeight: "260px",
-    overflowY: "auto",
-  },
-  option: {
-    display: "flex",
-    alignItems: "center",
-    gap: "0.5rem",
-    width: "100%",
-    padding: "0.35rem 0.5rem",
-    background: "transparent",
-    border: "none",
-    borderRadius: "0.25rem",
-    cursor: "pointer",
-    textAlign: "left",
-  },
-  optionActive: { background: "#eff6ff" },
-  avatar: {
-    display: "inline-flex",
-    alignItems: "center",
-    justifyContent: "center",
-    width: "1.75rem",
-    height: "1.75rem",
-    borderRadius: "999px",
-    background: "#2563eb",
-    color: "#fff",
-    fontSize: "0.7rem",
-    fontWeight: 700,
-    flexShrink: 0,
-  },
-  optionText: { display: "flex", flexDirection: "column", overflow: "hidden" },
-  optionName: {
-    fontSize: "0.85rem",
-    color: "#111827",
-    overflow: "hidden",
-    textOverflow: "ellipsis",
-    whiteSpace: "nowrap",
-  },
-  optionEmail: {
-    fontSize: "0.75rem",
-    color: "#6b7280",
-    overflow: "hidden",
-    textOverflow: "ellipsis",
-    whiteSpace: "nowrap",
-  },
-  loading: {
-    position: "absolute",
-    right: "0.5rem",
-    top: "0.4rem",
-    color: "#9ca3af",
-    fontSize: "0.9rem",
-  },
-};

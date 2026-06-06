@@ -228,7 +228,7 @@ export default function ContactsView() {
         )}
       </div>
 
-      <div role="tablist" style={{ display: "flex", gap: "0.5rem", marginBottom: "1rem" }}>
+      <div role="tablist" className="mb-4 flex gap-2">
         <button
           role="tab"
           aria-selected={tab === "personal"}
@@ -258,15 +258,15 @@ export default function ContactsView() {
       {loading && <p>Loading…</p>}
 
       {tab === "personal" ? (
-        <div style={{ display: "flex", gap: "1rem" }}>
-          <div style={{ flex: 1 }}>
-            <div style={{ display: "flex", gap: "0.5rem", marginBottom: "0.5rem" }}>
+        <div className="flex gap-4">
+          <div className="flex-1">
+            <div className="mb-2 flex gap-2">
               <input
                 type="search"
                 placeholder="Search contacts..."
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
-                style={{ flex: 1 }}
+                className="flex-1"
               />
               {allGroups.length > 0 && (
                 <select value={groupFilter} onChange={(e) => setGroupFilter(e.target.value)}>
@@ -277,7 +277,7 @@ export default function ContactsView() {
                 </select>
               )}
             </div>
-            <div style={{ display: "flex", gap: "0.5rem", marginBottom: "0.5rem" }}>
+            <div className="mb-2 flex gap-2">
               <button onClick={() => startEdit(null)}>+ New contact</button>
               <button onClick={() => fileInputRef.current?.click()}>Import vCard</button>
               <button onClick={onExport} disabled={!bookId || contacts.length === 0}>
@@ -287,7 +287,7 @@ export default function ContactsView() {
                 ref={fileInputRef}
                 type="file"
                 accept=".vcf,text/vcard"
-                style={{ display: "none" }}
+                className="hidden"
                 onChange={(e) => {
                   const f = e.target.files?.[0];
                   if (f) onImportFile(f);
@@ -303,7 +303,7 @@ export default function ContactsView() {
                       <img
                         src={c.photoUrl}
                         alt=""
-                        style={{ width: 24, height: 24, borderRadius: "50%", marginRight: 8, verticalAlign: "middle" }}
+                        className="mr-2 inline-block size-6 rounded-full align-middle"
                       />
                     )}
                     <strong>{c.fn}</strong>
@@ -319,8 +319,8 @@ export default function ContactsView() {
             </ul>
           </div>
 
-          <div style={{ flex: 1 }}>
-            <form onSubmit={onSave} style={{ display: "grid", gap: "0.5rem" }}>
+          <div className="flex-1">
+            <form onSubmit={onSave} className="grid gap-2">
               <h3>{editing ? "Edit contact" : "New contact"}</h3>
               <label>
                 Full name
@@ -378,7 +378,7 @@ export default function ContactsView() {
                   onChange={(e) => setDraft({ ...draft, note: e.target.value })}
                 />
               </label>
-              <div style={{ display: "flex", gap: "0.5rem" }}>
+              <div className="flex gap-2">
                 <button type="submit">{editing ? "Save" : "Create"}</button>
                 {editing && (
                   <button type="button" onClick={() => confirmDelete(editing)}>
@@ -396,13 +396,13 @@ export default function ContactsView() {
         </div>
       ) : (
         <div>
-          <div style={{ display: "flex", gap: "0.5rem", marginBottom: "0.5rem" }}>
+          <div className="mb-2 flex gap-2">
             <input
               type="search"
               placeholder="Search the directory..."
               value={galQuery}
               onChange={(e) => setGalQuery(e.target.value)}
-              style={{ flex: 1 }}
+              className="flex-1"
             />
             <button onClick={loadGAL}>Refresh</button>
           </div>
@@ -426,7 +426,7 @@ export default function ContactsView() {
             <p>
               Delete <strong>{pendingDelete.fn}</strong>? This cannot be undone.
             </p>
-            <div style={{ display: "flex", gap: "0.5rem" }}>
+            <div className="flex gap-2">
               <button onClick={onDeleteConfirmed}>Delete</button>
               <button onClick={() => setPendingDelete(null)}>Cancel</button>
             </div>

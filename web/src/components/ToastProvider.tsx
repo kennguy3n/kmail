@@ -11,7 +11,6 @@ import type { ReactNode } from "react";
 
 import { Toast } from "./ui/Toast";
 import type { ToastData, ToastVariant } from "./ui/Toast";
-import styles from "./ToastProvider.module.css";
 
 export interface ToastOptions {
   /** Provide to deduplicate / update an existing toast. */
@@ -175,7 +174,11 @@ export function ToastProvider({
           announcements. Wrapping role="alert" toasts inside a polite
           live region made some screen readers (e.g. NVDA) announce
           twice. The container is a positioning/grouping element only. */}
-      <div className={styles.viewport} role="region" aria-label="Notifications">
+      <div
+        className="pointer-events-none fixed inset-x-4 bottom-[calc(1rem+env(safe-area-inset-bottom,0px))] z-toast flex flex-col items-stretch gap-2 sm:inset-x-auto sm:bottom-auto sm:right-4 sm:top-4 sm:items-end"
+        role="region"
+        aria-label="Notifications"
+      >
         {toasts.map((t) => (
           <Toast key={t.id} toast={t} onDismiss={dismiss} />
         ))}

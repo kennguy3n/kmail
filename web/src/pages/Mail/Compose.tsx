@@ -7,6 +7,8 @@ import {
 } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 
+import { cn } from "../../lib/cn";
+
 import {
   ATTACHMENT_LINK_THRESHOLD_BYTES,
   jmapClient,
@@ -682,17 +684,17 @@ export default function Compose() {
         : "New message";
 
   return (
-    <section style={styles.root}>
-      <header style={styles.header}>
-        <h2 style={styles.title}>{heading}</h2>
+    <section className={styles.root}>
+      <header className={styles.header}>
+        <h2 className={styles.title}>{heading}</h2>
       </header>
       {error && (
-        <div style={styles.error} role="alert">
+        <div className={styles.error} role="alert">
           <span>{error}</span>
           <button
             type="button"
             onClick={() => setError(null)}
-            style={styles.errorDismiss}
+            className={styles.errorDismiss}
             aria-label="Dismiss error"
           >
             ×
@@ -700,12 +702,12 @@ export default function Compose() {
         </div>
       )}
       {successMessage && (
-        <div style={styles.success} role="status">
+        <div className={styles.success} role="status">
           {successMessage}
         </div>
       )}
       {pendingSend && (
-        <div style={styles.undoBanner} role="status" aria-live="polite">
+        <div className={styles.undoBanner} role="status" aria-live="polite">
           <span>
             Sending in {Math.ceil(remainingMs / 1000)}s…
           </span>
@@ -713,7 +715,7 @@ export default function Compose() {
             type="button"
             onClick={handleCancelUndoSend}
             disabled={isCancelling}
-            style={styles.undoCancel}
+            className={styles.undoCancel}
             data-testid="undo-send-cancel"
           >
             {isCancelling ? "Cancelling…" : "Undo"}
@@ -722,7 +724,7 @@ export default function Compose() {
       )}
       {scheduledConfirm && (
         <div
-          style={styles.scheduledBanner}
+          className={styles.scheduledBanner}
           role="status"
           aria-live="polite"
           data-testid="scheduled-send-confirm"
@@ -733,23 +735,23 @@ export default function Compose() {
             <button
               type="button"
               onClick={() => navigate("/mail/scheduled")}
-              style={styles.linkButton}
+              className={styles.linkButton}
             >
               View scheduled sends
             </button>
           </span>
         </div>
       )}
-      <form onSubmit={handleSend} style={styles.form}>
-        <div style={styles.row}>
-          <label htmlFor="compose-from" style={styles.label}>
+      <form onSubmit={handleSend} className={styles.form}>
+        <div className={styles.row}>
+          <label htmlFor="compose-from" className={styles.label}>
             From
           </label>
           <select
             id="compose-from"
             value={selectedIdentityId}
             onChange={(e) => setSelectedIdentityId(e.target.value)}
-            style={styles.select}
+            className={styles.select}
             disabled={!identities || identities.length === 0}
           >
             {(identities ?? []).length === 0 ? (
@@ -763,15 +765,15 @@ export default function Compose() {
             )}
           </select>
         </div>
-        <div style={styles.row}>
-          <label htmlFor="compose-signature" style={styles.label}>
+        <div className={styles.row}>
+          <label htmlFor="compose-signature" className={styles.label}>
             Signature
           </label>
           <select
             id="compose-signature"
             value={signatureId}
             onChange={(e) => setSignatureId(e.target.value)}
-            style={styles.select}
+            className={styles.select}
           >
             <option value="">No signature</option>
             {signatures.map((s) => (
@@ -782,8 +784,8 @@ export default function Compose() {
             ))}
           </select>
         </div>
-        <div style={styles.row}>
-          <label htmlFor="compose-to" style={styles.label}>
+        <div className={styles.row}>
+          <label htmlFor="compose-to" className={styles.label}>
             To
           </label>
           <ContactPicker
@@ -794,11 +796,11 @@ export default function Compose() {
             placeholder="name@example.com, other@example.com"
             required
             ariaLabel="To recipients"
-            inputStyle={styles.input}
+            inputClassName={styles.input}
           />
         </div>
-        <div style={styles.row}>
-          <label htmlFor="compose-cc" style={styles.label}>
+        <div className={styles.row}>
+          <label htmlFor="compose-cc" className={styles.label}>
             Cc
           </label>
           <ContactPicker
@@ -807,11 +809,11 @@ export default function Compose() {
             onChange={setCc}
             tenantId={selectedTenantId}
             ariaLabel="Cc recipients"
-            inputStyle={styles.input}
+            inputClassName={styles.input}
           />
         </div>
-        <div style={styles.row}>
-          <label htmlFor="compose-bcc" style={styles.label}>
+        <div className={styles.row}>
+          <label htmlFor="compose-bcc" className={styles.label}>
             Bcc
           </label>
           <ContactPicker
@@ -820,30 +822,21 @@ export default function Compose() {
             onChange={setBcc}
             tenantId={selectedTenantId}
             ariaLabel="Bcc recipients"
-            inputStyle={styles.input}
+            inputClassName={styles.input}
           />
         </div>
         {/* WS7: frequent contacts + co-recipient suggestions */}
         {(frequentContacts.length > 0 || coRecipients.length > 0) && (
-          <div style={{ ...styles.row, flexWrap: "wrap", gap: 4 }}>
-            <span style={{ ...styles.label, alignSelf: "flex-start", marginTop: 4 }}>
+          <div className={cn(styles.row, "flex-wrap gap-1")}>
+            <span className={cn(styles.label, "mt-1 self-start")}>
               Suggestions
             </span>
-            <div style={{ display: "flex", flexWrap: "wrap", gap: 4, flex: 1 }}>
+            <div className="flex flex-1 flex-wrap gap-1">
               {frequentContacts.map((c) => (
                 <button
                   key={c.email}
                   type="button"
-                  style={{
-                    padding: "2px 10px",
-                    fontSize: "0.8rem",
-                    border: "1px solid #c2d9fd",
-                    borderRadius: 12,
-                    background: "#e8f0fe",
-                    color: "#1a73e8",
-                    cursor: "pointer",
-                    whiteSpace: "nowrap",
-                  }}
+                  className="cursor-pointer whitespace-nowrap rounded-pill border border-primary/30 bg-primary-subtle px-2.5 py-0.5 text-xs text-primary"
                   onClick={() => {
                     const cur = to.trim();
                     setTo(cur ? `${cur}, ${c.email}` : c.email);
@@ -856,16 +849,7 @@ export default function Compose() {
                 <button
                   key={c.email}
                   type="button"
-                  style={{
-                    padding: "2px 10px",
-                    fontSize: "0.8rem",
-                    border: "1px solid #d4edda",
-                    borderRadius: 12,
-                    background: "#e8f5e9",
-                    color: "#2e7d32",
-                    cursor: "pointer",
-                    whiteSpace: "nowrap",
-                  }}
+                  className="cursor-pointer whitespace-nowrap rounded-pill border border-success/30 bg-success-bg px-2.5 py-0.5 text-xs text-success-fg"
                   onClick={() => {
                     const cur = cc.trim();
                     setCc(cur ? `${cur}, ${c.email}` : c.email);
@@ -877,8 +861,8 @@ export default function Compose() {
             </div>
           </div>
         )}
-        <div style={styles.row}>
-          <label htmlFor="compose-subject" style={styles.label}>
+        <div className={styles.row}>
+          <label htmlFor="compose-subject" className={styles.label}>
             Subject
           </label>
           <input
@@ -886,18 +870,18 @@ export default function Compose() {
             type="text"
             value={subject}
             onChange={(e) => setSubject(e.target.value)}
-            style={styles.input}
+            className={styles.input}
           />
         </div>
-        <div style={styles.row}>
-          <label htmlFor="compose-privacy" style={styles.label}>
+        <div className={styles.row}>
+          <label htmlFor="compose-privacy" className={styles.label}>
             Privacy
           </label>
           <select
             id="compose-privacy"
             value={privacyMode}
             onChange={(e) => setPrivacyMode(e.target.value as PrivacyMode)}
-            style={styles.select}
+            className={styles.select}
           >
             <option value="standard">Standard Private Mail</option>
             <option value="confidential-send">Confidential Send</option>
@@ -905,9 +889,9 @@ export default function Compose() {
           </select>
         </div>
         {privacyMode === "confidential-send" && (
-          <div style={styles.row}>
-            <label style={styles.label}>Secure portal</label>
-            <div style={{ display: "grid", gap: "0.5rem" }}>
+          <div className={styles.row}>
+            <label className={styles.label}>Secure portal</label>
+            <div className="grid gap-2">
               <label>
                 Expires in&nbsp;
                 <select
@@ -968,24 +952,24 @@ export default function Compose() {
           </div>
         )}
         {secureLink && (
-          <div style={styles.row}>
-            <label style={styles.label}>Secure link</label>
-            <div style={{ display: "grid", gap: "0.25rem" }}>
-              <code style={{ wordBreak: "break-all" }}>{secureLink}</code>
+          <div className={styles.row}>
+            <label className={styles.label}>Secure link</label>
+            <div className="grid gap-1">
+              <code className="break-all">{secureLink}</code>
               <div>
                 <button type="button" onClick={onCopyLink}>
                   {linkCopied ? "Copied!" : "Copy link"}
                 </button>
               </div>
-              <p style={{ margin: 0, color: "#475569", fontSize: "0.85rem" }}>
+              <p className="m-0 text-sm text-fg-muted">
                 Share this link with the recipient. The portal enforces
                 expiry, password, and max-views automatically.
               </p>
             </div>
           </div>
         )}
-        <div style={styles.row}>
-          <label style={styles.label}>Attachments</label>
+        <div className={styles.row}>
+          <label className={styles.label}>Attachments</label>
           <div>
             <input
               type="file"
@@ -1001,10 +985,10 @@ export default function Compose() {
             />
             {fileUploading && <span>&nbsp;Uploading…</span>}
             {attachments.filter((a) => !a.inline).length > 0 && (
-              <ul style={styles.attachmentList}>
+              <ul className={styles.attachmentList}>
                 {attachments.map((a, i) =>
                   a.inline ? null : (
-                    <li key={a.blobId || `att-${i}`} style={styles.attachmentItem}>
+                    <li key={a.blobId || `att-${i}`} className={styles.attachmentItem}>
                       <span>
                         {a.name}
                         {typeof a.size === "number"
@@ -1014,7 +998,7 @@ export default function Compose() {
                       <button
                         type="button"
                         onClick={() => removeAttachment(i)}
-                        style={styles.attachmentRemove}
+                        className={styles.attachmentRemove}
                         aria-label={`Remove ${a.name}`}
                       >
                         ×
@@ -1024,8 +1008,8 @@ export default function Compose() {
                 )}
               </ul>
             )}
-            <details style={styles.largeFileDetails}>
-              <summary style={styles.largeFileSummary}>
+            <details className={styles.largeFileDetails}>
+              <summary className={styles.largeFileSummary}>
                 Send a large file as a link (over 10 MB)
               </summary>
               <input
@@ -1077,7 +1061,7 @@ export default function Compose() {
               />
               {attachmentUploading && <span>&nbsp;Uploading…</span>}
               {attachmentLinks.length > 0 && (
-                <ul style={{ margin: "0.25rem 0 0", paddingLeft: "1.2rem" }}>
+                <ul className="mt-1 pl-[1.2rem]">
                   {attachmentLinks.map((a) => (
                     <li key={a.id || a.url}>
                       {a.filename} ({Math.round(a.size_bytes / 1024 / 1024)} MB)
@@ -1087,17 +1071,17 @@ export default function Compose() {
               )}
             </details>
             {attachmentError && (
-              <p role="alert" style={{ color: "#991b1b", margin: "0.25rem 0 0" }}>
+              <p role="alert" className="mt-1 text-danger-fg">
                 {attachmentError}
               </p>
             )}
           </div>
         </div>
-        <div style={styles.composeToolbar}>
+        <div className={styles.composeToolbar}>
           <button
             type="button"
             onClick={toggleBodyMode}
-            style={styles.toolbarButton}
+            className={styles.toolbarButton}
           >
             {bodyMode === "rich" ? "Switch to plain text" : "Switch to rich text"}
           </button>
@@ -1107,11 +1091,11 @@ export default function Compose() {
               setTemplates(listTemplates());
               setTemplatePickerOpen(true);
             }}
-            style={styles.toolbarButton}
+            className={styles.toolbarButton}
           >
             Insert template
           </button>
-          <label style={styles.receiptLabel}>
+          <label className={styles.receiptLabel}>
             <input
               type="checkbox"
               checked={requestReceipt}
@@ -1121,10 +1105,7 @@ export default function Compose() {
           </label>
         </div>
         <div
-          style={{
-            ...styles.bodyRow,
-            ...(isDragging ? styles.bodyRowDragging : null),
-          }}
+          className={cn(styles.bodyRow, isDragging && styles.bodyRowDragging)}
           onDragOver={(e) => {
             if (e.dataTransfer.types.includes("Files")) {
               e.preventDefault();
@@ -1149,23 +1130,22 @@ export default function Compose() {
               value={body}
               onChange={(e) => setBody(e.target.value)}
               placeholder="Write your message…"
-              style={styles.textarea}
+              className={styles.textarea}
               rows={16}
             />
           )}
           {isDragging && (
-            <div style={styles.dropHint}>Drop files to attach</div>
+            <div className={styles.dropHint}>Drop files to attach</div>
           )}
         </div>
-        <div style={styles.buttonRow}>
+        <div className={styles.buttonRow}>
           <button
             type="submit"
             disabled={!canSubmit}
-            style={{
-              ...styles.primaryButton,
-              opacity: canSubmit ? 1 : 0.6,
-              cursor: canSubmit ? "pointer" : "not-allowed",
-            }}
+            className={cn(
+              styles.primaryButton,
+              !canSubmit && "cursor-not-allowed opacity-60",
+            )}
             data-testid="compose-send"
           >
             {isSending
@@ -1179,7 +1159,7 @@ export default function Compose() {
             value={sendMode}
             onChange={(e) => setSendMode(e.target.value as "now" | "schedule")}
             disabled={isSending}
-            style={styles.secondarySelect}
+            className={styles.secondarySelect}
             data-testid="compose-send-mode"
           >
             <option value="now">Send now</option>
@@ -1192,7 +1172,7 @@ export default function Compose() {
               value={scheduleAtLocal}
               onChange={(e) => setScheduleAtLocal(e.target.value)}
               disabled={isSending}
-              style={styles.scheduleInput}
+              className={styles.scheduleInput}
               data-testid="compose-schedule-at"
             />
           )}
@@ -1200,14 +1180,14 @@ export default function Compose() {
             type="button"
             onClick={handleSaveDraft}
             disabled={isSending || isSavingDraft || !draftsMailbox}
-            style={styles.secondaryButton}
+            className={styles.secondaryButton}
           >
             {isSavingDraft ? "Saving…" : "Save draft"}
           </button>
           <button
             type="button"
             onClick={() => navigate(-1)}
-            style={styles.secondaryButton}
+            className={styles.secondaryButton}
             disabled={isSending}
           >
             Cancel
@@ -1453,240 +1433,61 @@ function parseLocalDatetime(raw: string): Date | null {
   return d;
 }
 
-const styles: Record<string, React.CSSProperties> = {
-  root: {
-    padding: "1rem",
-    maxWidth: "900px",
-  },
-  header: {
-    marginBottom: "0.75rem",
-  },
-  title: {
-    margin: 0,
-    fontSize: "1.25rem",
-  },
-  form: {
-    display: "flex",
-    flexDirection: "column",
-    gap: "0.5rem",
-    border: "1px solid #e5e7eb",
-    borderRadius: "0.5rem",
-    padding: "1rem",
-    background: "#fff",
-  },
-  row: {
-    display: "grid",
-    gridTemplateColumns: "80px 1fr",
-    alignItems: "center",
-    gap: "0.5rem",
-  },
-  bodyRow: {
-    display: "flex",
-    flexDirection: "column",
-    marginTop: "0.25rem",
-    position: "relative",
-  },
-  bodyRowDragging: {
-    outline: "2px dashed #2563eb",
-    outlineOffset: "2px",
-    borderRadius: "0.25rem",
-  },
-  dropHint: {
-    position: "absolute",
-    inset: 0,
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    background: "rgba(37,99,235,0.08)",
-    color: "#1d4ed8",
-    fontWeight: 600,
-    pointerEvents: "none",
-    borderRadius: "0.25rem",
-  },
-  composeToolbar: {
-    display: "flex",
-    alignItems: "center",
-    gap: "0.5rem",
-    flexWrap: "wrap",
-    marginTop: "0.5rem",
-  },
-  toolbarButton: {
-    padding: "0.35rem 0.7rem",
-    fontSize: "0.8rem",
-    background: "#fff",
-    border: "1px solid #d1d5db",
-    borderRadius: "0.25rem",
-    cursor: "pointer",
-    color: "#374151",
-  },
-  receiptLabel: {
-    fontSize: "0.82rem",
-    color: "#374151",
-    display: "inline-flex",
-    alignItems: "center",
-    marginLeft: "auto",
-  },
-  attachmentList: {
-    listStyle: "none",
-    margin: "0.4rem 0 0",
-    padding: 0,
-    display: "grid",
-    gap: "0.25rem",
-  },
-  attachmentItem: {
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "space-between",
-    gap: "0.5rem",
-    fontSize: "0.83rem",
-    background: "#f3f4f6",
-    borderRadius: "0.25rem",
-    padding: "0.25rem 0.5rem",
-  },
-  attachmentRemove: {
-    border: "none",
-    background: "none",
-    color: "#6b7280",
-    cursor: "pointer",
-    fontSize: "1rem",
-    lineHeight: 1,
-  },
-  largeFileDetails: {
-    marginTop: "0.5rem",
-    fontSize: "0.83rem",
-  },
-  largeFileSummary: {
-    cursor: "pointer",
-    color: "#6b7280",
-  },
-  label: {
-    fontSize: "0.85rem",
-    color: "#374151",
-    fontWeight: 600,
-  },
-  input: {
-    padding: "0.4rem 0.5rem",
-    fontSize: "0.9rem",
-    border: "1px solid #d1d5db",
-    borderRadius: "0.25rem",
-  },
-  select: {
-    padding: "0.4rem 0.5rem",
-    fontSize: "0.9rem",
-    border: "1px solid #d1d5db",
-    borderRadius: "0.25rem",
-    background: "#fff",
-  },
-  textarea: {
-    padding: "0.6rem",
-    fontSize: "0.9rem",
-    fontFamily: "inherit",
-    border: "1px solid #d1d5db",
-    borderRadius: "0.25rem",
-    resize: "vertical",
-    minHeight: "16rem",
-  },
-  buttonRow: {
-    display: "flex",
-    gap: "0.5rem",
-    marginTop: "0.5rem",
-  },
-  primaryButton: {
-    padding: "0.5rem 1rem",
-    fontSize: "0.9rem",
-    background: "#2563eb",
-    color: "#fff",
-    border: "none",
-    borderRadius: "0.25rem",
-  },
-  secondaryButton: {
-    padding: "0.5rem 1rem",
-    fontSize: "0.9rem",
-    background: "#fff",
-    border: "1px solid #d1d5db",
-    borderRadius: "0.25rem",
-    cursor: "pointer",
-    color: "#374151",
-  },
-  error: {
-    padding: "0.5rem 0.75rem",
-    background: "#fee2e2",
-    color: "#991b1b",
-    borderRadius: "0.25rem",
-    marginBottom: "0.5rem",
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "space-between",
-    gap: "0.5rem",
-  },
-  errorDismiss: {
-    background: "transparent",
-    border: "none",
-    color: "#991b1b",
-    fontSize: "1.1rem",
-    cursor: "pointer",
-    lineHeight: 1,
-    padding: "0 0.25rem",
-  },
-  success: {
-    padding: "0.5rem 0.75rem",
-    background: "#dcfce7",
-    color: "#166534",
-    borderRadius: "0.25rem",
-    marginBottom: "0.5rem",
-  },
-  undoBanner: {
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "space-between",
-    gap: "0.75rem",
-    padding: "0.5rem 0.75rem",
-    background: "#1f2937",
-    color: "#f9fafb",
-    borderRadius: "0.25rem",
-    marginBottom: "0.5rem",
-  },
-  undoCancel: {
-    padding: "0.25rem 0.75rem",
-    border: "1px solid #f9fafb",
-    background: "transparent",
-    color: "#f9fafb",
-    borderRadius: "0.25rem",
-    cursor: "pointer",
-    fontWeight: 600,
-  },
-  scheduledBanner: {
-    display: "flex",
-    alignItems: "center",
-    gap: "0.75rem",
-    padding: "0.5rem 0.75rem",
-    background: "#e0f2fe",
-    color: "#0c4a6e",
-    borderRadius: "0.25rem",
-    marginBottom: "0.5rem",
-  },
-  linkButton: {
-    background: "transparent",
-    border: "none",
-    padding: 0,
-    color: "#0369a1",
-    cursor: "pointer",
-    textDecoration: "underline",
-    font: "inherit",
-  },
-  secondarySelect: {
-    padding: "0.5rem 0.75rem",
-    fontSize: "0.9rem",
-    background: "#fff",
-    border: "1px solid #d1d5db",
-    borderRadius: "0.25rem",
-    color: "#374151",
-  },
-  scheduleInput: {
-    padding: "0.5rem 0.75rem",
-    fontSize: "0.9rem",
-    border: "1px solid #d1d5db",
-    borderRadius: "0.25rem",
-    color: "#111827",
-  },
+
+/**
+ * Tailwind class recipes for the Compose form. Values map onto the
+ * semantic design tokens (see `tailwind.config.ts`) so the form,
+ * banners and controls follow the active light/dark theme instead of
+ * the previous hard-coded palette.
+ */
+const styles: Record<string, string> = {
+  root: "max-w-[900px] p-4",
+  header: "mb-3",
+  title: "m-0 text-xl font-semibold",
+  form: "flex flex-col gap-2 rounded-lg border border-border bg-surface p-4",
+  row: "grid grid-cols-[80px_1fr] items-center gap-2",
+  bodyRow: "relative mt-1 flex flex-col",
+  bodyRowDragging: "rounded-sm outline-dashed outline-2 outline-offset-2 outline-primary",
+  dropHint:
+    "pointer-events-none absolute inset-0 flex items-center justify-center rounded-sm bg-primary/10 font-semibold text-primary",
+  composeToolbar: "mt-2 flex flex-wrap items-center gap-2",
+  toolbarButton:
+    "cursor-pointer rounded-md border border-border bg-surface px-2.5 py-1.5 text-xs text-fg transition-colors hover:bg-surface-hover",
+  receiptLabel: "ml-auto inline-flex items-center text-xs text-fg-muted",
+  attachmentList: "m-0 mt-1.5 grid list-none gap-1 p-0",
+  attachmentItem:
+    "flex items-center justify-between gap-2 rounded-md bg-surface-muted px-2 py-1 text-xs text-fg",
+  attachmentRemove:
+    "cursor-pointer border-0 bg-transparent text-base leading-none text-fg-muted hover:text-fg",
+  largeFileDetails: "mt-2 text-xs",
+  largeFileSummary: "cursor-pointer text-fg-muted",
+  label: "text-sm font-semibold text-fg-muted",
+  input:
+    "rounded-md border border-border bg-surface px-2 py-1.5 text-sm text-fg outline-none focus-visible:border-primary focus-visible:ring-2 focus-visible:ring-primary-subtle",
+  select:
+    "rounded-md border border-border bg-surface px-2 py-1.5 text-sm text-fg outline-none focus-visible:border-primary focus-visible:ring-2 focus-visible:ring-primary-subtle",
+  textarea:
+    "min-h-64 resize-y rounded-md border border-border bg-surface p-2.5 text-sm text-fg outline-none focus-visible:border-primary focus-visible:ring-2 focus-visible:ring-primary-subtle",
+  buttonRow: "mt-2 flex gap-2",
+  primaryButton:
+    "cursor-pointer rounded-md border-0 bg-primary px-4 py-2 text-sm font-medium text-primary-fg transition-colors hover:bg-primary-hover",
+  secondaryButton:
+    "cursor-pointer rounded-md border border-border bg-surface px-4 py-2 text-sm text-fg transition-colors hover:bg-surface-hover",
+  error:
+    "mb-2 flex items-center justify-between gap-2 rounded-md bg-danger-bg px-3 py-2 text-danger-fg",
+  errorDismiss:
+    "cursor-pointer border-0 bg-transparent px-1 text-lg leading-none text-danger-fg",
+  success: "mb-2 rounded-md bg-success-bg px-3 py-2 text-success-fg",
+  undoBanner:
+    "mb-2 flex items-center justify-between gap-3 rounded-md bg-fg px-3 py-2 text-bg",
+  undoCancel:
+    "cursor-pointer rounded-md border border-bg bg-transparent px-3 py-1 font-semibold text-bg",
+  scheduledBanner:
+    "mb-2 flex items-center gap-3 rounded-md bg-info-bg px-3 py-2 text-info-fg",
+  linkButton:
+    "cursor-pointer border-0 bg-transparent p-0 font-[inherit] text-primary underline",
+  secondarySelect:
+    "rounded-md border border-border bg-surface px-3 py-2 text-sm text-fg",
+  scheduleInput:
+    "rounded-md border border-border bg-surface px-3 py-2 text-sm text-fg",
 };
