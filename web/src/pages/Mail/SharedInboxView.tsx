@@ -147,9 +147,8 @@ export default function SharedInboxView() {
               <button type="button" onClick={doAssign}>Assign</button>
             </label>
             <label>
-              Status
+              Assignment status
               <select
-                aria-label="Assignment status"
                 value={selected.status}
                 onChange={(e) => doStatus(e.target.value as AssignmentStatus)}
               >
