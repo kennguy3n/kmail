@@ -102,11 +102,34 @@ func (s *Service) Log(ctx context.Context, e Entry) (*Entry, error) {
 		if err := middleware.SetTenantGUC(ctx, tx, e.TenantID); err != nil {
 			return err
 		}
+		// Serialize appends *per tenant* so the read-latest-hash →
+		// insert sequence below is atomic with respect to other
+		// appends to the same tenant's chain. Without this, two
+		// concurrent Log calls under READ COMMITTED both read the
+		// same `prev_hash`, both insert, and the chain forks (two
+		// rows sharing one prev_hash) — which VerifyChain then
+		// reports as broken. A transaction-scoped advisory lock,
+		// keyed on the tenant, is released automatically on
+		// COMMIT/ROLLBACK and lets different tenants append
+		// concurrently (their keys differ). The `audit_log:`
+		// namespace prefix keeps the key space disjoint from any
+		// other advisory-lock user in the codebase.
+		if _, err := tx.Exec(ctx,
+			`SELECT pg_advisory_xact_lock(hashtext('kmail.audit_log:' || $1))`,
+			e.TenantID,
+		); err != nil {
+			return err
+		}
 		var prevHash string
+		// Order by the monotonic append sequence (migration 011), not
+		// created_at/id: created_at is the transaction-start time and
+		// is not monotonic with commit order under the advisory lock,
+		// and id is a random UUID. seq is assigned at INSERT, so the
+		// MAX(seq) row for this tenant is the true chain tail.
 		err := tx.QueryRow(ctx, `
 			SELECT entry_hash FROM audit_log
 			WHERE tenant_id = $1::uuid
-			ORDER BY created_at DESC, id DESC
+			ORDER BY seq DESC
 			LIMIT 1
 		`, e.TenantID).Scan(&prevHash)
 		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
@@ -292,7 +315,7 @@ func (s *Service) VerifyChain(ctx context.Context, tenantID string) error {
 			       COALESCE(host(ip_address), ''), COALESCE(user_agent, ''),
 			       prev_hash, entry_hash, created_at
 			FROM audit_log
-			ORDER BY created_at ASC, id ASC
+			ORDER BY seq ASC
 		`)
 		if err != nil {
 			return err

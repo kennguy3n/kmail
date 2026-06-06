@@ -49,7 +49,20 @@ type TOTPConfig struct {
 	Issuer   string // shown in authenticator apps; defaults to "KMail"
 	Envelope SecretEnvelope
 	Now      func() time.Time
+
+	// MaxFailedAttempts is the number of consecutive failed
+	// verifications (wrong TOTP or recovery code) tolerated before
+	// the account is locked. Defaults to defaultMaxFailedAttempts.
+	MaxFailedAttempts int
+	// LockoutDuration is how long a locked account is refused before
+	// the window resets. Defaults to defaultLockoutDuration.
+	LockoutDuration time.Duration
 }
+
+const (
+	defaultMaxFailedAttempts = 5
+	defaultLockoutDuration   = 15 * time.Minute
+)
 
 // SecretEnvelope is the small interface this package needs from
 // `internal/cmk` (or a test fake). It mirrors cmk.SecretsEnvelope
@@ -79,6 +92,12 @@ func NewTOTPHandlers(cfg TOTPConfig) *TOTPHandlers {
 	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
+	}
+	if cfg.MaxFailedAttempts <= 0 {
+		cfg.MaxFailedAttempts = defaultMaxFailedAttempts
+	}
+	if cfg.LockoutDuration <= 0 {
+		cfg.LockoutDuration = defaultLockoutDuration
 	}
 	if cfg.Envelope == nil {
 		cfg.Logger.Print("totp: KMAIL_SECRETS_KEY not set — running without envelope wrap (DEV ONLY)")
@@ -161,12 +180,16 @@ func (h *TOTPHandlers) verify(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not enrolled", http.StatusBadRequest)
 		return
 	}
+	if h.locked(w, cred) {
+		return
+	}
 	secret, err := h.unwrapSecret(cred.EncryptedSecret)
 	if err != nil {
 		http.Error(w, "envelope: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 	if !verifyCode(secret, strings.TrimSpace(in.Code), h.cfg.Now()) {
+		h.registerFailure(r, tenantID, userID)
 		http.Error(w, "invalid code", http.StatusUnauthorized)
 		return
 	}
@@ -199,6 +222,9 @@ func (h *TOTPHandlers) check(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not enabled", http.StatusUnauthorized)
 		return
 	}
+	if h.locked(w, cred) {
+		return
+	}
 	secret, err := h.unwrapSecret(cred.EncryptedSecret)
 	if err != nil {
 		http.Error(w, "envelope: "+err.Error(), http.StatusInternalServerError)
@@ -214,10 +240,46 @@ func (h *TOTPHandlers) check(w http.ResponseWriter, r *http.Request) {
 	updated, ok := consumeRecoveryCode(cred.RecoveryCodesHash, code)
 	if ok {
 		_ = h.store.UpdateRecoveryCodes(r.Context(), tenantID, userID, updated)
+		// A recovery code is a successful second factor — clear the
+		// failed-attempt counter and any standing lock.
+		_ = h.store.MarkUsed(r.Context(), tenantID, userID, h.cfg.Now())
 		writeJSON(w, http.StatusOK, map[string]any{"verified": true, "method": "recovery"})
 		return
 	}
+	h.registerFailure(r, tenantID, userID)
 	http.Error(w, "invalid code", http.StatusUnauthorized)
+}
+
+// locked enforces the per-account brute-force lockout. When the
+// credential is currently locked it writes a 429 with a
+// Retry-After header (seconds until the lock elapses) and returns
+// true so the caller stops before checking the submitted code.
+func (h *TOTPHandlers) locked(w http.ResponseWriter, cred *TOTPCredential) bool {
+	if cred.LockedUntil == nil {
+		return false
+	}
+	remaining := cred.LockedUntil.Sub(h.cfg.Now())
+	if remaining <= 0 {
+		return false
+	}
+	secs := int(remaining.Seconds())
+	if secs < 1 {
+		secs = 1
+	}
+	w.Header().Set("Retry-After", itoa(secs))
+	http.Error(w, "too many attempts; try again later", http.StatusTooManyRequests)
+	return true
+}
+
+// registerFailure records a failed verification, applying a
+// lockout once the consecutive-failure ceiling is reached. Errors
+// are logged but not surfaced — the caller has already decided to
+// reject the request; a bookkeeping failure must not turn a
+// wrong-code 401 into a 500.
+func (h *TOTPHandlers) registerFailure(r *http.Request, tenantID, userID string) {
+	if _, err := h.store.RegisterFailure(r.Context(), tenantID, userID, h.cfg.Now(), h.cfg.MaxFailedAttempts, h.cfg.LockoutDuration); err != nil {
+		h.cfg.Logger.Printf("totp: register failure for %s/%s: %v", tenantID, userID, err)
+	}
 }
 
 func (h *TOTPHandlers) status(w http.ResponseWriter, r *http.Request) {

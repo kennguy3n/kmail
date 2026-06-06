@@ -1,5 +1,5 @@
 -- ================================================================
--- 006_confidential_send_mls.sql
+-- 007_confidential_send_mls.sql
 -- ----------------------------------------------------------------
 -- Phase 6: wire real MLS (Messaging Layer Security) wrapping into
 -- Confidential Send. Previously a confidential link only stored the
