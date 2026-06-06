@@ -1743,13 +1743,20 @@ export const handlers = [
     HttpResponse.json({ ok: true }),
   ),
   http.get("/api/v1/email-analytics", () => {
+    // Deterministic pseudo-variation seeded by the bucket index instead of
+    // Math.random(), so the data looks lively but is identical across runs
+    // — the analytics screenshot must be reproducible like every other mock.
+    const seededInt = (seed: number, span: number) => {
+      const f = Math.abs(Math.sin(seed * 12.9898) * 43758.5453);
+      return Math.floor((f - Math.floor(f)) * span);
+    };
     const daily = Array.from({ length: 14 }, (_, i) => {
       const d = new Date(NOW);
       d.setUTCDate(d.getUTCDate() - 13 + i);
       return {
         date: d.toISOString().slice(0, 10),
-        sent: 3 + Math.floor(Math.random() * 12),
-        received: 8 + Math.floor(Math.random() * 25),
+        sent: 3 + seededInt(i + 1, 12),
+        received: 8 + seededInt(i + 101, 25),
       };
     });
     return HttpResponse.json({
@@ -1773,7 +1780,7 @@ export const handlers = [
       ],
       busiest_hours: Array.from({ length: 24 }, (_, h) => ({
         hour: h,
-        count: h >= 8 && h <= 18 ? 5 + Math.floor(Math.random() * 20) : Math.floor(Math.random() * 3),
+        count: h >= 8 && h <= 18 ? 5 + seededInt(h + 201, 20) : seededInt(h + 301, 3),
       })),
       avg_response_seconds: 4320,
       response_sample_size: 42,
