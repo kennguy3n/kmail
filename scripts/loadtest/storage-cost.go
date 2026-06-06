@@ -117,9 +117,10 @@ func main() {
 		os.Exit(2)
 	}
 
-	// $/GB-mo from the headline $/TB-mo. tbBytes/1e9 converts the
-	// billing-TB into GB so the per-GB price matches the price's
-	// own decimal/binary convention.
+	// $/GB-mo from the headline $/TB-mo. gbPerTB is the number of GB in
+	// one billing-TB (tbBytes/1e9 = 1000 for Wasabi's decimal TB), used
+	// as the divisor so the per-GB price honours the price's own
+	// decimal/binary convention: $6.99/TB ÷ 1000 GB/TB = $0.00699/GB.
 	gbPerTB := tbBytes / 1e9
 	pricePerGB := pricePerTB / gbPerTB
 

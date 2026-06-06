@@ -122,8 +122,15 @@ The chaos scripts probe `/api/v1/admin/feature-flags` and the
     "Session 7" for the full finding.
 - **`chaos-shard.sh`** needs a provisioned Stalwart mailbox for the
   authenticated principal; otherwise the BFF returns `404
-  accountNotFound` before reaching a shard. Seed a mailbox (or inject
-  `X-KMail-Dev-Stalwart-Account-Id`) first.
+  accountNotFound` before reaching a shard and the circuit-breaker
+  fail-over is never exercised. The script **probes `/jmap` once
+  pre-fault and auto-detects this**: a non-2xx pre-fault probe ⇒
+  report-only (it measures + exits 0) rather than a guaranteed false
+  red. `KMAIL_CHAOS_SHARD_ENFORCE` overrides the auto-detection
+  (`1` = always enforce the SLO, `0` = always report-only). To get a
+  real enforced run, seed a mailbox (or inject
+  `X-KMail-Dev-Stalwart-Account-Id`) first, then set
+  `KMAIL_CHAOS_SHARD_ENFORCE=1`.
 
 Container names default to the compose `container_name:` values
 (`kmail-postgres`, `kmail-valkey`, `kmail-stalwart`); override with

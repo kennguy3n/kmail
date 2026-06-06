@@ -177,7 +177,13 @@ func (h *Handlers) put(w http.ResponseWriter, r *http.Request) {
 	// the post-write state without a follow-up GET.
 	views, err := h.store.loadViews(r.Context())
 	if err != nil {
-		h.logger.Printf("featureflags: put reload: %v", err)
+		// The write already succeeded; only the convenience reload
+		// failed, so still return 200 with the key. Guard the logger to
+		// match writeStoreErr (a directly-constructed Handlers may have
+		// a nil logger).
+		if h.logger != nil {
+			h.logger.Printf("featureflags: put reload: %v", err)
+		}
 		writeJSON(w, http.StatusOK, map[string]string{"key": in.Key})
 		return
 	}
