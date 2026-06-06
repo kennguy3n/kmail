@@ -32,6 +32,9 @@
 /* Map the semantic design tokens onto Tailwind's theme namespaces. */
 @config "../../tailwind.config.ts";
 
+/* Shared `kmail-*` component classes (admin pages, secure portal, …). */
+@import "./components.css";
+
 /* `data-theme="dark"` is written to <html> by hooks/useTheme. Register
    it as the `dark:` variant for explicit dark-only tweaks. */
 @custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
