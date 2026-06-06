@@ -50,7 +50,8 @@ runbook.
 | TSC | Control | Evidence |
 |-----|---------|----------|
 | CC6.1 | OIDC auth via KChat | `internal/middleware/oidc.go` |
-| CC6.2 | Tenant isolation | PostgreSQL RLS + per-tenant Stalwart shards + per-tenant zk-object-fabric buckets |
+| CC6.1 | MFA: TOTP with per-account brute-force lockout; WebAuthn | `internal/middleware/totp.go` (migration 010), `internal/middleware/webauthn.go` |
+| CC6.2 | Tenant isolation | PostgreSQL RLS (FORCED on every tenant table, migration 008) + per-tenant Stalwart shards + per-tenant zk-object-fabric buckets; regression-tested in `internal/middleware/rls_db_test.go` |
 | CC6.3 | Privileged access auditing | `audit_log` chained writes for every admin route |
 | CC6.6 | External boundary protection | TLS terminator, security middleware (`internal/middleware/security.go`) |
 | CC6.7 | Restricted physical access | Inherited from cloud provider SOC 2 |
@@ -61,6 +62,7 @@ runbook.
 | TSC | Control | Evidence |
 |-----|---------|----------|
 | CC7.1 | Capacity / availability | `internal/monitoring/` SLO tracker |
+| CC7.1 | Dependency vulnerability scanning | `.github/workflows/security-scan.yml` (govulncheck / npm audit / cargo audit) + `.github/dependabot.yml`; findings in [`SECURITY_FINDINGS.md`](./SECURITY_FINDINGS.md) |
 | CC7.2 | Incident response | Pager runbook + audit log |
 | CC7.3 | Detection of security events | `internal/deliverability/` + audit chain verification |
 | CC7.4 | Recovery from incidents | DB PITR, zk-object-fabric versioning |
@@ -117,7 +119,10 @@ runbook.
 ## Audit Evidence Locations
 
 * CI logs: GitHub Actions `Build` workflow per PR
-* Audit chain verification: `internal/audit/audit.go` `VerifyChain`
+* Audit chain verification: `internal/audit/audit.go` `VerifyChain` (concurrency-safe: per-tenant advisory lock + monotonic `seq`, migrations 009/011)
+* Threat model: [`THREAT_MODEL.md`](./THREAT_MODEL.md); endpoint + auth inventory: [`API_ENDPOINTS.md`](./API_ENDPOINTS.md)
+* SOC 2 readiness self-assessment: [`SOC2_READINESS_CHECKLIST.md`](./SOC2_READINESS_CHECKLIST.md)
+* Dependency-scan findings tracker: [`SECURITY_FINDINGS.md`](./SECURITY_FINDINGS.md)
 * Penetration test summary: shared on request under NDA — see [`../SECURITY_TESTING.md`](../SECURITY_TESTING.md)
 * Sub-processor changes: in-product changelog + email
 
@@ -132,6 +137,7 @@ collectable rows into a single timestamped bundle.
 | Control | Evidence artifact | Cadence | Owner | Automated by |
 |---------|-------------------|---------|-------|--------------|
 | CC4.2 / CC6.3 | Audit-log hash-chain verification output | Monthly | Security | `generate-evidence.sh --audit` |
+| CC7.1 / CC9.2 | Dependency vulnerability scan output (Go/npm/cargo) | Per release + weekly | Security | `generate-evidence.sh --deps` |
 | CC6.1 / CC6.2 | Quarterly user access review (per-tenant role dump) | Quarterly | Security + tenant admins | `generate-evidence.sh --access-review` |
 | CC8.1 | Change log: merged PRs with reviewer + CI status | Per release | Eng leads | `generate-evidence.sh --change-log` |
 | CC7.2 | Incident postmortems | Per incident | On-call | [`incident-response.md`](./incident-response.md) |
