@@ -227,7 +227,7 @@ func (s *Service) Query(ctx context.Context, tenantID string, f QueryFilters) ([
 			       COALESCE(user_agent, ''), prev_hash, entry_hash, created_at
 			FROM audit_log
 			%s
-			ORDER BY created_at DESC, id DESC
+			ORDER BY seq DESC
 			LIMIT $%d OFFSET $%d
 		`, clause, idx, idx+1)
 		rows, err := tx.Query(ctx, query, args...)

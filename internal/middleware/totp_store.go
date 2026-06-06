@@ -93,7 +93,16 @@ func (s *TOTPStore) Upsert(ctx context.Context, tenantID, userID string, encrypt
 			ON CONFLICT (tenant_id, user_id) DO UPDATE SET
 				encrypted_secret    = EXCLUDED.encrypted_secret,
 				recovery_codes_hash = EXCLUDED.recovery_codes_hash,
-				enabled             = EXCLUDED.enabled
+				enabled             = EXCLUDED.enabled,
+				-- (Re)enrollment is a fresh credential lifecycle, so it
+				-- must clear any brute-force lockout left over on the
+				-- existing row. Without this, failed attempts recorded
+				-- during enrollment confirmation (verify) would persist
+				-- into the login (check) phase and the account could be
+				-- locked out on its first wrong code there. New INSERTs
+				-- default these columns to 0/NULL already.
+				failed_attempts     = 0,
+				locked_until        = NULL
 		`, tenantID, userID, encryptedSecret, recoveryHash, enabled, now)
 		return err
 	})

@@ -114,3 +114,76 @@ func TestTOTPLockout_EnforcedPerAccount(t *testing.T) {
 		t.Fatalf("after reset: want 401, got %d", rec.Code)
 	}
 }
+
+// TestTOTPLockout_ReenrollmentClearsLock guards the fix for the
+// enrollment path leaking lockout state: Upsert (used by enroll and
+// by verify on enrollment confirmation) must reset failed_attempts
+// and locked_until, so a freshly (re)enrolled credential never
+// carries a stale lock into the login (check) phase.
+func TestTOTPLockout_ReenrollmentClearsLock(t *testing.T) {
+	admin := testAdminPool(t)
+	tenantID, userID := seedTenantWithUser(t, admin, "totp-reenroll")
+
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return now }
+
+	const maxAttempts = 3
+	h := NewTOTPHandlers(TOTPConfig{
+		Pool:              admin,
+		Now:               clock,
+		MaxFailedAttempts: maxAttempts,
+		LockoutDuration:   15 * time.Minute,
+	})
+
+	secret := []byte("12345678901234567890")
+	if err := h.store.Upsert(t.Context(), tenantID, userID, secret, "", true, clock()); err != nil {
+		t.Fatalf("seed totp credential: %v", err)
+	}
+
+	doCheck := func(code string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/totp/check",
+			bytes.NewReader([]byte(`{"code":"`+code+`"}`)))
+		req.Header.Set("X-KMail-Dev-Tenant-Id", tenantID)
+		req.Header.Set("X-KMail-Dev-User-Id", userID)
+		rec := httptest.NewRecorder()
+		h.check(rec, req)
+		return rec
+	}
+
+	valid := generateHOTP(secret, clock().Unix()/30)
+	wrong := "654321"
+	if wrong == valid {
+		wrong = "123456"
+	}
+
+	// Drive the account into a locked state.
+	for i := 0; i < maxAttempts; i++ {
+		doCheck(wrong)
+	}
+	cred, err := h.store.Get(t.Context(), tenantID, userID)
+	if err != nil {
+		t.Fatalf("get after lock: %v", err)
+	}
+	if cred.LockedUntil == nil {
+		t.Fatalf("precondition: account should be locked after %d failures", maxAttempts)
+	}
+
+	// Re-enroll over the locked row (mirrors the verify success path).
+	if err := h.store.Upsert(t.Context(), tenantID, userID, secret, "newrecoveryhash", true, clock()); err != nil {
+		t.Fatalf("re-enroll Upsert: %v", err)
+	}
+
+	cred, err = h.store.Get(t.Context(), tenantID, userID)
+	if err != nil {
+		t.Fatalf("get after re-enroll: %v", err)
+	}
+	if cred.FailedAttempts != 0 || cred.LockedUntil != nil {
+		t.Fatalf("re-enrollment must clear lockout: failed_attempts=%d locked_until=%v",
+			cred.FailedAttempts, cred.LockedUntil)
+	}
+
+	// And the lock no longer bites: a correct code succeeds immediately.
+	if rec := doCheck(valid); rec.Code != http.StatusOK {
+		t.Fatalf("after re-enroll valid code: want 200, got %d (body=%q)", rec.Code, rec.Body.String())
+	}
+}
