@@ -166,7 +166,11 @@ export default function SharedInboxView() {
               </li>
             ))}
           </ul>
-          <textarea value={noteText} onChange={(e) => setNoteText(e.target.value)} />
+          <textarea
+            aria-label="Internal note"
+            value={noteText}
+            onChange={(e) => setNoteText(e.target.value)}
+          />
           <button type="button" onClick={doNote}>Add note</button>
         </div>
       )}
