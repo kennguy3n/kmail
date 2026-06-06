@@ -5,6 +5,16 @@ import {
   useLocation,
   useNavigate,
 } from "react-router-dom";
+import {
+  Building2,
+  ChevronRight,
+  Keyboard,
+  KeyRound,
+  Menu,
+  Moon,
+  Search,
+  Sun,
+} from "lucide-react";
 
 import { Avatar } from "./ui/Avatar";
 import { Dropdown } from "./ui/Dropdown";
@@ -18,15 +28,11 @@ import {
   expandedGroupIdsForPath,
 } from "./navConfig";
 import type { NavNode } from "./navConfig";
+import { cn } from "../lib/cn";
 import { useTheme } from "../hooks/useTheme";
 import { useIsMobile } from "../hooks/useMediaQuery";
 import { useKeyboardShortcuts } from "../hooks/useKeyboardShortcuts";
 import type { KeyboardShortcut } from "../hooks/useKeyboardShortcuts";
-import styles from "./Layout.module.css";
-
-function cx(...classes: Array<string | false | undefined>): string {
-  return classes.filter(Boolean).join(" ");
-}
 
 /**
  * Layout — the production shell around every authenticated KMail
@@ -164,7 +170,7 @@ export default function Layout(): JSX.Element {
     [],
   );
 
-  useKeyboardShortcuts(globalShortcuts, { enabled: !helpOpen });
+  useKeyboardShortcuts(globalShortcuts);
 
   const onSearchSubmit = (e: React.FormEvent): void => {
     e.preventDefault();
@@ -176,70 +182,91 @@ export default function Layout(): JSX.Element {
     {
       id: "tenant",
       label: "Tenant admin",
-      icon: "🏢",
+      icon: <Building2 />,
       onSelect: () => navigate("/admin/tenant"),
     },
     {
       id: "security",
       label: "Security keys",
-      icon: "🔑",
+      icon: <KeyRound />,
       onSelect: () => navigate("/admin/security"),
     },
     {
       id: "theme",
       label: resolvedTheme === "dark" ? "Switch to light" : "Switch to dark",
-      icon: resolvedTheme === "dark" ? "☀" : "🌙",
+      icon: resolvedTheme === "dark" ? <Sun /> : <Moon />,
       onSelect: toggleTheme,
       separatorBefore: true,
     },
     {
       id: "shortcuts",
       label: "Keyboard shortcuts",
-      icon: "⌨",
+      icon: <Keyboard />,
       onSelect: () => setHelpOpen(true),
     },
   ];
 
+  const iconButton =
+    "inline-flex size-11 items-center justify-center rounded-md bg-transparent text-fg-muted transition-colors hover:bg-surface-hover hover:text-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring";
+
   return (
-    <div className={styles.shell}>
+    <div className="flex min-h-screen flex-col bg-canvas text-fg">
       <a href="#kmail-main" className="skip-link">
         Skip to content
       </a>
 
-      <header className={styles.header}>
-        <div className={styles.headerLeft}>
+      <header className="sticky top-0 z-header flex h-[var(--header-height)] items-center gap-4 border-b border-border bg-elevated px-4">
+        <div className="flex flex-none items-center gap-2">
           {isMobile && (
             <button
               type="button"
-              className={styles.iconButton}
+              className={iconButton}
               aria-label={drawerOpen ? "Close menu" : "Open menu"}
               aria-expanded={drawerOpen}
               aria-controls="kmail-sidebar"
               onClick={() => setDrawerOpen((v) => !v)}
             >
-              ☰
+              <Menu className="size-5" aria-hidden="true" />
             </button>
           )}
-          <NavLink to="/mail" className={styles.brand}>
-            <span className={styles.brandMark} aria-hidden="true">
-              ✉
+          <NavLink
+            to="/mail"
+            className="inline-flex items-center gap-2 text-lg font-bold text-fg hover:no-underline"
+          >
+            <span
+              className="inline-flex size-8 items-center justify-center rounded-lg bg-primary text-primary-fg"
+              aria-hidden="true"
+            >
+              <svg
+                viewBox="0 0 24 24"
+                className="size-5"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <rect x="2" y="4" width="20" height="16" rx="2" />
+                <path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7" />
+              </svg>
             </span>
-            <span className={styles.brandName}>KMail</span>
+            <span className="max-sm:hidden">KMail</span>
           </NavLink>
         </div>
 
         <form
-          className={styles.search}
+          className="relative flex max-w-xl flex-1 items-center"
           role="search"
           onSubmit={onSearchSubmit}
         >
-          <span className={styles.searchIcon} aria-hidden="true">
-            🔍
-          </span>
+          <Search
+            className="pointer-events-none absolute left-3 size-4 text-fg-subtle"
+            aria-hidden="true"
+          />
           <input
             ref={searchRef}
             type="search"
-            className={styles.searchInput}
+            className="h-10 w-full rounded-pill border border-border bg-surface-muted pl-9 pr-3 text-sm text-fg outline-none transition-colors placeholder:text-fg-subtle focus-visible:border-primary focus-visible:bg-surface focus-visible:ring-2 focus-visible:ring-primary-subtle"
             placeholder="Search mail…  ( / )"
             aria-label="Search mail"
             value={search}
@@ -247,13 +274,13 @@ export default function Layout(): JSX.Element {
           />
         </form>
 
-        <div className={styles.headerRight}>
+        <div className="flex flex-none items-center gap-1">
           <Tooltip
             label={resolvedTheme === "dark" ? "Light mode" : "Dark mode"}
           >
             <button
               type="button"
-              className={styles.iconButton}
+              className={iconButton}
               aria-label={
                 resolvedTheme === "dark"
                   ? "Switch to light mode"
@@ -262,17 +289,21 @@ export default function Layout(): JSX.Element {
               aria-pressed={resolvedTheme === "dark"}
               onClick={toggleTheme}
             >
-              {resolvedTheme === "dark" ? "☀" : "🌙"}
+              {resolvedTheme === "dark" ? (
+                <Sun className="size-5" aria-hidden="true" />
+              ) : (
+                <Moon className="size-5" aria-hidden="true" />
+              )}
             </button>
           </Tooltip>
           <Tooltip label="Keyboard shortcuts ( ? )">
             <button
               type="button"
-              className={styles.iconButton}
+              className={iconButton}
               aria-label="Keyboard shortcuts"
               onClick={() => setHelpOpen(true)}
             >
-              ?
+              <Keyboard className="size-5" aria-hidden="true" />
             </button>
           </Tooltip>
           <Dropdown
@@ -281,7 +312,7 @@ export default function Layout(): JSX.Element {
             trigger={
               <button
                 type="button"
-                className={styles.accountButton}
+                className="inline-flex items-center rounded-pill bg-transparent p-1 transition-colors hover:bg-surface-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                 aria-label="Account menu"
               >
                 <Avatar name="KMail User" size="sm" />
@@ -292,11 +323,11 @@ export default function Layout(): JSX.Element {
         </div>
       </header>
 
-      <div className={styles.body}>
+      <div className="flex min-h-0 flex-1">
         {/* Backdrop behind the mobile drawer. */}
         {isMobile && drawerOpen && (
           <div
-            className={styles.backdrop}
+            className="fixed inset-x-0 bottom-0 top-[var(--header-height)] z-drawer bg-overlay"
             onClick={() => setDrawerOpen(false)}
             aria-hidden="true"
           />
@@ -304,14 +335,15 @@ export default function Layout(): JSX.Element {
 
         <nav
           id="kmail-sidebar"
-          className={cx(
-            styles.sidebar,
-            isMobile && styles.sidebarMobile,
-            isMobile && drawerOpen && styles.sidebarOpen,
+          className={cn(
+            "w-[var(--sidebar-width)] flex-none overflow-y-auto border-r border-border bg-surface-muted py-3",
+            isMobile &&
+              "fixed bottom-0 left-0 top-[var(--header-height)] z-[301] -translate-x-full shadow-lg transition-transform duration-200",
+            isMobile && drawerOpen && "translate-x-0",
           )}
           aria-label="Primary"
         >
-          <ul className={styles.navList}>
+          <ul className="flex flex-col gap-px">
             {NAV_TREE.map((node) => (
               <NavTreeNode
                 key={node.type === "group" ? node.id : node.to}
@@ -324,13 +356,17 @@ export default function Layout(): JSX.Element {
           </ul>
         </nav>
 
-        <main id="kmail-main" className={styles.main} tabIndex={-1}>
+        <main
+          id="kmail-main"
+          className="flex min-w-0 flex-1 flex-col focus:outline-none"
+          tabIndex={-1}
+        >
           {breadcrumbs.length > 0 && (
-            <div className={styles.breadcrumbBar}>
+            <div className="border-b border-border bg-canvas px-6 py-3 max-sm:px-4 max-sm:py-2">
               <Breadcrumbs items={breadcrumbs} />
             </div>
           )}
-          <div className={styles.content}>
+          <div className="flex-1 p-6 max-sm:p-4">
             <Outlet />
           </div>
         </main>
@@ -360,22 +396,30 @@ function NavTreeNode({
   onToggle,
 }: NavTreeNodeProps): JSX.Element {
   if (node.type === "link") {
+    const Icon = node.icon;
     return (
       <li>
         <NavLink
           to={node.to}
           end
           className={({ isActive }) =>
-            cx(styles.navLink, isActive && styles.navLinkActive)
+            cn(
+              "flex min-h-10 items-center gap-2 border-l-[3px] border-transparent py-2 pr-4 text-sm text-fg-muted transition-colors hover:bg-surface-hover hover:text-fg hover:no-underline",
+              isActive &&
+                "border-primary bg-surface-active font-semibold text-primary",
+            )
           }
           style={{ paddingLeft: `calc(var(--space-4) + ${depth} * 0.75rem)` }}
         >
-          {node.icon && (
-            <span className={styles.navIcon} aria-hidden="true">
-              {node.icon}
+          {Icon && (
+            <span
+              className="inline-flex w-5 flex-none justify-center"
+              aria-hidden="true"
+            >
+              <Icon className="size-[1.05rem]" />
             </span>
           )}
-          <span className={styles.navLabel}>{node.label}</span>
+          <span className="flex-1 truncate">{node.label}</span>
         </NavLink>
       </li>
     );
@@ -383,11 +427,16 @@ function NavTreeNode({
 
   const expanded = openGroups.has(node.id);
   const sectionId = `nav-group-${node.id}`;
+  const Icon = node.icon;
   return (
-    <li className={styles.group}>
+    <li className="flex flex-col">
       <button
         type="button"
-        className={cx(styles.groupHeader, depth > 0 && styles.groupHeaderSub)}
+        className={cn(
+          "flex min-h-10 w-full items-center gap-2 py-2 pr-4 text-left text-sm font-semibold text-fg transition-colors hover:bg-surface-hover",
+          depth > 0 &&
+            "text-xs font-semibold uppercase tracking-wide text-fg-muted",
+        )}
         aria-expanded={expanded}
         // Only reference the sub-list while it's actually in the DOM
         // (it's unmounted when collapsed), so aria-controls never
@@ -396,21 +445,25 @@ function NavTreeNode({
         onClick={() => onToggle(node.id)}
         style={{ paddingLeft: `calc(var(--space-4) + ${depth} * 0.75rem)` }}
       >
-        {node.icon && (
-          <span className={styles.navIcon} aria-hidden="true">
-            {node.icon}
+        {Icon && (
+          <span
+            className="inline-flex w-5 flex-none justify-center"
+            aria-hidden="true"
+          >
+            <Icon className="size-[1.05rem]" />
           </span>
         )}
-        <span className={styles.navLabel}>{node.label}</span>
-        <span
-          className={cx(styles.chevron, expanded && styles.chevronOpen)}
+        <span className="flex-1 truncate">{node.label}</span>
+        <ChevronRight
+          className={cn(
+            "ml-auto size-4 text-fg-subtle transition-transform",
+            expanded && "rotate-90",
+          )}
           aria-hidden="true"
-        >
-          ▸
-        </span>
+        />
       </button>
       {expanded && (
-        <ul id={sectionId} className={styles.subList}>
+        <ul id={sectionId} className="flex flex-col gap-px">
           {node.children.map((child) => (
             <NavTreeNode
               key={child.type === "group" ? child.id : child.to}
