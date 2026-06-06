@@ -180,7 +180,7 @@ function Card({ slo }: { slo: SLOResponse }) {
   const meetsHA = a.availability >= HA_TARGET;
   const meetsLegacy = a.availability >= LEGACY_TARGET;
   return (
-    <div className="kmail-slo-card" style={{ display: "grid", gap: "0.5rem" }}>
+    <div className="kmail-slo-card">
       <p>
         Availability: <strong>{(a.availability * 100).toFixed(3)}%</strong> (
         {a.successes}/{a.total} successes)

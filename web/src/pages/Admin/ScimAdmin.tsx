@@ -112,7 +112,7 @@ export default function ScimAdmin() {
 
       {selectedTenantId && (
         <>
-          <form onSubmit={onGenerate} style={{ display: "grid", gap: "0.5rem", maxWidth: 480 }}>
+          <form onSubmit={onGenerate} className="grid max-w-[480px] gap-2">
             <h3>Generate token</h3>
             <label>
               Description
@@ -131,8 +131,8 @@ export default function ScimAdmin() {
           {newToken && (
             <div className="kmail-admin-card" role="region" aria-label="New SCIM token">
               <h4>New token (copy now — it will not be shown again)</h4>
-              <code style={{ wordBreak: "break-all", display: "block" }}>{newToken}</code>
-              <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.5rem" }}>
+              <code className="block break-all">{newToken}</code>
+              <div className="mt-2 flex gap-2">
                 <button onClick={copyToken}>Copy token</button>
                 <button onClick={() => setNewToken(null)}>Hide</button>
               </div>
@@ -178,7 +178,7 @@ export default function ScimAdmin() {
               Revoke token <strong>{pendingRevoke.description || pendingRevoke.id}</strong>?
               Provisioning calls using this token will fail immediately.
             </p>
-            <div style={{ display: "flex", gap: "0.5rem" }}>
+            <div className="flex gap-2">
               <button onClick={onRevokeConfirmed}>Revoke</button>
               <button onClick={() => setPendingRevoke(null)}>Cancel</button>
             </div>

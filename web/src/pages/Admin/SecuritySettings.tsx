@@ -105,7 +105,7 @@ export default function SecuritySettings() {
           </select>
         </label>
       </div>
-      <nav className="tabs" style={{ display: "flex", gap: "12px", margin: "12px 0" }}>
+      <nav className="tabs my-3 flex gap-3">
         <button type="button" onClick={() => setTab("webauthn")} aria-pressed={tab === "webauthn"}>
           Security keys (WebAuthn)
         </button>
