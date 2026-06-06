@@ -6,15 +6,20 @@
 //   - records applied files in the existing `schema_migrations`
 //     bookkeeping table (filename-keyed — backward compatible with
 //     the old shell runner so a half-migrated DB keeps working),
+//   - treats the leading integer **version** as a migration's stable
+//     identity, so renaming a migration file (same version, different
+//     description) reconciles the bookkeeping in place rather than
+//     re-running the migration — see planUp,
 //   - serialises runs behind a Postgres advisory lock so two
 //     concurrent deploys can't apply the same migration twice,
 //   - supports rollback via optional `migrations/NNN_*.down.sql`
 //     companions.
 //
 // Migration files keep their existing names; the leading integer is
-// the version and `.down.sql` marks a rollback companion. No file
-// rename is required, which keeps this additive for sibling
-// workstreams that own individual migration files.
+// the version and `.down.sql` marks a rollback companion. Because the
+// version is the stable identity, a file can be renamed without a
+// forced re-apply, which keeps this additive for sibling workstreams
+// that own individual migration files.
 package schemamigrate
 
 import (
@@ -213,6 +218,80 @@ func execFile(ctx context.Context, conn *pgxpool.Conn, path string) error {
 	return nil
 }
 
+// upAction is what Up should do for a single discovered migration,
+// given the current bookkeeping state.
+type upAction int
+
+const (
+	// actionApply: the migration has never been applied — run its up
+	// file and record it.
+	actionApply upAction = iota
+	// actionSkip: already applied under this exact filename — nothing
+	// to do.
+	actionSkip
+	// actionReconcile: this version is already applied under a
+	// *different* filename (the file was renamed). Reconcile the
+	// bookkeeping to the new name instead of re-running the migration.
+	actionReconcile
+)
+
+// plannedMigration pairs a discovered migration with the action Up
+// should take for it. OldFilename is set only for actionReconcile.
+type plannedMigration struct {
+	Mig         Migration
+	Action      upAction
+	OldFilename string
+}
+
+// appliedVersions maps each applied version to the filename it was
+// recorded under, derived from the bookkeeping filename set. The
+// version (the leading integer) is a migration's stable identity, so
+// this lets Up recognise a renamed file by version.
+func appliedVersions(applied map[string]bool) map[int]string {
+	out := make(map[int]string, len(applied))
+	for name := range applied {
+		m := upRe.FindStringSubmatch(name)
+		if m == nil {
+			continue
+		}
+		v, err := strconv.Atoi(m[1])
+		if err != nil {
+			continue
+		}
+		out[v] = name
+	}
+	return out
+}
+
+// planUp decides, for each discovered migration, whether to apply it,
+// skip it (already applied under the same name), or reconcile a rename
+// (the same version is already applied under a different filename).
+// It is pure (no DB) so the apply/skip/rename decision is unit-tested
+// without a database. Keying "already applied" on the version — not
+// just the filename — is what makes a migration-file rename safe: the
+// runner records applied migrations by filename (schema_migrations is
+// filename-keyed for backward compatibility), but a rename that keeps
+// the version is recognised and reconciled rather than re-executed.
+func planUp(migs []Migration, applied map[string]bool) []plannedMigration {
+	byVersion := appliedVersions(applied)
+	out := make([]plannedMigration, 0, len(migs))
+	for _, m := range migs {
+		switch {
+		case applied[m.Filename]:
+			out = append(out, plannedMigration{Mig: m, Action: actionSkip})
+		case byVersion[m.Version] != "":
+			out = append(out, plannedMigration{
+				Mig:         m,
+				Action:      actionReconcile,
+				OldFilename: byVersion[m.Version],
+			})
+		default:
+			out = append(out, plannedMigration{Mig: m, Action: actionApply})
+		}
+	}
+	return out
+}
+
 // Up applies all pending migrations in version order.
 func (r *Runner) Up(ctx context.Context) error {
 	migs, err := Discover(r.dir)
@@ -227,23 +306,38 @@ func (r *Runner) Up(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		var pending int
-		for _, m := range migs {
-			if applied[m.Filename] {
+		var appliedCount, reconciled int
+		for _, p := range planUp(migs, applied) {
+			switch p.Action {
+			case actionSkip:
 				continue
+			case actionReconcile:
+				// Same version, different filename: the migration file
+				// was renamed. Move the bookkeeping row to the new name
+				// instead of re-running an already-applied migration.
+				r.logger.Printf("schemamigrate: version %d already applied as %q; reconciling bookkeeping to renamed file %q",
+					p.Mig.Version, p.OldFilename, p.Mig.Filename)
+				if _, err := conn.Exec(ctx,
+					"UPDATE schema_migrations SET filename = $1 WHERE filename = $2",
+					p.Mig.Filename, p.OldFilename); err != nil {
+					return fmt.Errorf("schemamigrate: reconcile rename %s -> %s: %w", p.OldFilename, p.Mig.Filename, err)
+				}
+				reconciled++
+			case actionApply:
+				r.logger.Printf("schemamigrate: applying %s", p.Mig.Filename)
+				if err := execFile(ctx, conn, p.Mig.UpPath); err != nil {
+					return err
+				}
+				if _, err := conn.Exec(ctx,
+					"INSERT INTO schema_migrations (filename) VALUES ($1) ON CONFLICT (filename) DO NOTHING",
+					p.Mig.Filename); err != nil {
+					return fmt.Errorf("schemamigrate: record %s: %w", p.Mig.Filename, err)
+				}
+				appliedCount++
 			}
-			r.logger.Printf("schemamigrate: applying %s", m.Filename)
-			if err := execFile(ctx, conn, m.UpPath); err != nil {
-				return err
-			}
-			if _, err := conn.Exec(ctx,
-				"INSERT INTO schema_migrations (filename) VALUES ($1) ON CONFLICT (filename) DO NOTHING",
-				m.Filename); err != nil {
-				return fmt.Errorf("schemamigrate: record %s: %w", m.Filename, err)
-			}
-			pending++
 		}
-		r.logger.Printf("schemamigrate: up complete (%d applied, %d already present)", pending, len(migs)-pending)
+		r.logger.Printf("schemamigrate: up complete (%d applied, %d reconciled, %d already present)",
+			appliedCount, reconciled, len(migs)-appliedCount-reconciled)
 		return nil
 	})
 }
