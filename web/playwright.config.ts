@@ -31,12 +31,17 @@ export default defineConfig({
     baseURL: BASE_URL,
     trace: "on-first-retry",
     screenshot: "only-on-failure",
-    viewport: { width: 1440, height: 900 },
   },
   projects: [
     {
       name: "chromium",
-      use: { ...devices["Desktop Chrome"] },
+      // Spread the device preset first, then pin the viewport: project
+      // `use` merges over the global `use`, and `devices["Desktop Chrome"]`
+      // carries its own 1280x720 viewport that would otherwise win. Order
+      // matters — the explicit viewport must come after the spread so the
+      // fixed 1440x900 frame (used for the visual-regression baselines)
+      // actually takes effect.
+      use: { ...devices["Desktop Chrome"], viewport: { width: 1440, height: 900 } },
     },
   ],
   webServer: {

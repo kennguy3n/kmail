@@ -47,8 +47,11 @@ test("assign an email, add a note, then resolve it", async ({ page }) => {
   expect(noteResponse.status()).toBe(201);
   await expect(page.getByText("Following up with billing.")).toBeVisible();
 
-  // Resolve the assignment via the detail status selector.
-  const statusSelect = page.getByRole("combobox").last();
+  // Resolve the assignment via the detail status selector. The list
+  // filter and the detail panel both render a control labelled "Status",
+  // so target the detail one by its distinct accessible name rather than
+  // a positional `.last()` that breaks if the DOM gains another combobox.
+  const statusSelect = page.getByLabel("Assignment status");
   const [statusResponse] = await Promise.all([
     page.waitForResponse(
       (r) => /\/emails\/msg-2\/status$/.test(r.url()) && r.request().method() === "PUT",

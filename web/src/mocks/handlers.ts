@@ -8,12 +8,19 @@
  * render an "internal error" / "Failed to fetch" banner instead
  * of realistic content.
  *
- * Every handler returns *static* sample data — no persistence,
- * no shared state across requests — so the screenshots are
+ * Most handlers return *static* sample data so the screenshots are
  * deterministic. The data is shaped to look like a polished
  * "Acme Corp" demo tenant with healthy metrics, all-verified DNS
  * records, a small set of users, and a handful of recent emails
  * and calendar events.
+ *
+ * A small number of surfaces are intentionally *stateful within a
+ * single page load* so the Playwright E2E suite can assert
+ * "create X, then see X" round-trips (shared-inbox notes, vault
+ * folders, and migration jobs — see `sharedInboxNotes`,
+ * `vaultFolders()`, and `migrationJobs()` below). These module-scoped
+ * stores reset on every page load, and each Playwright test runs in a
+ * fresh browser context, so determinism is preserved.
  *
  * Add a new handler whenever a UI page starts hitting a new
  * endpoint that the screenshot capture script visits — otherwise
@@ -96,6 +103,50 @@ function vaultFolders(): StoredVaultFolder[] {
     ];
   }
   return vaultFolderStore;
+}
+
+/**
+ * In-memory migration-jobs store so a job created via POST shows up in
+ * the subsequent GET the wizard issues to refresh its jobs table. This
+ * lets the E2E flow assert on the job it *just created* (matched by the
+ * source mailbox it typed) rather than on the pre-seeded sample row.
+ * Module-scoped, so it resets on every page load.
+ */
+interface StoredMigrationJob {
+  id: string;
+  tenant_id: string;
+  source_type: string;
+  source_host: string;
+  source_user: string;
+  destination_user_id: string;
+  status: string;
+  messages_total: number;
+  messages_synced: number;
+  started_at?: string;
+  completed_at?: string;
+  created_at: string;
+}
+let migrationJobStore: StoredMigrationJob[] | null = null;
+function migrationJobs(): StoredMigrationJob[] {
+  if (migrationJobStore === null) {
+    migrationJobStore = [
+      {
+        id: "mig-1",
+        tenant_id: TENANT_ID,
+        source_type: "gmail_imap",
+        source_host: "imap.gmail.com",
+        source_user: "founder@oldcompany.com",
+        destination_user_id: ADMIN_USER_ID,
+        status: "completed",
+        messages_total: 12_540,
+        messages_synced: 12_540,
+        started_at: relPast(45 * 24 * 60 * 60),
+        completed_at: relPast(44 * 24 * 60 * 60),
+        created_at: relPast(45 * 24 * 60 * 60),
+      },
+    ];
+  }
+  return migrationJobStore;
 }
 
 type Json = Record<string, unknown>;
@@ -1487,24 +1538,7 @@ export const handlers = [
 
   // ─── Migrations / Resource calendars ───────────────────────────────
   http.get("/api/v1/migrations", () =>
-    HttpResponse.json({
-      jobs: [
-        {
-          id: "mig-1",
-          tenant_id: TENANT_ID,
-          source_type: "gmail_imap",
-          source_host: "imap.gmail.com",
-          source_user: "founder@oldcompany.com",
-          destination_user_id: ADMIN_USER_ID,
-          status: "completed",
-          messages_total: 12_540,
-          messages_synced: 12_540,
-          started_at: relPast(45 * 24 * 60 * 60),
-          completed_at: relPast(44 * 24 * 60 * 60),
-          created_at: relPast(45 * 24 * 60 * 60),
-        },
-      ],
-    }),
+    HttpResponse.json({ jobs: migrationJobs() }),
   ),
 
   http.get("/api/v1/resource-calendars", () =>
@@ -1761,21 +1795,22 @@ export const handlers = [
       string,
       unknown
     >;
-    return HttpResponse.json(
-      {
-        id: `mig-${Math.random().toString(36).slice(2, 8)}`,
-        tenant_id: TENANT_ID,
-        source_type: String(body.source_type ?? "generic_imap"),
-        source_host: String(body.source_host ?? ""),
-        source_user: String(body.source_user ?? ""),
-        destination_user_id: String(body.destination_user_id ?? ADMIN_USER_ID),
-        status: "pending",
-        messages_total: 0,
-        messages_synced: 0,
-        created_at: NOW.toISOString(),
-      },
-      { status: 201 },
-    );
+    const job: StoredMigrationJob = {
+      id: `mig-${Math.random().toString(36).slice(2, 8)}`,
+      tenant_id: TENANT_ID,
+      source_type: String(body.source_type ?? "generic_imap"),
+      source_host: String(body.source_host ?? ""),
+      source_user: String(body.source_user ?? ""),
+      destination_user_id: String(body.destination_user_id ?? ADMIN_USER_ID),
+      status: "pending",
+      messages_total: 0,
+      messages_synced: 0,
+      created_at: NOW.toISOString(),
+    };
+    // Newest first so the freshly-created job is the top row when the
+    // wizard reloads the jobs table.
+    migrationJobs().unshift(job);
+    return HttpResponse.json(job, { status: 201 });
   }),
 
   // User admin: PATCH echoes the merged user so the row re-renders

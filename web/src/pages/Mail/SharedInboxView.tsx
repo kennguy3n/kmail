@@ -148,7 +148,11 @@ export default function SharedInboxView() {
             </label>
             <label>
               Status
-              <select value={selected.status} onChange={(e) => doStatus(e.target.value as AssignmentStatus)}>
+              <select
+                aria-label="Assignment status"
+                value={selected.status}
+                onChange={(e) => doStatus(e.target.value as AssignmentStatus)}
+              >
                 {STATUS_OPTIONS.map((s) => (
                   <option key={s} value={s}>{s}</option>
                 ))}

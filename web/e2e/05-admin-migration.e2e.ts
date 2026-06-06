@@ -45,8 +45,11 @@ test("run the IMAP migration wizard end to end", async ({ page }) => {
   ]);
   expect(createResponse.status()).toBe(201);
 
-  // The wizard reloads the jobs table after the import starts.
+  // After the import starts the wizard reloads the jobs table. Assert on
+  // the mailbox we *just entered* (not a pre-seeded fixture row) so this
+  // genuinely verifies the create -> reload round-trip: the mock persists
+  // the POSTed job and the subsequent GET returns it.
   await expect(
-    page.getByRole("cell", { name: "founder@oldcompany.com" }),
+    page.getByRole("cell", { name: "founder@oldco.com" }),
   ).toBeVisible();
 });
