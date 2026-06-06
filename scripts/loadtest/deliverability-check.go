@@ -277,9 +277,16 @@ func render(domain, selector string, records dns.DomainRecords, checks []check) 
 	return b.String()
 }
 
+// truncate shortens s to at most n runes, appending an ellipsis when it
+// trims. It counts runes (not bytes) so multi-byte values are not cut
+// mid-character, and guards n<=0 so it never panics on an empty budget.
 func truncate(s string, n int) string {
-	if len(s) <= n {
+	if n <= 0 {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= n {
 		return s
 	}
-	return s[:n-1] + "…"
+	return string(r[:n-1]) + "…"
 }

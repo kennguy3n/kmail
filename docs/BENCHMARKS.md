@@ -232,8 +232,10 @@ Chaos-harness bugs fixed (`chaos-shard.sh`, `chaos-postgres.sh`,
 - **No request timeout**: a paused Postgres made `curl` hang
   indefinitely. Added `--max-time` everywhere.
 - **`set -e` abort**: `code=$(curl …)` aborted the whole script when
-  curl exited non-zero (timeout/connect error). Guarded with
-  `|| echo 000`.
+  curl exited non-zero (timeout/connect error). Guarded with `|| true`
+  plus a `code=${code:-000}` fallback — `curl -w "%{http_code}"` already
+  emits `000` on no response, so this yields a single unambiguous code
+  rather than a doubled `000000`.
 - **Stuck-down stack**: a failed assertion under `set -e` left the
   killed container down. Added `trap … EXIT` restart guards to
   `chaos-valkey` and `chaos-shard` (`chaos-postgres` already had one).
