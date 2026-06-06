@@ -188,11 +188,14 @@ func (s *Service) Query(ctx context.Context, tenantID string, f QueryFilters) ([
 		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
 			return err
 		}
-		var (
-			where []string
-			args  []any
-		)
-		idx := 1
+		// Seed the WHERE clause with an explicit tenant predicate in
+		// addition to the RLS GUC set above (defense in depth, and
+		// consistent with Log/VerifyChain). The application role has
+		// RLS enforced, but scoping explicitly keeps the query
+		// correct if it is ever run from an elevated/BYPASSRLS role.
+		where := []string{"tenant_id = $1::uuid"}
+		args := []any{tenantID}
+		idx := 2
 		add := func(clause string, val any) {
 			where = append(where, fmt.Sprintf(clause, idx))
 			args = append(args, val)
@@ -309,14 +312,25 @@ func (s *Service) VerifyChain(ctx context.Context, tenantID string) error {
 		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
 			return err
 		}
+		// Scope explicitly by tenant_id in addition to setting the
+		// RLS GUC above. RLS is the isolation control for the
+		// application's runtime role, but VerifyChain also runs from
+		// the kmail-audit operations CLI, which typically connects as
+		// a superuser / maintenance role with BYPASSRLS — for which
+		// the policy is skipped entirely. Without an explicit filter
+		// the walk would span every tenant's rows and report a false
+		// prev_hash mismatch at the first tenant boundary. The
+		// explicit predicate mirrors Log's tail query and keeps
+		// verification correct regardless of the connecting role.
 		rows, err := tx.Query(ctx, `
 			SELECT id::text, tenant_id::text, actor_id, actor_type, action,
 			       resource_type, COALESCE(resource_id, ''), metadata,
 			       COALESCE(host(ip_address), ''), COALESCE(user_agent, ''),
 			       prev_hash, entry_hash, created_at
 			FROM audit_log
+			WHERE tenant_id = $1::uuid
 			ORDER BY seq ASC
-		`)
+		`, tenantID)
 		if err != nil {
 			return err
 		}
