@@ -16,6 +16,15 @@
     5. optional egress allow-lists (DNS + managed data services + the
        in-cluster Stalwart hop) when restrictEgress=true.
 
+  Release scoping: every policy's own `spec.podSelector` pins
+  name+instance (kmail.selectorLabels) so it governs only its own
+  release's pods. The JMAP-mesh PEER selectors (Stalwart ingress
+  `from:` and the app egress `to:` Stalwart hop) match the chart NAME
+  only (kmail.meshNameLabel), because a co-located canary
+  (instance=kmail-canary, stalwart.external.enabled) legitimately speaks
+  JMAP to the production Stalwart fleet (instance=kmail) and must not be
+  blackholed; mTLS authenticates that hop.
+
   NetworkPolicies are additive within a namespace, so the default-deny
   baseline + the allow policies compose into the intended posture.
   Port numbers below are kept in lock-step with the container ports in
@@ -112,15 +121,20 @@ spec:
   policyTypes:
     - Ingress
   ingress:
-    # JMAP from the BFF and the dispatch workers.
+    # JMAP from the BFF and the dispatch workers. The peer selectors match on
+    # the chart NAME only (kmail.meshNameLabel), NOT name+instance: a canary
+    # release (instance=kmail-canary) co-located in this namespace runs with
+    # stalwart.external.enabled and speaks JMAP to THIS production fleet, so
+    # pinning instance here would deny the canary's mail path. mTLS authenticates
+    # the hop; this is namespace-scoped L3/L4 defense-in-depth over kmail pods.
     - from:
         - podSelector:
             matchLabels:
-              {{- include "kmail.selectorLabels" . | nindent 14 }}
+              {{- include "kmail.meshNameLabel" . | nindent 14 }}
               app.kubernetes.io/component: api
         - podSelector:
             matchLabels:
-              {{- include "kmail.selectorLabels" . | nindent 14 }}
+              {{- include "kmail.meshNameLabel" . | nindent 14 }}
               app.kubernetes.io/component: worker
       ports:
         - protocol: TCP
@@ -188,11 +202,18 @@ spec:
   policyTypes:
     - Egress
   egress:
-    # In-cluster hop to Stalwart (JMAP).
+    # In-cluster hop to Stalwart (JMAP). The destination selector matches on
+    # the chart NAME only (kmail.meshNameLabel), NOT name+instance, so this
+    # works for BOTH a release that owns its Stalwart fleet AND a canary
+    # (stalwart.enabled=false, stalwart.external.enabled=true) whose target
+    # fleet is owned by the production release (instance=kmail) — under
+    # restrictEgress the canary still needs to reach those pods. The governing
+    # podSelector above keeps name+instance so this policy only constrains THIS
+    # release's own api/worker egress.
     - to:
         - podSelector:
             matchLabels:
-              {{- include "kmail.selectorLabels" . | nindent 14 }}
+              {{- include "kmail.meshNameLabel" . | nindent 14 }}
               app.kubernetes.io/component: stalwart
       ports:
         - protocol: TCP

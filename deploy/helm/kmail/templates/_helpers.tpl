@@ -76,6 +76,29 @@ Three cases:
 {{- end -}}
 
 {{/*
+kmail.meshNameLabel emits ONLY app.kubernetes.io/name (the chart name, which is
+shared by EVERY kmail release co-located in a namespace — production and its
+canary both render `app.kubernetes.io/name: kmail`).
+
+Use it ONLY in NetworkPolicy peer selectors (ingress `from:` / egress `to:`)
+that must cross a RELEASE boundary within the namespace — specifically the
+prod<->canary JMAP mesh: the canary's BFF/worker (instance=kmail-canary) speak
+JMAP to the PRODUCTION Stalwart fleet (instance=kmail), and the production
+Stalwart must accept them. Pinning `instance` in those peer selectors (as
+kmail.selectorLabels does) would scope the allow-list to a single release and
+silently blackhole the canary's mail path.
+
+Every podSelector that GOVERNS a release's OWN pods (the `spec.podSelector` of
+each policy) still uses kmail.selectorLabels (name+instance) so a policy only
+ever governs its own release. mTLS (client certs from kmail-internal-ca) remains
+the authentication layer for the JMAP hop; this selector is L3/L4
+defense-in-depth scoped to kmail pods within the one namespace.
+*/}}
+{{- define "kmail.meshNameLabel" -}}
+app.kubernetes.io/name: {{ include "kmail.name" . }}
+{{- end -}}
+
+{{/*
 kmail.topologySpreadConstraints renders a list of TopologySpreadConstraint
 entries, injecting a chart-correct `labelSelector` into any entry that does
 not already define one.
