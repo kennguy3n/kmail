@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -1093,11 +1094,16 @@ func main() {
 	// usable from any authenticator app. The shared secret is
 	// wrapped by the kmail-secrets envelope; recovery codes are
 	// SHA-256 hashed.
+	// Brute-force lockout thresholds are env-tunable so operators can
+	// tighten/loosen them without a rebuild; unset/invalid values fall
+	// back to the conservative package defaults (5 attempts / 15m).
 	middleware.NewTOTPHandlers(middleware.TOTPConfig{
-		Pool:     pool,
-		Logger:   logger,
-		Issuer:   "KMail",
-		Envelope: secretsEnvelope,
+		Pool:              pool,
+		Logger:            logger,
+		Issuer:            "KMail",
+		Envelope:          secretsEnvelope,
+		MaxFailedAttempts: getenvInt("KMAIL_TOTP_MAX_FAILED_ATTEMPTS", 0),
+		LockoutDuration:   getenvDuration("KMAIL_TOTP_LOCKOUT_DURATION", 0),
 	}).Register(mux, authMW)
 
 	// Shared-inbox workflow state machine. The service was built
@@ -1609,6 +1615,20 @@ func getenvDuration(key string, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	return d
+}
+
+// getenvInt reads an integer env var with a fallback. Empty or
+// unparseable values return the fallback.
+func getenvInt(key string, fallback int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return fallback
+	}
+	return n
 }
 
 // buildPushTransport assembles the per-platform push transports

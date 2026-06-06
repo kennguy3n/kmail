@@ -175,32 +175,46 @@ func (h *TOTPHandlers) verify(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid body", http.StatusBadRequest)
 		return
 	}
-	cred, err := h.store.Get(r.Context(), tenantID, userID)
-	if err != nil {
-		http.Error(w, "not enrolled", http.StatusBadRequest)
-		return
-	}
-	if h.locked(w, cred) {
-		return
-	}
-	secret, err := h.unwrapSecret(cred.EncryptedSecret)
-	if err != nil {
-		http.Error(w, "envelope: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	if !verifyCode(secret, strings.TrimSpace(in.Code), h.cfg.Now()) {
-		h.registerFailure(r, tenantID, userID)
-		http.Error(w, "invalid code", http.StatusUnauthorized)
-		return
-	}
+	code := strings.TrimSpace(in.Code)
+	// Recovery codes are minted up front but only persisted (and
+	// returned) when verification succeeds — see the success branch
+	// of EvaluateAttempt. On a wrong code they are simply discarded.
 	codes, hashed, err := newRecoveryCodes(10)
 	if err != nil {
 		http.Error(w, "rand: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	if err := h.store.Upsert(r.Context(), tenantID, userID, cred.EncryptedSecret, hashed, true, h.cfg.Now()); err != nil {
+	enabled := true
+	res, err := h.store.EvaluateAttempt(
+		r.Context(), tenantID, userID, h.cfg.Now(),
+		h.cfg.MaxFailedAttempts, h.cfg.LockoutDuration,
+		false, // enrollment confirmation: the row exists but is not yet enabled
+		func(cred *TOTPCredential) TOTPVerification {
+			secret, uerr := h.unwrapSecret(cred.EncryptedSecret)
+			if uerr != nil {
+				return TOTPVerification{Err: uerr}
+			}
+			if verifyCode(secret, code, h.cfg.Now()) {
+				return TOTPVerification{OK: true, Method: "totp", SetRecoveryHash: &hashed, SetEnabled: &enabled}
+			}
+			return TOTPVerification{}
+		},
+	)
+	if errors.Is(err, ErrTOTPNotFound) {
+		http.Error(w, "not enrolled", http.StatusBadRequest)
+		return
+	}
+	if err != nil {
 		h.cfg.Logger.Printf("totp.verify: %v", err)
-		http.Error(w, "store: "+err.Error(), http.StatusInternalServerError)
+		http.Error(w, "store error", http.StatusInternalServerError)
+		return
+	}
+	if res.Locked {
+		h.writeLocked(w, res.RetryAfter)
+		return
+	}
+	if !res.Verified {
+		http.Error(w, "invalid code", http.StatusUnauthorized)
 		return
 	}
 	writeJSON(w, http.StatusOK, VerifyResponse{RecoveryCodes: codes})
@@ -217,69 +231,61 @@ func (h *TOTPHandlers) check(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid body", http.StatusBadRequest)
 		return
 	}
-	cred, err := h.store.Get(r.Context(), tenantID, userID)
-	if err != nil || !cred.Enabled {
+	code := strings.TrimSpace(in.Code)
+	res, err := h.store.EvaluateAttempt(
+		r.Context(), tenantID, userID, h.cfg.Now(),
+		h.cfg.MaxFailedAttempts, h.cfg.LockoutDuration,
+		true, // login: only an enabled credential may be checked
+		func(cred *TOTPCredential) TOTPVerification {
+			secret, uerr := h.unwrapSecret(cred.EncryptedSecret)
+			if uerr != nil {
+				return TOTPVerification{Err: uerr}
+			}
+			if verifyCode(secret, code, h.cfg.Now()) {
+				return TOTPVerification{OK: true, Method: "totp"}
+			}
+			// Recovery code: hash + compare against the stored set,
+			// persisting the post-consumption bundle atomically so the
+			// code cannot be double-spent by a concurrent attempt.
+			if updated, ok := consumeRecoveryCode(cred.RecoveryCodesHash, code); ok {
+				return TOTPVerification{OK: true, Method: "recovery", SetRecoveryHash: &updated}
+			}
+			return TOTPVerification{}
+		},
+	)
+	if errors.Is(err, ErrTOTPNotFound) {
 		http.Error(w, "not enabled", http.StatusUnauthorized)
 		return
 	}
-	if h.locked(w, cred) {
-		return
-	}
-	secret, err := h.unwrapSecret(cred.EncryptedSecret)
 	if err != nil {
-		http.Error(w, "envelope: "+err.Error(), http.StatusInternalServerError)
+		h.cfg.Logger.Printf("totp.check: %v", err)
+		http.Error(w, "store error", http.StatusInternalServerError)
 		return
 	}
-	code := strings.TrimSpace(in.Code)
-	if verifyCode(secret, code, h.cfg.Now()) {
-		_ = h.store.MarkUsed(r.Context(), tenantID, userID, h.cfg.Now())
-		writeJSON(w, http.StatusOK, map[string]any{"verified": true, "method": "totp"})
+	if res.NotEnabled {
+		http.Error(w, "not enabled", http.StatusUnauthorized)
 		return
 	}
-	// Try recovery code: hash and compare against the stored set.
-	updated, ok := consumeRecoveryCode(cred.RecoveryCodesHash, code)
-	if ok {
-		_ = h.store.UpdateRecoveryCodes(r.Context(), tenantID, userID, updated)
-		// A recovery code is a successful second factor — clear the
-		// failed-attempt counter and any standing lock.
-		_ = h.store.MarkUsed(r.Context(), tenantID, userID, h.cfg.Now())
-		writeJSON(w, http.StatusOK, map[string]any{"verified": true, "method": "recovery"})
+	if res.Locked {
+		h.writeLocked(w, res.RetryAfter)
 		return
 	}
-	h.registerFailure(r, tenantID, userID)
-	http.Error(w, "invalid code", http.StatusUnauthorized)
+	if !res.Verified {
+		http.Error(w, "invalid code", http.StatusUnauthorized)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"verified": true, "method": res.Method})
 }
 
-// locked enforces the per-account brute-force lockout. When the
-// credential is currently locked it writes a 429 with a
-// Retry-After header (seconds until the lock elapses) and returns
-// true so the caller stops before checking the submitted code.
-func (h *TOTPHandlers) locked(w http.ResponseWriter, cred *TOTPCredential) bool {
-	if cred.LockedUntil == nil {
-		return false
-	}
-	remaining := cred.LockedUntil.Sub(h.cfg.Now())
-	if remaining <= 0 {
-		return false
-	}
+// writeLocked renders the brute-force lockout response: 429 with a
+// Retry-After header (seconds until the lock elapses, floored at 1).
+func (h *TOTPHandlers) writeLocked(w http.ResponseWriter, remaining time.Duration) {
 	secs := int(remaining.Seconds())
 	if secs < 1 {
 		secs = 1
 	}
 	w.Header().Set("Retry-After", itoa(secs))
 	http.Error(w, "too many attempts; try again later", http.StatusTooManyRequests)
-	return true
-}
-
-// registerFailure records a failed verification, applying a
-// lockout once the consecutive-failure ceiling is reached. Errors
-// are logged but not surfaced — the caller has already decided to
-// reject the request; a bookkeeping failure must not turn a
-// wrong-code 401 into a 500.
-func (h *TOTPHandlers) registerFailure(r *http.Request, tenantID, userID string) {
-	if _, err := h.store.RegisterFailure(r.Context(), tenantID, userID, h.cfg.Now(), h.cfg.MaxFailedAttempts, h.cfg.LockoutDuration); err != nil {
-		h.cfg.Logger.Printf("totp: register failure for %s/%s: %v", tenantID, userID, err)
-	}
 }
 
 func (h *TOTPHandlers) status(w http.ResponseWriter, r *http.Request) {

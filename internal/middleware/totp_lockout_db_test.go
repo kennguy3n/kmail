@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -185,5 +186,170 @@ func TestTOTPLockout_ReenrollmentClearsLock(t *testing.T) {
 	// And the lock no longer bites: a correct code succeeds immediately.
 	if rec := doCheck(valid); rec.Code != http.StatusOK {
 		t.Fatalf("after re-enroll valid code: want 200, got %d (body=%q)", rec.Code, rec.Body.String())
+	}
+}
+
+// TestTOTPLockout_ConcurrentBurstRespectsCeiling guards the fix for
+// the check-then-act (TOCTOU) race: a burst of simultaneous wrong
+// guesses must not be evaluated past the lockout ceiling. Because
+// EvaluateAttempt locks the credential row FOR UPDATE, attempts are
+// fully serialized — exactly maxAttempts guesses are evaluated (401)
+// and every later request in the burst is refused with 429 without
+// its guess being checked. Before the fix, all N requests read the
+// pre-attempt state, sailed past the in-memory lock check, and were
+// all evaluated as guesses.
+func TestTOTPLockout_ConcurrentBurstRespectsCeiling(t *testing.T) {
+	admin := testAdminPool(t)
+	tenantID, userID := seedTenantWithUser(t, admin, "totp-burst")
+
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return now }
+
+	const maxAttempts = 3
+	const burst = 12
+	h := NewTOTPHandlers(TOTPConfig{
+		Pool:              admin,
+		Now:               clock,
+		MaxFailedAttempts: maxAttempts,
+		LockoutDuration:   15 * time.Minute,
+	})
+
+	secret := []byte("12345678901234567890")
+	if err := h.store.Upsert(t.Context(), tenantID, userID, secret, "", true, clock()); err != nil {
+		t.Fatalf("seed totp credential: %v", err)
+	}
+
+	valid := generateHOTP(secret, clock().Unix()/30)
+	wrong := "654321"
+	if wrong == valid {
+		wrong = "123456"
+	}
+
+	doCheck := func(code string) int {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/totp/check",
+			bytes.NewReader([]byte(`{"code":"`+code+`"}`)))
+		req.Header.Set("X-KMail-Dev-Tenant-Id", tenantID)
+		req.Header.Set("X-KMail-Dev-User-Id", userID)
+		rec := httptest.NewRecorder()
+		h.check(rec, req)
+		return rec.Code
+	}
+
+	var unauthorized, locked, other int64
+	var wg sync.WaitGroup
+	for i := 0; i < burst; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			switch doCheck(wrong) {
+			case http.StatusUnauthorized:
+				atomic.AddInt64(&unauthorized, 1)
+			case http.StatusTooManyRequests:
+				atomic.AddInt64(&locked, 1)
+			default:
+				atomic.AddInt64(&other, 1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if other != 0 {
+		t.Fatalf("unexpected non-401/429 responses: %d", other)
+	}
+	// No more than the ceiling of guesses may ever be evaluated, even
+	// under a concurrent burst. Serialization makes this exact.
+	if unauthorized != maxAttempts {
+		t.Fatalf("guesses evaluated = %d, want exactly %d (ceiling); burst leaked past the lock",
+			unauthorized, maxAttempts)
+	}
+	if locked != burst-maxAttempts {
+		t.Fatalf("locked responses = %d, want %d", locked, burst-maxAttempts)
+	}
+
+	// The row is locked and the counter was reset to 0 at lock time.
+	cred, err := h.store.Get(t.Context(), tenantID, userID)
+	if err != nil {
+		t.Fatalf("get after burst: %v", err)
+	}
+	if cred.LockedUntil == nil {
+		t.Fatal("account should be locked after the burst")
+	}
+}
+
+// TestTOTPLockout_RecoveryCodeConsumeAtomic guards the fix for the
+// non-atomic recovery-code consume + lockout-clear: two concurrent
+// /check requests presenting the SAME recovery code must not both
+// succeed (a double-spend). EvaluateAttempt consumes the code and
+// persists the post-consumption bundle inside the same row-locked
+// transaction, so the second request sees the already-consumed
+// bundle and is rejected.
+func TestTOTPLockout_RecoveryCodeConsumeAtomic(t *testing.T) {
+	admin := testAdminPool(t)
+	tenantID, userID := seedTenantWithUser(t, admin, "totp-recov")
+
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return now }
+
+	// A ceiling well above the racer count guarantees the burst's
+	// losing attempts can never themselves trip the lockout, so this
+	// test isolates the double-spend property cleanly.
+	h := NewTOTPHandlers(TOTPConfig{
+		Pool:              admin,
+		Now:               clock,
+		MaxFailedAttempts: 50,
+		LockoutDuration:   15 * time.Minute,
+	})
+
+	// Mint a real recovery bundle and seed it on an enabled credential.
+	codes, hashed, err := newRecoveryCodes(5)
+	if err != nil {
+		t.Fatalf("newRecoveryCodes: %v", err)
+	}
+	secret := []byte("12345678901234567890")
+	if err := h.store.Upsert(t.Context(), tenantID, userID, secret, hashed, true, clock()); err != nil {
+		t.Fatalf("seed totp credential: %v", err)
+	}
+
+	doCheck := func(code string) int {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/totp/check",
+			bytes.NewReader([]byte(`{"code":"`+code+`"}`)))
+		req.Header.Set("X-KMail-Dev-Tenant-Id", tenantID)
+		req.Header.Set("X-KMail-Dev-User-Id", userID)
+		rec := httptest.NewRecorder()
+		h.check(rec, req)
+		return rec.Code
+	}
+
+	const racers = 8
+	var success, rejected int64
+	var wg sync.WaitGroup
+	for i := 0; i < racers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			switch doCheck(codes[0]) {
+			case http.StatusOK:
+				atomic.AddInt64(&success, 1)
+			default:
+				atomic.AddInt64(&rejected, 1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if success != 1 {
+		t.Fatalf("recovery code accepted %d times, want exactly 1 (double-spend)", success)
+	}
+	if rejected != racers-1 {
+		t.Fatalf("rejected = %d, want %d", rejected, racers-1)
+	}
+
+	// The consumed code is gone from the stored bundle; reusing it fails.
+	if rec := doCheck(codes[0]); rec != http.StatusUnauthorized {
+		t.Fatalf("reused recovery code: want 401, got %d", rec)
+	}
+	// A different, still-valid recovery code is accepted.
+	if rec := doCheck(codes[1]); rec != http.StatusOK {
+		t.Fatalf("second recovery code: want 200, got %d", rec)
 	}
 }

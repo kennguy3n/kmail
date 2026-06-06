@@ -108,78 +108,142 @@ func (s *TOTPStore) Upsert(ctx context.Context, tenantID, userID string, encrypt
 	})
 }
 
-// MarkUsed updates `last_used_at` and clears the brute-force
-// lockout state (a successful verification resets the counter and
-// any standing lock). Callers invoke this on every successful
-// TOTP/recovery verification.
-func (s *TOTPStore) MarkUsed(ctx context.Context, tenantID, userID string, now time.Time) error {
-	if s.pool == nil {
-		return nil
-	}
-	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		if err := SetTenantGUC(ctx, tx, tenantID); err != nil {
-			return err
-		}
-		_, err := tx.Exec(ctx, `
-			UPDATE totp_credentials
-			SET last_used_at = $3, failed_attempts = 0, locked_until = NULL
-			WHERE tenant_id = $1::uuid AND user_id = $2
-		`, tenantID, userID, now)
-		return err
-	})
+// TOTPVerification is the verifier's decision about a submitted
+// code, evaluated against the credential row while it is locked
+// FOR UPDATE inside EvaluateAttempt.
+type TOTPVerification struct {
+	// OK reports whether the submitted code was accepted.
+	OK bool
+	// Method labels the accepted factor ("totp" | "recovery").
+	Method string
+	// SetRecoveryHash, when non-nil, is written to
+	// recovery_codes_hash on success — used to persist a consumed
+	// recovery bundle, or a freshly minted bundle on enrollment.
+	// Ignored on failure.
+	SetRecoveryHash *string
+	// SetEnabled, when non-nil, is written to enabled on success —
+	// used by enrollment confirmation to flip the credential live.
+	// Ignored on failure.
+	SetEnabled *bool
+	// Err, when non-nil, aborts the attempt without spending one
+	// (e.g. a secret-envelope failure). The transaction rolls back
+	// and the error is surfaced to the caller; no counter changes.
+	Err error
 }
 
-// RegisterFailure records one failed verification for (tenant,
-// user) and, when the consecutive-failure count reaches
-// maxAttempts, parks the account until now+lockFor. The increment
-// and the lock decision happen in a single atomic UPDATE so
-// concurrent failed attempts cannot race past the ceiling. When a
-// lock is applied the counter resets to 0 so that, after the lock
-// elapses, the account starts a fresh window rather than
-// re-locking on the very next failure. Returns the resulting
-// locked_until (nil when the account is not currently locked).
-func (s *TOTPStore) RegisterFailure(ctx context.Context, tenantID, userID string, now time.Time, maxAttempts int, lockFor time.Duration) (*time.Time, error) {
+// TOTPAttemptResult is the outcome of EvaluateAttempt.
+type TOTPAttemptResult struct {
+	// NotEnabled is set (only when requireEnabled was requested) if
+	// the credential exists but is not yet enabled.
+	NotEnabled bool
+	// Locked is set when the account is currently within its lockout
+	// window; RetryAfter is the time remaining. No attempt is spent.
+	Locked     bool
+	RetryAfter time.Duration
+	// Verified reports whether the submitted code was accepted, and
+	// Method labels the factor used.
+	Verified bool
+	Method   string
+}
+
+// EvaluateAttempt runs a brute-force-guarded verification
+// atomically. It locks the credential row (SELECT ... FOR UPDATE)
+// so that all concurrent attempts for a single account are fully
+// serialized — closing the check-then-act race where a burst of
+// guesses could be evaluated (or a recovery code double-spent)
+// before the incremented counter / lock became visible to peers.
+//
+// Everything happens inside one transaction:
+//  1. lock + read the row (ErrTOTPNotFound when absent);
+//  2. when requireEnabled and the row is not enabled, return NotEnabled;
+//  3. when locked_until is still in the future, return Locked (no
+//     attempt spent);
+//  4. run verify() against the locked row;
+//  5. on success: reset failed_attempts/locked_until, bump
+//     last_used_at, and apply any SetRecoveryHash / SetEnabled —
+//     all in the same statement;
+//  6. on failure: increment failed_attempts and apply the lockout
+//     once the ceiling is reached (counter resets to 0 at lock time
+//     so the post-cooldown window starts fresh).
+func (s *TOTPStore) EvaluateAttempt(
+	ctx context.Context,
+	tenantID, userID string,
+	now time.Time,
+	maxAttempts int,
+	lockFor time.Duration,
+	requireEnabled bool,
+	verify func(cred *TOTPCredential) TOTPVerification,
+) (TOTPAttemptResult, error) {
 	if s.pool == nil {
-		return nil, nil
+		return TOTPAttemptResult{}, ErrTOTPNotFound
 	}
 	if maxAttempts < 1 {
 		maxAttempts = 1
 	}
-	lockUntil := now.Add(lockFor)
-	var locked *time.Time
+	var res TOTPAttemptResult
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		if err := SetTenantGUC(ctx, tx, tenantID); err != nil {
 			return err
 		}
-		return tx.QueryRow(ctx, `
-			UPDATE totp_credentials
-			SET failed_attempts = CASE WHEN failed_attempts + 1 >= $3 THEN 0 ELSE failed_attempts + 1 END,
-			    locked_until    = CASE WHEN failed_attempts + 1 >= $3 THEN $4::timestamptz ELSE locked_until END
+		var c TOTPCredential
+		if err := tx.QueryRow(ctx, `
+			SELECT tenant_id::text, user_id, encrypted_secret,
+			       recovery_codes_hash, enabled, created_at, last_used_at,
+			       failed_attempts, locked_until
+			FROM totp_credentials
 			WHERE tenant_id = $1::uuid AND user_id = $2
-			RETURNING locked_until
-		`, tenantID, userID, maxAttempts, lockUntil).Scan(&locked)
-	})
-	if err != nil {
-		return nil, err
-	}
-	return locked, nil
-}
+			FOR UPDATE
+		`, tenantID, userID).Scan(
+			&c.TenantID, &c.UserID, &c.EncryptedSecret,
+			&c.RecoveryCodesHash, &c.Enabled, &c.CreatedAt, &c.LastUsedAt,
+			&c.FailedAttempts, &c.LockedUntil,
+		); err != nil {
+			return ErrTOTPNotFound
+		}
 
-// UpdateRecoveryCodes replaces the recovery-codes hash bundle.
-func (s *TOTPStore) UpdateRecoveryCodes(ctx context.Context, tenantID, userID, hash string) error {
-	if s.pool == nil {
-		return nil
-	}
-	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		if err := SetTenantGUC(ctx, tx, tenantID); err != nil {
+		if requireEnabled && !c.Enabled {
+			res.NotEnabled = true
+			return nil
+		}
+		if c.LockedUntil != nil {
+			if remaining := c.LockedUntil.Sub(now); remaining > 0 {
+				res.Locked = true
+				res.RetryAfter = remaining
+				return nil
+			}
+		}
+
+		v := verify(&c)
+		if v.Err != nil {
+			return v.Err
+		}
+		if !v.OK {
+			_, err := tx.Exec(ctx, `
+				UPDATE totp_credentials
+				SET failed_attempts = CASE WHEN failed_attempts + 1 >= $3 THEN 0 ELSE failed_attempts + 1 END,
+				    locked_until    = CASE WHEN failed_attempts + 1 >= $3 THEN $4::timestamptz ELSE locked_until END
+				WHERE tenant_id = $1::uuid AND user_id = $2
+			`, tenantID, userID, maxAttempts, now.Add(lockFor))
 			return err
 		}
+
+		res.Verified = true
+		res.Method = v.Method
 		_, err := tx.Exec(ctx, `
-			UPDATE totp_credentials SET recovery_codes_hash = $3
+			UPDATE totp_credentials
+			SET last_used_at        = $3,
+			    failed_attempts     = 0,
+			    locked_until        = NULL,
+			    recovery_codes_hash = COALESCE($4::text, recovery_codes_hash),
+			    enabled             = COALESCE($5::boolean, enabled)
 			WHERE tenant_id = $1::uuid AND user_id = $2
-		`, tenantID, userID, hash)
+		`, tenantID, userID, now, v.SetRecoveryHash, v.SetEnabled)
 		return err
 	})
+	if err != nil {
+		return TOTPAttemptResult{}, err
+	}
+	return res, nil
 }
 
 // Delete removes a credential row.
