@@ -17,3 +17,9 @@ dist/
 # Rust / Cargo (sdk/ workspace)
 target/
 **/*.rs.bk
+
+# Production secrets for docker-compose.prod.yml (.env.prod.example is tracked)
+.env.prod
+.env.prod.local
+# Local TLS material bind-mounted by docker-compose.prod.yml
+/deploy/tls/
