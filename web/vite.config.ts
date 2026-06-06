@@ -1,5 +1,6 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
+import tailwindcss from "@tailwindcss/vite";
 
 // See docs/ARCHITECTURE.md §8 for the client protocol topology.
 // The dev server proxies `/jmap` to the local Go BFF so the React
@@ -12,7 +13,7 @@ import react from "@vitejs/plugin-react";
 // you override the BFF address in your shell, update both target
 // URLs below to match.
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), tailwindcss()],
   server: {
     port: 5173,
     proxy: {

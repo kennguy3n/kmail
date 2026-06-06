@@ -1,6 +1,6 @@
 import type { CSSProperties } from "react";
 
-import styles from "./Skeleton.module.css";
+import { cn } from "../../lib/cn";
 
 export interface SkeletonProps {
   /** CSS width (e.g. "100%", "8rem"). */
@@ -16,9 +16,7 @@ export interface SkeletonProps {
   label?: string;
 }
 
-function cx(...classes: Array<string | false | undefined>): string {
-  return classes.filter(Boolean).join(" ");
-}
+const BAR = "block animate-pulse rounded-md bg-surface-muted";
 
 /**
  * Skeleton — an animated loading placeholder. A single instance is
@@ -35,17 +33,18 @@ export function Skeleton({
 }: SkeletonProps): JSX.Element {
   const style: CSSProperties = {
     width: circle ? height ?? width : width,
-    height,
+    height: height ?? "1em",
     borderRadius: circle ? "50%" : undefined,
   };
 
   const content =
     lines > 1 ? (
-      <span className={styles.stack}>
+      <span className="flex flex-col gap-2">
         {Array.from({ length: lines }).map((_, i) => (
           <span
             key={i}
-            className={cx(styles.skeleton, className)}
+            className={cn(BAR, className)}
+            aria-hidden="true"
             style={{
               ...style,
               // Last line is shorter to mimic real text.
@@ -56,7 +55,7 @@ export function Skeleton({
       </span>
     ) : (
       <span
-        className={cx(styles.skeleton, className)}
+        className={cn(BAR, className)}
         style={style}
         aria-hidden="true"
       />
@@ -64,7 +63,7 @@ export function Skeleton({
 
   if (label) {
     return (
-      <span role="status" aria-busy="true" className={styles.status}>
+      <span role="status" aria-busy="true" className="block">
         <span className="visually-hidden">{label}</span>
         {content}
       </span>

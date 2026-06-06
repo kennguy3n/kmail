@@ -1,6 +1,6 @@
 import { useRef, useState } from "react";
 
-import styles from "./Avatar.module.css";
+import { cn } from "../../lib/cn";
 
 export type AvatarSize = "sm" | "md" | "lg";
 
@@ -36,9 +36,11 @@ function hueFromString(value: string): number {
   return Math.abs(hash) % 360;
 }
 
-function cx(...classes: Array<string | false | undefined>): string {
-  return classes.filter(Boolean).join(" ");
-}
+const sizeClass: Record<AvatarSize, string> = {
+  sm: "size-7 text-[0.7rem]",
+  md: "size-9 text-sm",
+  lg: "size-11 text-base",
+};
 
 /** Avatar — a circular user marker showing an image or initials. */
 export function Avatar({
@@ -62,7 +64,11 @@ export function Avatar({
 
   return (
     <span
-      className={cx(styles.avatar, styles[size], className)}
+      className={cn(
+        "relative inline-flex shrink-0 select-none items-center justify-center overflow-hidden rounded-full font-semibold leading-none",
+        sizeClass[size],
+        className,
+      )}
       style={
         showImage
           ? undefined
@@ -77,7 +83,7 @@ export function Avatar({
     >
       {showImage ? (
         <img
-          className={styles.img}
+          className="size-full object-cover"
           src={src}
           alt=""
           onError={() => setImgFailed(true)}
