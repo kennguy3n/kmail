@@ -94,21 +94,21 @@ export default function Delegation() {
   };
 
   return (
-    <section style={styles.root}>
-      <header style={styles.header}>
-        <h2 style={styles.title}>Delegate access &amp; Send-as</h2>
-        <Link to="/mail" style={styles.backLink}>
+    <section className={styles.root}>
+      <header className={styles.header}>
+        <h2 className={styles.title}>Delegate access &amp; Send-as</h2>
+        <Link to="/mail" className={styles.backLink}>
           ← Back to mail
         </Link>
       </header>
 
-      {error && <div style={styles.error}>{error}</div>}
-      {info && <div style={styles.info}>{info}</div>}
+      {error && <div className={styles.error}>{error}</div>}
+      {info && <div className={styles.info}>{info}</div>}
 
-      <div style={styles.form}>
-        <h3 style={styles.subhead}>Grant access</h3>
-        <div style={styles.formGrid}>
-          <label style={styles.fieldLabel} htmlFor="del-owner">
+      <div className={styles.form}>
+        <h3 className={styles.subhead}>Grant access</h3>
+        <div className={styles.formGrid}>
+          <label className={styles.fieldLabel} htmlFor="del-owner">
             Mailbox owner
           </label>
           {identities.length > 0 ? (
@@ -118,7 +118,7 @@ export default function Delegation() {
               onChange={(e) =>
                 setDraft((d) => ({ ...d, ownerEmail: e.target.value }))
               }
-              style={styles.input}
+              className={styles.input}
             >
               {identities.map((id) => (
                 <option key={id.id} value={id.email}>
@@ -135,11 +135,11 @@ export default function Delegation() {
                 setDraft((d) => ({ ...d, ownerEmail: e.target.value }))
               }
               placeholder="owner@example.com"
-              style={styles.input}
+              className={styles.input}
             />
           )}
 
-          <label style={styles.fieldLabel} htmlFor="del-delegate">
+          <label className={styles.fieldLabel} htmlFor="del-delegate">
             Delegate
           </label>
           <input
@@ -150,10 +150,10 @@ export default function Delegation() {
               setDraft((d) => ({ ...d, delegateEmail: e.target.value }))
             }
             placeholder="delegate@example.com"
-            style={styles.input}
+            className={styles.input}
           />
 
-          <label style={styles.fieldLabel} htmlFor="del-access">
+          <label className={styles.fieldLabel} htmlFor="del-access">
             Access level
           </label>
           <select
@@ -165,7 +165,7 @@ export default function Delegation() {
                 access: e.target.value as DelegationGrant["access"],
               }))
             }
-            style={styles.input}
+            className={styles.input}
           >
             {ACCESS_OPTIONS.map((a) => (
               <option key={a} value={a}>
@@ -174,10 +174,10 @@ export default function Delegation() {
             ))}
           </select>
 
-          <label style={styles.fieldLabel} htmlFor="del-sendas">
+          <label className={styles.fieldLabel} htmlFor="del-sendas">
             Send-as
           </label>
-          <label style={styles.checkboxRow}>
+          <label className={styles.checkboxRow}>
             <input
               id="del-sendas"
               type="checkbox"
@@ -189,31 +189,31 @@ export default function Delegation() {
             Allow sending under this identity
           </label>
         </div>
-        <button type="button" onClick={onCreate} style={styles.primaryButton}>
+        <button type="button" onClick={onCreate} className={styles.primaryButton}>
           Add grant
         </button>
       </div>
 
-      <h3 style={styles.subhead}>Existing grants</h3>
+      <h3 className={styles.subhead}>Existing grants</h3>
       {grants.length === 0 ? (
-        <p style={styles.muted}>No delegation grants yet.</p>
+        <p className={styles.muted}>No delegation grants yet.</p>
       ) : (
-        <table style={styles.table}>
+        <table className={styles.table}>
           <thead>
             <tr>
-              <th style={styles.th}>Owner</th>
-              <th style={styles.th}>Delegate</th>
-              <th style={styles.th}>Access</th>
-              <th style={styles.th}>Send-as</th>
-              <th style={styles.th} aria-label="Actions" />
+              <th className={styles.th}>Owner</th>
+              <th className={styles.th}>Delegate</th>
+              <th className={styles.th}>Access</th>
+              <th className={styles.th}>Send-as</th>
+              <th className={styles.th} aria-label="Actions" />
             </tr>
           </thead>
           <tbody>
             {grants.map((g) => (
               <tr key={g.id}>
-                <td style={styles.td}>{g.ownerEmail}</td>
-                <td style={styles.td}>{g.delegateEmail}</td>
-                <td style={styles.td}>
+                <td className={styles.td}>{g.ownerEmail}</td>
+                <td className={styles.td}>{g.delegateEmail}</td>
+                <td className={styles.td}>
                   <select
                     value={g.access}
                     onChange={(e) =>
@@ -231,7 +231,7 @@ export default function Delegation() {
                     ))}
                   </select>
                 </td>
-                <td style={styles.td}>
+                <td className={styles.td}>
                   <input
                     type="checkbox"
                     checked={g.sendAs}
@@ -239,11 +239,11 @@ export default function Delegation() {
                     aria-label={`Send-as for ${g.delegateEmail}`}
                   />
                 </td>
-                <td style={styles.td}>
+                <td className={styles.td}>
                   <button
                     type="button"
                     onClick={() => onRevoke(g.id)}
-                    style={styles.dangerButton}
+                    className={styles.dangerButton}
                   >
                     Revoke
                   </button>
@@ -257,85 +257,27 @@ export default function Delegation() {
   );
 }
 
-const styles: Record<string, React.CSSProperties> = {
-  root: { padding: "1rem", maxWidth: "860px" },
-  header: {
-    display: "flex",
-    alignItems: "baseline",
-    justifyContent: "space-between",
-    marginBottom: "1rem",
-  },
-  title: { margin: 0, fontSize: "1.25rem" },
-  backLink: { color: "#2563eb", textDecoration: "none", fontSize: "0.9rem" },
-  subhead: { fontSize: "1rem", margin: "1rem 0 0.5rem" },
-  form: {
-    border: "1px solid #e5e7eb",
-    borderRadius: "0.5rem",
-    padding: "1rem",
-    background: "#f9fafb",
-  },
-  formGrid: {
-    display: "grid",
-    gridTemplateColumns: "140px 1fr",
-    gap: "0.5rem 0.75rem",
-    alignItems: "center",
-    marginBottom: "0.75rem",
-  },
-  fieldLabel: { fontSize: "0.8rem", fontWeight: 600, color: "#374151" },
-  input: {
-    padding: "0.4rem 0.6rem",
-    fontSize: "0.9rem",
-    border: "1px solid #d1d5db",
-    borderRadius: "0.25rem",
-  },
-  checkboxRow: {
-    display: "flex",
-    alignItems: "center",
-    gap: "0.4rem",
-    fontSize: "0.85rem",
-    color: "#374151",
-  },
-  primaryButton: {
-    padding: "0.45rem 0.9rem",
-    background: "#2563eb",
-    color: "#fff",
-    border: "none",
-    borderRadius: "0.25rem",
-    cursor: "pointer",
-    fontSize: "0.85rem",
-  },
-  dangerButton: {
-    padding: "0.3rem 0.6rem",
-    background: "#fff",
-    color: "#991b1b",
-    border: "1px solid #fca5a5",
-    borderRadius: "0.25rem",
-    cursor: "pointer",
-    fontSize: "0.8rem",
-  },
-  table: { width: "100%", borderCollapse: "collapse", fontSize: "0.85rem" },
-  th: {
-    textAlign: "left",
-    padding: "0.4rem 0.5rem",
-    borderBottom: "2px solid #e5e7eb",
-    color: "#374151",
-  },
-  td: { padding: "0.4rem 0.5rem", borderBottom: "1px solid #f3f4f6" },
-  error: {
-    padding: "0.4rem 0.6rem",
-    background: "#fee2e2",
-    color: "#991b1b",
-    borderRadius: "0.25rem",
-    fontSize: "0.85rem",
-    marginBottom: "0.5rem",
-  },
-  info: {
-    padding: "0.4rem 0.6rem",
-    background: "#ecfdf5",
-    color: "#065f46",
-    borderRadius: "0.25rem",
-    fontSize: "0.85rem",
-    marginBottom: "0.5rem",
-  },
-  muted: { color: "#6b7280", fontStyle: "italic", fontSize: "0.85rem" },
+/** Theme-aware Tailwind class recipes for the Delegation admin view. */
+const styles: Record<string, string> = {
+  root: "max-w-[860px] p-4",
+  header: "mb-4 flex items-baseline justify-between",
+  title: "m-0 text-xl font-semibold",
+  backLink: "text-sm text-primary no-underline hover:underline",
+  subhead: "mb-2 mt-4 text-base font-semibold",
+  form: "rounded-lg border border-border bg-surface-muted p-4",
+  formGrid: "mb-3 grid grid-cols-[140px_1fr] items-center gap-x-3 gap-y-2",
+  fieldLabel: "text-xs font-semibold text-fg-muted",
+  input:
+    "rounded-md border border-border bg-surface px-2.5 py-1.5 text-sm text-fg outline-none focus-visible:border-primary focus-visible:ring-2 focus-visible:ring-primary-subtle",
+  checkboxRow: "flex items-center gap-1.5 text-sm text-fg-muted",
+  primaryButton:
+    "cursor-pointer rounded-md border-0 bg-primary px-3.5 py-1.5 text-sm font-medium text-primary-fg transition-colors hover:bg-primary-hover",
+  dangerButton:
+    "cursor-pointer rounded-md border border-danger/40 bg-surface px-2.5 py-1.5 text-xs text-danger-fg transition-colors hover:bg-danger-bg",
+  table: "w-full border-collapse text-sm",
+  th: "border-b-2 border-border px-2 py-1.5 text-left text-fg-muted",
+  td: "border-b border-border px-2 py-1.5",
+  error: "mb-2 rounded-md bg-danger-bg px-2.5 py-1.5 text-sm text-danger-fg",
+  info: "mb-2 rounded-md bg-success-bg px-2.5 py-1.5 text-sm text-success-fg",
+  muted: "text-sm italic text-fg-muted",
 };

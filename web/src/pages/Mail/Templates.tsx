@@ -1,6 +1,8 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
 
+import { cn } from "../../lib/cn";
+
 import {
   createTemplate,
   deleteTemplate,
@@ -75,35 +77,35 @@ export default function Templates() {
   };
 
   return (
-    <section style={styles.root}>
-      <header style={styles.header}>
-        <h2 style={styles.title}>Templates</h2>
-        <Link to="/mail" style={styles.backLink}>
+    <section className={styles.root}>
+      <header className={styles.header}>
+        <h2 className={styles.title}>Templates</h2>
+        <Link to="/mail" className={styles.backLink}>
           ← Back to mail
         </Link>
       </header>
 
-      <div style={styles.layout}>
-        <aside style={styles.list}>
-          <button type="button" onClick={startNew} style={styles.newButton}>
+      <div className={styles.layout}>
+        <aside className={styles.list}>
+          <button type="button" onClick={startNew} className={styles.newButton}>
             + New template
           </button>
           {templates.length === 0 && (
-            <p style={styles.muted}>No templates yet.</p>
+            <p className={styles.muted}>No templates yet.</p>
           )}
-          <ul style={styles.ul}>
+          <ul className={styles.ul}>
             {templates.map((t) => (
               <li key={t.id}>
                 <button
                   type="button"
                   onClick={() => startEdit(t)}
-                  style={{
-                    ...styles.listItem,
-                    ...(editingId === t.id ? styles.listItemActive : {}),
-                  }}
+                  className={cn(
+                    styles.listItem,
+                    editingId === t.id && styles.listItemActive,
+                  )}
                 >
-                  <span style={styles.listItemName}>{t.name}</span>
-                  <span style={styles.listItemScope}>
+                  <span className={styles.listItemName}>{t.name}</span>
+                  <span className={styles.listItemScope}>
                     {t.scope === "shared" ? "Shared" : "Personal"}
                   </span>
                 </button>
@@ -112,9 +114,9 @@ export default function Templates() {
           </ul>
         </aside>
 
-        <div style={styles.editor}>
-          {info && <div style={styles.info}>{info}</div>}
-          <label style={styles.fieldLabel} htmlFor="tpl-name">
+        <div className={styles.editor}>
+          {info && <div className={styles.info}>{info}</div>}
+          <label className={styles.fieldLabel} htmlFor="tpl-name">
             Name
           </label>
           <input
@@ -123,10 +125,10 @@ export default function Templates() {
             value={draft.name}
             onChange={(e) => setDraft((d) => ({ ...d, name: e.target.value }))}
             placeholder="e.g. Meeting follow-up"
-            style={styles.input}
+            className={styles.input}
           />
 
-          <label style={styles.fieldLabel} htmlFor="tpl-subject">
+          <label className={styles.fieldLabel} htmlFor="tpl-subject">
             Subject
           </label>
           <input
@@ -137,10 +139,10 @@ export default function Templates() {
               setDraft((d) => ({ ...d, subject: e.target.value }))
             }
             placeholder="Hi {{sender_name}}…"
-            style={styles.input}
+            className={styles.input}
           />
 
-          <label style={styles.fieldLabel} htmlFor="tpl-scope">
+          <label className={styles.fieldLabel} htmlFor="tpl-scope">
             Scope
           </label>
           <select
@@ -152,13 +154,13 @@ export default function Templates() {
                 scope: e.target.value as EmailTemplateDraft["scope"],
               }))
             }
-            style={styles.input}
+            className={styles.input}
           >
             <option value="personal">Personal</option>
             <option value="shared">Shared (tenant)</option>
           </select>
 
-          <label style={styles.fieldLabel}>Body</label>
+          <label className={styles.fieldLabel}>Body</label>
           <RichTextEditor
             value={draft.body}
             onChange={(body) => setDraft((d) => ({ ...d, body }))}
@@ -167,30 +169,30 @@ export default function Templates() {
             minHeight={160}
           />
 
-          <p style={styles.varsHint}>
+          <p className={styles.varsHint}>
             Variables detected:{" "}
             {variables.length > 0 ? (
               variables.map((v) => (
-                <code key={v} style={styles.varChip}>{`{{${v}}}`}</code>
+                <code key={v} className={styles.varChip}>{`{{${v}}}`}</code>
               ))
             ) : (
-              <span style={styles.muted}>none</span>
+              <span className={styles.muted}>none</span>
             )}
             <br />
-            Built-ins: <code style={styles.varChip}>{"{{sender_name}}"}</code>
-            <code style={styles.varChip}>{"{{company}}"}</code>
-            <code style={styles.varChip}>{"{{date}}"}</code>
+            Built-ins: <code className={styles.varChip}>{"{{sender_name}}"}</code>
+            <code className={styles.varChip}>{"{{company}}"}</code>
+            <code className={styles.varChip}>{"{{date}}"}</code>
           </p>
 
-          <div style={styles.buttonRow}>
-            <button type="button" onClick={onSave} style={styles.primaryButton}>
+          <div className={styles.buttonRow}>
+            <button type="button" onClick={onSave} className={styles.primaryButton}>
               {editingId ? "Save changes" : "Create template"}
             </button>
             {editingId && (
               <button
                 type="button"
                 onClick={() => onDelete(editingId)}
-                style={styles.dangerButton}
+                className={styles.dangerButton}
               >
                 Delete
               </button>
@@ -202,87 +204,34 @@ export default function Templates() {
   );
 }
 
-const styles: Record<string, React.CSSProperties> = {
-  root: { padding: "1rem", maxWidth: "1000px" },
-  header: {
-    display: "flex",
-    alignItems: "baseline",
-    justifyContent: "space-between",
-    marginBottom: "1rem",
-  },
-  title: { margin: 0, fontSize: "1.25rem" },
-  backLink: { color: "#2563eb", textDecoration: "none", fontSize: "0.9rem" },
-  layout: { display: "grid", gridTemplateColumns: "240px 1fr", gap: "1rem" },
-  list: { borderRight: "1px solid #e5e7eb", paddingRight: "1rem" },
-  newButton: {
-    width: "100%",
-    padding: "0.4rem",
-    marginBottom: "0.5rem",
-    background: "#2563eb",
-    color: "#fff",
-    border: "none",
-    borderRadius: "0.25rem",
-    cursor: "pointer",
-    fontSize: "0.85rem",
-  },
-  ul: { listStyle: "none", margin: 0, padding: 0, display: "grid", gap: "0.25rem" },
-  listItem: {
-    display: "flex",
-    flexDirection: "column",
-    gap: "0.15rem",
-    width: "100%",
-    padding: "0.4rem 0.5rem",
-    background: "#fff",
-    border: "1px solid #e5e7eb",
-    borderRadius: "0.25rem",
-    cursor: "pointer",
-    textAlign: "left",
-  },
-  listItemActive: { background: "#eff6ff", borderColor: "#2563eb" },
-  listItemName: { fontSize: "0.9rem", fontWeight: 600, color: "#111827" },
-  listItemScope: { fontSize: "0.75rem", color: "#6b7280" },
-  editor: { display: "grid", gap: "0.5rem", alignContent: "start" },
-  fieldLabel: { fontSize: "0.8rem", fontWeight: 600, color: "#374151" },
-  input: {
-    padding: "0.4rem 0.6rem",
-    fontSize: "0.9rem",
-    border: "1px solid #d1d5db",
-    borderRadius: "0.25rem",
-  },
-  varsHint: { fontSize: "0.8rem", color: "#374151", margin: 0, lineHeight: 1.9 },
-  varChip: {
-    background: "#f3f4f6",
-    border: "1px solid #e5e7eb",
-    borderRadius: "0.25rem",
-    padding: "0.05rem 0.3rem",
-    margin: "0 0.2rem",
-    fontSize: "0.75rem",
-  },
-  buttonRow: { display: "flex", gap: "0.5rem", marginTop: "0.25rem" },
-  primaryButton: {
-    padding: "0.45rem 0.9rem",
-    background: "#2563eb",
-    color: "#fff",
-    border: "none",
-    borderRadius: "0.25rem",
-    cursor: "pointer",
-    fontSize: "0.85rem",
-  },
-  dangerButton: {
-    padding: "0.45rem 0.9rem",
-    background: "#fff",
-    color: "#991b1b",
-    border: "1px solid #fca5a5",
-    borderRadius: "0.25rem",
-    cursor: "pointer",
-    fontSize: "0.85rem",
-  },
-  info: {
-    padding: "0.4rem 0.6rem",
-    background: "#ecfdf5",
-    color: "#065f46",
-    borderRadius: "0.25rem",
-    fontSize: "0.85rem",
-  },
-  muted: { color: "#6b7280", fontStyle: "italic", fontSize: "0.85rem" },
+/** Theme-aware Tailwind class recipes for the Templates manager. */
+const styles: Record<string, string> = {
+  root: "max-w-[1000px] p-4",
+  header: "mb-4 flex items-baseline justify-between",
+  title: "m-0 text-xl font-semibold",
+  backLink: "text-sm text-primary no-underline hover:underline",
+  layout: "grid grid-cols-[240px_1fr] gap-4",
+  list: "border-r border-border pr-4",
+  newButton:
+    "mb-2 w-full cursor-pointer rounded-md border-0 bg-primary p-1.5 text-sm font-medium text-primary-fg transition-colors hover:bg-primary-hover",
+  ul: "m-0 grid list-none gap-1 p-0",
+  listItem:
+    "flex w-full cursor-pointer flex-col gap-0.5 rounded-md border border-border bg-surface px-2 py-1.5 text-left transition-colors hover:bg-surface-hover",
+  listItemActive: "border-primary bg-primary-subtle",
+  listItemName: "text-sm font-semibold text-fg",
+  listItemScope: "text-xs text-fg-muted",
+  editor: "grid content-start gap-2",
+  fieldLabel: "text-xs font-semibold text-fg-muted",
+  input:
+    "rounded-md border border-border bg-surface px-2.5 py-1.5 text-sm text-fg outline-none focus-visible:border-primary focus-visible:ring-2 focus-visible:ring-primary-subtle",
+  varsHint: "m-0 text-xs leading-loose text-fg-muted",
+  varChip:
+    "mx-1 rounded-sm border border-border bg-surface-muted px-1 py-px text-xs",
+  buttonRow: "mt-1 flex gap-2",
+  primaryButton:
+    "cursor-pointer rounded-md border-0 bg-primary px-3.5 py-1.5 text-sm font-medium text-primary-fg transition-colors hover:bg-primary-hover",
+  dangerButton:
+    "cursor-pointer rounded-md border border-danger/40 bg-surface px-3.5 py-1.5 text-sm text-danger-fg transition-colors hover:bg-danger-bg",
+  info: "rounded-md bg-success-bg px-2.5 py-1.5 text-sm text-success-fg",
+  muted: "text-sm italic text-fg-muted",
 };

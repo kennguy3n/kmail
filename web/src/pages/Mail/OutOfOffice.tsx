@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 
+import { cn } from "../../lib/cn";
+
 import {
   createSieveRule,
   deploySieveRules,
@@ -116,23 +118,23 @@ export default function OutOfOffice() {
   const preview = buildVacationScript(settings);
 
   return (
-    <section style={styles.root}>
-      <header style={styles.header}>
-        <h2 style={styles.title}>Out of Office</h2>
-        <Link to="/mail" style={styles.backLink}>
+    <section className={styles.root}>
+      <header className={styles.header}>
+        <h2 className={styles.title}>Out of Office</h2>
+        <Link to="/mail" className={styles.backLink}>
           ← Back to mail
         </Link>
       </header>
 
-      <div style={styles.tenantRow}>
-        <label htmlFor="ooo-tenant" style={styles.fieldLabel}>
+      <div className={styles.tenantRow}>
+        <label htmlFor="ooo-tenant" className={styles.fieldLabel}>
           Tenant
         </label>
         <select
           id="ooo-tenant"
           value={selectedTenantId ?? ""}
           onChange={(e) => selectTenant(e.target.value)}
-          style={styles.input}
+          className={styles.input}
         >
           <option value="">— select —</option>
           {(tenants ?? []).map((t) => (
@@ -143,20 +145,20 @@ export default function OutOfOffice() {
         </select>
       </div>
 
-      {error && <div style={styles.error}>{error}</div>}
-      {info && <div style={styles.info}>{info}</div>}
-      {loading && <p style={styles.muted}>Loading…</p>}
+      {error && <div className={styles.error}>{error}</div>}
+      {info && <div className={styles.info}>{info}</div>}
+      {loading && <p className={styles.muted}>Loading…</p>}
 
-      <div style={styles.statusRow}>
+      <div className={styles.statusRow}>
         <span
-          style={{
-            ...styles.statusDot,
-            background: settings.enabled ? "#22c55e" : "#9ca3af",
-          }}
+          className={cn(
+            styles.statusDot,
+            settings.enabled ? "bg-success" : "bg-fg-subtle",
+          )}
           aria-hidden="true"
         />
         <strong>{settings.enabled ? "Auto-reply is ON" : "Auto-reply is OFF"}</strong>
-        <label style={styles.switch}>
+        <label className={styles.switch}>
           <input
             type="checkbox"
             checked={settings.enabled}
@@ -167,7 +169,7 @@ export default function OutOfOffice() {
         </label>
       </div>
 
-      <label style={styles.fieldLabel} htmlFor="ooo-subject">
+      <label className={styles.fieldLabel} htmlFor="ooo-subject">
         Reply subject
       </label>
       <input
@@ -177,10 +179,10 @@ export default function OutOfOffice() {
         onChange={(e) =>
           setSettings((s) => ({ ...s, subject: e.target.value }))
         }
-        style={styles.input}
+        className={styles.input}
       />
 
-      <label style={styles.fieldLabel} htmlFor="ooo-message">
+      <label className={styles.fieldLabel} htmlFor="ooo-message">
         Reply message
       </label>
       <textarea
@@ -190,12 +192,12 @@ export default function OutOfOffice() {
           setSettings((s) => ({ ...s, message: e.target.value }))
         }
         rows={5}
-        style={styles.textarea}
+        className={styles.textarea}
       />
 
-      <div style={styles.dateRow}>
+      <div className={styles.dateRow}>
         <div>
-          <label style={styles.fieldLabel} htmlFor="ooo-start">
+          <label className={styles.fieldLabel} htmlFor="ooo-start">
             Start date (optional)
           </label>
           <input
@@ -208,11 +210,11 @@ export default function OutOfOffice() {
                 startDate: e.target.value || null,
               }))
             }
-            style={styles.input}
+            className={styles.input}
           />
         </div>
         <div>
-          <label style={styles.fieldLabel} htmlFor="ooo-end">
+          <label className={styles.fieldLabel} htmlFor="ooo-end">
             End date (optional)
           </label>
           <input
@@ -222,12 +224,12 @@ export default function OutOfOffice() {
             onChange={(e) =>
               setSettings((s) => ({ ...s, endDate: e.target.value || null }))
             }
-            style={styles.input}
+            className={styles.input}
           />
         </div>
       </div>
 
-      <label style={styles.checkboxRow}>
+      <label className={styles.checkboxRow}>
         <input
           type="checkbox"
           checked={settings.contactsOnly}
@@ -238,128 +240,51 @@ export default function OutOfOffice() {
         Only reply to senders in my contacts
       </label>
 
-      <div style={styles.buttonRow}>
+      <div className={styles.buttonRow}>
         <button
           type="button"
           onClick={() => void persist(settings)}
           disabled={!selectedTenantId || saving}
-          style={styles.primaryButton}
+          className={styles.primaryButton}
         >
           {saving ? "Saving…" : "Save"}
         </button>
       </div>
 
-      <details style={styles.preview}>
-        <summary style={styles.previewSummary}>Generated Sieve script</summary>
-        <pre style={styles.previewPre}>{preview}</pre>
+      <details className={styles.preview}>
+        <summary className={styles.previewSummary}>Generated Sieve script</summary>
+        <pre className={styles.previewPre}>{preview}</pre>
       </details>
     </section>
   );
 }
 
-const styles: Record<string, React.CSSProperties> = {
-  root: { padding: "1rem", maxWidth: "720px", display: "grid", gap: "0.5rem" },
-  header: {
-    display: "flex",
-    alignItems: "baseline",
-    justifyContent: "space-between",
-    marginBottom: "0.5rem",
-  },
-  title: { margin: 0, fontSize: "1.25rem" },
-  backLink: { color: "#2563eb", textDecoration: "none", fontSize: "0.9rem" },
-  tenantRow: { display: "grid", gap: "0.25rem", marginBottom: "0.5rem" },
-  statusRow: {
-    display: "flex",
-    alignItems: "center",
-    gap: "0.6rem",
-    padding: "0.6rem 0.75rem",
-    background: "#f9fafb",
-    border: "1px solid #e5e7eb",
-    borderRadius: "0.375rem",
-    margin: "0.25rem 0 0.75rem",
-  },
-  statusDot: {
-    width: "0.7rem",
-    height: "0.7rem",
-    borderRadius: "999px",
-    display: "inline-block",
-  },
-  switch: {
-    marginLeft: "auto",
-    display: "flex",
-    alignItems: "center",
-    gap: "0.35rem",
-    fontSize: "0.85rem",
-    cursor: "pointer",
-  },
-  fieldLabel: { fontSize: "0.8rem", fontWeight: 600, color: "#374151" },
-  input: {
-    padding: "0.4rem 0.6rem",
-    fontSize: "0.9rem",
-    border: "1px solid #d1d5db",
-    borderRadius: "0.25rem",
-    width: "100%",
-    boxSizing: "border-box",
-  },
-  textarea: {
-    padding: "0.4rem 0.6rem",
-    fontSize: "0.9rem",
-    border: "1px solid #d1d5db",
-    borderRadius: "0.25rem",
-    width: "100%",
-    boxSizing: "border-box",
-    resize: "vertical",
-  },
-  dateRow: {
-    display: "grid",
-    gridTemplateColumns: "1fr 1fr",
-    gap: "0.75rem",
-  },
-  checkboxRow: {
-    display: "flex",
-    alignItems: "center",
-    gap: "0.4rem",
-    fontSize: "0.85rem",
-    color: "#374151",
-    marginTop: "0.25rem",
-  },
-  buttonRow: { display: "flex", gap: "0.5rem", marginTop: "0.5rem" },
-  primaryButton: {
-    padding: "0.45rem 0.9rem",
-    background: "#2563eb",
-    color: "#fff",
-    border: "none",
-    borderRadius: "0.25rem",
-    cursor: "pointer",
-    fontSize: "0.85rem",
-  },
-  error: {
-    padding: "0.4rem 0.6rem",
-    background: "#fee2e2",
-    color: "#991b1b",
-    borderRadius: "0.25rem",
-    fontSize: "0.85rem",
-  },
-  info: {
-    padding: "0.4rem 0.6rem",
-    background: "#ecfdf5",
-    color: "#065f46",
-    borderRadius: "0.25rem",
-    fontSize: "0.85rem",
-  },
-  muted: { color: "#6b7280", fontStyle: "italic", fontSize: "0.85rem" },
-  preview: { marginTop: "0.75rem" },
-  previewSummary: {
-    cursor: "pointer",
-    fontSize: "0.85rem",
-    color: "#374151",
-  },
-  previewPre: {
-    background: "#0f172a",
-    color: "#e2e8f0",
-    padding: "0.75rem",
-    borderRadius: "0.375rem",
-    overflowX: "auto",
-    fontSize: "0.8rem",
-  },
+/** Theme-aware Tailwind class recipes for the Out-of-office settings. */
+const styles: Record<string, string> = {
+  root: "grid max-w-[720px] gap-2 p-4",
+  header: "mb-2 flex items-baseline justify-between",
+  title: "m-0 text-xl font-semibold",
+  backLink: "text-sm text-primary no-underline hover:underline",
+  tenantRow: "mb-2 grid gap-1",
+  statusRow:
+    "mb-3 mt-1 flex items-center gap-2.5 rounded-md border border-border bg-surface-muted px-3 py-2.5",
+  statusDot: "inline-block size-3 rounded-pill",
+  switch: "ml-auto flex cursor-pointer items-center gap-1.5 text-sm",
+  fieldLabel: "text-xs font-semibold text-fg-muted",
+  input:
+    "box-border w-full rounded-md border border-border bg-surface px-2.5 py-1.5 text-sm text-fg outline-none focus-visible:border-primary focus-visible:ring-2 focus-visible:ring-primary-subtle",
+  textarea:
+    "box-border w-full resize-y rounded-md border border-border bg-surface px-2.5 py-1.5 text-sm text-fg outline-none focus-visible:border-primary focus-visible:ring-2 focus-visible:ring-primary-subtle",
+  dateRow: "grid grid-cols-2 gap-3",
+  checkboxRow: "mt-1 flex items-center gap-1.5 text-sm text-fg-muted",
+  buttonRow: "mt-2 flex gap-2",
+  primaryButton:
+    "cursor-pointer rounded-md border-0 bg-primary px-3.5 py-1.5 text-sm font-medium text-primary-fg transition-colors hover:bg-primary-hover",
+  error: "rounded-md bg-danger-bg px-2.5 py-1.5 text-sm text-danger-fg",
+  info: "rounded-md bg-success-bg px-2.5 py-1.5 text-sm text-success-fg",
+  muted: "text-sm italic text-fg-muted",
+  preview: "mt-3",
+  previewSummary: "cursor-pointer text-sm text-fg-muted",
+  previewPre:
+    "mt-2 overflow-x-auto rounded-md bg-slate-900 p-3 text-xs text-slate-200",
 };
