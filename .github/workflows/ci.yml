@@ -210,13 +210,13 @@ jobs:
         env:
           BASE_BRANCH: ${{ github.base_ref || 'main' }}
 
-      # WS4 Task 5 — coverage gate. Floor is just below the current
-      # measured baseline (~35%) and is meant to ratchet UP toward
-      # 60%→80% as the suite grows, never down.
+      # WS4 Task 5 — coverage gate. Ratcheted up to 60% after the
+      # Session 2 test-coverage expansion. The gate only ever moves
+      # UP toward the 60%→80% target as the suite grows, never down.
       - name: Test coverage gate
         run: make cover
         env:
-          MIN_COVERAGE: "30"
+          MIN_COVERAGE: "60"
 
   sdk:
     name: SDK
