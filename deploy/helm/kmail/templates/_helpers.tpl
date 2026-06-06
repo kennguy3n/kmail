@@ -41,6 +41,41 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 
 {{/*
+kmail.stalwartMtlsUrl returns the HTTPS (jmap-tls / 8443) URL the BFF and
+dispatch workers should use to reach Stalwart when mTLS is enabled, or an
+empty string when this release should fall through to the ConfigMap value.
+
+Three cases:
+  1. stalwart.enabled: this release OWNS its StatefulSet. Target its own
+     pod-0 via the headless Service. cert-manager bakes this exact hostname
+     into the server cert SAN list (see stalwart-mtls.yaml), so the handshake
+     verifies.
+  2. else if stalwart.external.enabled: a control-plane-only release (the
+     canary) targeting an EXISTING fleet owned by ANOTHER release. We
+     synthesize the URL from the SAME `<fullname>-stalwart-<ordinal>.<svc>.
+     <ns>.svc.cluster.local:8443` shape that the owning release uses for its
+     own pods, driven by named, self-documenting fields. This guarantees the
+     hostname matches a SAN on that fleet's server cert and stays well-formed
+     — instead of a hand-built URL string that silently breaks the TLS
+     handshake if a character is off. `fullname` is the owning release's
+     `kmail.fullname` value (e.g. release `kmail` => `kmail-kmail`).
+  3. else: "" — the operator supplies KMAIL_STALWART_URL via kmailApi.config
+     and is responsible for SAN-covered hostname / mtls.serverName.
+*/}}
+{{- define "kmail.stalwartMtlsUrl" -}}
+{{- $s := .Values.stalwart -}}
+{{- if $s.enabled -}}
+{{- printf "https://%s-stalwart-0.%s.%s.svc.cluster.local:8443" (include "kmail.fullname" .) $s.service.headlessName .Release.Namespace -}}
+{{- else if and $s.external $s.external.enabled -}}
+{{- $fullname := required "stalwart.external.fullname is required when stalwart.external.enabled=true (the kmail.fullname of the release that owns the Stalwart fleet, e.g. release `kmail` => `kmail-kmail`)" $s.external.fullname -}}
+{{- $svc := $s.external.headlessName | default $s.service.headlessName -}}
+{{- $ns := $s.external.namespace | default .Release.Namespace -}}
+{{- $ordinal := $s.external.ordinal | default 0 -}}
+{{- printf "https://%s-stalwart-%v.%s.%s.svc.cluster.local:8443" $fullname $ordinal $svc $ns -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 kmail.topologySpreadConstraints renders a list of TopologySpreadConstraint
 entries, injecting a chart-correct `labelSelector` into any entry that does
 not already define one.

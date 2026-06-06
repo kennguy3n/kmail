@@ -269,6 +269,32 @@ stalwart:
     partition: 0
   service:
     headlessName: kmail-stalwart
+  # Target an EXISTING Stalwart fleet owned by ANOTHER release, used ONLY
+  # when `enabled: false` (a control-plane-only release such as the canary,
+  # which runs the new BFF against the production mail fleet without
+  # provisioning duplicate mailbox storage). When `external.enabled` is true
+  # the api/worker deployments synthesize the mTLS Stalwart URL from these
+  # named fields via the `kmail.stalwartMtlsUrl` helper, reusing the SAME
+  # `<fullname>-stalwart-<ordinal>.<headlessName>.<namespace>.svc.cluster.local:8443`
+  # shape the owning release uses — so the hostname is guaranteed to match a
+  # SAN on that fleet's server cert (see stalwart-mtls.yaml). Prefer this over
+  # hand-writing KMAIL_STALWART_URL in kmailApi.config: an operator who uses a
+  # different upstream release name / namespace edits obvious knobs instead of
+  # a fragile URL string. Leave `external.enabled: false` (the default) and
+  # the deployments fall through to the ConfigMap value.
+  external:
+    enabled: false
+    # The OWNING release's `kmail.fullname` value (NOT this release's). For a
+    # production release named `kmail`, fullname renders as `kmail-kmail`.
+    fullname: ""
+    # The headless Service fronting the owning fleet (its
+    # stalwart.service.headlessName). Defaults to this chart's headlessName.
+    headlessName: ""
+    # Namespace the owning fleet runs in. Defaults to this release's namespace
+    # (the canary normally co-locates with production).
+    namespace: ""
+    # Which stable pod ordinal to target. 0 = the first shard.
+    ordinal: 0
   # Spread mail nodes across AZs. Stalwart is a StatefulSet, so each
   # replica owns a stable identity AND a per-pod PVC; an AZ outage
   # that took out two co-located mail nodes would drop two shards'

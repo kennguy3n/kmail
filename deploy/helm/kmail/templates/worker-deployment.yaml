@@ -88,15 +88,15 @@ spec:
             - name: KMAIL_DISABLE_WORKERS
               value: "true"
             {{- if .Values.mtls.enabled }}
-            {{- if .Values.stalwart.enabled }}
-            # See deployment-api.yaml for the full rationale: only
-            # synthesize the in-chart Stalwart FQDN when this release
-            # actually owns the StatefulSet. When stalwart.enabled=false
-            # (the canary) we fall through to the ConfigMap value so the
-            # dispatch workers reach the EXISTING Stalwart fleet instead
-            # of a non-existent <thisRelease>-stalwart-0 pod.
+            {{- $stalwartUrl := include "kmail.stalwartMtlsUrl" . }}
+            {{- if $stalwartUrl }}
+            # See deployment-api.yaml for the full rationale. The shared
+            # kmail.stalwartMtlsUrl helper synthesizes the SAN-covered HTTPS
+            # hostname for the in-chart fleet (stalwart.enabled) or an
+            # external fleet (stalwart.external.enabled, e.g. the canary),
+            # and returns "" to fall through to the ConfigMap value.
             - name: KMAIL_STALWART_URL
-              value: {{ printf "https://%s-stalwart-0.%s.%s.svc.cluster.local:8443" (include "kmail.fullname" .) .Values.stalwart.service.headlessName .Release.Namespace | quote }}
+              value: {{ $stalwartUrl | quote }}
             {{- end }}
             - name: KMAIL_STALWART_TLS_CERT
               value: /etc/kmail/tls/stalwart-client/tls.crt

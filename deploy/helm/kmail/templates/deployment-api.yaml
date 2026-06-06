@@ -103,28 +103,20 @@ spec:
             - name: KMAIL_DISABLE_WORKERS
               value: "true"
             {{- if .Values.mtls.enabled }}
-            {{- if .Values.stalwart.enabled }}
-            # When mTLS is enabled AND this release owns its own
-            # Stalwart StatefulSet, the BFF MUST speak HTTPS on
-            # Stalwart's `jmap-tls` listener (port 8443), and the
-            # hostname MUST be one of the SANs cert-manager baked
-            # into the server certificate (see stalwart-mtls.yaml).
-            # The .svc-only short form is NOT in the SAN list, so
-            # we override KMAIL_STALWART_URL here with the FQDN
-            # form. `env:` takes precedence over the ConfigMap
-            # value carried in envFrom.
+            {{- $stalwartUrl := include "kmail.stalwartMtlsUrl" . }}
+            {{- if $stalwartUrl }}
+            # When mTLS is enabled the BFF MUST speak HTTPS on Stalwart's
+            # `jmap-tls` listener (8443) using a hostname that is a SAN on
+            # the server cert (see stalwart-mtls.yaml). kmail.stalwartMtlsUrl
+            # synthesizes that hostname for BOTH the in-chart fleet
+            # (stalwart.enabled) AND an external fleet a control-plane-only
+            # release targets (stalwart.external.enabled, e.g. the canary),
+            # so we never hand-build a fragile URL string. It returns ""
+            # when the operator supplies KMAIL_STALWART_URL via the ConfigMap
+            # instead, in which case we emit no override and the value flows
+            # from envFrom. `env:` takes precedence over the ConfigMap value.
             - name: KMAIL_STALWART_URL
-              value: {{ printf "https://%s-stalwart-0.%s.%s.svc.cluster.local:8443" (include "kmail.fullname" .) .Values.stalwart.service.headlessName .Release.Namespace | quote }}
-            {{- else }}
-            # stalwart.enabled=false (e.g. the canary): this release
-            # does NOT render a Stalwart StatefulSet, so synthesizing
-            # `https://<thisRelease>-stalwart-0...` would point at a
-            # pod that never exists. We deliberately do NOT emit a
-            # KMAIL_STALWART_URL env override here and instead let the
-            # value flow from the ConfigMap (kmailApi.config), which
-            # the operator MUST point at the EXISTING Stalwart fleet
-            # (and set mtls.serverName / a SAN-covered host so the TLS
-            # handshake against that fleet's server cert verifies).
+              value: {{ $stalwartUrl | quote }}
             {{- end }}
             - name: KMAIL_STALWART_TLS_CERT
               value: /etc/kmail/tls/stalwart-client/tls.crt
