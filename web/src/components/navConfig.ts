@@ -37,7 +37,7 @@ export const NAV_TREE: NavNode[] = [
       {
         type: "link",
         label: "Priority",
-        to: "/mail?view=priority",
+        to: "/mail/priority",
         icon: "⭐",
       },
       { type: "link", label: "Compose", to: "/mail/compose", icon: "✏" },

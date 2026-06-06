@@ -83,6 +83,7 @@ export default function App() {
         <Route index element={<Navigate to="/mail" replace />} />
 
         <Route path="mail" element={<Inbox />} />
+        <Route path="mail/priority" element={<Inbox />} />
         <Route path="mail/compose" element={<Compose />} />
         <Route path="mail/shared" element={<SharedInboxView />} />
         <Route path="mail/vault" element={<VaultView />} />

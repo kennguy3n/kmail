@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
+import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
 
 import { jmapClient } from "../../api/jmap";
 import { snoozeEmail } from "../../api/snooze";
@@ -52,8 +52,12 @@ function categoryTabBtn(
 
 export default function Inbox() {
   const navigate = useNavigate();
-  const [searchParams] = useSearchParams();
-  const isPriorityView = searchParams.get("view") === "priority";
+  // Priority Inbox is its own route (`/mail/priority`) rather than a
+  // `?view=priority` query param so the WS1 sidebar/breadcrumb model —
+  // which matches on `pathname` only — highlights the active link and
+  // builds the right crumb trail.
+  const { pathname } = useLocation();
+  const isPriorityView = pathname === "/mail/priority";
   const { mailboxId: selectedFromRoute } = useParams<{ mailboxId?: string }>();
 
   const [mailboxes, setMailboxes] = useState<Mailbox[] | null>(null);
