@@ -171,14 +171,20 @@ metadata:
   labels:
     {{- include "kmail.labels" . | nindent 4 }}
 spec:
+  # `kmail.selectorLabels` pins BOTH app.kubernetes.io/name AND
+  # app.kubernetes.io/instance (the release name), so this egress allow-list
+  # only matches THIS release's pods. matchLabels + matchExpressions are
+  # ANDed, so the component clause narrows it to api+worker. Without the
+  # instance label this would also select a co-located release's api/worker
+  # pods (e.g. `kmail` and `kmail-canary` share namespace `kmail`), leaking
+  # egress permissions across release boundaries.
   podSelector:
+    matchLabels:
+      {{- include "kmail.selectorLabels" . | nindent 6 }}
     matchExpressions:
       - key: app.kubernetes.io/component
         operator: In
         values: ["api", "worker"]
-      - key: app.kubernetes.io/name
-        operator: In
-        values: [{{ include "kmail.name" . | quote }}]
   policyTypes:
     - Egress
   egress:

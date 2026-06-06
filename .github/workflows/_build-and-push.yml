@@ -48,9 +48,17 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # All ${{ }} values consumed by a `run:` step are bound through `env:`
+      # first and referenced as shell variables, never interpolated directly
+      # into the script. With the value living in an env var the shell treats
+      # it as inert data, so an attacker-influenced input (notably the
+      # free-form `image_tag` from a workflow_dispatch deploy) cannot inject
+      # shell metacharacters. See _helm-deploy.yml for the same pattern.
       - name: Compute lowercase image name
         id: name
-        run: echo "image=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+        env:
+          REPOSITORY: ${{ github.repository }}
+        run: echo "image=ghcr.io/$(echo "$REPOSITORY" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
 
       - name: Build and push
         id: build
@@ -65,9 +73,13 @@ jobs:
 
       - name: Export image reference (by digest)
         id: ref
+        env:
+          IMAGE_NAME: ${{ steps.name.outputs.image }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
         run: |
-          if [ -n "${{ steps.build.outputs.digest }}" ]; then
-            echo "image=${{ steps.name.outputs.image }}@${{ steps.build.outputs.digest }}" >> "$GITHUB_OUTPUT"
+          if [ -n "$IMAGE_DIGEST" ]; then
+            echo "image=${IMAGE_NAME}@${IMAGE_DIGEST}" >> "$GITHUB_OUTPUT"
           else
-            echo "image=${{ steps.name.outputs.image }}:${{ inputs.image_tag }}" >> "$GITHUB_OUTPUT"
+            echo "image=${IMAGE_NAME}:${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
           fi
