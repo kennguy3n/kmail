@@ -21,7 +21,6 @@ PROJECT="${KMAIL_COMPOSE_PROJECT:-kmail}"
 PG_CONTAINER="${KMAIL_PG_CONTAINER:-${PROJECT}-postgres}"
 JMAP_URL="${KMAIL_JMAP_URL:-http://localhost:8088}"
 AUTH_TOKEN="${KMAIL_AUTH_TOKEN:-kmail-dev}"
-PAUSE_S="${KMAIL_CHAOS_PAUSE_S:-15}"
 ITERATIONS="${KMAIL_CHAOS_ITERATIONS:-50}"
 # Per-request ceiling so a Postgres outage cannot hang the harness
 # indefinitely (a control-plane read with no cached fallback blocks
@@ -38,7 +37,11 @@ for _ in $(seq 1 5); do
   curl -fsS -H "Authorization: Bearer $AUTH_TOKEN" "$JMAP_URL$ENDPOINT" >/dev/null
 done
 
-echo "chaos-postgres: pausing $PG_CONTAINER for ${PAUSE_S}s"
+# Postgres stays paused for the duration of the probe loop below
+# (the measurement window): up to ITERATIONS x MAX_TIME seconds, each
+# request timing out against the frozen DB. There is no separate fixed
+# sleep — the loop *is* the outage window — then we unpause.
+echo "chaos-postgres: pausing $PG_CONTAINER for the ${ITERATIONS}-probe window (<= ${ITERATIONS}x${MAX_TIME}s)"
 docker pause "$PG_CONTAINER" >/dev/null
 trap 'docker unpause '"$PG_CONTAINER"' >/dev/null || true' EXIT
 
