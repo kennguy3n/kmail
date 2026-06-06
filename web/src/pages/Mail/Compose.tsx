@@ -1479,9 +1479,9 @@ const styles: Record<string, string> = {
     "cursor-pointer border-0 bg-transparent px-1 text-lg leading-none text-danger-fg",
   success: "mb-2 rounded-md bg-success-bg px-3 py-2 text-success-fg",
   undoBanner:
-    "mb-2 flex items-center justify-between gap-3 rounded-md bg-fg px-3 py-2 text-bg",
+    "mb-2 flex items-center justify-between gap-3 rounded-md bg-fg px-3 py-2 text-canvas",
   undoCancel:
-    "cursor-pointer rounded-md border border-bg bg-transparent px-3 py-1 font-semibold text-bg",
+    "cursor-pointer rounded-md border border-canvas bg-transparent px-3 py-1 font-semibold text-canvas",
   scheduledBanner:
     "mb-2 flex items-center gap-3 rounded-md bg-info-bg px-3 py-2 text-info-fg",
   linkButton:
