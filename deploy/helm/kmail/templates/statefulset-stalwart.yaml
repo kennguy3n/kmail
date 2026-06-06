@@ -1,3 +1,4 @@
+{{- if .Values.stalwart.enabled }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -111,3 +112,4 @@ spec:
         resources:
           requests:
             storage: {{ .Values.stalwart.storage.size }}
+{{- end }}

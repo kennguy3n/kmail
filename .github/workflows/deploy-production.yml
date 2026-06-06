@@ -1,0 +1,57 @@
+# Deploy to production.
+#
+# Manual-only, and gated by the `production` GitHub Environment's
+# required reviewers + (optional) wait timer. Promotes a specific,
+# already-validated image (the SHA that went through staging and
+# canary) to the full production release. Defaults the image to the
+# current ref's SHA but you should pass the exact SHA you canaried.
+name: Deploy production
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: Image tag to release (the git SHA validated in staging + canary). Defaults to the current ref's SHA.
+        required: false
+        default: ""
+      stalwart_partition:
+        description: >-
+          StatefulSet update partition for a progressive Stalwart roll
+          (see docs/runbooks/stalwart-upgrade.md). 0 = roll all shards.
+        required: false
+        default: "0"
+      dry_run:
+        description: Render/diff only, do not apply.
+        type: boolean
+        default: false
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    uses: ./.github/workflows/_build-and-push.yml
+    with:
+      image_tag: ${{ inputs.image_tag != '' && inputs.image_tag || github.sha }}
+    permissions:
+      contents: read
+      packages: write
+
+  deploy:
+    needs: build
+    uses: ./.github/workflows/_helm-deploy.yml
+    with:
+      environment: production
+      namespace: kmail
+      release_name: kmail
+      image: ${{ needs.build.outputs.image }}
+      values_file: deploy/helm/kmail/values-production.yaml
+      extra_args: --set stalwart.updateStrategy.partition=${{ inputs.stalwart_partition }}
+      dry_run: ${{ inputs.dry_run }}
+    secrets:
+      KUBE_CONFIG: ${{ secrets.KUBE_CONFIG_PRODUCTION }}

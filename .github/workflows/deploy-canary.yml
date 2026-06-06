@@ -1,0 +1,52 @@
+# Deploy a canary to production cluster.
+#
+# Manual-only. Deploys a given image (default: current commit SHA) as a
+# small, separate `kmail-canary` release in the production cluster. The
+# `canary` GitHub Environment is configured with required reviewers, so
+# this run pauses for manual approval before anything is applied — no
+# approval logic lives in the repo, only the environment binding.
+name: Deploy canary
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: Image tag to canary (a git SHA already built by deploy-staging). Defaults to the current ref's SHA.
+        required: false
+        default: ""
+      dry_run:
+        description: Render/diff only, do not apply.
+        type: boolean
+        default: false
+
+concurrency:
+  group: deploy-canary
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    # Builds (or, if the tag already exists in GHCR, refreshes) the image
+    # so a SHA that was never pushed by staging can still be canaried.
+    uses: ./.github/workflows/_build-and-push.yml
+    with:
+      image_tag: ${{ inputs.image_tag != '' && inputs.image_tag || github.sha }}
+    permissions:
+      contents: read
+      packages: write
+
+  deploy:
+    needs: build
+    uses: ./.github/workflows/_helm-deploy.yml
+    with:
+      environment: canary
+      namespace: kmail
+      release_name: kmail-canary
+      image: ${{ needs.build.outputs.image }}
+      values_file: deploy/helm/kmail/values-canary.yaml
+      dry_run: ${{ inputs.dry_run }}
+    secrets:
+      KUBE_CONFIG: ${{ secrets.KUBE_CONFIG_PRODUCTION }}

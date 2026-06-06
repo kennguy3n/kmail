@@ -1,0 +1,52 @@
+# KMail — canary values overlay.
+#
+# Layered on top of the chart's base values.yaml by
+# .github/workflows/deploy-canary.yml. The canary is a small, SEPARATE
+# release (release name `kmail-canary`) running the NEW image in the
+# production cluster behind a small replica count, so a bad build is
+# caught on a sliver of traffic before the full production rollout.
+#
+#   helm upgrade --install kmail-canary deploy/helm/kmail \
+#     -f deploy/helm/kmail/values-canary.yaml
+#
+# This overlay is self-contained (it does NOT require layering
+# values-production.yaml) so the deploy workflow can pass a single -f.
+
+# Minimal footprint: a single API replica, no autoscaling.
+kmailApi:
+  replicaCount: 1
+  hpa:
+    enabled: false
+
+# Canary does not own mailbox storage; it exercises the BFF/control
+# plane against the EXISTING production Stalwart fleet. Disabling the
+# in-chart StatefulSet avoids provisioning duplicate mailbox volumes.
+stalwart:
+  enabled: false
+
+# Same hardening posture as production so the canary is a faithful
+# preview. mTLS still needs the client cert to reach prod Stalwart.
+mtls:
+  enabled: true
+  issuerRef:
+    name: kmail-internal-ca
+
+networkPolicy:
+  enabled: true
+
+# Label the canary's metrics so its error-budget burn rate can be
+# evaluated independently from the stable production release.
+serviceMonitor:
+  enabled: true
+  labels:
+    kmail.deploy/track: canary
+
+prometheusRule:
+  enabled: true
+  labels:
+    kmail.deploy/track: canary
+  slo:
+    availabilityTarget: 0.999
+
+grafanaDashboards:
+  enabled: true

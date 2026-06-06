@@ -247,6 +247,12 @@ kmailWorker:
 # `kubectl scale statefulset`. See docs/DEVELOPMENT.md
 # "Scaling Stalwart with mTLS enabled" for the procedure.
 stalwart:
+  # Render the in-chart Stalwart StatefulSet + headless Service. Set to
+  # false for control-plane-only installs (e.g. the canary release in
+  # deploy/helm/kmail/values-canary.yaml) that target the EXISTING
+  # production Stalwart fleet instead of provisioning their own mailbox
+  # storage.
+  enabled: true
   replicaCount: 2
   image:
     repository: stalwartlabs/stalwart
