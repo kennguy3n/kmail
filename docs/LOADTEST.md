@@ -90,6 +90,32 @@ docker compose up -d
 make chaos
 ```
 
+### Prerequisites & known gaps (compose-local)
+
+The chaos scripts probe `/api/v1/admin/feature-flags` and the
+`/jmap` surface. Against a vanilla compose stack note:
+
+- **`chaos-valkey.sh`** only exercises the rate limiter when it is
+  enabled. The limiter is gated by `KMAIL_RATELIMIT_ENABLED` (default
+  off in dev), so start the BFF with
+  `KMAIL_RATELIMIT_ENABLED=true KMAIL_RATELIMIT_FAIL_CLOSED=false`
+  for the fail-open assertion to be meaningful.
+- **`chaos-postgres.sh`** currently surfaces a gap rather than a
+  pass: control-plane reads have no cached fallback / DB timeout, so
+  a Postgres outage hangs them (now bounded by `--max-time`). The
+  graceful-degradation middleware (`internal/middleware/degradation.go`)
+  is implemented but not wired into `cmd/kmail-api`, and it targets
+  the `/jmap` + Stalwart-health path, not control-plane Postgres
+  reads. See `docs/BENCHMARKS.md` → "Session 7" for the full finding.
+- **`chaos-shard.sh`** needs a provisioned Stalwart mailbox for the
+  authenticated principal; otherwise the BFF returns `404
+  accountNotFound` before reaching a shard. Seed a mailbox (or inject
+  `X-KMail-Dev-Stalwart-Account-Id`) first.
+
+Container names default to the compose `container_name:` values
+(`kmail-postgres`, `kmail-valkey`, `kmail-stalwart`); override with
+`KMAIL_{PG,VALKEY,SHARD}_CONTAINER` for a differently-named stack.
+
 ### Interpreting failures
 
 - **Shard chaos failure** — start with the BFF logs around the
@@ -99,9 +125,10 @@ make chaos
   (`KMAIL_CHAOS_ITERATIONS`) exposes more than your shard
   topology can absorb. Genuine regressions look like 503s lasting
   past the breaker recovery window.
-- **Postgres chaos failure** — confirm
-  `internal/middleware/degraded.go` still serves cached responses
-  on the affected route. Cache misses count as failures.
+- **Postgres chaos failure** — the graceful-degradation middleware
+  (`internal/middleware/degradation.go`) must be wired into the
+  affected route for cached responses to be served; it currently is
+  not (see the gap note above). Cache misses count as failures.
 - **Valkey chaos failure** — the rate limiter is the suspect.
   Confirm the middleware logs the Valkey error and admits the
   request.

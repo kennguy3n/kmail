@@ -17,21 +17,34 @@
 set -euo pipefail
 
 PROJECT="${KMAIL_COMPOSE_PROJECT:-kmail}"
-SHARD_CONTAINER="${KMAIL_SHARD_CONTAINER:-${PROJECT}-stalwart-1}"
+# docker-compose.yml pins `container_name: kmail-stalwart` (no compose
+# `-1` index suffix), so default to that rather than the generated
+# `${PROJECT}-stalwart-1` name, which does not exist in this stack.
+SHARD_CONTAINER="${KMAIL_SHARD_CONTAINER:-${PROJECT}-stalwart}"
 JMAP_URL="${KMAIL_JMAP_URL:-http://localhost:8088}"
 AUTH_TOKEN="${KMAIL_AUTH_TOKEN:-kmail-dev}"
 ITERATIONS="${KMAIL_CHAOS_ITERATIONS:-200}"
+MAX_TIME="${KMAIL_CHAOS_MAX_TIME:-10}"
 SLO_PCT="${KMAIL_CHAOS_SLO_PCT:-0.05}"
+# PREREQUISITE: the JMAP probe below requires a provisioned Stalwart
+# mailbox for the authenticated principal. With the dev-bypass token
+# and no seeded mailbox the BFF returns 404 accountNotFound *before*
+# touching a shard, so every iteration counts as an error regardless
+# of shard health. Seed a mailbox first (see docs/LOADTEST.md) or set
+# X-KMail-Dev-Stalwart-Account-Id via KMAIL_AUTH_* before running.
 
 echo "chaos-shard: pre-fault /readyz"
 curl -fsS "$JMAP_URL/readyz" >/dev/null
 
 echo "chaos-shard: killing $SHARD_CONTAINER"
 docker kill "$SHARD_CONTAINER" >/dev/null
+# Always restart the shard, even if the SLO assertion below fails
+# under `set -e`; otherwise a breach leaves the shard down.
+trap 'docker start '"$SHARD_CONTAINER"' >/dev/null 2>&1 || true' EXIT
 
 errs=0
 for i in $(seq 1 "$ITERATIONS"); do
-  if ! curl -fsS -X POST "$JMAP_URL/jmap" \
+  if ! curl -fsS --max-time "$MAX_TIME" -X POST "$JMAP_URL/jmap" \
        -H "Authorization: Bearer $AUTH_TOKEN" \
        -H "Content-Type: application/json" \
        -d '{"using":["urn:ietf:params:jmap:core"],"methodCalls":[]}' \
@@ -42,6 +55,7 @@ done
 
 echo "chaos-shard: restarting $SHARD_CONTAINER"
 docker start "$SHARD_CONTAINER" >/dev/null
+trap - EXIT
 sleep 5
 curl -fsS "$JMAP_URL/readyz" >/dev/null
 
