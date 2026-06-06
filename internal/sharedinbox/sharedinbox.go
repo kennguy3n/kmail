@@ -208,7 +208,7 @@ func (s *WorkflowService) ListAssignments(ctx context.Context, tenantID, sharedI
 		args = append(args, opts.Limit, opts.Offset)
 		rows, err := tx.Query(ctx, `
 			SELECT id::text, tenant_id::text, shared_inbox_id::text, email_id,
-			       COALESCE(assignee_user_id, '') AS assignee_user_id,
+			       COALESCE(assignee_user_id::text, '') AS assignee_user_id,
 			       status, created_at, updated_at
 			FROM shared_inbox_assignments
 			WHERE `+where+`
@@ -342,7 +342,7 @@ func (s *WorkflowService) upsertAssignment(ctx context.Context, tenantID, shared
 				assignee_user_id = COALESCE($4, shared_inbox_assignments.assignee_user_id),
 				status = CASE WHEN $6::boolean THEN $5 ELSE shared_inbox_assignments.status END,
 				updated_at = now()
-			RETURNING id::text, COALESCE(assignee_user_id, '') AS assignee_user_id, status, created_at, updated_at
+			RETURNING id::text, COALESCE(assignee_user_id::text, '') AS assignee_user_id, status, created_at, updated_at
 		`, tenantID, sharedInboxID, emailID, assigneeArg, statusArg, status != nil,
 		).Scan(&out.ID, &out.AssigneeUserID, &out.Status, &out.CreatedAt, &out.UpdatedAt)
 	})
