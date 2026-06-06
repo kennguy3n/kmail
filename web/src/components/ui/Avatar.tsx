@@ -39,7 +39,7 @@ function hueFromString(value: string): number {
 const sizeClass: Record<AvatarSize, string> = {
   sm: "size-7 text-[0.7rem]",
   md: "size-9 text-sm",
-  lg: "size-11 text-base",
+  lg: "size-12 text-[1.1rem]",
 };
 
 /** Avatar — a circular user marker showing an image or initials. */

@@ -40,6 +40,16 @@ const accent: Record<ToastVariant, string> = {
   info: "text-info",
 };
 
+// 4px variant-coloured left border (matches the old Toast.module.css).
+// Pairs with the icon colour so the toast's variant stays salient even
+// if the small icon hue is missed.
+const leftBorder: Record<ToastVariant, string> = {
+  success: "border-l-success",
+  error: "border-l-danger",
+  warning: "border-l-warning",
+  info: "border-l-info",
+};
+
 /**
  * Toast — a single notification card. Error and warning toasts use
  * `role="alert"` (assertive) so screen readers interrupt; success and
@@ -52,7 +62,10 @@ export function Toast({ toast, onDismiss }: ToastProps): JSX.Element {
   const Icon = ICONS[toast.variant];
   return (
     <div
-      className="pointer-events-auto flex w-80 animate-slide-in-right items-start gap-3 rounded-lg border border-border bg-elevated p-3.5 shadow-lg"
+      className={cn(
+        "pointer-events-auto flex w-80 animate-slide-in-right items-start gap-3 rounded-lg border border-l-4 border-border bg-elevated p-3.5 shadow-lg",
+        leftBorder[toast.variant],
+      )}
       role={assertive ? "alert" : "status"}
     >
       <Icon

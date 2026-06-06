@@ -16,10 +16,12 @@ import type { Config } from "tailwindcss";
  */
 export default {
   content: ["./index.html", "./src/**/*.{ts,tsx}"],
-  // `data-theme="dark"` lives on <html> (see hooks/useTheme). Expose it
-  // as the `dark:` variant for the rare cases that need an explicit
-  // dark-only tweak beyond the auto-flipping semantic colours.
-  darkMode: ['selector', '[data-theme="dark"]'],
+  // NOTE: the `dark:` variant is defined once, in `styles/global.css`
+  // via `@custom-variant dark (...)` (Tailwind v4's CSS-first API).
+  // We intentionally do NOT also set the v3-style `darkMode` option
+  // here — defining it in both places is redundant and can emit
+  // double/duplicated `dark:` selectors. The colour system auto-flips
+  // through the semantic tokens, so `dark:` is rarely needed anyway.
   theme: {
     extend: {
       colors: {
