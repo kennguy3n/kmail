@@ -12,12 +12,28 @@
  *     up in the time grid.
  *   - The view starts in "week" mode.
  */
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 
 import CalendarView from "./CalendarView";
 import type { Calendar, CalendarEvent } from "../../types";
+
+// Pin the clock to a fixed mid-week, mid-day instant so the "+2h from
+// now" sample event always lands inside the current week's grid. The
+// previous wall-clock approach was flaky: within 2h of the week
+// boundary (e.g. late Saturday on a Sun–Sat week) the event rolls into
+// the next week and never renders. We fake only `Date` so React
+// Testing Library's real-timer async polling (findByText/waitFor) is
+// unaffected.
+beforeEach(() => {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(new Date("2026-06-10T12:00:00Z")); // Wednesday
+});
+
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 const calendars: Calendar[] = [
   {
@@ -38,8 +54,8 @@ const calendars: Calendar[] = [
 
 function eventInWindow(): CalendarEvent[] {
   // The CalendarView fetches events for the current week. Anchor a
-  // sample event two hours from now so it always lands inside the
-  // requested range regardless of when the test runs.
+  // sample event two hours from the (faked) mid-week clock so it always
+  // lands inside the requested range and the rendered week grid.
   const start = new Date(Date.now() + 2 * 60 * 60 * 1000);
   const end = new Date(start.getTime() + 60 * 60 * 1000);
   return [
