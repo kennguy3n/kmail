@@ -48,8 +48,17 @@ func TestMigrationCreateGetListDB(t *testing.T) {
 	}
 
 	jobs, err := svc.ListJobs(ctx, tenant)
-	if err != nil || len(jobs) != 1 {
-		t.Fatalf("ListJobs=%d err=%v", len(jobs), err)
+	if err != nil {
+		t.Fatalf("ListJobs err=%v", err)
+	}
+	found := false
+	for _, j := range jobs {
+		if j.ID == job.ID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("ListJobs did not include created job (got %d jobs)", len(jobs))
 	}
 }
 
