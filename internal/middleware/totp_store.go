@@ -198,7 +198,15 @@ func (s *TOTPStore) EvaluateAttempt(
 			&c.RecoveryCodesHash, &c.Enabled, &c.CreatedAt, &c.LastUsedAt,
 			&c.FailedAttempts, &c.LockedUntil,
 		); err != nil {
-			return ErrTOTPNotFound
+			// Only a genuinely absent row is "not enrolled". A
+			// transient DB error (connection drop, context
+			// cancellation, etc.) must surface as a real error so the
+			// handler returns 500 rather than masking it as a 401 —
+			// otherwise infrastructure blips look like auth rejections.
+			if errors.Is(err, pgx.ErrNoRows) {
+				return ErrTOTPNotFound
+			}
+			return err
 		}
 
 		if requireEnabled && !c.Enabled {

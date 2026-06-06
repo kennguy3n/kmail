@@ -14,7 +14,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -1102,7 +1101,7 @@ func main() {
 		Logger:            logger,
 		Issuer:            "KMail",
 		Envelope:          secretsEnvelope,
-		MaxFailedAttempts: getenvInt("KMAIL_TOTP_MAX_FAILED_ATTEMPTS", 0),
+		MaxFailedAttempts: config.GetenvInt("KMAIL_TOTP_MAX_FAILED_ATTEMPTS", 0),
 		LockoutDuration:   getenvDuration("KMAIL_TOTP_LOCKOUT_DURATION", 0),
 	}).Register(mux, authMW)
 
@@ -1615,20 +1614,6 @@ func getenvDuration(key string, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	return d
-}
-
-// getenvInt reads an integer env var with a fallback. Empty or
-// unparseable values return the fallback.
-func getenvInt(key string, fallback int) int {
-	v := os.Getenv(key)
-	if v == "" {
-		return fallback
-	}
-	n, err := strconv.Atoi(v)
-	if err != nil {
-		return fallback
-	}
-	return n
 }
 
 // buildPushTransport assembles the per-platform push transports
