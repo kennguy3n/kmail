@@ -18,6 +18,26 @@ export interface NavItem {
   href: string;
 }
 
+/**
+ * Competitor comparison rows, shared by the homepage comparison
+ * section and the dedicated `/compare` page so the two never drift.
+ */
+export interface CompetitorRow {
+  feature: string;
+  kmail: string;
+  gmail: string;
+  m365: string;
+}
+
+export const COMPETITORS: CompetitorRow[] = [
+  { feature: "Private business email", kmail: "Yes", gmail: "Ads-funded history", m365: "Yes" },
+  { feature: "Zero-access vaults", kmail: "Yes", gmail: "No", m365: "No" },
+  { feature: "Customer-managed keys (CMK)", kmail: "Yes", gmail: "Enterprise add-on", m365: "Enterprise add-on" },
+  { feature: "Shared inboxes (no paid seat)", kmail: "Yes", gmail: "Paid groups", m365: "Shared mailbox" },
+  { feature: "Open JMAP API", kmail: "Yes", gmail: "No", m365: "No" },
+  { feature: "Transparent per-seat pricing", kmail: "$3–$9", gmail: "$7–$22", m365: "$6–$22" },
+];
+
 export const PRIMARY_NAV: NavItem[] = [
   { label: "Features", href: "/features" },
   { label: "Pricing", href: "/pricing" },
@@ -32,6 +52,7 @@ export const FOOTER_NAV: { heading: string; items: NavItem[] }[] = [
     heading: "Product",
     items: [
       { label: "Features", href: "/features" },
+      { label: "Compare", href: "/compare" },
       { label: "Pricing", href: "/pricing" },
       { label: "Security", href: "/security" },
       { label: "Privacy", href: "/privacy" },

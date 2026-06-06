@@ -3,7 +3,7 @@ import BaseLayout from "../layouts/BaseLayout.astro";
 import TrustBadges from "../components/TrustBadges.astro";
 import PricingCards from "../components/PricingCards.astro";
 import CTA from "../components/CTA.astro";
-import { SITE } from "../data/site";
+import { SITE, COMPETITORS } from "../data/site";
 
 const valueProps = [
   {
@@ -28,14 +28,7 @@ const valueProps = [
   },
 ];
 
-const competitors = [
-  { feature: "Private business email", kmail: "Yes", gmail: "Ads-funded history", m365: "Yes" },
-  { feature: "Zero-access vaults", kmail: "Yes", gmail: "No", m365: "No" },
-  { feature: "Customer-managed keys (CMK)", kmail: "Yes", gmail: "Enterprise add-on", m365: "Enterprise add-on" },
-  { feature: "Shared inboxes (no paid seat)", kmail: "Yes", gmail: "Paid groups", m365: "Shared mailbox" },
-  { feature: "Open JMAP API", kmail: "Yes", gmail: "No", m365: "No" },
-  { feature: "Transparent per-seat pricing", kmail: "$3–$9", gmail: "$7–$22", m365: "$6–$22" },
-];
+const competitors = COMPETITORS;
 ---
 
 <BaseLayout>
@@ -130,6 +123,9 @@ const competitors = [
           </tbody>
         </table>
       </div>
+      <p class="center" style="margin-top:1.5rem">
+        <a href="/compare">See the full comparison →</a>
+      </p>
     </div>
   </section>
 
