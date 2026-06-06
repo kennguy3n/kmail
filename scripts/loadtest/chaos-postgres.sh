@@ -44,12 +44,15 @@ trap 'docker unpause '"$PG_CONTAINER"' >/dev/null || true' EXIT
 
 succ=0
 for _ in $(seq 1 "$ITERATIONS"); do
-  # `|| echo 000` keeps the loop alive under `set -e`: curl exits
-  # non-zero on a connect error / --max-time timeout, which would
-  # otherwise abort the whole script via the failed assignment.
+  # `-w "%{http_code}"` already emits the status (000 when there is no
+  # response), so `|| true` is enough to keep the loop alive under
+  # `set -e` when curl exits non-zero on a connect error / --max-time
+  # timeout. The `${code:-000}` guard normalises the rare case where
+  # curl prints nothing at all to a single "000" (not a doubled value).
   code=$(curl -s -o /dev/null -w "%{http_code}" --max-time "$MAX_TIME" \
         -H "Authorization: Bearer $AUTH_TOKEN" \
-        "$JMAP_URL$ENDPOINT" || echo 000)
+        "$JMAP_URL$ENDPOINT" || true)
+  code=${code:-000}
   # Only genuine 2xx/3xx counts. A timeout ("000") or 5xx is a
   # failure; the old `-lt 500` test counted "000" timeouts as
   # success, masking the fact that reads hang under DB outage.

@@ -97,11 +97,9 @@ func main() {
 	})
 	records := svc.GenerateRecords(domain)
 
-	byName := map[string]dns.DomainRecord{}
 	var spf, dkim, dmarc dns.DomainRecord
 	var haveMX bool
 	for _, r := range records.Records {
-		byName[r.Type+" "+r.Name] = r
 		switch {
 		case r.Type == "MX":
 			haveMX = true
@@ -123,7 +121,7 @@ func main() {
 	checks = append(checks, dkimCheck)
 	checks = append(checks, validateKeyConsistency(pair.PrivateKey, dkimPub))
 
-	report := render(domain, selector, pair, records, checks)
+	report := render(domain, selector, records, checks)
 	if mdOut != "" {
 		if err := os.WriteFile(mdOut, []byte(report), 0o644); err != nil {
 			fmt.Fprintf(os.Stderr, "deliverability-check: write md: %v\n", err)
@@ -245,7 +243,7 @@ func extractTag(record, tag string) string {
 	return ""
 }
 
-func render(domain, selector string, pair dns.DKIMKeyPair, records dns.DomainRecords, checks []check) string {
+func render(domain, selector string, records dns.DomainRecords, checks []check) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "# Deliverability local validation — %s\n\n", domain)
 	fmt.Fprintf(&b, "> Local-only: validates DKIM signing/keys and SPF/DMARC record generation. ")

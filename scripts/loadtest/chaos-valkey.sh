@@ -33,12 +33,15 @@ trap 'docker start '"$VALKEY_CONTAINER"' >/dev/null 2>&1 || true' EXIT
 
 succ=0
 for _ in $(seq 1 "$ITERATIONS"); do
-  # `|| echo 000` keeps the loop alive under `set -e`: curl exits
-  # non-zero on a connect error / --max-time timeout, which would
-  # otherwise abort the whole script via the failed assignment.
+  # `-w "%{http_code}"` already emits the status (000 when there is no
+  # response), so `|| true` is enough to keep the loop alive under
+  # `set -e` when curl exits non-zero on a connect error / --max-time
+  # timeout. The `${code:-000}` guard normalises the rare case where
+  # curl prints nothing at all to a single "000" (not a doubled value).
   code=$(curl -s -o /dev/null -w "%{http_code}" --max-time "$MAX_TIME" \
         -H "Authorization: Bearer $AUTH_TOKEN" \
-        "$JMAP_URL$ENDPOINT" || echo 000)
+        "$JMAP_URL$ENDPOINT" || true)
+  code=${code:-000}
   # Count only genuine 2xx/3xx as fail-open success. curl emits "000"
   # on a connect error or --max-time timeout; the old `-lt 500` test
   # mis-counted those as success.
@@ -49,6 +52,11 @@ done
 
 echo "chaos-valkey: restarting $VALKEY_CONTAINER"
 docker start "$VALKEY_CONTAINER" >/dev/null
+# Container is back up; clear the restart trap so the final exit does
+# not issue a redundant `docker start` (matches chaos-shard.sh /
+# chaos-postgres.sh, which clear their traps after the explicit
+# unpause/restart).
+trap - EXIT
 sleep 3
 
 ratio=$(awk -v s="$succ" -v t="$ITERATIONS" 'BEGIN{printf "%.2f", 100.0*s/t}')
