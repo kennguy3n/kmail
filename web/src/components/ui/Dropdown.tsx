@@ -172,7 +172,7 @@ export function Dropdown({
                 {item.icon && (
                   <span
                     className={cn(
-                      "inline-flex shrink-0",
+                      "inline-flex w-5 shrink-0 justify-center",
                       item.danger ? "text-danger-fg" : "text-fg-muted",
                     )}
                     aria-hidden="true"

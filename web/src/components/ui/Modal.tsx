@@ -25,10 +25,14 @@ export interface ModalProps {
 const FOCUSABLE =
   'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])';
 
+// Explicit rem widths (24/32/48) rather than Tailwind's named scale
+// (max-w-sm/lg/3xl). The named values happen to match today, but the
+// literal widths come straight from the old Modal.module.css and can't
+// silently drift if the Tailwind max-width scale is ever themed.
 const sizeClass: Record<ModalSize, string> = {
-  sm: "max-w-sm",
-  md: "max-w-lg",
-  lg: "max-w-3xl",
+  sm: "max-w-[24rem]",
+  md: "max-w-[32rem]",
+  lg: "max-w-[48rem]",
 };
 
 // Ref-counted body scroll lock shared across all Modal instances. A
