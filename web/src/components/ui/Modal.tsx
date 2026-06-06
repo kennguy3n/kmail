@@ -28,7 +28,7 @@ const FOCUSABLE =
 const sizeClass: Record<ModalSize, string> = {
   sm: "max-w-sm",
   md: "max-w-lg",
-  lg: "max-w-2xl",
+  lg: "max-w-3xl",
 };
 
 // Ref-counted body scroll lock shared across all Modal instances. A
@@ -151,7 +151,7 @@ export function Modal({
       <div
         ref={dialogRef}
         className={cn(
-          "w-full animate-scale-in rounded-xl border border-border bg-elevated shadow-lg",
+          "flex max-h-[calc(100vh-14vh)] w-full animate-scale-in flex-col rounded-xl border border-border bg-elevated shadow-lg",
           sizeClass[size],
         )}
         role="dialog"
@@ -162,7 +162,7 @@ export function Modal({
         onKeyDown={handleKeyDown}
       >
         {title && (
-          <header className="flex items-center justify-between gap-4 border-b border-border px-5 py-4">
+          <header className="flex shrink-0 items-center justify-between gap-4 border-b border-border px-5 py-4">
             <h2 id={titleId} className="text-lg font-semibold text-fg">
               {title}
             </h2>
@@ -176,9 +176,9 @@ export function Modal({
             </button>
           </header>
         )}
-        <div className="px-5 py-4">{children}</div>
+        <div className="flex-1 overflow-y-auto px-5 py-4">{children}</div>
         {footer && (
-          <footer className="flex items-center justify-end gap-2 border-t border-border px-5 py-4">
+          <footer className="flex shrink-0 items-center justify-end gap-2 border-t border-border px-5 py-4">
             {footer}
           </footer>
         )}

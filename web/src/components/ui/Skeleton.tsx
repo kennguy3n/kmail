@@ -33,7 +33,7 @@ export function Skeleton({
 }: SkeletonProps): JSX.Element {
   const style: CSSProperties = {
     width: circle ? height ?? width : width,
-    height: height ?? "1em",
+    height: height ?? "1rem",
     borderRadius: circle ? "50%" : undefined,
   };
 

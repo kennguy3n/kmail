@@ -170,7 +170,7 @@ export default function Layout(): JSX.Element {
     [],
   );
 
-  useKeyboardShortcuts(globalShortcuts);
+  useKeyboardShortcuts(globalShortcuts, { enabled: !helpOpen });
 
   const onSearchSubmit = (e: React.FormEvent): void => {
     e.preventDefault();
