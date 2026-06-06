@@ -26,7 +26,7 @@ Status key: `[x]` in place · `[~]` partial / in progress · `[ ]` not started.
 - [x] **CC6.3 Privileged-access auditing** — every admin route writes to the `audit_log` hash chain; chain integrity is tamper-evident and concurrency-safe (migrations 009/011, advisory lock).
 - [x] **CC7.1 Vulnerability management** — automated dependency scanners (govulncheck / npm audit / cargo audit) + Dependabot; findings tracked in [`SECURITY_FINDINGS.md`](./SECURITY_FINDINGS.md).
 - [x] **CC7.2 Incident response** — [`incident-response.md`](./incident-response.md).
-- [x] **CC8.1 Change management** — branch protection on `main` (PR + review + required `CI Status`), numbered migrations, CODEOWNERS on sensitive paths.
+- [x] **CC8.1 Change management** — branch protection on `main` (PR + review + required `CI Status`), numbered migrations, CODEOWNERS on sensitive paths. **Deploy ordering:** schema migrations run to completion (`cmd/kmail-migrate`) **before** any new API/worker pod is rolled — the audit `seq` column (migration 011) and the TOTP lockout columns (migration 010) must exist before the code that reads them goes live.
 - [~] **CC7.3 Threat detection** — deliverability + audit-chain verification in place; centralised SIEM/alerting integration to be confirmed.
 - [ ] **CC1.x / CC4.x** — HR controls (background checks, security training, org chart) and periodic management review: confirm operational evidence exists for the window.
 
