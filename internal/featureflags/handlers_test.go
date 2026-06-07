@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/puddle/v2"
 	"github.com/kennguy3n/kmail/internal/middleware"
 )
 
@@ -316,6 +317,27 @@ func TestHandlerListServesStaleOnConnectionDrop(t *testing.T) {
 	}
 }
 
+// TestHandlerListServesStaleOnClosedPool asserts that puddle.ErrClosedPool
+// (what pgxpool.Acquire returns once the pool is closed, e.g. during a
+// pool reset) is classified as unavailability and served stale, not as a
+// genuine 500 — it is distinct from net.ErrClosed.
+func TestHandlerListServesStaleOnClosedPool(t *testing.T) {
+	store := newFakeStore()
+	store.flags["a"] = Flag{Key: "a", DefaultEnabled: true}
+	h := &Handlers{store: store, logger: discardLogger()}
+	h.list(httptest.NewRecorder(), authed(httptest.NewRequest(http.MethodGet, "/api/v1/admin/feature-flags", nil)))
+
+	store.loadErr = fmt.Errorf("acquire: %w", puddle.ErrClosedPool)
+	rec := httptest.NewRecorder()
+	h.list(rec, authed(httptest.NewRequest(http.MethodGet, "/api/v1/admin/feature-flags", nil)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (stale snapshot on closed pool), body %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("X-Kmail-Stale"); got != "true" {
+		t.Errorf("X-Kmail-Stale = %q, want \"true\"", got)
+	}
+}
+
 // TestHandlerListServerErrorNotServedStale asserts a server-side SQL
 // error (pgconn.PgError — Postgres is up and answering) is treated as a
 // genuine 500 and never served from the stale cache, even though it is
@@ -411,6 +433,8 @@ func TestHandlerPutReloadFailureReconcilesDecoupled(t *testing.T) {
 	if wrec.Code != http.StatusOK {
 		t.Fatalf("put: status %d, want 200, body %s", wrec.Code, wrec.Body.String())
 	}
+	// The reconcile runs off the response path; await it before asserting.
+	h.reconcileWG.Wait()
 
 	// A later outage read must serve the reconciled (new) state, not 503.
 	store.loadErr = context.DeadlineExceeded
@@ -459,6 +483,8 @@ func TestHandlerPutReloadFailureDropsCacheOnOutage(t *testing.T) {
 	if wrec.Code != http.StatusOK {
 		t.Fatalf("put: status %d, want 200, body %s", wrec.Code, wrec.Body.String())
 	}
+	// The reconcile runs off the response path; await it before asserting.
+	h.reconcileWG.Wait()
 
 	rec := httptest.NewRecorder()
 	h.list(rec, authed(httptest.NewRequest(http.MethodGet, "/api/v1/admin/feature-flags", nil)))

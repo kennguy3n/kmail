@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/puddle/v2"
 	"github.com/kennguy3n/kmail/internal/middleware"
 )
 
@@ -41,6 +42,12 @@ type Handlers struct {
 	cacheMu  sync.RWMutex
 	lastGood []FlagView
 	cachedAt time.Time
+
+	// reconcileWG tracks in-flight asynchronous post-write cache
+	// reconciliations (refreshCacheAfterWrite launched off the response
+	// path). It lets a graceful shutdown — and the tests — wait for a
+	// just-kicked reconcile to finish instead of racing it.
+	reconcileWG sync.WaitGroup
 }
 
 // adminStore is the write+read surface the handlers need. The pgx
@@ -173,6 +180,9 @@ const cacheRefreshBudget = 5 * time.Second
 // correct. Whole-flag deletes don't use this path: their cache effect
 // is fully known from the key, so removeFlagFromCache reconciles them
 // in memory without a reload.
+//
+// Callers run this off the response path via reconcileCacheAfterWriteAsync
+// so the write isn't blocked by the (up to cacheRefreshBudget) read.
 func (h *Handlers) refreshCacheAfterWrite(parent context.Context) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), cacheRefreshBudget)
 	defer cancel()
@@ -185,6 +195,24 @@ func (h *Handlers) refreshCacheAfterWrite(parent context.Context) {
 		return
 	}
 	h.cacheViews(views)
+}
+
+// reconcileCacheAfterWriteAsync runs refreshCacheAfterWrite in the
+// background so the write response returns immediately rather than
+// blocking up to cacheRefreshBudget on the reconciliation read. The
+// read is already decoupled from the request context (its own budget),
+// so it completes correctly after the handler returns; reconcileWG lets
+// shutdown and tests await it. Until it finishes, the cache still holds
+// the pre-reconcile snapshot — the same in-flight window the synchronous
+// version had, well within the system's bounded-staleness model — and it
+// converges to the committed state (or an empty cache → 503) once done.
+func (h *Handlers) reconcileCacheAfterWriteAsync(parent context.Context) {
+	detached := context.WithoutCancel(parent)
+	h.reconcileWG.Add(1)
+	go func() {
+		defer h.reconcileWG.Done()
+		h.refreshCacheAfterWrite(detached)
+	}()
 }
 
 // overrideOp is one override mutation in a PUT body. Delete=true
@@ -329,11 +357,13 @@ func (h *Handlers) put(w http.ResponseWriter, r *http.Request) {
 		}
 		// The write landed but the convenience reload (on the client's
 		// context) failed — most often a client disconnect. Reconcile
-		// the cache out of band on a decoupled context: a transient
-		// disconnect still re-caches the committed state, and only a
-		// genuine outage drops the snapshot (→ later read 503). Either
-		// way the cache never keeps a snapshot the write contradicted.
-		h.refreshCacheAfterWrite(r.Context())
+		// the cache out of band on a decoupled context, off the response
+		// path so this PUT isn't blocked by the reconciliation read: a
+		// transient disconnect still re-caches the committed state, and
+		// only a genuine outage drops the snapshot (→ later read 503).
+		// Either way the cache converges to a snapshot the write didn't
+		// contradict.
+		h.reconcileCacheAfterWriteAsync(r.Context())
 		cacheReconciled = true
 		writeJSON(w, http.StatusOK, map[string]string{"key": in.Key})
 		return
@@ -388,7 +418,12 @@ func isStoreUnavailable(err error) bool {
 	if errors.As(err, &netErr) {
 		return true
 	}
-	return errors.Is(err, net.ErrClosed) ||
+	// puddle.ErrClosedPool is what pgxpool.Acquire returns once the pool
+	// has been closed (e.g. during graceful shutdown or a pool reset);
+	// it is distinct from net.ErrClosed ("use of closed network
+	// connection") and would otherwise fall through to a 500.
+	return errors.Is(err, puddle.ErrClosedPool) ||
+		errors.Is(err, net.ErrClosed) ||
 		errors.Is(err, io.ErrUnexpectedEOF) ||
 		errors.Is(err, io.EOF)
 }
