@@ -1,5 +1,5 @@
 -- ================================================================
--- 008_force_rls.sql
+-- 010_force_rls.sql
 -- ----------------------------------------------------------------
 -- Security hardening (Session 6 / SOC 2 prep): make tenant
 -- row-level-security FORCED, not merely ENABLED.

@@ -1,5 +1,5 @@
 -- ================================================================
--- 009_audit_chain_linearity.sql
+-- 011_audit_chain_linearity.sql
 -- ----------------------------------------------------------------
 -- Security hardening (Session 6 / SOC 2 prep): make the audit
 -- hash-chain's linearity a database-enforced invariant.

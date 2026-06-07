@@ -33,15 +33,15 @@ inventory) and [`SECURITY_OVERVIEW.md`](./SECURITY_OVERVIEW.md)
 
 ### Spoofing
 - **Forged identity / token replay.** Mitigation: OIDC verification against KChat JWKS, fail-closed on missing/invalid claims (`internal/middleware/auth.go`); short-lived sessions with idle timeout and max-concurrent caps (`internal/middleware/session.go`).
-- **Second-factor bypass.** Mitigation: TOTP verify/check enforce a durable per-account brute-force lockout evaluated atomically under `SELECT … FOR UPDATE` (migration 010, `TOTPStore.EvaluateAttempt`); WebAuthn available.
+- **Second-factor bypass.** Mitigation: TOTP verify/check enforce a durable per-account brute-force lockout evaluated atomically under `SELECT … FOR UPDATE` (migration 012, `TOTPStore.EvaluateAttempt`); WebAuthn available.
 - **Lockout bypass via re-enrollment.** Mitigation: re-enrolling an already-enabled credential (which would otherwise reset the lockout/replace the secret) goes through the same `FOR UPDATE` lockout path and requires proving the current second factor — a live TOTP code or an unused recovery code (lost-authenticator escape hatch); refused with 429 while locked. First-time/unconfirmed enrollment is unaffected.
 - **Delete-then-re-enroll second-factor replacement.** Mitigation: `DELETE /api/v1/auth/totp` (disable) cannot be used to strip an enabled credential and then re-enroll a fresh one frictionlessly. Disabling an already-enabled credential is routed through the same `EvaluateAttempt` `FOR UPDATE` lockout path and requires the current second factor (TOTP or recovery code); refused with 429 while locked. Removing a not-yet-confirmed (disabled) credential, or one that does not exist, needs no factor (idempotent 204) since there is no active factor to protect.
 - **Webhook spoofing (Stripe).** Mitigation: Stripe signature verification (`KMAIL_STRIPE_WEBHOOK_SECRET`) on the public webhook route.
 
 ### Tampering
-- **Audit-log tampering.** Mitigation: SHA-256 prev-hash chain; `VerifyChain` recomputes end-to-end; per-tenant advisory lock + monotonic `seq` (migration 011) keep the chain linear and ordered under concurrency; unique `(tenant_id, prev_hash)` index (migration 009) structurally rejects forks.
+- **Audit-log tampering.** Mitigation: SHA-256 prev-hash chain; `VerifyChain` recomputes end-to-end; per-tenant advisory lock + monotonic `seq` (migration 013) keep the chain linear and ordered under concurrency; unique `(tenant_id, prev_hash)` index (migration 011) structurally rejects forks.
 - **Request/response tampering in transit.** Mitigation: TLS 1.2+ externally, mTLS to Stalwart.
-- **Cross-tenant write.** Mitigation: RLS `WITH CHECK` rejects inserts/updates claiming another tenant; **FORCE** RLS (migration 008) so even table-owner connections are policed. Regression-tested (`rls_db_test.go`).
+- **Cross-tenant write.** Mitigation: RLS `WITH CHECK` rejects inserts/updates claiming another tenant; **FORCE** RLS (migration 010) so even table-owner connections are policed. Regression-tested (`rls_db_test.go`).
 
 ### Repudiation
 - **"I didn't do that" on privileged actions.** Mitigation: every admin route writes an actor-attributed `audit_log` entry; tamper-evident chain; reverse-access proxy with approval (`internal/adminproxy`, `internal/approval`).
@@ -55,18 +55,18 @@ inventory) and [`SECURITY_OVERVIEW.md`](./SECURITY_OVERVIEW.md)
 ### Denial of service
 - **Auth/JMAP flooding.** Mitigation: `middleware.RateLimiter` (Redis-backed, fail-closed in prod) on auth + JMAP; signup funnel rate-limited.
 - **Algorithmic complexity (stdlib ParseAddress / x509).** Mitigation: keep Go toolchain patched (see SECURITY_FINDINGS §2.1).
-- **TOTP guess flooding.** Mitigation: per-account lockout (migration 010).
+- **TOTP guess flooding.** Mitigation: per-account lockout (migration 012).
 
 ### Elevation of privilege
 - **Tenant→tenant or user→admin escalation.** Mitigation: RLS scoping; admin routes behind OIDC + approval workflow; SCIM tokens tenant-scoped with RLS.
-- **Owner-role RLS bypass.** Mitigation: FORCE RLS (migration 008) closes the table-owner exemption.
+- **Owner-role RLS bypass.** Mitigation: FORCE RLS (migration 010) closes the table-owner exemption.
 
 ## 4. Multi-tenant isolation (deep dive)
 The dominant risk for KMail is one tenant reading or mutating
 another's data. Defense in depth:
 1. **Identity → tenant binding** at the OIDC layer; the tenant id is never client-supplied for data scoping.
 2. **`app.tenant_id` GUC** set inside every DB transaction (`middleware.SetTenantGUC`).
-3. **RLS policies** on every tenant-scoped table, now **forced** so they apply to all roles (migration 008).
+3. **RLS policies** on every tenant-scoped table, now **forced** so they apply to all roles (migration 010).
 4. **`WITH CHECK`** on policies blocks cross-tenant writes (verified by `TestRLS_CrossTenantIsolation`).
 5. **Concurrency**: `TestRLS_ConcurrentTenantsStayIsolated` exercises interleaved access from two tenants under load.
 6. **Data plane**: per-tenant Stalwart shard + zk-object-fabric bucket — isolation does not rely on the app alone.

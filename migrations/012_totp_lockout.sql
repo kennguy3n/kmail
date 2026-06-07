@@ -1,5 +1,5 @@
 -- ================================================================
--- 010_totp_lockout.sql
+-- 012_totp_lockout.sql
 -- ----------------------------------------------------------------
 -- Security hardening (Session 6 / SOC 2 prep): per-account
 -- brute-force lockout for the TOTP second factor.

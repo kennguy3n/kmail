@@ -4,7 +4,7 @@ package audit
 // SOC 2 data-protection step). Skips unless KMAIL_TEST_DATABASE_URL
 // or DATABASE_URL points at a migrated database.
 //
-// Before migration 008/009 + the per-tenant advisory lock in
+// Before migrations 011/013 + the per-tenant advisory lock in
 // Service.Log, concurrent appends to one tenant's chain raced on
 // the read-latest-hash → insert sequence and forked the chain
 // (two rows sharing a prev_hash), which VerifyChain then reports as
@@ -104,7 +104,7 @@ func TestAuditChain_ConcurrentWritesStayLinear(t *testing.T) {
 	}
 
 	// Sanity: exactly one genesis row (prev_hash = '') exists for the
-	// tenant — the structural invariant enforced by migration 009.
+	// tenant — the structural invariant enforced by migration 011.
 	var genesis int
 	if err := pool.QueryRow(ctx,
 		`SELECT count(*) FROM audit_log WHERE tenant_id = $1::uuid AND prev_hash = ''`, tenantID,

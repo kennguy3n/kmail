@@ -93,11 +93,13 @@ func TestTOTPHandlersLifecycleDB(t *testing.T) {
 		t.Errorf("check wrong=%d want 401", rec.Code)
 	}
 
-	// disable → 204, then status enrolled=false
+	// disable requires the current second factor for an enabled
+	// credential (closes the delete-then-re-enroll bypass): a valid
+	// TOTP code → 204, then status enrolled=false.
 	rec = httptest.NewRecorder()
-	h.disable(rec, totpReq(http.MethodDelete, tenant, user, ""))
+	h.disable(rec, totpReq(http.MethodDelete, tenant, user, `{"code":"`+code+`"}`))
 	if rec.Code != http.StatusNoContent {
-		t.Fatalf("disable=%d", rec.Code)
+		t.Fatalf("disable=%d body=%s", rec.Code, rec.Body.String())
 	}
 	rec = httptest.NewRecorder()
 	h.status(rec, totpReq(http.MethodGet, tenant, user, ""))

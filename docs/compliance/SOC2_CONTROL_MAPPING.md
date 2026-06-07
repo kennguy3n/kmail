@@ -50,8 +50,8 @@ runbook.
 | TSC | Control | Evidence |
 |-----|---------|----------|
 | CC6.1 | OIDC auth via KChat | `internal/middleware/oidc.go` |
-| CC6.1 | MFA: TOTP with per-account brute-force lockout; WebAuthn | `internal/middleware/totp.go` (migration 010), `internal/middleware/webauthn.go` |
-| CC6.2 | Tenant isolation | PostgreSQL RLS (FORCED on every tenant table, migration 008) + per-tenant Stalwart shards + per-tenant zk-object-fabric buckets; regression-tested in `internal/middleware/rls_db_test.go` |
+| CC6.1 | MFA: TOTP with per-account brute-force lockout; WebAuthn | `internal/middleware/totp.go` (migration 012), `internal/middleware/webauthn.go` |
+| CC6.2 | Tenant isolation | PostgreSQL RLS (FORCED on every tenant table, migration 010) + per-tenant Stalwart shards + per-tenant zk-object-fabric buckets; regression-tested in `internal/middleware/rls_db_test.go` |
 | CC6.3 | Privileged access auditing | `audit_log` chained writes for every admin route |
 | CC6.6 | External boundary protection | TLS terminator, security middleware (`internal/middleware/security.go`) |
 | CC6.7 | Restricted physical access | Inherited from cloud provider SOC 2 |

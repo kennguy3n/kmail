@@ -1,5 +1,5 @@
 -- ================================================================
--- 011_audit_seq.sql
+-- 013_audit_seq.sql
 -- ----------------------------------------------------------------
 -- Security hardening (Session 6 / SOC 2 prep): give the audit hash
 -- chain a monotonic append-order column so the tail can be found
@@ -23,7 +23,7 @@
 -- The consequence: a later append could read a non-tail row as the
 -- "latest" and attach its prev_hash to the same predecessor as an
 -- existing row, forking the chain (two rows sharing one prev_hash).
--- This is exactly what the migration 009 unique index on
+-- This is exactly what the migration 011 unique index on
 -- (tenant_id, prev_hash) now rejects with a 23505 — surfacing the
 -- ordering bug instead of silently corrupting the chain.
 --

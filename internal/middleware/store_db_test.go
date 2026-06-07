@@ -106,11 +106,17 @@ func TestTOTPStoreDB(t *testing.T) {
 		t.Errorf("after enable: %+v", c)
 	}
 
-	if err := store.UpdateRecoveryCodes(ctx, tenant, user, "rhash3"); err != nil {
-		t.Fatalf("UpdateRecoveryCodes: %v", err)
-	}
-	if err := store.MarkUsed(ctx, tenant, user, time.Now()); err != nil {
-		t.Fatalf("MarkUsed: %v", err)
+	// Recovery-hash rotation and last_used_at stamping now happen
+	// atomically inside EvaluateAttempt's success path; the standalone
+	// UpdateRecoveryCodes / MarkUsed methods were folded into it to
+	// close the lockout TOCTOU + recovery double-spend window.
+	rhash3 := "rhash3"
+	res, err := store.EvaluateAttempt(ctx, tenant, user, time.Now(), 5, 15*time.Minute, false,
+		func(*TOTPCredential) TOTPVerification {
+			return TOTPVerification{OK: true, Method: "totp", SetRecoveryHash: &rhash3}
+		})
+	if err != nil || !res.Verified {
+		t.Fatalf("EvaluateAttempt: verified=%v err=%v", res.Verified, err)
 	}
 	c, _ = store.Get(ctx, tenant, user)
 	if c.RecoveryCodesHash != "rhash3" || c.LastUsedAt == nil {

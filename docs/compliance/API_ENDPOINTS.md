@@ -81,7 +81,7 @@ nest under each prefix).
 | `/scim/v2/**` (Users, Groups, Schemas, ResourceTypes, ServiceProviderConfig) | **SCIM bearer token** (tenant-scoped, RLS) | `internal/scim` | Provisioning; tokens in `scim_tokens` with RLS. |
 
 ## Notes for pentesters
-- **Tenant isolation** is the highest-value target: attempt cross-tenant reads/writes on every `/api/v1/tenants/**` and `/jmap` route. Forced RLS (migration 008) + `WITH CHECK` should make all such attempts return no rows or a policy error.
+- **Tenant isolation** is the highest-value target: attempt cross-tenant reads/writes on every `/api/v1/tenants/**` and `/jmap` route. Forced RLS (migration 010) + `WITH CHECK` should make all such attempts return no rows or a policy error.
 - **TOTP** `verify`/`check`: confirm the per-account lockout (5 failures → 15-min 429) cannot be reset by rotating IPs or parallel requests (lockout is keyed on `(tenant_id, user_id)`, incremented atomically).
 - **TOTP** `enroll`: confirm it cannot be used to bypass the lockout — re-enrolling an already-enabled credential must require a valid current TOTP/recovery code and must be refused with 429 while the account is locked (first-time/unconfirmed enrollment is intentionally frictionless).
 - **TOTP** `disable` (`DELETE /api/v1/auth/totp`): confirm the delete-then-re-enroll bypass is closed — removing an already-enabled credential must require a valid current TOTP/recovery code (sent in the body) and must be refused with 429 while the account is locked. Removing a not-yet-confirmed credential, or when nothing is enrolled, is frictionless (204).

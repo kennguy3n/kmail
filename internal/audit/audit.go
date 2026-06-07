@@ -121,7 +121,7 @@ func (s *Service) Log(ctx context.Context, e Entry) (*Entry, error) {
 			return err
 		}
 		var prevHash string
-		// Order by the monotonic append sequence (migration 011), not
+		// Order by the monotonic append sequence (migration 013), not
 		// created_at/id: created_at is the transaction-start time and
 		// is not monotonic with commit order under the advisory lock,
 		// and id is a random UUID. seq is assigned at INSERT, so the

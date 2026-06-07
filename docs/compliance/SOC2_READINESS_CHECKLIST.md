@@ -20,13 +20,13 @@ Status key: `[x]` in place · `[~]` partial / in progress · `[ ]` not started.
 
 ## 2. Security (Common Criteria)
 - [x] **CC6.1 Authentication** — OIDC via KChat, fail-closed (`internal/middleware/auth.go`, `oidc.go`).
-- [x] **CC6.1 MFA** — TOTP second factor with per-account brute-force lockout (`internal/middleware/totp.go`, migration 010); WebAuthn available (`internal/middleware/webauthn.go`).
-- [x] **CC6.2 Tenant isolation** — PostgreSQL RLS **forced** on every tenant-scoped table (migration 008), per-tenant Stalwart shards, per-tenant zk-object-fabric buckets. Continuously regression-tested (`internal/middleware/rls_db_test.go`).
+- [x] **CC6.1 MFA** — TOTP second factor with per-account brute-force lockout (`internal/middleware/totp.go`, migration 012); WebAuthn available (`internal/middleware/webauthn.go`).
+- [x] **CC6.2 Tenant isolation** — PostgreSQL RLS **forced** on every tenant-scoped table (migration 010), per-tenant Stalwart shards, per-tenant zk-object-fabric buckets. Continuously regression-tested (`internal/middleware/rls_db_test.go`).
 - [x] **CC6.6 Boundary protection** — security headers + CORS allow-list + restrictive CSP (`internal/middleware/security.go`); TLS 1.2+ externally, mTLS to Stalwart.
 - [x] **CC6.3 Privileged-access auditing** — every admin route writes to the `audit_log` hash chain; chain integrity is tamper-evident and concurrency-safe (migrations 009/011, advisory lock).
 - [x] **CC7.1 Vulnerability management** — automated dependency scanners (govulncheck / npm audit / cargo audit) + Renovate (`.github/renovate.json`, vulnerability-alert PRs enabled); findings tracked in [`SECURITY_FINDINGS.md`](./SECURITY_FINDINGS.md).
 - [x] **CC7.2 Incident response** — [`incident-response.md`](./incident-response.md).
-- [x] **CC8.1 Change management** — branch protection on `main` (PR + review + required `CI Status`), numbered migrations, CODEOWNERS on sensitive paths. **Deploy ordering:** schema migrations run to completion (`cmd/kmail-migrate`) **before** any new API/worker pod is rolled — the audit `seq` column (migration 011) and the TOTP lockout columns (migration 010) must exist before the code that reads them goes live.
+- [x] **CC8.1 Change management** — branch protection on `main` (PR + review + required `CI Status`), numbered migrations, CODEOWNERS on sensitive paths. **Deploy ordering:** schema migrations run to completion (`cmd/kmail-migrate`) **before** any new API/worker pod is rolled — the audit `seq` column (migration 013) and the TOTP lockout columns (migration 012) must exist before the code that reads them goes live.
 - [~] **CC7.3 Threat detection** — deliverability + audit-chain verification in place; centralised SIEM/alerting integration to be confirmed.
 - [ ] **CC1.x / CC4.x** — HR controls (background checks, security training, org chart) and periodic management review: confirm operational evidence exists for the window.
 

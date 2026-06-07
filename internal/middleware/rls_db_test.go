@@ -7,7 +7,7 @@ package middleware
 //   - TestRLS_ForcedOnEveryEnabledTable is a schema invariant:
 //     every table that ENABLEs RLS must also FORCE it, so the
 //     policies bind even when the application connects as the
-//     table owner. This directly guards migration 008.
+//     table owner. This directly guards migration 010.
 //
 //   - TestRLS_CrossTenantIsolation connects as a non-superuser,
 //     non-BYPASSRLS role and asserts that, with the tenant GUC set
