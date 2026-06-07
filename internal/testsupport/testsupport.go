@@ -26,9 +26,47 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// Pool dials the integration database named by KMAIL_TEST_DATABASE_URL
-// (or DATABASE_URL). When neither is set the calling test is skipped.
-// The returned pool is closed via t.Cleanup.
+// maxTestPoolConns bounds the size of every pool this package hands out.
+// Go runs test packages in parallel (default -p = GOMAXPROCS), and each
+// package's test binary shares a single cached pool. Capping the pool keeps
+// the total connection count well under the Postgres default of
+// max_connections=100 even when many packages run concurrently, which would
+// otherwise cause flaky "too many clients" failures.
+const maxTestPoolConns = 4
+
+// newPool dials dsn with a bounded MaxConns and verifies connectivity.
+func newPool(dsn string) (*pgxpool.Pool, error) {
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, err
+	}
+	cfg.MaxConns = maxTestPoolConns
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, err
+	}
+	return pool, nil
+}
+
+var (
+	sharedPool     *pgxpool.Pool
+	sharedPoolOnce sync.Once
+	sharedPoolErr  error
+)
+
+// Pool returns a process-wide Postgres pool for the integration database
+// named by KMAIL_TEST_DATABASE_URL (or DATABASE_URL). When neither is set the
+// calling test is skipped. The pool is created once per test binary and shared
+// across all callers (pgxpool is safe for concurrent use), rather than dialing
+// a fresh pool per call, so parallel tests don't exhaust Postgres connections.
+// It is intentionally not closed via t.Cleanup: the OS reclaims the
+// connections when the test process exits.
 func Pool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	dsn := os.Getenv("KMAIL_TEST_DATABASE_URL")
@@ -38,18 +76,11 @@ func Pool(t *testing.T) *pgxpool.Pool {
 	if dsn == "" {
 		t.Skip("set KMAIL_TEST_DATABASE_URL or DATABASE_URL to run DB integration tests")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	pool, err := pgxpool.New(ctx, dsn)
-	if err != nil {
-		t.Fatalf("pgxpool.New: %v", err)
+	sharedPoolOnce.Do(func() { sharedPool, sharedPoolErr = newPool(dsn) })
+	if sharedPoolErr != nil {
+		t.Skipf("database unreachable (%v); skipping integration test", sharedPoolErr)
 	}
-	if err := pool.Ping(ctx); err != nil {
-		pool.Close()
-		t.Skipf("database unreachable (%v); skipping integration test", err)
-	}
-	t.Cleanup(pool.Close)
-	return pool
+	return sharedPool
 }
 
 // rlsRole / rlsPassword name the dedicated non-superuser, NOBYPASSRLS
@@ -60,7 +91,12 @@ const (
 	rlsPassword = "kmail_test_rls_pw"
 )
 
-var rlsProvisionOnce sync.Once
+var (
+	rlsProvisionOnce sync.Once
+	rlsPool          *pgxpool.Pool
+	rlsPoolOnce      sync.Once
+	rlsPoolErr       error
+)
 
 // RLSPool returns a pool connected as a non-superuser role with
 // NOBYPASSRLS set, so Postgres row-level-security policies are actually
@@ -87,26 +123,22 @@ func RLSPool(t *testing.T) *pgxpool.Pool {
 		}
 	}
 
-	dsn := os.Getenv("KMAIL_TEST_DATABASE_URL")
-	if dsn == "" {
-		dsn = os.Getenv("DATABASE_URL")
+	rlsPoolOnce.Do(func() {
+		dsn := os.Getenv("KMAIL_TEST_DATABASE_URL")
+		if dsn == "" {
+			dsn = os.Getenv("DATABASE_URL")
+		}
+		rlsDSN, err := swapUserinfo(dsn, rlsRole, rlsPassword)
+		if err != nil {
+			rlsPoolErr = fmt.Errorf("derive RLS DSN: %w", err)
+			return
+		}
+		rlsPool, rlsPoolErr = newPool(rlsDSN)
+	})
+	if rlsPoolErr != nil {
+		t.Skipf("RLS pool unavailable (%v); skipping", rlsPoolErr)
 	}
-	rlsDSN, err := swapUserinfo(dsn, rlsRole, rlsPassword)
-	if err != nil {
-		t.Skipf("cannot derive RLS DSN (%v); skipping", err)
-	}
-	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	pool, err := pgxpool.New(cctx, rlsDSN)
-	if err != nil {
-		t.Skipf("RLS pool dial failed (%v); skipping", err)
-	}
-	if err := pool.Ping(cctx); err != nil {
-		pool.Close()
-		t.Skipf("RLS role unreachable (%v); skipping", err)
-	}
-	t.Cleanup(pool.Close)
-	return pool
+	return rlsPool
 }
 
 func provisionRLSRole(ctx context.Context, admin *pgxpool.Pool) error {
