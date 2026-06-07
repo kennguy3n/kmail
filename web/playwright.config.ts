@@ -31,6 +31,12 @@ export default defineConfig({
     baseURL: BASE_URL,
     trace: "on-first-retry",
     screenshot: "only-on-failure",
+    // Pin the browser locale so number/date formatting is deterministic
+    // across machines. Specs that compare against a value formatted with
+    // `toLocaleString("en-US")` in Node (e.g. the user-quota label in
+    // `06-admin-user-quota.e2e.ts`) would otherwise depend on whatever
+    // default locale the runner's Chromium happens to use.
+    locale: "en-US",
   },
   projects: [
     {

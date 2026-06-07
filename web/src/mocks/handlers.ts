@@ -127,6 +127,25 @@ interface StoredMigrationJob {
   created_at: string;
 }
 let migrationJobStore: StoredMigrationJob[] | null = null;
+
+/**
+ * Clear every module-scoped mutable store so the mock layer returns to its
+ * freshly-seeded state without a page reload.
+ *
+ * The stores normally reset on navigation (each Playwright test runs in a
+ * fresh context, and `capture-screenshots.mjs` only reads), so the E2E and
+ * screenshot flows don't need this. It exists for *long-lived manual*
+ * sessions — a developer poking at `VITE_MOCK_API=true` who has created a
+ * pile of notes/folders/migration jobs and wants a clean slate. It's wired
+ * to `window.__resetMockState()` in `main.tsx`. Lazy stores are nulled so
+ * they re-seed on next access; the eagerly-built notes Map is emptied.
+ */
+export function resetMockState(): void {
+  sharedInboxNotes.clear();
+  vaultFolderStore = null;
+  migrationJobStore = null;
+}
+
 function migrationJobs(): StoredMigrationJob[] {
   if (migrationJobStore === null) {
     migrationJobStore = [
