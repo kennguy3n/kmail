@@ -40,8 +40,12 @@ export function Breadcrumbs({
                     {crumb.label}
                   </Link>
                 ) : (
+                  // Any crumb rendered as plain text (the last crumb, or a
+                  // non-last crumb that omits `to`) is the "current"-style
+                  // emphasis the old Breadcrumbs.module.css used. Only the
+                  // true last crumb carries aria-current="page".
                   <span
-                    className={cn(isLast ? "font-medium text-fg" : "text-fg-muted")}
+                    className="font-medium text-fg"
                     aria-current={isLast ? "page" : undefined}
                   >
                     {crumb.label}
