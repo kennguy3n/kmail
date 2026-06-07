@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -11,10 +13,15 @@ import (
 	"github.com/kennguy3n/kmail/internal/middleware"
 )
 
+// discardLogger is a no-op logger for handler tests that exercise the
+// error paths (which log) without polluting test output.
+func discardLogger() *log.Logger { return log.New(io.Discard, "", 0) }
+
 // fakeStore is an in-memory adminStore for handler tests.
 type fakeStore struct {
 	flags     map[string]Flag
 	overrides map[string]Override // key: scopeKey on the (single) test flag set
+	loadErr   error               // when set, loadViews returns it (DB-outage simulation)
 }
 
 func newFakeStore() *fakeStore {
@@ -24,6 +31,9 @@ func newFakeStore() *fakeStore {
 func ovKey(flag string, scope Scope, id string) string { return flag + "|" + scopeKey(scope, id) }
 
 func (f *fakeStore) loadViews(context.Context) ([]FlagView, error) {
+	if f.loadErr != nil {
+		return nil, f.loadErr
+	}
 	flags := make([]Flag, 0, len(f.flags))
 	for _, fl := range f.flags {
 		flags = append(flags, fl)
@@ -171,3 +181,45 @@ func TestHandlerList(t *testing.T) {
 		t.Fatalf("unexpected list: %+v", resp.Flags)
 	}
 }
+
+// TestHandlerListDBUnavailableReturns503 asserts that a control-plane
+// read failing because the DB is unavailable — a read-deadline timeout,
+// a cancelled request, or a missing pool — surfaces as a retryable 503
+// (not a 500), with a Retry-After hint. This is the user-visible half
+// of the chaos-postgres fix: a stalled Postgres now fails fast and
+// retryably instead of hanging the request.
+func TestHandlerListDBUnavailableReturns503(t *testing.T) {
+	cases := map[string]error{
+		"deadline": context.DeadlineExceeded,
+		"canceled": context.Canceled,
+		"no-pool":  ErrNoPool,
+		// The Store wraps query errors with fmt.Errorf %w; ensure the
+		// 503 classification still unwraps through that chain.
+		"wrapped-deadline": wrap(context.DeadlineExceeded),
+	}
+	for name, loadErr := range cases {
+		t.Run(name, func(t *testing.T) {
+			store := newFakeStore()
+			store.loadErr = loadErr
+			h := &Handlers{store: store, logger: discardLogger()}
+			req := authed(httptest.NewRequest(http.MethodGet, "/api/v1/admin/feature-flags", nil))
+			rec := httptest.NewRecorder()
+			h.list(rec, req)
+			if rec.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status = %d, want 503", rec.Code)
+			}
+			if got := rec.Header().Get("Retry-After"); got == "" {
+				t.Errorf("missing Retry-After header")
+			}
+		})
+	}
+}
+
+// wrap mirrors how the Store wraps query errors (fmt.Errorf %w), so the
+// test verifies errors.Is unwraps through the Store's error chain.
+func wrap(err error) error { return errWrap{err} }
+
+type errWrap struct{ err error }
+
+func (e errWrap) Error() string { return "featureflags: list flags: " + e.err.Error() }
+func (e errWrap) Unwrap() error { return e.err }

@@ -3,6 +3,9 @@
 *.test
 *.out
 
+# Load-test / scale harness output (scripts/loadtest/, Makefile SCALE_OUT)
+/loadtest-out/
+
 # Node / Vite
 node_modules/
 dist/
