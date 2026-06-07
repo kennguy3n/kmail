@@ -56,6 +56,36 @@ func TestNewProxy_RequiresStalwartURL(t *testing.T) {
 	}
 }
 
+// TestShardsAvailable verifies the graceful-degradation health
+// signal: a single-shard proxy (no resolver) reports its default
+// Target host as available until that host's breaker trips, and
+// recovers once a probe succeeds. The verdict must track the same
+// breaker the failover transport consults so degradation kicks in
+// exactly when the proxy would otherwise 502.
+func TestShardsAvailable(t *testing.T) {
+	p := newTestProxy(t)
+	ctx := context.Background()
+	host := p.Target().Host
+
+	if !p.ShardsAvailable(ctx, "tenant-1") {
+		t.Fatal("fresh proxy should report shard available")
+	}
+
+	// Default breaker trips after 3 consecutive failures (Cooldown=0
+	// → stays open until a success).
+	for i := 0; i < 3; i++ {
+		p.breaker.RecordFailure(ctx, host)
+	}
+	if p.ShardsAvailable(ctx, "tenant-1") {
+		t.Fatal("shard should be unavailable after breaker trips")
+	}
+
+	p.breaker.RecordSuccess(ctx, host)
+	if !p.ShardsAvailable(ctx, "tenant-1") {
+		t.Fatal("shard should recover after a successful probe closes the breaker")
+	}
+}
+
 func TestNewProxy_RequiresPool(t *testing.T) {
 	_, err := NewProxy(ProxyConfig{StalwartURL: "http://stalwart.test"})
 	if err == nil {

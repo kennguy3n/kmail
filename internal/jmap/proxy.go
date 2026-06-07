@@ -871,6 +871,31 @@ func (p *Proxy) ResolveShardURLs(ctx context.Context, tenantID string) []string 
 	return p.resolveShardURLs(ctx, tenantID)
 }
 
+// ShardsAvailable reports whether at least one candidate Stalwart
+// shard for the tenant is currently serving — i.e. its circuit
+// breaker is not open. It keys the breaker on the same `u.Host`
+// the failover transport uses, so the verdict matches the proxy's
+// own routing decision: when every candidate is tripped the proxy
+// would surface a 502/503, which is exactly when a read should
+// fall back to a last-known-good cache instead. Single-shard
+// deployments (no resolver) consult the default Target host.
+func (p *Proxy) ShardsAvailable(ctx context.Context, tenantID string) bool {
+	urls := p.resolveShardURLs(ctx, tenantID)
+	if len(urls) == 0 && p.target != nil {
+		urls = []string{p.target.String()}
+	}
+	for _, raw := range urls {
+		u, err := url.Parse(raw)
+		if err != nil || u.Host == "" {
+			continue
+		}
+		if !p.breaker.Open(ctx, u.Host) {
+			return true
+		}
+	}
+	return false
+}
+
 // shardCtxKey carries the resolved shard URL list (primary first)
 // to the custom transport so retries can switch hosts without
 // re-querying Postgres on every attempt.

@@ -135,6 +135,37 @@ The chaos scripts probe `/api/v1/admin/feature-flags` and the
   `X-KMail-Dev-Stalwart-Account-Id`) first, then set
   `KMAIL_CHAOS_SHARD_ENFORCE=1`.
 
+### JMAP graceful degradation (data-plane stale-serve)
+
+`chaos-shard.sh` exercises the *write/RPC* fail-over path
+(`POST /jmap`), where the circuit breaker diverts to a secondary
+shard. The read analog of the control-plane stale-serve (see
+`chaos-postgres.sh` above) is **graceful degradation** on
+`GET /jmap/session`: when every candidate Stalwart shard for the
+tenant is tripped, the BFF serves the tenant's last successful
+session document from Valkey (`200`, tagged `X-KMail-Degraded:
+true`) instead of a `502`, so the client can still bootstrap during
+a full shard outage. Writes on a degraded read path return a clean
+`503` (silently dropping a Send is worse than failing it loudly).
+
+It is **opt-in** and gated by these env vars on the BFF:
+
+- `KMAIL_DEGRADATION_ENABLED` (default `false`) — turn the
+  middleware on. Requires `KMAIL_VALKEY_URL` (the cache to serve
+  from); with no Valkey it logs and stays disabled.
+- `KMAIL_DEGRADATION_TTL` (default `5m`) — how long a cached
+  response stays servable.
+- `KMAIL_DEGRADATION_READ_PATHS` (default `/jmap/session`) —
+  space-separated path prefixes eligible for cached fallback.
+  Deliberately excludes blob download/upload: those are unbounded
+  and must never be buffered into the cache (the middleware also
+  caps any cached body at 256 KiB as a backstop).
+
+The cache key is scoped by tenant + user, so a degraded read is
+never served across identities. Health is the proxy's own
+per-tenant breaker view, so degradation kicks in exactly when the
+proxy would otherwise surface a 502.
+
 Container names default to the compose `container_name:` values
 (`kmail-postgres`, `kmail-valkey`, `kmail-stalwart`); override with
 `KMAIL_{PG,VALKEY,SHARD}_CONTAINER` for a differently-named stack.
