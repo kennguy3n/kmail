@@ -1,0 +1,103 @@
+name: Security Scan
+
+# Dependency / vulnerability scanning for the three language
+# ecosystems in this repo (Go, web/npm, sdk/cargo).
+#
+# IMPORTANT: this workflow is intentionally INFORMATIONAL and
+# NON-BLOCKING. It is a separate workflow from `ci.yml` and is NOT
+# part of the `CI Status` aggregate that branch protection requires,
+# so it can never block a merge on its own. In addition every scan
+# job sets `continue-on-error: true`, so a newly-published advisory
+# cannot turn the workflow red overnight and wedge unrelated PRs.
+# The `summary` job always succeeds and surfaces results in the run
+# summary. Findings are triaged in docs/compliance/SECURITY_FINDINGS.md;
+# promote individual scanners to required only once their findings
+# are fully resolved.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly sweep so newly-disclosed advisories are surfaced even
+    # without a PR (Mondays 07:00 UTC).
+    - cron: "0 7 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  govulncheck:
+    name: govulncheck (Go)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          # Pin a patch release that includes the latest stdlib
+          # security fixes so the scan does not flag the toolchain
+          # itself (see docs/compliance/SECURITY_FINDINGS.md).
+          go-version: "1.25.x"
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+      - name: Run govulncheck
+        run: govulncheck ./...
+
+  npm-audit:
+    name: npm audit (web)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20.x"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Run npm audit (production deps, high+)
+        # Production runtime deps gated at high severity. Dev-only
+        # tooling advisories are reported separately below so they
+        # don't mask a shipped-code finding.
+        run: npm audit --omit=dev --audit-level=high
+      - name: Run npm audit (all deps, informational)
+        if: always()
+        run: npm audit || true
+
+  cargo-audit:
+    name: cargo audit (sdk)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    defaults:
+      run:
+        working-directory: sdk
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Run cargo audit
+        run: cargo audit
+
+  summary:
+    name: Security Scan Summary
+    if: always()
+    needs: [govulncheck, npm-audit, cargo-audit]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report (non-blocking)
+        run: |
+          echo "govulncheck:  ${{ needs.govulncheck.result }}"
+          echo "npm audit:    ${{ needs.npm-audit.result }}"
+          echo "cargo audit:  ${{ needs.cargo-audit.result }}"
+          echo ""
+          echo "This workflow is informational and non-blocking by design."
+          echo "Triage findings in docs/compliance/SECURITY_FINDINGS.md."

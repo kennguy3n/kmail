@@ -18,6 +18,7 @@
 #   --access-review   Per-tenant user/role dump        (CC6.1/CC6.2)
 #   --change-log      Merged PRs + reviewer + CI        (CC8.1)
 #   --vendor-review   Snapshot the vendor register      (CC9.1)
+#   --deps            Dependency vuln scans (Go/npm/cargo) (CC7.1/CC9.2)
 #
 # Options:
 #   --out DIR         Output root (default: ./compliance-evidence)
@@ -40,6 +41,7 @@ RUN_AUDIT=0
 RUN_ACCESS=0
 RUN_CHANGE=0
 RUN_VENDOR=0
+RUN_DEPS=0
 ANY_COLLECTOR=0
 
 usage() { sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
@@ -50,6 +52,7 @@ while [ $# -gt 0 ]; do
 		--access-review) RUN_ACCESS=1; ANY_COLLECTOR=1 ;;
 		--change-log)    RUN_CHANGE=1; ANY_COLLECTOR=1 ;;
 		--vendor-review) RUN_VENDOR=1; ANY_COLLECTOR=1 ;;
+		--deps)          RUN_DEPS=1; ANY_COLLECTOR=1 ;;
 		--out)           OUT_ROOT="$2"; shift ;;
 		--database-url)  DATABASE_URL="$2"; shift ;;
 		--since)         SINCE="$2"; shift ;;
@@ -61,7 +64,7 @@ done
 
 # No collector selected → run everything.
 if [ "$ANY_COLLECTOR" -eq 0 ]; then
-	RUN_AUDIT=1; RUN_ACCESS=1; RUN_CHANGE=1; RUN_VENDOR=1
+	RUN_AUDIT=1; RUN_ACCESS=1; RUN_CHANGE=1; RUN_VENDOR=1; RUN_DEPS=1
 fi
 
 if [ -z "$SINCE" ]; then
@@ -174,10 +177,46 @@ collect_vendor_review() {
 	fi
 }
 
+# collect_deps runs the same dependency vulnerability scanners that
+# the (non-blocking) Security Scan workflow runs, capturing their
+# output as dated evidence. Each scanner degrades gracefully when
+# its toolchain is absent so the bundle records what was actually
+# collectable. Non-zero scanner exit codes (findings present) are
+# expected and captured, not treated as collector failures.
+collect_deps() {
+	local f="${OUT_DIR}/dependency-scan.txt"
+	note "CC7.1/CC9.2 dependency vulnerability scans"
+	{
+		echo "Dependency-scan evidence — ${TS}"
+		echo "Control: CC7.1 (system operations), CC9.2 (risk mitigation)"
+		echo "Scanners: govulncheck (Go), npm audit (web), cargo audit (sdk)"
+		echo "=== govulncheck ./... ==="
+		if command -v govulncheck >/dev/null 2>&1; then
+			(cd "$REPO_ROOT" && govulncheck ./... 2>&1) || true
+		else
+			echo "SKIPPED: govulncheck not installed (go install golang.org/x/vuln/cmd/govulncheck@latest)"
+		fi
+		echo "=== npm audit (web, --omit=dev) ==="
+		if command -v npm >/dev/null 2>&1 && [ -f "${REPO_ROOT}/web/package-lock.json" ]; then
+			(cd "${REPO_ROOT}/web" && npm audit --omit=dev 2>&1) || true
+		else
+			echo "SKIPPED: npm or web/package-lock.json not available"
+		fi
+		echo "=== cargo audit (sdk) ==="
+		if command -v cargo-audit >/dev/null 2>&1 && [ -f "${REPO_ROOT}/sdk/Cargo.lock" ]; then
+			(cd "${REPO_ROOT}/sdk" && cargo audit 2>&1) || true
+		else
+			echo "SKIPPED: cargo-audit or sdk/Cargo.lock not available"
+		fi
+	} > "$f"
+	record "dependency-scan.txt            OK"
+}
+
 [ "$RUN_AUDIT" -eq 1 ]  && collect_audit
 [ "$RUN_ACCESS" -eq 1 ] && collect_access_review
 [ "$RUN_CHANGE" -eq 1 ] && collect_change_log
 [ "$RUN_VENDOR" -eq 1 ] && collect_vendor_review
+[ "$RUN_DEPS" -eq 1 ]   && collect_deps
 
 note "evidence bundle written to ${OUT_DIR}"
 cat "$MANIFEST"

@@ -147,7 +147,8 @@ detectable cryptographically.
 
 * Mandatory PR-time CI gates: `go vet`, `go build`, `go test
   -race`, frontend `npm run typecheck` and `npm run build`.
-* Renovate / Dependabot covers Go modules and npm packages.
+* Renovate (`.github/renovate.json`) covers Go modules, npm, cargo,
+  and GitHub Actions, with vulnerability-alert PRs enabled.
 * Annual third-party penetration test; remediation tracked in
   the internal risk register.
 

@@ -1093,11 +1093,16 @@ func main() {
 	// usable from any authenticator app. The shared secret is
 	// wrapped by the kmail-secrets envelope; recovery codes are
 	// SHA-256 hashed.
+	// Brute-force lockout thresholds are env-tunable so operators can
+	// tighten/loosen them without a rebuild; unset/invalid values fall
+	// back to the conservative package defaults (5 attempts / 15m).
 	middleware.NewTOTPHandlers(middleware.TOTPConfig{
-		Pool:     pool,
-		Logger:   logger,
-		Issuer:   "KMail",
-		Envelope: secretsEnvelope,
+		Pool:              pool,
+		Logger:            logger,
+		Issuer:            "KMail",
+		Envelope:          secretsEnvelope,
+		MaxFailedAttempts: config.GetenvInt("KMAIL_TOTP_MAX_FAILED_ATTEMPTS", 0),
+		LockoutDuration:   getenvDuration("KMAIL_TOTP_LOCKOUT_DURATION", 0),
 	}).Register(mux, authMW)
 
 	// Shared-inbox workflow state machine. The service was built

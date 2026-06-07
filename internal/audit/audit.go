@@ -102,11 +102,34 @@ func (s *Service) Log(ctx context.Context, e Entry) (*Entry, error) {
 		if err := middleware.SetTenantGUC(ctx, tx, e.TenantID); err != nil {
 			return err
 		}
+		// Serialize appends *per tenant* so the read-latest-hash →
+		// insert sequence below is atomic with respect to other
+		// appends to the same tenant's chain. Without this, two
+		// concurrent Log calls under READ COMMITTED both read the
+		// same `prev_hash`, both insert, and the chain forks (two
+		// rows sharing one prev_hash) — which VerifyChain then
+		// reports as broken. A transaction-scoped advisory lock,
+		// keyed on the tenant, is released automatically on
+		// COMMIT/ROLLBACK and lets different tenants append
+		// concurrently (their keys differ). The `audit_log:`
+		// namespace prefix keeps the key space disjoint from any
+		// other advisory-lock user in the codebase.
+		if _, err := tx.Exec(ctx,
+			`SELECT pg_advisory_xact_lock(hashtext('kmail.audit_log:' || $1))`,
+			e.TenantID,
+		); err != nil {
+			return err
+		}
 		var prevHash string
+		// Order by the monotonic append sequence (migration 013), not
+		// created_at/id: created_at is the transaction-start time and
+		// is not monotonic with commit order under the advisory lock,
+		// and id is a random UUID. seq is assigned at INSERT, so the
+		// MAX(seq) row for this tenant is the true chain tail.
 		err := tx.QueryRow(ctx, `
 			SELECT entry_hash FROM audit_log
 			WHERE tenant_id = $1::uuid
-			ORDER BY created_at DESC, id DESC
+			ORDER BY seq DESC
 			LIMIT 1
 		`, e.TenantID).Scan(&prevHash)
 		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
@@ -165,11 +188,14 @@ func (s *Service) Query(ctx context.Context, tenantID string, f QueryFilters) ([
 		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
 			return err
 		}
-		var (
-			where []string
-			args  []any
-		)
-		idx := 1
+		// Seed the WHERE clause with an explicit tenant predicate in
+		// addition to the RLS GUC set above (defense in depth, and
+		// consistent with Log/VerifyChain). The application role has
+		// RLS enforced, but scoping explicitly keeps the query
+		// correct if it is ever run from an elevated/BYPASSRLS role.
+		where := []string{"tenant_id = $1::uuid"}
+		args := []any{tenantID}
+		idx := 2
 		add := func(clause string, val any) {
 			where = append(where, fmt.Sprintf(clause, idx))
 			args = append(args, val)
@@ -201,7 +227,7 @@ func (s *Service) Query(ctx context.Context, tenantID string, f QueryFilters) ([
 			       COALESCE(user_agent, ''), prev_hash, entry_hash, created_at
 			FROM audit_log
 			%s
-			ORDER BY created_at DESC, id DESC
+			ORDER BY seq DESC
 			LIMIT $%d OFFSET $%d
 		`, clause, idx, idx+1)
 		rows, err := tx.Query(ctx, query, args...)
@@ -286,14 +312,25 @@ func (s *Service) VerifyChain(ctx context.Context, tenantID string) error {
 		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
 			return err
 		}
+		// Scope explicitly by tenant_id in addition to setting the
+		// RLS GUC above. RLS is the isolation control for the
+		// application's runtime role, but VerifyChain also runs from
+		// the kmail-audit operations CLI, which typically connects as
+		// a superuser / maintenance role with BYPASSRLS — for which
+		// the policy is skipped entirely. Without an explicit filter
+		// the walk would span every tenant's rows and report a false
+		// prev_hash mismatch at the first tenant boundary. The
+		// explicit predicate mirrors Log's tail query and keeps
+		// verification correct regardless of the connecting role.
 		rows, err := tx.Query(ctx, `
 			SELECT id::text, tenant_id::text, actor_id, actor_type, action,
 			       resource_type, COALESCE(resource_id, ''), metadata,
 			       COALESCE(host(ip_address), ''), COALESCE(user_agent, ''),
 			       prev_hash, entry_hash, created_at
 			FROM audit_log
-			ORDER BY created_at ASC, id ASC
-		`)
+			WHERE tenant_id = $1::uuid
+			ORDER BY seq ASC
+		`, tenantID)
 		if err != nil {
 			return err
 		}
