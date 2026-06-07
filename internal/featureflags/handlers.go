@@ -55,8 +55,8 @@ type Handlers struct {
 
 	// reconcileWG tracks in-flight asynchronous post-write cache
 	// reconciliations (refreshCacheAfterWrite launched off the response
-	// path). It lets a graceful shutdown — and the tests — wait for a
-	// just-kicked reconcile to finish instead of racing it.
+	// path). Drain waits on it so a graceful shutdown — and the tests —
+	// can let a just-kicked reconcile finish instead of racing it.
 	reconcileWG sync.WaitGroup
 
 	// maxStaleAge bounds how old the last-known-good snapshot may be and
@@ -280,6 +280,30 @@ func (h *Handlers) reconcileCacheAfterWriteAsync(parent context.Context) {
 		// values stay readable and its deadline/cancel are dropped.
 		h.refreshCacheAfterWrite(parent)
 	}()
+}
+
+// Drain blocks until every in-flight asynchronous post-write cache
+// reconciliation (kicked off the response path by
+// reconcileCacheAfterWriteAsync) has finished, or until ctx is done —
+// whichever comes first. It is meant to be called once during graceful
+// shutdown, after the HTTP server has stopped accepting requests, so a
+// reconcile that outlived its triggering request isn't orphaned by
+// process exit. Each reconcile is independently bounded by
+// cacheRefreshBudget, so this returns promptly in practice; ctx is a
+// backstop so a shutdown deadline is always honoured. Returns ctx.Err()
+// if the context fired before the reconciles completed, nil otherwise.
+func (h *Handlers) Drain(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		h.reconcileWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // overrideOp is one override mutation in a PUT body. Delete=true
