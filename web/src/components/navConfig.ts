@@ -8,19 +8,44 @@
  * into collapsible sections without hand-maintaining markup.
  */
 
+import {
+  Calendar,
+  CalendarDays,
+  CalendarPlus,
+  CalendarRange,
+  Clock,
+  Contact,
+  FileText,
+  FolderLock,
+  Inbox,
+  KeyRound,
+  Lock,
+  Mail,
+  Moon,
+  PenLine,
+  Plane,
+  Settings,
+  SquarePen,
+  Star,
+  Tag,
+  User,
+  Users,
+} from "lucide-react";
+import type { LucideIcon } from "lucide-react";
+
 export interface NavLink {
   type: "link";
   label: string;
   to: string;
-  /** Short text glyph used as the nav icon (kept dependency-free). */
-  icon?: string;
+  /** Lucide icon component rendered as the nav glyph. */
+  icon?: LucideIcon;
 }
 
 export interface NavGroup {
   type: "group";
   id: string;
   label: string;
-  icon?: string;
+  icon?: LucideIcon;
   children: NavNode[];
 }
 
@@ -31,51 +56,51 @@ export const NAV_TREE: NavNode[] = [
     type: "group",
     id: "mail",
     label: "Mail",
-    icon: "✉",
+    icon: Mail,
     children: [
-      { type: "link", label: "Inbox", to: "/mail", icon: "📥" },
+      { type: "link", label: "Inbox", to: "/mail", icon: Inbox },
       {
         type: "link",
         label: "Priority",
         to: "/mail/priority",
-        icon: "⭐",
+        icon: Star,
       },
-      { type: "link", label: "Compose", to: "/mail/compose", icon: "✏" },
-      { type: "link", label: "Shared inboxes", to: "/mail/shared", icon: "👥" },
-      { type: "link", label: "Zero-Access Vault", to: "/mail/vault", icon: "🔒" },
+      { type: "link", label: "Compose", to: "/mail/compose", icon: SquarePen },
+      { type: "link", label: "Shared inboxes", to: "/mail/shared", icon: Users },
+      { type: "link", label: "Zero-Access Vault", to: "/mail/vault", icon: Lock },
       {
         type: "link",
         label: "Protected folders",
         to: "/mail/protected-folders",
-        icon: "🗂",
+        icon: FolderLock,
       },
-      { type: "link", label: "Scheduled", to: "/mail/scheduled", icon: "⏰" },
-      { type: "link", label: "Snoozed", to: "/mail/snoozed", icon: "😴" },
-      { type: "link", label: "Labels", to: "/mail/labels", icon: "🏷" },
-      { type: "link", label: "Signatures", to: "/mail/signatures", icon: "✒" },
-      { type: "link", label: "Templates", to: "/mail/templates", icon: "📝" },
+      { type: "link", label: "Scheduled", to: "/mail/scheduled", icon: Clock },
+      { type: "link", label: "Snoozed", to: "/mail/snoozed", icon: Moon },
+      { type: "link", label: "Labels", to: "/mail/labels", icon: Tag },
+      { type: "link", label: "Signatures", to: "/mail/signatures", icon: PenLine },
+      { type: "link", label: "Templates", to: "/mail/templates", icon: FileText },
       {
         type: "link",
         label: "Out of Office",
         to: "/mail/out-of-office",
-        icon: "🌴",
+        icon: Plane,
       },
-      { type: "link", label: "Delegation", to: "/mail/delegation", icon: "🔑" },
+      { type: "link", label: "Delegation", to: "/mail/delegation", icon: KeyRound },
     ],
   },
   {
     type: "group",
     id: "calendar",
     label: "Calendar",
-    icon: "📅",
+    icon: Calendar,
     children: [
-      { type: "link", label: "Calendar", to: "/calendar", icon: "📅" },
-      { type: "link", label: "New event", to: "/calendar/new", icon: "➕" },
+      { type: "link", label: "Calendar", to: "/calendar", icon: CalendarDays },
+      { type: "link", label: "New event", to: "/calendar/new", icon: CalendarPlus },
       {
         type: "link",
         label: "Shared calendars",
         to: "/calendar/shared",
-        icon: "🤝",
+        icon: CalendarRange,
       },
     ],
   },
@@ -83,14 +108,14 @@ export const NAV_TREE: NavNode[] = [
     type: "group",
     id: "contacts",
     label: "Contacts",
-    icon: "👤",
-    children: [{ type: "link", label: "Contacts", to: "/contacts", icon: "👤" }],
+    icon: Contact,
+    children: [{ type: "link", label: "Contacts", to: "/contacts", icon: User }],
   },
   {
     type: "group",
     id: "admin",
     label: "Admin",
-    icon: "⚙",
+    icon: Settings,
     children: [
       {
         type: "group",

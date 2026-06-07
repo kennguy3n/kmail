@@ -1,6 +1,6 @@
 import type { HTMLAttributes, ReactNode } from "react";
 
-import styles from "./Card.module.css";
+import { cn } from "../../lib/cn";
 
 export interface CardProps
   extends Omit<HTMLAttributes<HTMLDivElement>, "title"> {
@@ -13,10 +13,6 @@ export interface CardProps
   children: ReactNode;
 }
 
-function cx(...classes: Array<string | false | undefined>): string {
-  return classes.filter(Boolean).join(" ");
-}
-
 /** Card — a surface container with an optional titled header. */
 export function Card({
   title,
@@ -27,14 +23,24 @@ export function Card({
   ...rest
 }: CardProps): JSX.Element {
   return (
-    <div className={cx(styles.card, className)} {...rest}>
+    <div
+      className={cn(
+        "overflow-hidden rounded-xl border border-border bg-surface shadow-sm",
+        className,
+      )}
+      {...rest}
+    >
       {(title || actions) && (
-        <div className={styles.header}>
-          {title && <h3 className={styles.title}>{title}</h3>}
-          {actions && <div className={styles.actions}>{actions}</div>}
+        <div className="flex items-center justify-between gap-3 border-b border-border px-5 py-3.5">
+          {title && (
+            <h3 className="text-base font-semibold text-fg">{title}</h3>
+          )}
+          {actions && (
+            <div className="flex items-center gap-2">{actions}</div>
+          )}
         </div>
       )}
-      <div className={cx(styles.body, flush && styles.flush)}>{children}</div>
+      <div className={cn(!flush && "p-5")}>{children}</div>
     </div>
   );
 }

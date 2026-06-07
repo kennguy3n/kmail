@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 
-import styles from "./EmptyState.module.css";
+import { cn } from "../../lib/cn";
 
 export interface EmptyStateProps {
   /** Decorative icon / illustration. */
@@ -12,10 +12,6 @@ export interface EmptyStateProps {
   className?: string;
 }
 
-function cx(...classes: Array<string | false | undefined>): string {
-  return classes.filter(Boolean).join(" ");
-}
-
 /** EmptyState — friendly placeholder for empty lists / zero results. */
 export function EmptyState({
   icon,
@@ -25,15 +21,25 @@ export function EmptyState({
   className,
 }: EmptyStateProps): JSX.Element {
   return (
-    <div className={cx(styles.empty, className)}>
+    <div
+      className={cn(
+        "flex flex-col items-center justify-center gap-3 px-6 py-12 text-center",
+        className,
+      )}
+    >
       {icon && (
-        <div className={styles.icon} aria-hidden="true">
+        <div
+          className="flex size-12 items-center justify-center rounded-full bg-surface-muted text-fg-subtle [&>svg]:size-6"
+          aria-hidden="true"
+        >
           {icon}
         </div>
       )}
-      <p className={styles.title}>{title}</p>
-      {description && <p className={styles.description}>{description}</p>}
-      {action && <div className={styles.action}>{action}</div>}
+      <p className="text-base font-semibold text-fg">{title}</p>
+      {description && (
+        <p className="max-w-prose text-sm text-fg-muted">{description}</p>
+      )}
+      {action && <div className="mt-1">{action}</div>}
     </div>
   );
 }

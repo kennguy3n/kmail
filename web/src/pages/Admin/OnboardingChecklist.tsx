@@ -148,48 +148,30 @@ export default function OnboardingChecklist() {
               aria-valuenow={pct}
               aria-valuemin={0}
               aria-valuemax={100}
-              style={{
-                background: "#eee",
-                borderRadius: 4,
-                marginTop: 8,
-                height: 12,
-                overflow: "hidden",
-              }}
+              className="mt-2 h-3 overflow-hidden rounded bg-surface-muted"
             >
               <div
-                style={{
-                  width: `${pct}%`,
-                  background: "var(--kmail-accent, #4a8)",
-                  height: "100%",
-                }}
+                className="h-full bg-primary"
+                style={{ width: `${pct}%` }}
               />
             </div>
           </div>
 
-          <div style={{ display: "grid", gap: "1rem" }}>
+          <div className="grid gap-4">
             {checklist.steps.map((s) => (
               <div key={s.id} className="kmail-admin-card">
                 <h3>
-                  <span aria-hidden style={{ marginRight: 8 }}>{statusIcon(s)}</span>
+                  <span aria-hidden className="mr-2">{statusIcon(s)}</span>
                   {s.title}
                   {s.optional ? <small> (optional)</small> : null}
                   {s.auto_completed && (
-                    <small
-                      style={{
-                        marginLeft: 8,
-                        background: "#d1fae5",
-                        color: "#065f46",
-                        padding: "0 6px",
-                        borderRadius: 4,
-                        fontSize: 12,
-                      }}
-                    >
+                    <small className="ml-2 rounded bg-success-bg px-1.5 text-xs text-success-fg">
                       completed automatically
                     </small>
                   )}
                 </h3>
                 <p>{s.description}</p>
-                <div style={{ display: "flex", gap: "0.5rem" }}>
+                <div className="flex gap-2">
                   {s.link && s.status !== "complete" && (
                     <a href={s.link} className="kmail-button">Open</a>
                   )}
@@ -220,7 +202,7 @@ export default function OnboardingChecklist() {
                 from current tenant state.
               </p>
             )}
-            <div style={{ display: "flex", gap: "0.5rem" }}>
+            <div className="flex gap-2">
               <button onClick={onConfirm}>Confirm</button>
               <button onClick={() => setConfirm(null)}>Cancel</button>
             </div>

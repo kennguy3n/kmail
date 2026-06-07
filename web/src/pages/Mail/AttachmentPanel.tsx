@@ -95,44 +95,44 @@ export default function AttachmentPanel({
     !!type && (type.startsWith("image/") || type === "application/pdf");
 
   return (
-    <section style={styles.box}>
-      <div style={styles.headerRow}>
-        <h2 style={styles.title}>Attachments ({attachments.length})</h2>
+    <section className={styles.box}>
+      <div className={styles.headerRow}>
+        <h2 className={styles.title}>Attachments ({attachments.length})</h2>
         {attachments.length > 1 && (
           <button
             type="button"
             onClick={() => void downloadAll()}
             disabled={busy}
-            style={styles.downloadAll}
+            className={styles.downloadAll}
           >
             {busy ? "Downloading…" : "Download all"}
           </button>
         )}
       </div>
-      {error && <div style={styles.error}>{error}</div>}
-      <ul style={styles.list}>
+      {error && <div className={styles.error}>{error}</div>}
+      <ul className={styles.list}>
         {attachments.map((a, i) => {
           const key = keyFor(a, i);
           const previewable = canPreview(a.type);
           return (
-            <li key={key} style={styles.item}>
-              <div style={styles.itemRow}>
-                <span style={styles.fileIcon} aria-hidden="true">
+            <li key={key} className={styles.item}>
+              <div className={styles.itemRow}>
+                <span className={styles.fileIcon} aria-hidden="true">
                   📎
                 </span>
-                <span style={styles.name}>{a.name ?? "(unnamed)"}</span>
-                <span style={styles.meta}>
+                <span className={styles.name}>{a.name ?? "(unnamed)"}</span>
+                <span className={styles.meta}>
                   {a.type ?? "application/octet-stream"}
                   {typeof a.size === "number"
                     ? ` · ${formatBytes(a.size)}`
                     : ""}
                 </span>
-                <span style={styles.spacer} />
+                <span className={styles.spacer} />
                 {previewable && (
                   <button
                     type="button"
                     onClick={() => void togglePreview(a, key)}
-                    style={styles.smallButton}
+                    className={styles.smallButton}
                   >
                     {previewId === key ? "Hide" : "Preview"}
                   </button>
@@ -140,24 +140,24 @@ export default function AttachmentPanel({
                 <button
                   type="button"
                   onClick={() => void download(a)}
-                  style={styles.smallButton}
+                  className={styles.smallButton}
                 >
                   Download
                 </button>
               </div>
               {previewId === key && previewUrl && (
-                <div style={styles.preview}>
+                <div className={styles.preview}>
                   {a.type?.startsWith("image/") ? (
                     <img
                       src={previewUrl}
                       alt={a.name ?? "attachment preview"}
-                      style={styles.previewImage}
+                      className={styles.previewImage}
                     />
                   ) : (
                     <iframe
                       title={`Preview of ${a.name ?? "attachment"}`}
                       src={previewUrl}
-                      style={styles.previewFrame}
+                      className={styles.previewFrame}
                     />
                   )}
                 </div>
@@ -170,72 +170,24 @@ export default function AttachmentPanel({
   );
 }
 
-const styles: Record<string, React.CSSProperties> = {
-  box: { marginTop: "1rem", paddingTop: "0.75rem", borderTop: "1px solid #e5e7eb" },
-  headerRow: {
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "space-between",
-    marginBottom: "0.5rem",
-  },
-  title: { margin: 0, fontSize: "0.95rem" },
-  downloadAll: {
-    padding: "0.3rem 0.6rem",
-    fontSize: "0.8rem",
-    background: "#fff",
-    border: "1px solid #d1d5db",
-    borderRadius: "0.25rem",
-    cursor: "pointer",
-    color: "#374151",
-  },
-  list: { listStyle: "none", margin: 0, padding: 0, display: "grid", gap: "0.4rem" },
-  item: {
-    border: "1px solid #e5e7eb",
-    borderRadius: "0.375rem",
-    padding: "0.4rem 0.5rem",
-    background: "#fff",
-  },
-  itemRow: {
-    display: "flex",
-    alignItems: "center",
-    gap: "0.5rem",
-    fontSize: "0.85rem",
-  },
-  fileIcon: { fontSize: "0.9rem" },
-  name: { fontWeight: 600, color: "#111827" },
-  meta: { color: "#6b7280", fontSize: "0.78rem" },
-  spacer: { flex: 1 },
-  smallButton: {
-    padding: "0.25rem 0.55rem",
-    fontSize: "0.78rem",
-    background: "#fff",
-    border: "1px solid #d1d5db",
-    borderRadius: "0.25rem",
-    cursor: "pointer",
-    color: "#374151",
-  },
-  preview: {
-    marginTop: "0.5rem",
-    borderTop: "1px solid #f3f4f6",
-    paddingTop: "0.5rem",
-  },
-  previewImage: {
-    maxWidth: "100%",
-    maxHeight: "480px",
-    borderRadius: "0.25rem",
-  },
-  previewFrame: {
-    width: "100%",
-    height: "520px",
-    border: "1px solid #e5e7eb",
-    borderRadius: "0.25rem",
-  },
-  error: {
-    padding: "0.4rem 0.6rem",
-    background: "#fee2e2",
-    color: "#991b1b",
-    borderRadius: "0.25rem",
-    fontSize: "0.82rem",
-    marginBottom: "0.5rem",
-  },
+/** Theme-aware Tailwind class recipes for the AttachmentPanel. */
+const styles: Record<string, string> = {
+  box: "mt-4 border-t border-border pt-3",
+  headerRow: "mb-2 flex items-center justify-between",
+  title: "m-0 text-sm font-semibold",
+  downloadAll:
+    "cursor-pointer rounded-md border border-border bg-surface px-2.5 py-1.5 text-xs text-fg transition-colors hover:bg-surface-hover",
+  list: "m-0 grid list-none gap-1.5 p-0",
+  item: "rounded-md border border-border bg-surface px-2 py-1.5",
+  itemRow: "flex items-center gap-2 text-sm",
+  fileIcon: "text-sm",
+  name: "font-semibold text-fg",
+  meta: "text-xs text-fg-muted",
+  spacer: "flex-1",
+  smallButton:
+    "cursor-pointer rounded-md border border-border bg-surface px-2 py-1 text-xs text-fg transition-colors hover:bg-surface-hover",
+  preview: "mt-2 border-t border-border pt-2",
+  previewImage: "max-h-[480px] max-w-full rounded-sm",
+  previewFrame: "h-[520px] w-full rounded-sm border border-border",
+  error: "mb-2 rounded-md bg-danger-bg px-2.5 py-1.5 text-xs text-danger-fg",
 };

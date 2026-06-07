@@ -1,7 +1,9 @@
 import { forwardRef, useId } from "react";
 import type { ReactNode, SelectHTMLAttributes } from "react";
+import { ChevronDown } from "lucide-react";
 
-import styles from "./Field.module.css";
+import { cn } from "../../lib/cn";
+import { fieldControl, fieldControlInvalid } from "./Input";
 
 export interface SelectOption {
   value: string;
@@ -17,10 +19,6 @@ export interface SelectProps
   requiredMark?: boolean;
   /** Convenience: render options from data. `children` still works. */
   options?: SelectOption[];
-}
-
-function cx(...classes: Array<string | false | undefined>): string {
-  return classes.filter(Boolean).join(" ");
 }
 
 /**
@@ -39,26 +37,26 @@ export const Select = forwardRef<HTMLSelectElement, SelectProps>(
     const describedById = hint || error ? `${selectId}-desc` : undefined;
 
     return (
-      <div className={styles.field}>
+      <div className="flex flex-col gap-1">
         {label && (
-          <label htmlFor={selectId} className={styles.label}>
+          <label htmlFor={selectId} className="text-sm font-medium text-fg">
             {label}
             {requiredMark && (
-              <span className={styles.required} aria-hidden="true">
+              <span className="text-danger" aria-hidden="true">
                 {" "}
                 *
               </span>
             )}
           </label>
         )}
-        <div className={styles.selectWrap}>
+        <div className="relative flex">
           <select
             ref={ref}
             id={selectId}
-            className={cx(
-              styles.control,
-              styles.select,
-              !!error && styles.invalid,
+            className={cn(
+              fieldControl,
+              "cursor-pointer appearance-none pr-9",
+              !!error && fieldControlInvalid,
               className,
             )}
             aria-invalid={error ? true : undefined}
@@ -77,17 +75,18 @@ export const Select = forwardRef<HTMLSelectElement, SelectProps>(
                 ))
               : children}
           </select>
-          <span className={styles.chevron} aria-hidden="true">
-            ▾
-          </span>
+          <ChevronDown
+            className="pointer-events-none absolute right-3 top-1/2 size-4 -translate-y-1/2 text-fg-muted"
+            aria-hidden="true"
+          />
         </div>
         {error ? (
-          <p id={describedById} className={styles.error}>
+          <p id={describedById} className="text-xs text-danger-fg">
             {error}
           </p>
         ) : (
           hint && (
-            <p id={describedById} className={styles.hint}>
+            <p id={describedById} className="text-xs text-fg-muted">
               {hint}
             </p>
           )

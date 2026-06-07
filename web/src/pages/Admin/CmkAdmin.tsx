@@ -145,7 +145,7 @@ export default function CmkAdmin() {
       )}
 
       {selectedTenantId && eligible && (
-        <div role="tablist" style={{ display: "flex", gap: "0.5rem", marginBottom: "1rem" }}>
+        <div role="tablist" className="mb-4 flex gap-2">
           <button role="tab" aria-selected={tab === "pem"} onClick={() => setTab("pem")}>
             PEM key
           </button>

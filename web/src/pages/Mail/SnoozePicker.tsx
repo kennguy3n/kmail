@@ -71,14 +71,14 @@ export default function SnoozePicker({
   }
 
   return (
-    <div role="dialog" aria-label="Snooze" style={styles.root}>
-      <p style={styles.title}>Snooze until…</p>
-      <ul style={styles.list}>
+    <div role="dialog" aria-label="Snooze" className={styles.root}>
+      <p className={styles.title}>Snooze until…</p>
+      <ul className={styles.list}>
         {presets.map((preset) => (
           <li key={preset.label}>
             <button
               type="button"
-              style={styles.preset}
+              className={styles.preset}
               onClick={() => handlePreset(preset.label, preset.resolve)}
             >
               {preset.label}
@@ -86,21 +86,21 @@ export default function SnoozePicker({
           </li>
         ))}
       </ul>
-      <div style={styles.customRow}>
+      <div className={styles.customRow}>
         <input
           type="datetime-local"
           value={customValue}
           onChange={(e) => setCustomValue(e.target.value)}
           aria-label="Custom snooze date and time"
-          style={styles.customInput}
+          className={styles.customInput}
         />
-        <button type="button" onClick={handleCustom} style={styles.customGo}>
+        <button type="button" onClick={handleCustom} className={styles.customGo}>
           Pick
         </button>
       </div>
-      {error && <p style={styles.error}>{error}</p>}
-      <div style={styles.footer}>
-        <button type="button" onClick={onCancel} style={styles.cancel}>
+      {error && <p className={styles.error}>{error}</p>}
+      <div className={styles.footer}>
+        <button type="button" onClick={onCancel} className={styles.cancel}>
           Cancel
         </button>
       </div>
@@ -108,79 +108,20 @@ export default function SnoozePicker({
   );
 }
 
-const styles: Record<string, React.CSSProperties> = {
-  root: {
-    position: "absolute",
-    right: 0,
-    top: "100%",
-    background: "#fff",
-    border: "1px solid #d1d5db",
-    borderRadius: "0.5rem",
-    boxShadow: "0 8px 24px rgba(0,0,0,0.12)",
-    padding: "0.75rem",
-    minWidth: "240px",
-    zIndex: 10,
-  },
-  title: {
-    margin: 0,
-    fontWeight: 600,
-    fontSize: "0.85rem",
-    marginBottom: "0.5rem",
-  },
-  list: {
-    listStyle: "none",
-    margin: 0,
-    padding: 0,
-    display: "flex",
-    flexDirection: "column",
-    gap: "0.125rem",
-  },
-  preset: {
-    width: "100%",
-    textAlign: "left",
-    padding: "0.4rem 0.5rem",
-    background: "transparent",
-    border: "none",
-    cursor: "pointer",
-    borderRadius: "0.25rem",
-    fontSize: "0.85rem",
-  },
-  customRow: {
-    display: "flex",
-    gap: "0.25rem",
-    marginTop: "0.5rem",
-  },
-  customInput: {
-    flex: 1,
-    padding: "0.25rem 0.4rem",
-    fontSize: "0.85rem",
-    border: "1px solid #d1d5db",
-    borderRadius: "0.25rem",
-  },
-  customGo: {
-    padding: "0.25rem 0.6rem",
-    background: "#2563eb",
-    color: "#fff",
-    border: "none",
-    borderRadius: "0.25rem",
-    fontSize: "0.85rem",
-    cursor: "pointer",
-  },
-  footer: {
-    marginTop: "0.5rem",
-    textAlign: "right",
-  },
-  cancel: {
-    padding: "0.2rem 0.5rem",
-    background: "transparent",
-    border: "1px solid #d1d5db",
-    borderRadius: "0.25rem",
-    cursor: "pointer",
-    fontSize: "0.85rem",
-  },
-  error: {
-    color: "#b91c1c",
-    fontSize: "0.8rem",
-    margin: "0.5rem 0 0 0",
-  },
+/** Theme-aware Tailwind class recipes for the SnoozePicker popover. */
+const styles: Record<string, string> = {
+  root: "absolute right-0 top-full z-dropdown min-w-[240px] rounded-lg border border-border bg-elevated p-3 shadow-lg",
+  title: "mb-2 mt-0 text-sm font-semibold",
+  list: "m-0 flex list-none flex-col gap-0.5 p-0",
+  preset:
+    "w-full cursor-pointer rounded-md border-0 bg-transparent px-2 py-1.5 text-left text-sm transition-colors hover:bg-surface-hover",
+  customRow: "mt-2 flex gap-1",
+  customInput:
+    "flex-1 rounded-md border border-border bg-surface px-1.5 py-1 text-sm text-fg outline-none focus-visible:border-primary focus-visible:ring-2 focus-visible:ring-primary-subtle",
+  customGo:
+    "cursor-pointer rounded-md border-0 bg-primary px-2.5 py-1 text-sm font-medium text-primary-fg transition-colors hover:bg-primary-hover",
+  footer: "mt-2 text-right",
+  cancel:
+    "cursor-pointer rounded-md border border-border bg-transparent px-2 py-1 text-sm text-fg transition-colors hover:bg-surface-hover",
+  error: "m-0 mt-2 text-xs text-danger-fg",
 };
