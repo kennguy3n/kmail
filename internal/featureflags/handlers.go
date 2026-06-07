@@ -42,6 +42,16 @@ type Handlers struct {
 	cacheMu  sync.RWMutex
 	lastGood []FlagView
 	cachedAt time.Time
+	// cachedReadStart is the monotonic instant the loadViews that
+	// produced the current snapshot *began* (or the time a cache-
+	// clearing action was decided). It orders concurrent cache writes so
+	// a slower reconcile that started earlier can neither overwrite a
+	// snapshot from a later-started read nor wipe one with a stale drop:
+	// a mutation is applied only when its read started no earlier than
+	// the one already reflected in the cache. Reads observe at least
+	// every commit that landed before they began, so "latest read-start
+	// wins" converges the cache to the most-recently-committed state.
+	cachedReadStart time.Time
 
 	// reconcileWG tracks in-flight asynchronous post-write cache
 	// reconciliations (refreshCacheAfterWrite launched off the response
@@ -97,6 +107,7 @@ func (h *Handlers) Register(mux *http.ServeMux, authMW *middleware.OIDC) {
 }
 
 func (h *Handlers) list(w http.ResponseWriter, r *http.Request) {
+	readStart := time.Now()
 	views, err := h.store.loadViews(r.Context())
 	if err != nil {
 		// Postgres is momentarily unavailable. Prefer serving the
@@ -121,17 +132,24 @@ func (h *Handlers) list(w http.ResponseWriter, r *http.Request) {
 		h.writeStoreErr(w, err)
 		return
 	}
-	h.cacheViews(views)
+	h.cacheViews(views, readStart)
 	writeJSON(w, http.StatusOK, map[string]any{"flags": views})
 }
 
-// cacheViews records the latest successful read as the last-known-good
-// snapshot served during a subsequent DB outage.
-func (h *Handlers) cacheViews(views []FlagView) {
+// cacheViews records a successful read as the last-known-good snapshot
+// served during a subsequent DB outage. readStart is the instant that
+// read began; the snapshot is applied only if no later-started read has
+// already updated the cache, so a slow reconcile can't clobber a fresher
+// entry (see cachedReadStart).
+func (h *Handlers) cacheViews(views []FlagView, readStart time.Time) {
 	h.cacheMu.Lock()
+	defer h.cacheMu.Unlock()
+	if readStart.Before(h.cachedReadStart) {
+		return
+	}
 	h.lastGood = views
 	h.cachedAt = time.Now()
-	h.cacheMu.Unlock()
+	h.cachedReadStart = readStart
 }
 
 // cachedViews returns the last-known-good snapshot and its age, or
@@ -155,12 +173,20 @@ func (h *Handlers) withinStaleBound(age time.Duration) bool {
 
 // dropCache clears the last-known-good snapshot so the next read during
 // an outage degrades to a retryable 503 rather than serving data that a
-// confirmed write has already contradicted.
-func (h *Handlers) dropCache() {
+// confirmed write has already contradicted. readStart orders the clear
+// like cacheViews: a drop decided from an earlier-started read won't
+// wipe a snapshot a later-started read already cached. Pass time.Now()
+// for an unconditional clear (a write whose post-state can't be
+// confirmed at all).
+func (h *Handlers) dropCache(readStart time.Time) {
 	h.cacheMu.Lock()
+	defer h.cacheMu.Unlock()
+	if readStart.Before(h.cachedReadStart) {
+		return
+	}
 	h.lastGood = nil
 	h.cachedAt = time.Time{}
-	h.cacheMu.Unlock()
+	h.cachedReadStart = readStart
 }
 
 // removeFlagFromCache reconciles the stale-serving cache with a
@@ -172,9 +198,15 @@ func (h *Handlers) dropCache() {
 // to a client disconnect. Other entries stay as stale as the last full
 // read, so cachedAt is intentionally left unchanged. A nil (cold) cache
 // stays cold.
+//
+// The delete commits before this runs, so it advances cachedReadStart to
+// now: any in-flight reconcile that started earlier (and may still see
+// the deleted flag) is then rejected by cacheViews and cannot resurrect
+// it.
 func (h *Handlers) removeFlagFromCache(key string) {
 	h.cacheMu.Lock()
 	defer h.cacheMu.Unlock()
+	h.cachedReadStart = time.Now()
 	if h.lastGood == nil {
 		return
 	}
@@ -218,15 +250,16 @@ const cacheRefreshBudget = 5 * time.Second
 func (h *Handlers) refreshCacheAfterWrite(parent context.Context) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), cacheRefreshBudget)
 	defer cancel()
+	readStart := time.Now()
 	views, err := h.store.loadViews(ctx)
 	if err != nil {
 		if h.logger != nil {
 			h.logger.Printf("featureflags: cache refresh after write failed (%v); dropping stale snapshot", err)
 		}
-		h.dropCache()
+		h.dropCache(readStart)
 		return
 	}
-	h.cacheViews(views)
+	h.cacheViews(views, readStart)
 }
 
 // reconcileCacheAfterWriteAsync runs refreshCacheAfterWrite in the
@@ -344,7 +377,10 @@ func (h *Handlers) put(w http.ResponseWriter, r *http.Request) {
 		if mutated {
 			h.invalidate()
 			if !cacheReconciled {
-				h.dropCache()
+				// A write landed but we couldn't reconcile (e.g. a later
+				// override op failed): the post-state is unconfirmable, so
+				// clear unconditionally (time.Now() always wins the order).
+				h.dropCache(time.Now())
 			}
 		}
 	}()
@@ -380,6 +416,7 @@ func (h *Handlers) put(w http.ResponseWriter, r *http.Request) {
 
 	// Return the resulting view for the flag so the admin UI can render
 	// the post-write state without a follow-up GET.
+	readStart := time.Now()
 	views, err := h.store.loadViews(r.Context())
 	if err != nil {
 		// The write already succeeded; only the convenience reload
@@ -402,7 +439,7 @@ func (h *Handlers) put(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"key": in.Key})
 		return
 	}
-	h.cacheViews(views)
+	h.cacheViews(views, readStart)
 	cacheReconciled = true
 	for _, v := range views {
 		if v.Key == in.Key {

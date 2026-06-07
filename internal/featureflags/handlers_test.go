@@ -402,6 +402,38 @@ func TestHandlerListMaxStaleAge(t *testing.T) {
 	}
 }
 
+// TestHandlerCacheWriteOrdering asserts the monotonic read-start guard:
+// a slower reconcile that *started* earlier can neither overwrite a
+// snapshot from a later-started read nor wipe it with a stale drop. This
+// keeps concurrent admin writes (each kicking an async reconcile) from
+// regressing the cache to an older state.
+func TestHandlerCacheWriteOrdering(t *testing.T) {
+	h := &Handlers{store: newFakeStore(), logger: discardLogger()}
+	older := []FlagView{{Flag: Flag{Key: "old"}}}
+	newer := []FlagView{{Flag: Flag{Key: "new"}}}
+	t0 := time.Now()
+	t1 := t0.Add(time.Second)
+
+	// A later-started read wins even if it lands first.
+	h.cacheViews(newer, t1)
+	h.cacheViews(older, t0) // earlier read-start → rejected
+	if got, _, _ := h.cachedViews(); len(got) != 1 || got[0].Key != "new" {
+		t.Fatalf("stale reconcile clobbered newer snapshot: got %+v", got)
+	}
+
+	// An earlier-started drop must not wipe the newer snapshot.
+	h.dropCache(t0)
+	if _, _, ok := h.cachedViews(); !ok {
+		t.Fatal("stale drop wiped a newer snapshot")
+	}
+
+	// A later drop does clear it.
+	h.dropCache(t1.Add(time.Second))
+	if _, _, ok := h.cachedViews(); ok {
+		t.Fatal("fresh drop did not clear the cache")
+	}
+}
+
 // TestHandlerListServerErrorNotServedStale asserts a server-side SQL
 // error (pgconn.PgError — Postgres is up and answering) is treated as a
 // genuine 500 and never served from the stale cache, even though it is
