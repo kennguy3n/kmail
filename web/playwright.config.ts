@@ -31,23 +31,28 @@ export default defineConfig({
     baseURL: BASE_URL,
     trace: "on-first-retry",
     screenshot: "only-on-failure",
-    // Pin the browser locale so number/date formatting is deterministic
-    // across machines. Specs that compare against a value formatted with
-    // `toLocaleString("en-US")` in Node (e.g. the user-quota label in
-    // `06-admin-user-quota.e2e.ts`) would otherwise depend on whatever
-    // default locale the runner's Chromium happens to use.
-    locale: "en-US",
   },
   projects: [
     {
       name: "chromium",
-      // Spread the device preset first, then pin the viewport: project
-      // `use` merges over the global `use`, and `devices["Desktop Chrome"]`
-      // carries its own 1280x720 viewport that would otherwise win. Order
-      // matters — the explicit viewport must come after the spread so the
-      // fixed 1440x900 frame (used for the visual-regression baselines)
-      // actually takes effect.
-      use: { ...devices["Desktop Chrome"], viewport: { width: 1440, height: 900 } },
+      // Spread the device preset first, then pin our deterministic overrides:
+      // project `use` merges over the global `use`, and `devices["Desktop
+      // Chrome"]` carries its own values (e.g. a 1280x720 viewport) that would
+      // otherwise win. Order matters — these explicit fields must come *after*
+      // the spread so they take effect even if a future Playwright version adds
+      // them to the device descriptor:
+      //   - viewport: the fixed 1440x900 frame the visual-regression baselines
+      //     were captured at.
+      //   - locale: en-US, so number/date formatting is deterministic across
+      //     machines. The user-quota spec compares the rendered cell against a
+      //     value formatted with `toLocaleString("en-US")` in Node
+      //     (`06-admin-user-quota.e2e.ts`); without this it would depend on
+      //     whatever default locale the runner's Chromium happens to use.
+      use: {
+        ...devices["Desktop Chrome"],
+        viewport: { width: 1440, height: 900 },
+        locale: "en-US",
+      },
     },
   ],
   webServer: {
