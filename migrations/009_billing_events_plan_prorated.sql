@@ -6,6 +6,8 @@
 -- proration history was silently lost. Widen the allowed set to match
 -- the event types the application actually emits.
 
+BEGIN;
+
 ALTER TABLE billing_events DROP CONSTRAINT billing_events_event_type_check;
 
 ALTER TABLE billing_events ADD CONSTRAINT billing_events_event_type_check
@@ -15,3 +17,5 @@ ALTER TABLE billing_events ADD CONSTRAINT billing_events_event_type_check
         'plan_changed', 'plan_prorated', 'invoice_generated',
         'limit_adjusted'
     ));
+
+COMMIT;

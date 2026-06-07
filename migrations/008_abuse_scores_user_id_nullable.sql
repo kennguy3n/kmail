@@ -9,6 +9,9 @@
 -- with partial indexes. This keeps the FK to users(id) and its
 -- ON DELETE CASCADE cleanup for per-user rows, while letting
 -- tenant-level rows use NULL (which the FK ignores).
+
+BEGIN;
+
 ALTER TABLE abuse_scores DROP CONSTRAINT abuse_scores_pkey;
 ALTER TABLE abuse_scores ALTER COLUMN user_id DROP NOT NULL;
 
@@ -19,3 +22,5 @@ CREATE UNIQUE INDEX abuse_scores_tenant_level_key
 -- At most one row per (tenant, user) for per-user scores.
 CREATE UNIQUE INDEX abuse_scores_user_level_key
     ON abuse_scores (tenant_id, user_id) WHERE user_id IS NOT NULL;
+
+COMMIT;
