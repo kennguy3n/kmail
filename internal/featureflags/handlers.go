@@ -4,12 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log"
+	"net"
 	"net/http"
 	"strconv"
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/kennguy3n/kmail/internal/middleware"
 )
 
@@ -111,6 +114,34 @@ func (h *Handlers) cachedViews() (views []FlagView, age time.Duration, ok bool) 
 	return h.lastGood, time.Since(h.cachedAt), true
 }
 
+// dropCache clears the last-known-good snapshot so the next read during
+// an outage degrades to a retryable 503 rather than serving data that a
+// confirmed write has already contradicted.
+func (h *Handlers) dropCache() {
+	h.cacheMu.Lock()
+	h.lastGood = nil
+	h.cachedAt = time.Time{}
+	h.cacheMu.Unlock()
+}
+
+// refreshCacheAfterWrite reconciles the stale-serving cache with a
+// just-committed mutation. It reloads the view set and re-caches it on
+// success; if that reload fails (e.g. the DB went unavailable right
+// after the write), it drops the cache so a subsequent outage read
+// returns 503 instead of serving a snapshot that no longer matches the
+// committed state (e.g. a just-deleted flag resurfacing).
+func (h *Handlers) refreshCacheAfterWrite(ctx context.Context) {
+	views, err := h.store.loadViews(ctx)
+	if err != nil {
+		if h.logger != nil {
+			h.logger.Printf("featureflags: cache refresh after write failed (%v); dropping stale snapshot", err)
+		}
+		h.dropCache()
+		return
+	}
+	h.cacheViews(views)
+}
+
 // overrideOp is one override mutation in a PUT body. Delete=true
 // removes the (scope, scope_id) override; otherwise it is upserted with
 // Enabled.
@@ -156,6 +187,9 @@ func (h *Handlers) put(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.invalidate()
+		// Keep the stale-serving cache consistent with the delete so a
+		// later outage read can't resurface the removed flag.
+		h.refreshCacheAfterWrite(r.Context())
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -233,6 +267,10 @@ func (h *Handlers) put(w http.ResponseWriter, r *http.Request) {
 		if h.logger != nil {
 			h.logger.Printf("featureflags: put reload: %v", err)
 		}
+		// The write landed but we couldn't refresh the snapshot, so the
+		// cached view set no longer reflects committed state. Drop it
+		// rather than risk serving it stale during a later outage.
+		h.dropCache()
 		writeJSON(w, http.StatusOK, map[string]string{"key": in.Key})
 		return
 	}
@@ -255,13 +293,39 @@ func (h *Handlers) invalidate() {
 
 // isStoreUnavailable reports whether err means the control plane is
 // momentarily unavailable (a missing pool, a read that hit its
-// deadline, or a cancelled request) rather than a malformed request or
-// a genuine bug. These are retryable and, for reads, eligible for the
-// stale-snapshot fallback.
+// deadline, a cancelled request, or a connection-level failure) rather
+// than a malformed request or a genuine bug. These are retryable and,
+// for reads, eligible for the stale-snapshot fallback.
 func isStoreUnavailable(err error) bool {
-	return errors.Is(err, ErrNoPool) ||
+	if err == nil {
+		return false
+	}
+	// A server-side error response (constraint violation, bad query,
+	// undefined column, …) means Postgres is up and answering: that's a
+	// genuine error, never eligible for the stale fallback even if it
+	// is wrapped alongside a transient-looking cause.
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return false
+	}
+	// Explicit unavailability signals: the read hit its deadline, the
+	// request was cancelled, or no pool is wired.
+	if errors.Is(err, ErrNoPool) ||
 		errors.Is(err, context.DeadlineExceeded) ||
-		errors.Is(err, context.Canceled)
+		errors.Is(err, context.Canceled) {
+		return true
+	}
+	// A connection-level failure that surfaced before the read deadline
+	// fired — refused/reset/no-route (net.Error), a closed pool, or a
+	// dropped connection (EOF) — is also unavailability, not a data
+	// bug, so a warm reader still gets the last-known-good snapshot.
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	return errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, io.EOF)
 }
 
 func (h *Handlers) writeStoreErr(w http.ResponseWriter, err error) {

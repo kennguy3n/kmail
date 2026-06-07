@@ -5,12 +5,15 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/kennguy3n/kmail/internal/middleware"
 )
 
@@ -278,6 +281,122 @@ func TestHandlerListGenuineErrorNotServedStale(t *testing.T) {
 	}
 	if got := rec.Header().Get("X-Kmail-Stale"); got != "" {
 		t.Errorf("genuine error must not be served stale; got X-Kmail-Stale=%q", got)
+	}
+}
+
+// TestHandlerListServesStaleOnConnectionDrop asserts the fallback also
+// covers connection-level failures that surface before the read
+// deadline fires (e.g. connection refused/reset), not just
+// DeadlineExceeded — a warm reader still gets the last-known-good
+// snapshot instead of a 500.
+func TestHandlerListServesStaleOnConnectionDrop(t *testing.T) {
+	store := newFakeStore()
+	store.flags["a"] = Flag{Key: "a", DefaultEnabled: true}
+	h := &Handlers{store: store, logger: discardLogger()}
+	h.list(httptest.NewRecorder(), authed(httptest.NewRequest(http.MethodGet, "/api/v1/admin/feature-flags", nil)))
+
+	// A dial failure wrapped the way pgx surfaces an unreachable DB.
+	store.loadErr = fmt.Errorf("connect: %w", &net.OpError{Op: "dial", Err: errors.New("connection refused")})
+	rec := httptest.NewRecorder()
+	h.list(rec, authed(httptest.NewRequest(http.MethodGet, "/api/v1/admin/feature-flags", nil)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (stale snapshot on connection drop), body %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("X-Kmail-Stale"); got != "true" {
+		t.Errorf("X-Kmail-Stale = %q, want \"true\"", got)
+	}
+}
+
+// TestHandlerListServerErrorNotServedStale asserts a server-side SQL
+// error (pgconn.PgError — Postgres is up and answering) is treated as a
+// genuine 500 and never served from the stale cache, even though it is
+// a database error.
+func TestHandlerListServerErrorNotServedStale(t *testing.T) {
+	store := newFakeStore()
+	store.flags["a"] = Flag{Key: "a"}
+	h := &Handlers{store: store, logger: discardLogger()}
+	h.list(httptest.NewRecorder(), authed(httptest.NewRequest(http.MethodGet, "/api/v1/admin/feature-flags", nil)))
+
+	store.loadErr = fmt.Errorf("list flags: %w", &pgconn.PgError{Code: "42703", Message: "column does not exist"})
+	rec := httptest.NewRecorder()
+	h.list(rec, authed(httptest.NewRequest(http.MethodGet, "/api/v1/admin/feature-flags", nil)))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 for a server-side SQL error", rec.Code)
+	}
+	if got := rec.Header().Get("X-Kmail-Stale"); got != "" {
+		t.Errorf("server-side error must not be served stale; got X-Kmail-Stale=%q", got)
+	}
+}
+
+// TestHandlerDeleteRefreshesStaleCache asserts that a confirmed DELETE
+// reconciles the stale-serving cache: a flag removed while the DB is
+// healthy must not resurface in a later stale read once Postgres goes
+// unavailable. Without the post-delete refresh the GET would happily
+// serve the warmed snapshot that still contained the deleted flag.
+func TestHandlerDeleteRefreshesStaleCache(t *testing.T) {
+	store := newFakeStore()
+	store.flags["a"] = Flag{Key: "a", DefaultEnabled: true}
+	h := &Handlers{store: store, logger: discardLogger()}
+
+	// Warm the cache with the flag present.
+	h.list(httptest.NewRecorder(), authed(httptest.NewRequest(http.MethodGet, "/api/v1/admin/feature-flags", nil)))
+
+	// Delete it (DB still healthy, so the post-write refresh succeeds).
+	del := authed(httptest.NewRequest(http.MethodPut, "/api/v1/admin/feature-flags", bytes.NewBufferString(`{"key":"a","delete":true}`)))
+	delRec := httptest.NewRecorder()
+	h.put(delRec, del)
+	if delRec.Code != http.StatusNoContent {
+		t.Fatalf("delete: status %d, body %s", delRec.Code, delRec.Body.String())
+	}
+
+	// Postgres now goes away; the stale read must reflect the delete.
+	store.loadErr = context.DeadlineExceeded
+	rec := httptest.NewRecorder()
+	h.list(rec, authed(httptest.NewRequest(http.MethodGet, "/api/v1/admin/feature-flags", nil)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (stale snapshot), body %s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Flags []FlagView `json:"flags"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	for _, v := range resp.Flags {
+		if v.Key == "a" {
+			t.Fatalf("deleted flag resurfaced in stale read: %+v", resp.Flags)
+		}
+	}
+}
+
+// TestHandlerDeleteDropsCacheWhenRefreshFails asserts that if the DB
+// becomes unavailable immediately after a delete (so the post-write
+// refresh can't reload), the stale cache is dropped rather than left
+// holding the just-deleted flag — a subsequent outage read then returns
+// the retryable 503 instead of serving contradicted data.
+func TestHandlerDeleteDropsCacheWhenRefreshFails(t *testing.T) {
+	store := newFakeStore()
+	store.flags["a"] = Flag{Key: "a", DefaultEnabled: true}
+	h := &Handlers{store: store, logger: discardLogger()}
+
+	h.list(httptest.NewRecorder(), authed(httptest.NewRequest(http.MethodGet, "/api/v1/admin/feature-flags", nil)))
+
+	// The delete itself succeeds, but the reload right after it fails.
+	store.loadErr = context.DeadlineExceeded
+	del := authed(httptest.NewRequest(http.MethodPut, "/api/v1/admin/feature-flags", bytes.NewBufferString(`{"key":"a","delete":true}`)))
+	delRec := httptest.NewRecorder()
+	h.put(delRec, del)
+	if delRec.Code != http.StatusNoContent {
+		t.Fatalf("delete: status %d, body %s", delRec.Code, delRec.Body.String())
+	}
+
+	rec := httptest.NewRecorder()
+	h.list(rec, authed(httptest.NewRequest(http.MethodGet, "/api/v1/admin/feature-flags", nil)))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (cache dropped, no stale snapshot to serve)", rec.Code)
+	}
+	if got := rec.Header().Get("X-Kmail-Stale"); got != "" {
+		t.Errorf("must not serve stale after cache drop; got X-Kmail-Stale=%q", got)
 	}
 }
 
