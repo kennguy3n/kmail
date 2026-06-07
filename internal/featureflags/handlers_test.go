@@ -11,7 +11,9 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/puddle/v2"
@@ -22,8 +24,14 @@ import (
 // error paths (which log) without polluting test output.
 func discardLogger() *log.Logger { return log.New(io.Discard, "", 0) }
 
-// fakeStore is an in-memory adminStore for handler tests.
+// fakeStore is an in-memory adminStore for handler tests. Its mutable
+// state is guarded by mu so it stays race-free even when a test triggers
+// an asynchronous post-write reconcile (reconcileCacheAfterWriteAsync)
+// that calls loadViews from a background goroutine. Tests arming a
+// failure that the background reconcile will observe use setLoadErr so
+// the write is ordered behind the same lock.
 type fakeStore struct {
+	mu          sync.Mutex
 	flags       map[string]Flag
 	overrides   map[string]Override // key: scopeKey on the (single) test flag set
 	loadErr     error               // when set, loadViews returns it (DB-outage simulation)
@@ -35,9 +43,20 @@ func newFakeStore() *fakeStore {
 	return &fakeStore{flags: map[string]Flag{}, overrides: map[string]Override{}}
 }
 
+// setLoadErr arms loadViews to fail with err. once=true clears it after
+// a single failure (client-disconnect-then-recover simulation).
+func (f *fakeStore) setLoadErr(err error, once bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.loadErr = err
+	f.loadErrOnce = once
+}
+
 func ovKey(flag string, scope Scope, id string) string { return flag + "|" + scopeKey(scope, id) }
 
 func (f *fakeStore) loadViews(context.Context) ([]FlagView, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.loadErr != nil {
 		err := f.loadErr
 		if f.loadErrOnce {
@@ -57,11 +76,15 @@ func (f *fakeStore) loadViews(context.Context) ([]FlagView, error) {
 }
 
 func (f *fakeStore) UpsertFlag(_ context.Context, fl Flag) (*Flag, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.flags[fl.Key] = fl
 	return &fl, nil
 }
 
 func (f *fakeStore) DeleteFlag(_ context.Context, key string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	delete(f.flags, key)
 	for k, o := range f.overrides {
 		if o.FlagKey == key {
@@ -72,6 +95,8 @@ func (f *fakeStore) DeleteFlag(_ context.Context, key string) error {
 }
 
 func (f *fakeStore) SetOverride(_ context.Context, o Override) (*Override, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.overrideErr != nil {
 		return nil, f.overrideErr
 	}
@@ -80,6 +105,8 @@ func (f *fakeStore) SetOverride(_ context.Context, o Override) (*Override, error
 }
 
 func (f *fakeStore) DeleteOverride(_ context.Context, flagKey string, scope Scope, scopeID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	delete(f.overrides, ovKey(flagKey, scope, scopeID))
 	return nil
 }
@@ -338,6 +365,43 @@ func TestHandlerListServesStaleOnClosedPool(t *testing.T) {
 	}
 }
 
+// TestHandlerListMaxStaleAge asserts the configurable staleness bound:
+// a snapshot within maxStaleAge is served stale, but once it ages past
+// the bound the read degrades to a retryable 503 instead of returning
+// arbitrarily old data.
+func TestHandlerListMaxStaleAge(t *testing.T) {
+	store := newFakeStore()
+	store.flags["a"] = Flag{Key: "a", DefaultEnabled: true}
+	h := (&Handlers{store: store, logger: discardLogger()}).WithMaxStaleAge(time.Minute)
+
+	// Warm the cache, then take Postgres down.
+	h.list(httptest.NewRecorder(), authed(httptest.NewRequest(http.MethodGet, "/api/v1/admin/feature-flags", nil)))
+	store.setLoadErr(context.DeadlineExceeded, false)
+
+	// Fresh snapshot (well within the bound) → served stale.
+	rec := httptest.NewRecorder()
+	h.list(rec, authed(httptest.NewRequest(http.MethodGet, "/api/v1/admin/feature-flags", nil)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("fresh snapshot: status = %d, want 200 (served stale), body %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("X-Kmail-Stale"); got != "true" {
+		t.Errorf("X-Kmail-Stale = %q, want \"true\"", got)
+	}
+
+	// Age the snapshot past the bound → degrade to 503.
+	h.cacheMu.Lock()
+	h.cachedAt = h.cachedAt.Add(-2 * time.Minute)
+	h.cacheMu.Unlock()
+	rec = httptest.NewRecorder()
+	h.list(rec, authed(httptest.NewRequest(http.MethodGet, "/api/v1/admin/feature-flags", nil)))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("over-aged snapshot: status = %d, want 503 (too stale to serve)", rec.Code)
+	}
+	if got := rec.Header().Get("X-Kmail-Stale"); got != "" {
+		t.Errorf("over-aged snapshot must not be served stale; got X-Kmail-Stale=%q", got)
+	}
+}
+
 // TestHandlerListServerErrorNotServedStale asserts a server-side SQL
 // error (pgconn.PgError — Postgres is up and answering) is treated as a
 // genuine 500 and never served from the stale cache, even though it is
@@ -425,8 +489,9 @@ func TestHandlerPutReloadFailureReconcilesDecoupled(t *testing.T) {
 
 	// The writes land; the convenience reload fails once (as a client
 	// disconnect would), but the decoupled reconcile read recovers.
-	store.loadErr = context.Canceled
-	store.loadErrOnce = true
+	// Use the guarded setter: the reconcile reads loadErr from a
+	// background goroutine.
+	store.setLoadErr(context.Canceled, true)
 	body := `{"key":"a","description":"new","default_enabled":false}`
 	wrec := httptest.NewRecorder()
 	h.put(wrec, authed(httptest.NewRequest(http.MethodPut, "/api/v1/admin/feature-flags", bytes.NewBufferString(body))))
@@ -437,7 +502,7 @@ func TestHandlerPutReloadFailureReconcilesDecoupled(t *testing.T) {
 	h.reconcileWG.Wait()
 
 	// A later outage read must serve the reconciled (new) state, not 503.
-	store.loadErr = context.DeadlineExceeded
+	store.setLoadErr(context.DeadlineExceeded, false)
 	rec := httptest.NewRecorder()
 	h.list(rec, authed(httptest.NewRequest(http.MethodGet, "/api/v1/admin/feature-flags", nil)))
 	if rec.Code != http.StatusOK {
@@ -476,7 +541,7 @@ func TestHandlerPutReloadFailureDropsCacheOnOutage(t *testing.T) {
 	h.list(httptest.NewRecorder(), authed(httptest.NewRequest(http.MethodGet, "/api/v1/admin/feature-flags", nil)))
 
 	// Writes land, but every reload (convenience + decoupled) fails.
-	store.loadErr = context.DeadlineExceeded
+	store.setLoadErr(context.DeadlineExceeded, false)
 	body := `{"key":"a","default_enabled":false}`
 	wrec := httptest.NewRecorder()
 	h.put(wrec, authed(httptest.NewRequest(http.MethodPut, "/api/v1/admin/feature-flags", bytes.NewBufferString(body))))

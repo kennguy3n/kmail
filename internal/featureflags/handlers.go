@@ -48,6 +48,16 @@ type Handlers struct {
 	// path). It lets a graceful shutdown — and the tests — wait for a
 	// just-kicked reconcile to finish instead of racing it.
 	reconcileWG sync.WaitGroup
+
+	// maxStaleAge bounds how old the last-known-good snapshot may be and
+	// still be served during an outage. Zero (the default) means
+	// unbounded: the admin GET keeps serving the snapshot — clearly
+	// marked stale — for as long as the DB is down, which for a
+	// control-plane read is usually preferable to a hard 503 blackout.
+	// Operators who want a ceiling set one via WithMaxStaleAge
+	// (KMAIL_FLAGS_MAX_STALE); past it, the read degrades to a retryable
+	// 503 instead of returning data that may be arbitrarily old.
+	maxStaleAge time.Duration
 }
 
 // adminStore is the write+read surface the handlers need. The pgx
@@ -71,6 +81,15 @@ func NewHandlers(store *Store, svc *Service, logger *log.Logger) *Handlers {
 	return &Handlers{store: store, svc: svc, logger: logger}
 }
 
+// WithMaxStaleAge sets the maximum age of a last-known-good snapshot
+// that the admin GET will serve during an outage. A non-positive value
+// (the default) leaves stale-serving unbounded. Returns the receiver
+// for chaining at construction.
+func (h *Handlers) WithMaxStaleAge(d time.Duration) *Handlers {
+	h.maxStaleAge = d
+	return h
+}
+
 // Register installs the admin routes on the mux behind authMW.
 func (h *Handlers) Register(mux *http.ServeMux, authMW *middleware.OIDC) {
 	mux.Handle("GET /api/v1/admin/feature-flags", authMW.Wrap(http.HandlerFunc(h.list)))
@@ -87,11 +106,16 @@ func (h *Handlers) list(w http.ResponseWriter, r *http.Request) {
 		// to the retryable error.
 		if isStoreUnavailable(err) {
 			if cached, age, ok := h.cachedViews(); ok {
-				if h.logger != nil {
-					h.logger.Printf("featureflags: store unavailable (%v); serving snapshot aged %s", err, age.Round(time.Second))
+				if h.withinStaleBound(age) {
+					if h.logger != nil {
+						h.logger.Printf("featureflags: store unavailable (%v); serving snapshot aged %s", err, age.Round(time.Second))
+					}
+					writeStaleJSON(w, age, map[string]any{"flags": cached})
+					return
 				}
-				writeStaleJSON(w, age, map[string]any{"flags": cached})
-				return
+				if h.logger != nil {
+					h.logger.Printf("featureflags: store unavailable (%v); snapshot aged %s exceeds max %s, degrading to 503", err, age.Round(time.Second), h.maxStaleAge)
+				}
 			}
 		}
 		h.writeStoreErr(w, err)
@@ -119,6 +143,14 @@ func (h *Handlers) cachedViews() (views []FlagView, age time.Duration, ok bool) 
 		return nil, 0, false
 	}
 	return h.lastGood, time.Since(h.cachedAt), true
+}
+
+// withinStaleBound reports whether a snapshot of the given age is still
+// servable. A non-positive maxStaleAge means unbounded (serve any age);
+// otherwise a snapshot older than the bound is too stale to serve and
+// the read degrades to a retryable 503.
+func (h *Handlers) withinStaleBound(age time.Duration) bool {
+	return h.maxStaleAge <= 0 || age <= h.maxStaleAge
 }
 
 // dropCache clears the last-known-good snapshot so the next read during
@@ -207,11 +239,13 @@ func (h *Handlers) refreshCacheAfterWrite(parent context.Context) {
 // version had, well within the system's bounded-staleness model — and it
 // converges to the committed state (or an empty cache → 503) once done.
 func (h *Handlers) reconcileCacheAfterWriteAsync(parent context.Context) {
-	detached := context.WithoutCancel(parent)
 	h.reconcileWG.Add(1)
 	go func() {
 		defer h.reconcileWG.Done()
-		h.refreshCacheAfterWrite(detached)
+		// refreshCacheAfterWrite detaches parent's cancellation itself,
+		// so passing the (now-returning) request context is fine: its
+		// values stay readable and its deadline/cancel are dropped.
+		h.refreshCacheAfterWrite(parent)
 	}()
 }
 
@@ -391,6 +425,14 @@ func (h *Handlers) invalidate() {
 // deadline, a cancelled request, or a connection-level failure) rather
 // than a malformed request or a genuine bug. These are retryable and,
 // for reads, eligible for the stale-snapshot fallback.
+//
+// It only ever classifies errors from the pgx-backed Store (loadViews /
+// the write methods). Within that scope a bare io.EOF means the server
+// closed the connection mid-read — i.e. unavailability — not an
+// application-level "end of stream"; the *pgconn.PgError guard below
+// runs first so a real server-side error is never misread as a dropped
+// connection. The breadth is deliberately confined to this control-plane
+// caller and is not a general-purpose error classifier.
 func isStoreUnavailable(err error) bool {
 	if err == nil {
 		return false
