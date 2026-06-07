@@ -8,21 +8,28 @@
 //
 // Wire shape:
 //
-//   POST /api/v1/auth/totp/enroll   — mints a fresh secret + QR
-//        URI, returns the otpauth:// URI and base32 secret. The
-//        client renders a QR code. Re-enrolling an already-enabled
-//        credential (secret rotation) requires proving the current
-//        second factor (a live TOTP code or an unused recovery code)
-//        in the body, checked through the same brute-force lockout
-//        path as /check so it cannot be used to bypass the cooldown.
-//   POST /api/v1/auth/totp/verify   — accepts a 6-digit code; on
-//        success flips the credential to `enabled=true` and
-//        returns 10 recovery codes (one-time view).
-//   POST /api/v1/auth/totp/check    — runs a verification (used at
-//        login). Honours both regular codes and recovery codes
-//        (recovery codes self-delete on use).
-//   GET  /api/v1/auth/totp/status   — returns `{enrolled, enabled}`.
-//   DELETE /api/v1/auth/totp        — disable TOTP for the user.
+//	POST /api/v1/auth/totp/enroll   — mints a fresh secret + QR
+//	     URI, returns the otpauth:// URI and base32 secret. The
+//	     client renders a QR code. Re-enrolling an already-enabled
+//	     credential (secret rotation) requires proving the current
+//	     second factor (a live TOTP code or an unused recovery code)
+//	     in the body, checked through the same brute-force lockout
+//	     path as /check so it cannot be used to bypass the cooldown.
+//	POST /api/v1/auth/totp/verify   — accepts a 6-digit code; on
+//	     success flips the credential to `enabled=true` and
+//	     returns 10 recovery codes (one-time view).
+//	POST /api/v1/auth/totp/check    — runs a verification (used at
+//	     login). Honours both regular codes and recovery codes
+//	     (recovery codes self-delete on use).
+//	GET  /api/v1/auth/totp/status   — returns `{enrolled, enabled}`.
+//	DELETE /api/v1/auth/totp        — disable TOTP for the user.
+//	     Removing an already-enabled credential requires proving the
+//	     current second factor (a live TOTP code or an unused recovery
+//	     code) in the body, checked through the same brute-force
+//	     lockout path as /check — otherwise a first-factor-only caller
+//	     could delete the credential and then re-enroll a fresh one
+//	     (frictionless for an absent row), sidestepping the
+//	     re-enrollment guard.
 package middleware
 
 import (
@@ -137,6 +144,16 @@ type EnrollResponse struct {
 
 // VerifyRequest is the body of /verify and /check.
 type VerifyRequest struct {
+	Code string `json:"code"`
+}
+
+// DisableRequest is the (optional) body of DELETE /api/v1/auth/totp.
+// The `code` field is consulted only when disabling an already-enabled
+// credential: the caller must prove possession of the current second
+// factor — a live TOTP code or an unused recovery code — before the
+// credential is removed. Removing a not-yet-confirmed credential (or
+// when nothing is enrolled) needs no factor.
+type DisableRequest struct {
 	Code string `json:"code"`
 }
 
@@ -417,6 +434,68 @@ func (h *TOTPHandlers) disable(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
 	}
+	// Optional current-factor proof. Required only to remove an
+	// already-enabled credential; empty when nothing is enrolled or the
+	// credential was never confirmed.
+	var in DisableRequest
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil && !errors.Is(err, io.EOF) {
+		http.Error(w, "invalid body", http.StatusBadRequest)
+		return
+	}
+	code := strings.TrimSpace(in.Code)
+
+	// Disable guard. Removing an ENABLED credential strips the second
+	// factor entirely, so it must prove the current factor through the
+	// same SELECT ... FOR UPDATE lockout path as /check. Otherwise a
+	// first-factor-only caller could DELETE the credential and then
+	// re-enroll a fresh one (a first-time enrollment is frictionless for
+	// an absent row), replacing the victim's authenticator and
+	// sidestepping the re-enrollment guard. The recovery code is the
+	// escape hatch for a lost authenticator.
+	//
+	// requireEnabled=true: a first-time (no row) or unconfirmed
+	// (disabled) credential never reaches the verify closure — nothing
+	// is protected yet, so it is removed without a factor.
+	res, err := h.store.EvaluateAttempt(
+		r.Context(), tenantID, userID, h.cfg.Now(),
+		h.cfg.MaxFailedAttempts, h.cfg.LockoutDuration,
+		true,
+		func(cred *TOTPCredential) TOTPVerification {
+			sec, uerr := h.unwrapSecret(cred.EncryptedSecret)
+			if uerr != nil {
+				return TOTPVerification{Err: uerr}
+			}
+			if verifyCode(sec, code, h.cfg.Now()) {
+				return TOTPVerification{OK: true, Method: "totp"}
+			}
+			if _, ok := consumeRecoveryCode(cred.RecoveryCodesHash, code); ok {
+				return TOTPVerification{OK: true, Method: "recovery"}
+			}
+			return TOTPVerification{}
+		},
+	)
+	switch {
+	case errors.Is(err, ErrTOTPNotFound):
+		// Nothing enrolled — deletion is an idempotent no-op success.
+		w.WriteHeader(http.StatusNoContent)
+		return
+	case err != nil:
+		h.cfg.Logger.Printf("totp.disable: %v", err)
+		http.Error(w, "store error", http.StatusInternalServerError)
+		return
+	case res.NotEnabled:
+		// Unconfirmed enrollment — no active factor to protect; fall
+		// through to remove it without a code.
+	case res.Locked:
+		h.writeLocked(w, res.RetryAfter)
+		return
+	case !res.Verified:
+		// Enabled credential, but no valid current factor supplied.
+		http.Error(w, "current TOTP or recovery code required to disable", http.StatusUnauthorized)
+		return
+	}
+	// Authorized: either an unconfirmed credential (NotEnabled) or a
+	// verified current factor. Remove it.
 	if err := h.store.Delete(r.Context(), tenantID, userID); err != nil {
 		http.Error(w, "store: "+err.Error(), http.StatusInternalServerError)
 		return

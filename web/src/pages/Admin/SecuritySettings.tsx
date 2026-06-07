@@ -387,13 +387,18 @@ function TOTPSection({ tenantId }: { tenantId: string }) {
     setError(null);
     setBusy(true);
     try {
+      // Disabling an enabled credential strips the second factor, so the
+      // server requires proof of the current factor (a live TOTP code or
+      // a recovery code) in the body — mirroring re-enrollment.
       const res = await fetch("/api/v1/auth/totp", {
         method: "DELETE",
         credentials: "include",
-        headers: headers(),
+        headers: { ...headers(), "Content-Type": "application/json" },
+        body: JSON.stringify({ code }),
       });
       if (!res.ok) throw new Error(`disable: ${res.status}`);
       setRecoveryCodes(null);
+      setCode("");
       await reload();
     } catch (e: unknown) {
       setError(String(e));
@@ -472,7 +477,16 @@ function TOTPSection({ tenantId }: { tenantId: string }) {
       )}
       {status?.enabled && (
         <div className="actions">
-          <button type="button" onClick={disable} disabled={busy}>
+          <label>
+            Current 6-digit or recovery code:{" "}
+            <input
+              value={code}
+              onChange={(e) => setCode(e.target.value)}
+              inputMode="text"
+              placeholder="required to disable"
+            />
+          </label>
+          <button type="button" onClick={disable} disabled={busy || code.trim().length === 0}>
             Disable TOTP
           </button>
         </div>

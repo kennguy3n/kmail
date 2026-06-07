@@ -13,6 +13,7 @@ package middleware
 
 import (
 	"bytes"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -650,5 +651,226 @@ func TestTOTPEnroll_ReenrollWhileLockedRefused(t *testing.T) {
 	}
 	if !cred.Enabled {
 		t.Fatal("locked re-enroll must not disable the live credential")
+	}
+}
+
+// doDisable sends DELETE /api/v1/auth/totp for (tenantID, userID). A
+// blank code sends an empty body (no current-factor proof); a non-blank
+// code sends {"code":...} to authorize disabling an enabled credential.
+func doDisable(h *TOTPHandlers, tenantID, userID, code string) *httptest.ResponseRecorder {
+	var body []byte
+	if code != "" {
+		body = []byte(`{"code":"` + code + `"}`)
+	}
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/auth/totp", bytes.NewReader(body))
+	req.Header.Set("X-KMail-Dev-Tenant-Id", tenantID)
+	req.Header.Set("X-KMail-Dev-User-Id", userID)
+	rec := httptest.NewRecorder()
+	h.disable(rec, req)
+	return rec
+}
+
+// TestTOTPDisable_NotEnrolledNoOp confirms disabling when nothing is
+// enrolled is an idempotent 204 — no factor required, no error.
+func TestTOTPDisable_NotEnrolledNoOp(t *testing.T) {
+	admin := testAdminPool(t)
+	tenantID, userID := seedTenantWithUser(t, admin, "totp-disable-none")
+
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	h := NewTOTPHandlers(TOTPConfig{Pool: admin, Now: func() time.Time { return now }})
+
+	if rec := doDisable(h, tenantID, userID, ""); rec.Code != http.StatusNoContent {
+		t.Fatalf("disable when not enrolled: want 204, got %d (body=%q)", rec.Code, rec.Body.String())
+	}
+}
+
+// TestTOTPDisable_UnconfirmedFrictionless confirms a not-yet-confirmed
+// (disabled) credential can be removed without a factor — there is no
+// active second factor to protect yet, mirroring the frictionless
+// enroll/restart path.
+func TestTOTPDisable_UnconfirmedFrictionless(t *testing.T) {
+	admin := testAdminPool(t)
+	tenantID, userID := seedTenantWithUser(t, admin, "totp-disable-unconf")
+
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	h := NewTOTPHandlers(TOTPConfig{Pool: admin, Now: func() time.Time { return now }})
+
+	secret := []byte("12345678901234567890")
+	if err := h.store.Upsert(t.Context(), tenantID, userID, secret, "", false, now); err != nil {
+		t.Fatalf("seed unconfirmed credential: %v", err)
+	}
+
+	if rec := doDisable(h, tenantID, userID, ""); rec.Code != http.StatusNoContent {
+		t.Fatalf("disable unconfirmed: want 204, got %d (body=%q)", rec.Code, rec.Body.String())
+	}
+	if _, err := h.store.Get(t.Context(), tenantID, userID); !errors.Is(err, ErrTOTPNotFound) {
+		t.Fatalf("disable must remove the unconfirmed credential: err=%v", err)
+	}
+}
+
+// TestTOTPDisable_EnabledRequiresFactor is the core hardening for the
+// delete-then-reenroll bypass: removing an ALREADY-ENABLED credential
+// without proving the current second factor is refused (401), spends a
+// failed attempt, and leaves the credential intact.
+func TestTOTPDisable_EnabledRequiresFactor(t *testing.T) {
+	admin := testAdminPool(t)
+	tenantID, userID := seedTenantWithUser(t, admin, "totp-disable-noauth")
+
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	h := NewTOTPHandlers(TOTPConfig{
+		Pool:              admin,
+		Now:               func() time.Time { return now },
+		MaxFailedAttempts: 5,
+		LockoutDuration:   15 * time.Minute,
+	})
+
+	secret := []byte("12345678901234567890")
+	if err := h.store.Upsert(t.Context(), tenantID, userID, secret, "recov-hash", true, now); err != nil {
+		t.Fatalf("seed enabled credential: %v", err)
+	}
+
+	// No code → refused.
+	if rec := doDisable(h, tenantID, userID, ""); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("disable without factor: want 401, got %d (body=%q)", rec.Code, rec.Body.String())
+	}
+	// Wrong code → also refused.
+	wrong := "654321"
+	if wrong == generateHOTP(secret, now.Unix()/30) {
+		wrong = "123456"
+	}
+	if rec := doDisable(h, tenantID, userID, wrong); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("disable with wrong code: want 401, got %d", rec.Code)
+	}
+
+	cred, err := h.store.Get(t.Context(), tenantID, userID)
+	if err != nil {
+		t.Fatalf("get after refused disable: %v", err)
+	}
+	if !cred.Enabled {
+		t.Fatal("refused disable must leave the credential enabled")
+	}
+	if !bytes.Equal(cred.EncryptedSecret, secret) {
+		t.Fatal("refused disable must not touch the secret")
+	}
+	if cred.FailedAttempts != 2 {
+		t.Fatalf("two refused disable attempts must each spend one: failed_attempts=%d, want 2", cred.FailedAttempts)
+	}
+}
+
+// TestTOTPDisable_WithValidTOTP confirms a live TOTP code authorizes
+// removal of an enabled credential.
+func TestTOTPDisable_WithValidTOTP(t *testing.T) {
+	admin := testAdminPool(t)
+	tenantID, userID := seedTenantWithUser(t, admin, "totp-disable-totp")
+
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	h := NewTOTPHandlers(TOTPConfig{
+		Pool:              admin,
+		Now:               func() time.Time { return now },
+		MaxFailedAttempts: 5,
+		LockoutDuration:   15 * time.Minute,
+	})
+
+	secret := []byte("12345678901234567890")
+	if err := h.store.Upsert(t.Context(), tenantID, userID, secret, "old-recov", true, now); err != nil {
+		t.Fatalf("seed enabled credential: %v", err)
+	}
+
+	valid := generateHOTP(secret, now.Unix()/30)
+	if rec := doDisable(h, tenantID, userID, valid); rec.Code != http.StatusNoContent {
+		t.Fatalf("disable with valid TOTP: want 204, got %d (body=%q)", rec.Code, rec.Body.String())
+	}
+	if _, err := h.store.Get(t.Context(), tenantID, userID); !errors.Is(err, ErrTOTPNotFound) {
+		t.Fatalf("authorized disable must remove the credential: err=%v", err)
+	}
+}
+
+// TestTOTPDisable_WithRecoveryCode confirms the lost-authenticator
+// escape hatch: an unused recovery code authorizes removal.
+func TestTOTPDisable_WithRecoveryCode(t *testing.T) {
+	admin := testAdminPool(t)
+	tenantID, userID := seedTenantWithUser(t, admin, "totp-disable-recov")
+
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	h := NewTOTPHandlers(TOTPConfig{
+		Pool:              admin,
+		Now:               func() time.Time { return now },
+		MaxFailedAttempts: 5,
+		LockoutDuration:   15 * time.Minute,
+	})
+
+	codes, hashed, err := newRecoveryCodes(5)
+	if err != nil {
+		t.Fatalf("newRecoveryCodes: %v", err)
+	}
+	secret := []byte("12345678901234567890")
+	if err := h.store.Upsert(t.Context(), tenantID, userID, secret, hashed, true, now); err != nil {
+		t.Fatalf("seed enabled credential: %v", err)
+	}
+
+	if rec := doDisable(h, tenantID, userID, codes[0]); rec.Code != http.StatusNoContent {
+		t.Fatalf("disable with recovery code: want 204, got %d (body=%q)", rec.Code, rec.Body.String())
+	}
+	if _, err := h.store.Get(t.Context(), tenantID, userID); !errors.Is(err, ErrTOTPNotFound) {
+		t.Fatalf("recovery-authorized disable must remove the credential: err=%v", err)
+	}
+}
+
+// TestTOTPDisable_WhileLockedRefused proves /disable honours the same
+// lockout gate as /check: while an account is locked, even a valid
+// current code cannot remove the credential — so disable cannot be used
+// to clear a standing lockout and then re-enroll.
+func TestTOTPDisable_WhileLockedRefused(t *testing.T) {
+	admin := testAdminPool(t)
+	tenantID, userID := seedTenantWithUser(t, admin, "totp-disable-locked")
+
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	const maxAttempts = 3
+	h := NewTOTPHandlers(TOTPConfig{
+		Pool:              admin,
+		Now:               func() time.Time { return now },
+		MaxFailedAttempts: maxAttempts,
+		LockoutDuration:   15 * time.Minute,
+	})
+
+	secret := []byte("12345678901234567890")
+	if err := h.store.Upsert(t.Context(), tenantID, userID, secret, "", true, now); err != nil {
+		t.Fatalf("seed enabled credential: %v", err)
+	}
+
+	wrong := "654321"
+	if wrong == generateHOTP(secret, now.Unix()/30) {
+		wrong = "123456"
+	}
+	doCheck := func(code string) int {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/totp/check",
+			bytes.NewReader([]byte(`{"code":"`+code+`"}`)))
+		req.Header.Set("X-KMail-Dev-Tenant-Id", tenantID)
+		req.Header.Set("X-KMail-Dev-User-Id", userID)
+		rec := httptest.NewRecorder()
+		h.check(rec, req)
+		return rec.Code
+	}
+	for i := 0; i < maxAttempts; i++ {
+		doCheck(wrong)
+	}
+
+	// Even a valid current code is refused with 429 while locked.
+	valid := generateHOTP(secret, now.Unix()/30)
+	rec := doDisable(h, tenantID, userID, valid)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("disable while locked: want 429, got %d (body=%q)", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("Retry-After") == "" {
+		t.Error("locked disable response missing Retry-After header")
+	}
+
+	// The credential survived — disable did not slip through the lock.
+	cred, err := h.store.Get(t.Context(), tenantID, userID)
+	if err != nil {
+		t.Fatalf("get after locked disable: %v", err)
+	}
+	if !cred.Enabled || !bytes.Equal(cred.EncryptedSecret, secret) {
+		t.Fatal("locked disable must not remove or alter the live credential")
 	}
 }
