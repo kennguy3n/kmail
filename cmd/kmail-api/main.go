@@ -1332,7 +1332,21 @@ func main() {
 	}
 	flagSvc := featureflags.NewStoreService(flagStore, logger)
 	featureflags.SetDefault(flagSvc)
-	featureflags.NewHandlers(flagStore, flagSvc, logger).Register(mux, authMW)
+	flagHandlers := featureflags.NewHandlers(flagStore, flagSvc, logger)
+	// During a Postgres outage the admin GET serves its last-known-good
+	// snapshot (marked stale) instead of 503. By default that snapshot
+	// is served for as long as the DB is down; KMAIL_FLAGS_MAX_STALE
+	// caps its age, after which the read degrades to a retryable 503
+	// rather than returning arbitrarily old data.
+	if v := os.Getenv("KMAIL_FLAGS_MAX_STALE"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			flagHandlers = flagHandlers.WithMaxStaleAge(d)
+			logger.Printf("featureflags: max stale-serve age set to %s", d)
+		} else {
+			logger.Printf("featureflags: ignoring invalid KMAIL_FLAGS_MAX_STALE %q: %v", v, err)
+		}
+	}
+	flagHandlers.Register(mux, authMW)
 	go flagSvc.Run(ctx)
 	// Phase 6: background watcher emits `session_expired` audit
 	// rows once `expires_at` passes. Register the expiry collector

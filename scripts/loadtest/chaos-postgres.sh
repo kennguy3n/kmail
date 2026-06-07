@@ -11,10 +11,13 @@
 #                5s) now guarantees: a frozen DB yields a fast,
 #                retryable 503 instead of a request that blocks until
 #                the client gives up.
-#   * served   — the request returned 2xx/3xx. Control-plane reads have
-#                no cached fallback yet, so this stays ~0% during a full
-#                outage; serving stale-but-usable data is the remaining
-#                optional enhancement (see docs/BENCHMARKS.md Step 2).
+#   * served   — the request returned 2xx/3xx. The admin GET now keeps a
+#                last-known-good snapshot and serves it (200, tagged
+#                `X-Kmail-Stale: true` + `Warning: 110`) when Postgres is
+#                unavailable, so a *warmed* endpoint stays ~100% served
+#                through a full outage. Only a cold process (no snapshot
+#                cached yet) degrades to a retryable 503 — see
+#                docs/BENCHMARKS.md Step 2.
 #
 # The script:
 #   1. Runs a quick warmup against a read-mostly endpoint.
@@ -34,18 +37,22 @@ JMAP_URL="${KMAIL_JMAP_URL:-http://localhost:8088}"
 AUTH_TOKEN="${KMAIL_AUTH_TOKEN:-kmail-dev}"
 ITERATIONS="${KMAIL_CHAOS_ITERATIONS:-50}"
 # Per-request ceiling for the probe. Kept comfortably ABOVE the server's
-# control-plane read timeout (KMAIL_FLAGS_READ_TIMEOUT, default 5s) so
-# the probe observes the server's fast 503 rather than tripping its own
-# client-side timeout first; curl only emits "000" if the server itself
-# fails to bound the read (the regression this harness guards against).
-MAX_TIME="${KMAIL_CHAOS_MAX_TIME:-8}"
+# control-plane read timeout (KMAIL_FLAGS_READ_TIMEOUT, default 5s) plus
+# the serve-stale overhead so the probe observes the server's bounded
+# response (a fast 503 cold, or a stale 200 warm) rather than tripping
+# its own client-side timeout first; curl only emits "000" if the server
+# itself fails to bound the read (the regression this harness guards
+# against). Measured steady-state is ~7.1s/request (5s read timeout +
+# ~2s overhead), so 10s leaves headroom.
+MAX_TIME="${KMAIL_CHAOS_MAX_TIME:-10}"
 # Minimum %% of reads that must stay *served* (2xx/3xx) while Postgres
-# is paused for this harness to PASS (exit 0). Defaults to 0 =
-# report-only, because control-plane reads have no cached fallback yet,
-# so served% is ~0 during a full outage. Raise this (e.g. =50) once a
-# cached-read fallback is added. Note this is SEPARATE from the bounded
-# check below: bounded liveness (no hang) is now enforced unconditionally.
-MIN_SUCCESS_PCT="${KMAIL_CHAOS_PG_MIN_SUCCESS_PCT:-0}"
+# is paused for this harness to PASS (exit 0). Defaults to 100 now that
+# the admin GET serves a last-known-good snapshot during an outage: the
+# warmup loop below primes that snapshot, so every probe should return a
+# stale 200. Set to 0 for report-only (e.g. when probing a build that
+# predates the cached-read fallback, or an endpoint that has no
+# snapshot). This is SEPARATE from the bounded check below.
+MIN_SUCCESS_PCT="${KMAIL_CHAOS_PG_MIN_SUCCESS_PCT:-100}"
 # Minimum %% of reads that must be *bounded* (return any HTTP status
 # within MAX_TIME rather than hanging to a "000" client timeout) for the
 # harness to PASS. Defaults to 100: with the control-plane read timeout
@@ -118,11 +125,16 @@ if [ "$MIN_BOUNDED_PCT" -gt 0 ]; then
   fi
 fi
 
-# Served ratio is opt-in: it requires a cached-read fallback that does
-# not exist yet, so it is report-only unless an operator sets a target.
+# Served ratio is now enforced by default: the admin GET serves its
+# last-known-good snapshot during an outage, so a warmed endpoint stays
+# served. A shortfall means the cached-read fallback regressed (or the
+# snapshot was never warmed).
 if [ "$MIN_SUCCESS_PCT" -gt 0 ]; then
-  echo "chaos-postgres: enforcing >= ${MIN_SUCCESS_PCT}% served"
-  awk -v p="$pct" -v m="$MIN_SUCCESS_PCT" 'BEGIN{exit !(p+0 >= m+0)}'
+  echo "chaos-postgres: enforcing >= ${MIN_SUCCESS_PCT}% served (stale snapshot fallback)"
+  if ! awk -v p="$pct" -v m="$MIN_SUCCESS_PCT" 'BEGIN{exit !(p+0 >= m+0)}'; then
+    echo "chaos-postgres: FAIL — served ${pct}% < ${MIN_SUCCESS_PCT}%; did the stale-snapshot fallback regress, or was the endpoint not warmed first?" >&2
+    exit 1
+  fi
 else
-  echo "chaos-postgres: served ratio is report-only (no cached fallback for control-plane reads yet; set KMAIL_CHAOS_PG_MIN_SUCCESS_PCT to enforce once added) — see docs/BENCHMARKS.md Step 2"
+  echo "chaos-postgres: served ratio is report-only (KMAIL_CHAOS_PG_MIN_SUCCESS_PCT=0)"
 fi
