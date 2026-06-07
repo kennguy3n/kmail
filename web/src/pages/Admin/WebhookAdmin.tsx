@@ -7,6 +7,8 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 
+import { cn } from "../../lib/cn";
+
 import {
   deleteWebhook,
   listWebhookDeliveries,
@@ -167,7 +169,7 @@ export default function WebhookAdmin() {
 
       {selectedTenantId && (
         <>
-          <form onSubmit={onRegister} style={{ display: "grid", gap: "0.5rem", maxWidth: 540 }}>
+          <form onSubmit={onRegister} className="grid max-w-[540px] gap-2">
             <h3>Register webhook</h3>
             <label>
               URL
@@ -186,7 +188,7 @@ export default function WebhookAdmin() {
             <fieldset>
               <legend>Events (none selected = all)</legend>
               {ALL_EVENTS.map((ev) => (
-                <label key={ev} style={{ display: "block" }}>
+                <label key={ev} className="block">
                   <input
                     type="checkbox"
                     checked={events.includes(ev)}
@@ -202,7 +204,7 @@ export default function WebhookAdmin() {
           {secret && (
             <div className="kmail-admin-card" role="region" aria-label="Webhook secret">
               <h4>Signing secret (copy now — not shown again)</h4>
-              <code style={{ wordBreak: "break-all", display: "block" }}>{secret}</code>
+              <code className="block break-all">{secret}</code>
               <button
                 onClick={() => {
                   navigator.clipboard?.writeText(secret).then(
@@ -298,7 +300,7 @@ export default function WebhookAdmin() {
               Delete webhook <code>{pendingDelete.url}</code>? Pending deliveries
               will be cancelled.
             </p>
-            <div style={{ display: "flex", gap: "0.5rem" }}>
+            <div className="flex gap-2">
               <button onClick={onDeleteConfirmed}>Delete</button>
               <button onClick={() => setPendingDelete(null)}>Cancel</button>
             </div>
@@ -311,21 +313,17 @@ export default function WebhookAdmin() {
 
 function HealthBadge({ health }: { health: Health }) {
   const colors: Record<Health, string> = {
-    healthy: "#16a34a",
-    degraded: "#d97706",
-    failing: "#dc2626",
-    idle: "#6b7280",
+    healthy: "bg-success",
+    degraded: "bg-warning",
+    failing: "bg-danger",
+    idle: "bg-fg-subtle",
   };
   return (
     <span
-      style={{
-        display: "inline-block",
-        padding: "0 0.5rem",
-        borderRadius: 8,
-        background: colors[health],
-        color: "white",
-        fontSize: 12,
-      }}
+      className={cn(
+        "inline-block rounded-lg px-2 text-xs text-white",
+        colors[health],
+      )}
     >
       {health}
     </span>

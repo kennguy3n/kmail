@@ -1,0 +1,104 @@
+{
+  "annotations": {"list": []},
+  "description": "KMail deliverability — bounce / complaint / suppression rates, IP pool health, warmup progress, DMARC pass rate, and abuse score distribution. Phase 8 GA-readiness dashboard.",
+  "editable": false,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "uid": "kmail-deliverability",
+  "title": "KMail — Deliverability",
+  "tags": ["kmail", "deliverability", "phase8"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "1m",
+  "time": {"from": "now-24h", "to": "now"},
+  "templating": {"list": []},
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Bounce rate (hard / soft)",
+      "id": 1,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "rate(kmail_deliverability_bounces_total{type=\"hard\"}[10m])", "legendFormat": "hard"},
+        {"refId": "B", "expr": "rate(kmail_deliverability_bounces_total{type=\"soft\"}[10m])", "legendFormat": "soft"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "ops"}}
+    },
+    {
+      "type": "timeseries",
+      "title": "Complaint rate (per pool)",
+      "id": 2,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "rate(kmail_deliverability_complaints_total[10m])", "legendFormat": "{{pool}}"}
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Suppression list size",
+      "id": 3,
+      "gridPos": {"h": 6, "w": 8, "x": 0, "y": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "kmail_deliverability_suppression_list_size"}
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "DMARC pass rate (24h)",
+      "id": 4,
+      "gridPos": {"h": 6, "w": 8, "x": 8, "y": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "sum(rate(kmail_dmarc_results_total{result=\"pass\"}[24h])) / sum(rate(kmail_dmarc_results_total[24h]))"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1}}
+    },
+    {
+      "type": "stat",
+      "title": "IP pool health (% reputable)",
+      "id": 5,
+      "gridPos": {"h": 6, "w": 8, "x": 16, "y": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "avg(kmail_ip_pool_reputation_score) by (pool)", "legendFormat": "{{pool}}"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1}}
+    },
+    {
+      "type": "timeseries",
+      "title": "Warmup progress (% of daily limit consumed)",
+      "id": 6,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 14},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "kmail_warmup_progress_ratio", "legendFormat": "tenant={{tenant}}"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1}}
+    },
+    {
+      "type": "histogram",
+      "title": "Abuse score distribution",
+      "id": 7,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 14},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "rate(kmail_abuse_score_bucket[1h])", "legendFormat": "{{le}}"}
+      ]
+    },
+    {
+      "type": "logs",
+      "title": "Bounce / complaint events (Loki)",
+      "id": 8,
+      "gridPos": {"h": 10, "w": 24, "x": 0, "y": 22},
+      "datasource": {"type": "loki", "uid": "loki"},
+      "targets": [
+        {"refId": "A", "expr": "{job=\"kmail-api\"} |~ \"deliverability|bounce|complaint|suppression\""}
+      ]
+    }
+  ]
+}

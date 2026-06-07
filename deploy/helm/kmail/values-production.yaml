@@ -1,0 +1,48 @@
+# KMail — production values overlay.
+#
+# Layered on top of values.yaml by .github/workflows/deploy-production.yml:
+#   helm upgrade --install kmail deploy/helm/kmail \
+#     -f deploy/helm/kmail/values.yaml -f deploy/helm/kmail/values-production.yaml
+#
+# Full-scale, all hardening on. Sized for the 5,000-tenant / ~10-shard
+# target (see docs/runbooks/capacity-planning.md).
+
+kmailApi:
+  replicaCount: 3
+  hpa:
+    enabled: true
+    minReplicas: 3
+    maxReplicas: 12
+    targetCPUUtilizationPercentage: 70
+
+stalwart:
+  replicaCount: 10
+  storage:
+    # SSD-backed, topology-aware, expandable. Create this StorageClass
+    # in the cluster (allowVolumeExpansion: true).
+    storageClass: kmail-ssd
+    size: 50Gi
+  updateStrategy:
+    type: RollingUpdate
+    # Default 0 rolls every shard; the deploy/upgrade runbook walks this
+    # down from a high ordinal for a progressive rollout.
+    partition: 0
+
+mtls:
+  enabled: true
+  issuerRef:
+    name: kmail-internal-ca
+
+networkPolicy:
+  enabled: true
+
+serviceMonitor:
+  enabled: true
+
+prometheusRule:
+  enabled: true
+  slo:
+    availabilityTarget: 0.999
+
+grafanaDashboards:
+  enabled: true

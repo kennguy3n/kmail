@@ -1,0 +1,250 @@
+{{- /*
+  NetworkPolicy — per-component network segmentation.
+
+  Gated on `networkPolicy.enabled`. Renders:
+    1. a default-deny baseline over every chart pod (ingress always;
+       egress only when restrictEgress=true);
+    2. an allow policy for kmail-api ingress (ingress controller +
+       monitoring scrape);
+    3. an allow policy for kmail-worker ingress (monitoring scrape
+       only — it serves no tenant traffic);
+    4. an allow policy for Stalwart ingress (api + worker over JMAP,
+       plus inbound mail from outside the cluster when allowInboundMail)
+       — only when this release owns its Stalwart fleet
+       (`stalwart.enabled`); a control-plane-only release like the
+       canary has no stalwart pods for it to select;
+    5. optional egress allow-lists (DNS + managed data services + the
+       in-cluster Stalwart hop) when restrictEgress=true.
+
+  Release scoping: every policy's own `spec.podSelector` pins
+  name+instance (kmail.selectorLabels) so it governs only its own
+  release's pods. The JMAP-mesh PEER selectors (Stalwart ingress
+  `from:` and the app egress `to:` Stalwart hop) match the chart NAME
+  only (kmail.meshNameLabel), because a co-located canary
+  (instance=kmail-canary, stalwart.external.enabled) legitimately speaks
+  JMAP to the production Stalwart fleet (instance=kmail) and must not be
+  blackholed; mTLS authenticates that hop.
+
+  NetworkPolicies are additive within a namespace, so the default-deny
+  baseline + the allow policies compose into the intended posture.
+  Port numbers below are kept in lock-step with the container ports in
+  deployment-api.yaml / worker-deployment.yaml / statefulset-stalwart.yaml.
+*/ -}}
+{{- if .Values.networkPolicy.enabled }}
+{{- $np := .Values.networkPolicy }}
+{{- $apiPort := .Values.kmailApi.service.targetPort }}
+{{- $workerPort := .Values.kmailWorker.metricsPort }}
+# 1. Default-deny baseline for every pod managed by this chart.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "kmail.fullname" . }}-default-deny
+  labels:
+    {{- include "kmail.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "kmail.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    {{- if $np.restrictEgress }}
+    - Egress
+    {{- end }}
+---
+# 2. kmail-api ingress: ingress controller (tenant traffic) + the
+#    monitoring namespace (/metrics scrape), both on the BFF's port.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "kmail.fullname" . }}-api-ingress
+  labels:
+    {{- include "kmail.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "kmail.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: api
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            {{- toYaml $np.ingressControllerNamespaceSelector | nindent 12 }}
+        - namespaceSelector:
+            {{- toYaml $np.monitoringNamespaceSelector | nindent 12 }}
+      ports:
+        - protocol: TCP
+          port: {{ $apiPort }}
+---
+# 3. kmail-worker ingress: monitoring namespace /metrics scrape only.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "kmail.fullname" . }}-worker-ingress
+  labels:
+    {{- include "kmail.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "kmail.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: worker
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            {{- toYaml $np.monitoringNamespaceSelector | nindent 12 }}
+      ports:
+        - protocol: TCP
+          port: {{ $workerPort }}
+{{- if .Values.stalwart.enabled }}
+---
+# 4. Stalwart ingress: JMAP from api + worker, plus inbound mail.
+#    Gated on `stalwart.enabled` so a control-plane-only release (the
+#    canary) doesn't emit a policy selecting stalwart pods that this
+#    release never renders — mirroring the StatefulSet, headless
+#    Service, and server-cert gating.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "kmail.fullname" . }}-stalwart-ingress
+  labels:
+    {{- include "kmail.labels" . | nindent 4 }}
+    app.kubernetes.io/component: stalwart
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "kmail.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: stalwart
+  policyTypes:
+    - Ingress
+  ingress:
+    # JMAP from the BFF and the dispatch workers. The peer selectors match on
+    # the chart NAME only (kmail.meshNameLabel), NOT name+instance: a canary
+    # release (instance=kmail-canary) co-located in this namespace runs with
+    # stalwart.external.enabled and speaks JMAP to THIS production fleet, so
+    # pinning instance here would deny the canary's mail path. mTLS authenticates
+    # the hop; this is namespace-scoped L3/L4 defense-in-depth over kmail pods.
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "kmail.meshNameLabel" . | nindent 14 }}
+              app.kubernetes.io/component: api
+        - podSelector:
+            matchLabels:
+              {{- include "kmail.meshNameLabel" . | nindent 14 }}
+              app.kubernetes.io/component: worker
+      ports:
+        - protocol: TCP
+          port: 8080
+        {{- if .Values.mtls.enabled }}
+        - protocol: TCP
+          port: 8443
+        {{- end }}
+    {{- if $np.allowInboundMail }}
+    # Inbound mail from outside the cluster (SMTP + IMAP). These map
+    # to the container ports declared in statefulset-stalwart.yaml.
+    - ports:
+        - protocol: TCP
+          port: 25
+        - protocol: TCP
+          port: 143
+    {{- end }}
+{{- end }}
+{{- if $np.restrictEgress }}
+---
+# 5a. DNS egress for every chart pod (kube-dns).
+{{- if $np.allowDNS }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "kmail.fullname" . }}-allow-dns
+  labels:
+    {{- include "kmail.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "kmail.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Egress
+  egress:
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+{{- end }}
+# 5b. api + worker egress: in-cluster Stalwart + managed data services.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "kmail.fullname" . }}-app-egress
+  labels:
+    {{- include "kmail.labels" . | nindent 4 }}
+spec:
+  # `kmail.selectorLabels` pins BOTH app.kubernetes.io/name AND
+  # app.kubernetes.io/instance (the release name), so this egress allow-list
+  # only matches THIS release's pods. matchLabels + matchExpressions are
+  # ANDed, so the component clause narrows it to api+worker. Without the
+  # instance label this would also select a co-located release's api/worker
+  # pods (e.g. `kmail` and `kmail-canary` share namespace `kmail`), leaking
+  # egress permissions across release boundaries.
+  podSelector:
+    matchLabels:
+      {{- include "kmail.selectorLabels" . | nindent 6 }}
+    matchExpressions:
+      - key: app.kubernetes.io/component
+        operator: In
+        values: ["api", "worker"]
+  policyTypes:
+    - Egress
+  egress:
+    # In-cluster hop to Stalwart (JMAP). The destination selector matches on
+    # the chart NAME only (kmail.meshNameLabel), NOT name+instance, so this
+    # works for BOTH a release that owns its Stalwart fleet AND a canary
+    # (stalwart.enabled=false, stalwart.external.enabled=true) whose target
+    # fleet is owned by the production release (instance=kmail) — under
+    # restrictEgress the canary still needs to reach those pods. The governing
+    # podSelector above keeps name+instance so this policy only constrains THIS
+    # release's own api/worker egress.
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "kmail.meshNameLabel" . | nindent 14 }}
+              app.kubernetes.io/component: stalwart
+      ports:
+        - protocol: TCP
+          port: 8080
+        {{- if .Values.mtls.enabled }}
+        - protocol: TCP
+          port: 8443
+        {{- end }}
+    # Managed data services (Postgres / Valkey / S3 / OpenSearch).
+    # Gated on a non-empty dataServicePorts: a k8s egress rule whose `ports`
+    # list is empty means "all ports", so emitting this rule with
+    # dataServicePorts=[] would silently widen egress to EVERY port on the
+    # (default 0.0.0.0/0) destination — the opposite of the restrictEgress
+    # intent. When an operator clears the port list we therefore drop the rule
+    # entirely and fail CLOSED (no data-service egress) rather than fail open.
+    {{- if $np.dataServicePorts }}
+    - to:
+        {{- if $np.dataServiceCIDRs }}
+        {{- range $cidr := $np.dataServiceCIDRs }}
+        - ipBlock:
+            cidr: {{ $cidr | quote }}
+        {{- end }}
+        {{- else }}
+        - ipBlock:
+            cidr: 0.0.0.0/0
+        {{- end }}
+      ports:
+        {{- range $port := $np.dataServicePorts }}
+        - protocol: TCP
+          port: {{ $port }}
+        {{- end }}
+    {{- end }}
+{{- end }}
+{{- end }}

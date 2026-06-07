@@ -147,8 +147,11 @@ export default function SharedInboxView() {
               <button type="button" onClick={doAssign}>Assign</button>
             </label>
             <label>
-              Status
-              <select value={selected.status} onChange={(e) => doStatus(e.target.value as AssignmentStatus)}>
+              Assignment status
+              <select
+                value={selected.status}
+                onChange={(e) => doStatus(e.target.value as AssignmentStatus)}
+              >
                 {STATUS_OPTIONS.map((s) => (
                   <option key={s} value={s}>{s}</option>
                 ))}
@@ -166,7 +169,11 @@ export default function SharedInboxView() {
               </li>
             ))}
           </ul>
-          <textarea value={noteText} onChange={(e) => setNoteText(e.target.value)} />
+          <textarea
+            aria-label="Internal note"
+            value={noteText}
+            onChange={(e) => setNoteText(e.target.value)}
+          />
           <button type="button" onClick={doNote}>Add note</button>
         </div>
       )}

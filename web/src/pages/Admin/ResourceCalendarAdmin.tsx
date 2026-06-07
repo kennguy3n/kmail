@@ -161,7 +161,7 @@ function CalendarNotificationSettings({ rows }: { rows: ResourceCalendar[] }) {
   const [status, setStatus] = useState<string | null>(null);
 
   return (
-    <section style={{ marginTop: "2rem" }}>
+    <section className="mt-8">
       <h3>Calendar notification routing</h3>
       <p>
         Pick the KChat channel events publish to. Per-resource overrides

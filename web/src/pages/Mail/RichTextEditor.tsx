@@ -8,6 +8,8 @@ import TextStyle from "@tiptap/extension-text-style";
 import Color from "@tiptap/extension-color";
 import Highlight from "@tiptap/extension-highlight";
 
+import { cn } from "../../lib/cn";
+
 /**
  * Reusable WYSIWYG editor built on TipTap.
  *
@@ -52,7 +54,7 @@ function ToolbarButton({
       title={title}
       aria-label={title}
       aria-pressed={active}
-      style={{ ...toolbarStyles.button, ...(active ? toolbarStyles.buttonActive : {}) }}
+      className={cn(toolbarStyles.button, active && toolbarStyles.buttonActive)}
     >
       {label}
     </button>
@@ -94,7 +96,7 @@ function Toolbar({
   };
 
   return (
-    <div style={toolbarStyles.bar} role="toolbar" aria-label="Formatting">
+    <div className={toolbarStyles.bar} role="toolbar" aria-label="Formatting">
       <ToolbarButton
         title="Bold"
         label="B"
@@ -119,7 +121,7 @@ function Toolbar({
         active={editor.isActive("strike")}
         onClick={() => editor.chain().focus().toggleStrike().run()}
       />
-      <span style={toolbarStyles.divider} />
+      <span className={toolbarStyles.divider} />
       <ToolbarButton
         title="Heading"
         label="H2"
@@ -152,10 +154,10 @@ function Toolbar({
         active={editor.isActive("codeBlock")}
         onClick={() => editor.chain().focus().toggleCodeBlock().run()}
       />
-      <span style={toolbarStyles.divider} />
+      <span className={toolbarStyles.divider} />
       <ToolbarButton title="Link" label="🔗" onClick={addLink} />
       <label
-        style={toolbarStyles.colorLabel}
+        className={toolbarStyles.colorLabel}
         title="Text colour"
         onMouseDown={(e) => e.preventDefault()}
       >
@@ -166,7 +168,7 @@ function Toolbar({
           onChange={(e) =>
             editor.chain().focus().setColor(e.target.value).run()
           }
-          style={toolbarStyles.colorInput}
+          className={toolbarStyles.colorInput}
         />
       </label>
       <ToolbarButton
@@ -177,7 +179,7 @@ function Toolbar({
       />
       {onImageUpload && (
         <label
-          style={toolbarStyles.button}
+          className={toolbarStyles.button}
           title="Insert image"
           onMouseDown={(e) => e.preventDefault()}
         >
@@ -185,7 +187,7 @@ function Toolbar({
           <input
             type="file"
             accept="image/*"
-            style={{ display: "none" }}
+            className="hidden"
             onChange={(e) => {
               void pickImage(e.target.files?.[0]);
               e.target.value = "";
@@ -263,12 +265,12 @@ export default function RichTextEditor({
   }, [value, editor]);
 
   return (
-    <div style={editorStyles.frame}>
+    <div className={editorStyles.frame}>
       {editor && <Toolbar editor={editor} onImageUpload={onImageUpload} />}
-      <div style={editorStyles.surface}>
+      <div className={editorStyles.surface}>
         <EditorContent editor={editor} />
         {editor && editor.isEmpty && placeholder && (
-          <div style={editorStyles.placeholder} aria-hidden="true">
+          <div className={editorStyles.placeholder} aria-hidden="true">
             {placeholder}
           </div>
         )}
@@ -277,83 +279,22 @@ export default function RichTextEditor({
   );
 }
 
-const toolbarStyles: Record<string, React.CSSProperties> = {
-  bar: {
-    display: "flex",
-    flexWrap: "wrap",
-    alignItems: "center",
-    gap: "0.15rem",
-    padding: "0.35rem",
-    borderBottom: "1px solid #e5e7eb",
-    background: "#f9fafb",
-  },
-  button: {
-    minWidth: "1.9rem",
-    padding: "0.2rem 0.4rem",
-    fontSize: "0.8rem",
-    fontWeight: 600,
-    background: "#fff",
-    border: "1px solid #d1d5db",
-    borderRadius: "0.25rem",
-    cursor: "pointer",
-    color: "#374151",
-    display: "inline-flex",
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  buttonActive: {
-    background: "#dbeafe",
-    borderColor: "#2563eb",
-    color: "#1d4ed8",
-  },
-  divider: {
-    width: "1px",
-    alignSelf: "stretch",
-    background: "#e5e7eb",
-    margin: "0 0.2rem",
-  },
-  colorLabel: {
-    position: "relative",
-    minWidth: "1.9rem",
-    padding: "0.2rem 0.4rem",
-    fontSize: "0.8rem",
-    fontWeight: 700,
-    background: "#fff",
-    border: "1px solid #d1d5db",
-    borderRadius: "0.25rem",
-    cursor: "pointer",
-    color: "#374151",
-    display: "inline-flex",
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  colorInput: {
-    position: "absolute",
-    inset: 0,
-    opacity: 0,
-    cursor: "pointer",
-    width: "100%",
-    height: "100%",
-  },
+/** Theme-aware Tailwind class recipes for the editor toolbar. */
+const toolbarStyles: Record<string, string> = {
+  bar: "flex flex-wrap items-center gap-0.5 border-b border-border bg-surface-muted p-1.5",
+  button:
+    "inline-flex min-w-[1.9rem] cursor-pointer items-center justify-center rounded-md border border-border bg-surface px-1.5 py-1 text-xs font-semibold text-fg transition-colors hover:bg-surface-hover",
+  buttonActive: "border-primary bg-primary-subtle text-primary",
+  divider: "mx-1 w-px self-stretch bg-border",
+  colorLabel:
+    "relative inline-flex min-w-[1.9rem] cursor-pointer items-center justify-center rounded-md border border-border bg-surface px-1.5 py-1 text-xs font-bold text-fg",
+  colorInput: "absolute inset-0 size-full cursor-pointer opacity-0",
 };
 
-const editorStyles: Record<string, React.CSSProperties> = {
-  frame: {
-    border: "1px solid #d1d5db",
-    borderRadius: "0.375rem",
-    overflow: "hidden",
-    background: "#fff",
-  },
-  surface: {
-    position: "relative",
-    padding: "0.6rem 0.75rem",
-  },
-  placeholder: {
-    position: "absolute",
-    top: "0.6rem",
-    left: "0.75rem",
-    color: "#9ca3af",
-    pointerEvents: "none",
-    fontSize: "0.9rem",
-  },
+/** Theme-aware Tailwind class recipes for the editable surface. */
+const editorStyles: Record<string, string> = {
+  frame: "overflow-hidden rounded-md border border-border bg-surface",
+  surface: "relative px-3 py-2.5",
+  placeholder:
+    "pointer-events-none absolute left-3 top-2.5 text-sm text-fg-subtle",
 };

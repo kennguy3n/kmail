@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 
+import { cn } from "../../lib/cn";
+
 import {
   AdminApiError,
   getBillingSummary,
@@ -181,28 +183,17 @@ export default function QuotaAdmin() {
 
 function UsageBar({ used, limit }: { used: number; limit: number }) {
   const pct = limit > 0 ? Math.min(100, Math.round((used / limit) * 100)) : 0;
-  const color = pct >= 90 ? "#c0392b" : pct >= 75 ? "#e67e22" : "#2980b9";
+  const barColor =
+    pct >= 90 ? "bg-danger" : pct >= 75 ? "bg-warning" : "bg-info";
   return (
-    <div
-      style={{
-        background: "#eee",
-        height: 14,
-        borderRadius: 4,
-        overflow: "hidden",
-        maxWidth: 480,
-      }}
-    >
+    <div className="h-3.5 max-w-[480px] overflow-hidden rounded bg-surface-muted">
       <div
         aria-valuenow={pct}
         aria-valuemin={0}
         aria-valuemax={100}
         role="progressbar"
-        style={{
-          width: `${pct}%`,
-          height: "100%",
-          background: color,
-          transition: "width 150ms linear",
-        }}
+        className={cn("h-full transition-[width] duration-150", barColor)}
+        style={{ width: `${pct}%` }}
       />
     </div>
   );

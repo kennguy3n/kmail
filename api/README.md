@@ -52,6 +52,7 @@ The prose contracts that the generated spec complements live in
 - Every endpoint is tenant-scoped; no cross-tenant query paths.
 - A small set of routes are intentionally public (no bearer token):
   `POST /api/v1/signup` and its status polling route, the
-  Confidential Send recipient portal (`/api/v1/secure/{token}`), open
-  tracking links (`/api/v1/send/{id}`), and `/.well-known/*`. These
-  are marked with an empty `security: []` in the spec.
+  Confidential Send recipient portal (`/api/v1/secure/{token}`), and
+  `/.well-known/*`. These are marked with an empty `security: []` in
+  the spec. The `/api/v1/send/{id}` undo-send routes are **not** public
+  — they are wrapped with `authMW.Wrap` and require a bearer token.

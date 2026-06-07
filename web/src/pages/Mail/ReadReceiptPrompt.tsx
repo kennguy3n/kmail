@@ -102,60 +102,36 @@ export default function ReadReceiptPrompt({ email }: { email: Email }) {
   };
 
   return (
-    <div style={styles.banner} role="status">
-      <span style={styles.text}>
+    <div className={styles.banner} role="status">
+      <span className={styles.text}>
         The sender requested a read receipt for this message.
       </span>
-      {error && <span style={styles.error}>{error}</span>}
-      <span style={styles.spacer} />
+      {error && <span className={styles.error}>{error}</span>}
+      <span className={styles.spacer} />
       <button
         type="button"
         onClick={() => void onSend()}
         disabled={state === "sending"}
-        style={styles.sendButton}
+        className={styles.sendButton}
       >
         {state === "sending" ? "Sending…" : "Send receipt"}
       </button>
-      <button type="button" onClick={onDismiss} style={styles.dismissButton}>
+      <button type="button" onClick={onDismiss} className={styles.dismissButton}>
         Not now
       </button>
     </div>
   );
 }
 
-const styles: Record<string, React.CSSProperties> = {
-  banner: {
-    display: "flex",
-    alignItems: "center",
-    gap: "0.5rem",
-    flexWrap: "wrap",
-    padding: "0.5rem 0.75rem",
-    background: "#fffbeb",
-    border: "1px solid #fde68a",
-    borderRadius: "0.375rem",
-    fontSize: "0.85rem",
-    color: "#92400e",
-    marginBottom: "0.75rem",
-  },
-  text: { fontWeight: 500 },
-  spacer: { flex: 1 },
-  error: { color: "#991b1b", flexBasis: "100%" },
-  sendButton: {
-    padding: "0.3rem 0.7rem",
-    fontSize: "0.8rem",
-    background: "#2563eb",
-    color: "#fff",
-    border: "none",
-    borderRadius: "0.25rem",
-    cursor: "pointer",
-  },
-  dismissButton: {
-    padding: "0.3rem 0.7rem",
-    fontSize: "0.8rem",
-    background: "#fff",
-    color: "#374151",
-    border: "1px solid #d1d5db",
-    borderRadius: "0.25rem",
-    cursor: "pointer",
-  },
+/** Theme-aware Tailwind class recipes for the ReadReceiptPrompt banner. */
+const styles: Record<string, string> = {
+  banner:
+    "mb-3 flex flex-wrap items-center gap-2 rounded-md border border-warning/40 bg-warning-bg px-3 py-2 text-sm text-warning-fg",
+  text: "font-medium",
+  spacer: "flex-1",
+  error: "basis-full text-danger-fg",
+  sendButton:
+    "cursor-pointer rounded-md border-0 bg-primary px-3 py-1.5 text-xs font-medium text-primary-fg transition-colors hover:bg-primary-hover",
+  dismissButton:
+    "cursor-pointer rounded-md border border-border bg-surface px-3 py-1.5 text-xs text-fg transition-colors hover:bg-surface-hover",
 };

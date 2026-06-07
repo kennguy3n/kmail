@@ -171,3 +171,112 @@ groups:
         annotations:
           summary: "KMail self-service signup failing for most users"
           description: "Failed signups exceed completions over the last 15m — onboarding is broken."
+
+  # ------------------------------------------------------------------
+  # SLO error-budget burn rate (availability target 99.9% => 0.1%
+  # budget). These mirror the chart PrometheusRule
+  # (deploy/helm/kmail/templates/prometheusrule.yaml) so the compose /
+  # non-operator Prometheus evaluates the same multi-window multi-burn-
+  # rate alerts. The recording rules below keep the alert expressions
+  # cheap and readable. severity=page burns route to PagerDuty per
+  # alertmanager.tmpl.yml.
+  # ------------------------------------------------------------------
+  # The denominator is clamp_min(..., 1) so idle windows record a 0
+  # ratio instead of NaN (0/0). Burn-rate alerts behave the same either
+  # way, but this keeps the recorded series numeric and consistent with
+  # the Grafana error-budget dashboard. Mirror of the chart PrometheusRule.
+  - name: kmail-slo-recording
+    rules:
+      - record: kmail:http_error_ratio:rate5m
+        expr: |
+          sum(rate(kmail_http_requests_total{status=~"5.."}[5m]))
+          /
+          clamp_min(sum(rate(kmail_http_requests_total[5m])), 1)
+      - record: kmail:http_error_ratio:rate30m
+        expr: |
+          sum(rate(kmail_http_requests_total{status=~"5.."}[30m]))
+          /
+          clamp_min(sum(rate(kmail_http_requests_total[30m])), 1)
+      - record: kmail:http_error_ratio:rate1h
+        expr: |
+          sum(rate(kmail_http_requests_total{status=~"5.."}[1h]))
+          /
+          clamp_min(sum(rate(kmail_http_requests_total[1h])), 1)
+      - record: kmail:http_error_ratio:rate2h
+        expr: |
+          sum(rate(kmail_http_requests_total{status=~"5.."}[2h]))
+          /
+          clamp_min(sum(rate(kmail_http_requests_total[2h])), 1)
+      - record: kmail:http_error_ratio:rate6h
+        expr: |
+          sum(rate(kmail_http_requests_total{status=~"5.."}[6h]))
+          /
+          clamp_min(sum(rate(kmail_http_requests_total[6h])), 1)
+      - record: kmail:http_error_ratio:rate1d
+        expr: |
+          sum(rate(kmail_http_requests_total{status=~"5.."}[1d]))
+          /
+          clamp_min(sum(rate(kmail_http_requests_total[1d])), 1)
+      - record: kmail:http_error_ratio:rate3d
+        expr: |
+          sum(rate(kmail_http_requests_total{status=~"5.."}[3d]))
+          /
+          clamp_min(sum(rate(kmail_http_requests_total[3d])), 1)
+
+  - name: kmail-slo-burnrate
+    rules:
+      - alert: KmailErrorBudgetBurnFast
+        # 14.4x burn (exhausts a 30d budget in ~2d). 0.001 budget.
+        expr: |
+          kmail:http_error_ratio:rate5m > 0.014400
+          and
+          kmail:http_error_ratio:rate1h > 0.014400
+        for: 2m
+        labels:
+          severity: page
+          slo: availability
+        annotations:
+          summary: "KMail availability error budget burning FAST (14.4x)"
+          description: "5m and 1h 5xx ratios both exceed 14.4x the 0.10% budget; the 30d budget will be exhausted in ~2d at this rate."
+
+      - alert: KmailErrorBudgetBurnMedium
+        # 6x burn (exhausts a 30d budget in ~5d).
+        expr: |
+          kmail:http_error_ratio:rate30m > 0.006000
+          and
+          kmail:http_error_ratio:rate6h > 0.006000
+        for: 15m
+        labels:
+          severity: page
+          slo: availability
+        annotations:
+          summary: "KMail availability error budget burning (6x)"
+          description: "30m and 6h 5xx ratios both exceed 6x the 0.10% budget."
+
+      - alert: KmailErrorBudgetBurnSlow
+        # 3x burn (exhausts a 30d budget in ~10d).
+        expr: |
+          kmail:http_error_ratio:rate2h > 0.003000
+          and
+          kmail:http_error_ratio:rate1d > 0.003000
+        for: 1h
+        labels:
+          severity: ticket
+          slo: availability
+        annotations:
+          summary: "KMail availability error budget burning slowly (3x)"
+          description: "2h and 1d 5xx ratios both exceed 3x the 0.10% budget."
+
+      - alert: KmailErrorBudgetBurnVerySlow
+        # 1x burn (on track to exactly exhaust the budget).
+        expr: |
+          kmail:http_error_ratio:rate6h > 0.001000
+          and
+          kmail:http_error_ratio:rate3d > 0.001000
+        for: 3h
+        labels:
+          severity: ticket
+          slo: availability
+        annotations:
+          summary: "KMail availability error budget on track to exhaust (1x)"
+          description: "6h and 3d 5xx ratios both exceed the 0.10% budget; investigate before the budget is gone."

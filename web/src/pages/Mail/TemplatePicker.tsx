@@ -61,14 +61,14 @@ export default function TemplatePicker({
   };
 
   return (
-    <div style={styles.overlay} role="dialog" aria-modal="true" aria-label="Insert template">
-      <div style={styles.modal}>
-        <header style={styles.header}>
-          <h3 style={styles.title}>Insert template</h3>
+    <div className={styles.overlay} role="dialog" aria-modal="true" aria-label="Insert template">
+      <div className={styles.modal}>
+        <header className={styles.header}>
+          <h3 className={styles.title}>Insert template</h3>
           <button
             type="button"
             onClick={onClose}
-            style={styles.close}
+            className={styles.close}
             aria-label="Close"
           >
             ×
@@ -76,12 +76,12 @@ export default function TemplatePicker({
         </header>
 
         {templates.length === 0 ? (
-          <p style={styles.muted}>
+          <p className={styles.muted}>
             No templates yet. Create one on the Templates page.
           </p>
         ) : (
           <>
-            <label style={styles.fieldLabel} htmlFor="tpl-pick">
+            <label className={styles.fieldLabel} htmlFor="tpl-pick">
               Template
             </label>
             <select
@@ -91,7 +91,7 @@ export default function TemplatePicker({
                 setSelectedId(e.target.value);
                 setValues({});
               }}
-              style={styles.input}
+              className={styles.input}
             >
               {templates.map((t) => (
                 <option key={t.id} value={t.id}>
@@ -101,11 +101,11 @@ export default function TemplatePicker({
             </select>
 
             {customVars.length > 0 && (
-              <div style={styles.vars}>
-                <p style={styles.varsHint}>Fill in template values:</p>
+              <div className={styles.vars}>
+                <p className={styles.varsHint}>Fill in template values:</p>
                 {customVars.map((v) => (
-                  <div key={v} style={styles.varRow}>
-                    <label style={styles.fieldLabel} htmlFor={`var-${v}`}>
+                  <div key={v} className={styles.varRow}>
+                    <label className={styles.fieldLabel} htmlFor={`var-${v}`}>
                       {v}
                     </label>
                     <input
@@ -115,26 +115,26 @@ export default function TemplatePicker({
                       onChange={(e) =>
                         setValues((cur) => ({ ...cur, [v]: e.target.value }))
                       }
-                      style={styles.input}
+                      className={styles.input}
                     />
                   </div>
                 ))}
               </div>
             )}
 
-            <div style={styles.buttonRow}>
+            <div className={styles.buttonRow}>
               <button
                 type="button"
                 onClick={apply}
                 disabled={!selected}
-                style={styles.primaryButton}
+                className={styles.primaryButton}
               >
                 Insert
               </button>
               <button
                 type="button"
                 onClick={onClose}
-                style={styles.secondaryButton}
+                className={styles.secondaryButton}
               >
                 Cancel
               </button>
@@ -146,75 +146,26 @@ export default function TemplatePicker({
   );
 }
 
-const styles: Record<string, React.CSSProperties> = {
-  overlay: {
-    position: "fixed",
-    inset: 0,
-    background: "rgba(0,0,0,0.4)",
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    zIndex: 50,
-  },
-  modal: {
-    background: "#fff",
-    borderRadius: "0.5rem",
-    padding: "1rem",
-    width: "min(480px, 92vw)",
-    display: "grid",
-    gap: "0.5rem",
-    boxShadow: "0 10px 40px rgba(0,0,0,0.2)",
-  },
-  header: {
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "space-between",
-  },
-  title: { margin: 0, fontSize: "1.05rem" },
-  close: {
-    border: "none",
-    background: "none",
-    fontSize: "1.4rem",
-    lineHeight: 1,
-    cursor: "pointer",
-    color: "#6b7280",
-  },
-  fieldLabel: { fontSize: "0.8rem", fontWeight: 600, color: "#374151" },
-  input: {
-    padding: "0.4rem 0.6rem",
-    fontSize: "0.9rem",
-    border: "1px solid #d1d5db",
-    borderRadius: "0.25rem",
-    width: "100%",
-    boxSizing: "border-box",
-  },
-  vars: {
-    display: "grid",
-    gap: "0.4rem",
-    padding: "0.5rem",
-    background: "#f9fafb",
-    borderRadius: "0.375rem",
-  },
-  varsHint: { margin: 0, fontSize: "0.8rem", color: "#374151" },
-  varRow: { display: "grid", gap: "0.2rem" },
-  buttonRow: { display: "flex", gap: "0.5rem", marginTop: "0.25rem" },
-  primaryButton: {
-    padding: "0.45rem 0.9rem",
-    background: "#2563eb",
-    color: "#fff",
-    border: "none",
-    borderRadius: "0.25rem",
-    cursor: "pointer",
-    fontSize: "0.85rem",
-  },
-  secondaryButton: {
-    padding: "0.45rem 0.9rem",
-    background: "#fff",
-    color: "#374151",
-    border: "1px solid #d1d5db",
-    borderRadius: "0.25rem",
-    cursor: "pointer",
-    fontSize: "0.85rem",
-  },
-  muted: { color: "#6b7280", fontStyle: "italic", fontSize: "0.85rem" },
+/** Theme-aware Tailwind class recipes for the TemplatePicker modal. */
+const styles: Record<string, string> = {
+  overlay:
+    "fixed inset-0 z-modal flex items-center justify-center bg-overlay",
+  modal:
+    "grid w-[min(480px,92vw)] gap-2 rounded-lg bg-elevated p-4 shadow-lg",
+  header: "flex items-center justify-between",
+  title: "m-0 text-base font-semibold",
+  close:
+    "cursor-pointer border-0 bg-transparent text-2xl leading-none text-fg-muted hover:text-fg",
+  fieldLabel: "text-xs font-semibold text-fg-muted",
+  input:
+    "box-border w-full rounded-md border border-border bg-surface px-2.5 py-1.5 text-sm text-fg outline-none focus-visible:border-primary focus-visible:ring-2 focus-visible:ring-primary-subtle",
+  vars: "grid gap-1.5 rounded-md bg-surface-muted p-2",
+  varsHint: "m-0 text-xs text-fg-muted",
+  varRow: "grid gap-1",
+  buttonRow: "mt-1 flex gap-2",
+  primaryButton:
+    "cursor-pointer rounded-md border-0 bg-primary px-3.5 py-1.5 text-sm font-medium text-primary-fg transition-colors hover:bg-primary-hover",
+  secondaryButton:
+    "cursor-pointer rounded-md border border-border bg-surface px-3.5 py-1.5 text-sm text-fg transition-colors hover:bg-surface-hover",
+  muted: "text-sm italic text-fg-muted",
 };

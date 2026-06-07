@@ -1,7 +1,7 @@
 import { cloneElement, useId, useState } from "react";
 import type { ReactElement, ReactNode } from "react";
 
-import styles from "./Tooltip.module.css";
+import { cn } from "../../lib/cn";
 
 export type TooltipPlacement = "top" | "bottom" | "left" | "right";
 
@@ -14,9 +14,12 @@ export interface TooltipProps {
   className?: string;
 }
 
-function cx(...classes: Array<string | false | undefined>): string {
-  return classes.filter(Boolean).join(" ");
-}
+const placementClass: Record<TooltipPlacement, string> = {
+  top: "bottom-[calc(100%+0.4rem)] left-1/2 -translate-x-1/2",
+  bottom: "top-[calc(100%+0.4rem)] left-1/2 -translate-x-1/2",
+  left: "right-[calc(100%+0.4rem)] top-1/2 -translate-y-1/2",
+  right: "left-[calc(100%+0.4rem)] top-1/2 -translate-y-1/2",
+};
 
 /**
  * Tooltip — shows supplementary text on hover/focus. The trigger is
@@ -61,13 +64,16 @@ export function Tooltip({
   });
 
   return (
-    <span className={cx(styles.wrap, className)}>
+    <span className={cn("relative inline-flex", className)}>
       {child}
       {visible && (
         <span
           role="tooltip"
           id={tooltipId}
-          className={cx(styles.tooltip, styles[placement])}
+          className={cn(
+            "pointer-events-none absolute z-tooltip w-max max-w-xs animate-fade-in rounded-md bg-fg px-2 py-1 text-xs font-medium text-fg-inverse shadow-md",
+            placementClass[placement],
+          )}
         >
           {label}
         </span>

@@ -1,6 +1,8 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
 
+import { cn } from "../../lib/cn";
+
 import {
   createLabel,
   deleteLabel,
@@ -57,38 +59,38 @@ export default function Labels() {
   };
 
   return (
-    <section style={styles.root}>
-      <header style={styles.header}>
-        <h2 style={styles.title}>Labels</h2>
-        <Link to="/mail" style={styles.backLink}>
+    <section className={styles.root}>
+      <header className={styles.header}>
+        <h2 className={styles.title}>Labels</h2>
+        <Link to="/mail" className={styles.backLink}>
           ← Back to mail
         </Link>
       </header>
 
-      <div style={styles.createRow}>
+      <div className={styles.createRow}>
         <input
           type="text"
           value={name}
           onChange={(e) => setName(e.target.value)}
           placeholder="New label name"
           aria-label="New label name"
-          style={styles.input}
+          className={styles.input}
           onKeyDown={(e) => {
             if (e.key === "Enter") onCreate();
           }}
         />
         <ColorPicker value={color} onChange={setColor} ariaPrefix="New label" />
-        <button type="button" onClick={onCreate} style={styles.primaryButton}>
+        <button type="button" onClick={onCreate} className={styles.primaryButton}>
           Add label
         </button>
       </div>
 
       {labels.length === 0 ? (
-        <p style={styles.muted}>No labels yet.</p>
+        <p className={styles.muted}>No labels yet.</p>
       ) : (
-        <ul style={styles.list}>
+        <ul className={styles.list}>
           {labels.map((label) => (
-            <li key={label.id} style={styles.listItem}>
+            <li key={label.id} className={styles.listItem}>
               {editingId === label.id ? (
                 <>
                   <input
@@ -96,7 +98,7 @@ export default function Labels() {
                     value={editName}
                     onChange={(e) => setEditName(e.target.value)}
                     aria-label={`Rename ${label.name}`}
-                    style={styles.input}
+                    className={styles.input}
                   />
                   <ColorPicker
                     value={editColor}
@@ -106,39 +108,40 @@ export default function Labels() {
                   <button
                     type="button"
                     onClick={onSaveEdit}
-                    style={styles.primaryButton}
+                    className={styles.primaryButton}
                   >
                     Save
                   </button>
                   <button
                     type="button"
                     onClick={() => setEditingId(null)}
-                    style={styles.secondaryButton}
+                    className={styles.secondaryButton}
                   >
                     Cancel
                   </button>
                 </>
               ) : (
                 <>
-                  <span style={styles.chip}>
+                  <span className={styles.chip}>
                     <span
-                      style={{ ...styles.dot, background: label.color }}
+                      className={styles.dot}
+                      style={{ background: label.color }}
                       aria-hidden="true"
                     />
                     {label.name}
                   </span>
-                  <span style={styles.spacer} />
+                  <span className={styles.spacer} />
                   <button
                     type="button"
                     onClick={() => startEdit(label)}
-                    style={styles.secondaryButton}
+                    className={styles.secondaryButton}
                   >
                     Edit
                   </button>
                   <button
                     type="button"
                     onClick={() => onDelete(label.id)}
-                    style={styles.dangerButton}
+                    className={styles.dangerButton}
                   >
                     Delete
                   </button>
@@ -162,7 +165,7 @@ function ColorPicker({
   ariaPrefix: string;
 }) {
   return (
-    <span style={styles.colorRow}>
+    <span className={styles.colorRow}>
       {LABEL_COLORS.map((c) => (
         <button
           key={c}
@@ -171,100 +174,40 @@ function ColorPicker({
           aria-label={`${ariaPrefix} colour ${c}`}
           aria-pressed={value === c}
           title={c}
-          style={{
-            ...styles.swatch,
-            background: c,
-            outline: value === c ? "2px solid #111827" : "none",
-          }}
+          className={cn(
+            styles.swatch,
+            value === c && "outline outline-2 outline-fg",
+          )}
+          style={{ background: c }}
         />
       ))}
     </span>
   );
 }
 
-const styles: Record<string, React.CSSProperties> = {
-  root: { padding: "1rem", maxWidth: "720px" },
-  header: {
-    display: "flex",
-    alignItems: "baseline",
-    justifyContent: "space-between",
-    marginBottom: "1rem",
-  },
-  title: { margin: 0, fontSize: "1.25rem" },
-  backLink: { color: "#2563eb", textDecoration: "none", fontSize: "0.9rem" },
-  createRow: {
-    display: "flex",
-    alignItems: "center",
-    gap: "0.5rem",
-    flexWrap: "wrap",
-    marginBottom: "1rem",
-  },
-  input: {
-    padding: "0.4rem 0.6rem",
-    fontSize: "0.9rem",
-    border: "1px solid #d1d5db",
-    borderRadius: "0.25rem",
-  },
-  colorRow: { display: "inline-flex", gap: "0.2rem", flexWrap: "wrap" },
-  swatch: {
-    width: "1.25rem",
-    height: "1.25rem",
-    borderRadius: "0.25rem",
-    border: "1px solid rgba(0,0,0,0.1)",
-    cursor: "pointer",
-    padding: 0,
-  },
-  list: { listStyle: "none", margin: 0, padding: 0, display: "grid", gap: "0.4rem" },
-  listItem: {
-    display: "flex",
-    alignItems: "center",
-    gap: "0.5rem",
-    padding: "0.4rem 0.5rem",
-    border: "1px solid #e5e7eb",
-    borderRadius: "0.375rem",
-    background: "#fff",
-  },
-  chip: {
-    display: "inline-flex",
-    alignItems: "center",
-    gap: "0.4rem",
-    fontSize: "0.9rem",
-    fontWeight: 600,
-    color: "#111827",
-  },
-  dot: {
-    width: "0.85rem",
-    height: "0.85rem",
-    borderRadius: "999px",
-    display: "inline-block",
-  },
-  spacer: { flex: 1 },
-  primaryButton: {
-    padding: "0.4rem 0.8rem",
-    background: "#2563eb",
-    color: "#fff",
-    border: "none",
-    borderRadius: "0.25rem",
-    cursor: "pointer",
-    fontSize: "0.85rem",
-  },
-  secondaryButton: {
-    padding: "0.4rem 0.8rem",
-    background: "#fff",
-    color: "#374151",
-    border: "1px solid #d1d5db",
-    borderRadius: "0.25rem",
-    cursor: "pointer",
-    fontSize: "0.85rem",
-  },
-  dangerButton: {
-    padding: "0.4rem 0.8rem",
-    background: "#fff",
-    color: "#991b1b",
-    border: "1px solid #fca5a5",
-    borderRadius: "0.25rem",
-    cursor: "pointer",
-    fontSize: "0.85rem",
-  },
-  muted: { color: "#6b7280", fontStyle: "italic", fontSize: "0.85rem" },
+/** Theme-aware Tailwind class recipes for the Labels manager. */
+const styles: Record<string, string> = {
+  root: "max-w-[720px] p-4",
+  header: "mb-4 flex items-baseline justify-between",
+  title: "m-0 text-xl font-semibold",
+  backLink: "text-sm text-primary no-underline hover:underline",
+  createRow: "mb-4 flex flex-wrap items-center gap-2",
+  input:
+    "rounded-md border border-border bg-surface px-2.5 py-1.5 text-sm text-fg outline-none focus-visible:border-primary focus-visible:ring-2 focus-visible:ring-primary-subtle",
+  colorRow: "inline-flex flex-wrap gap-1",
+  swatch:
+    "size-5 cursor-pointer rounded-sm border border-black/10 p-0",
+  list: "m-0 grid list-none gap-1.5 p-0",
+  listItem:
+    "flex items-center gap-2 rounded-md border border-border bg-surface px-2 py-1.5",
+  chip: "inline-flex items-center gap-1.5 text-sm font-semibold text-fg",
+  dot: "inline-block size-3.5 rounded-pill",
+  spacer: "flex-1",
+  primaryButton:
+    "cursor-pointer rounded-md border-0 bg-primary px-3 py-1.5 text-sm font-medium text-primary-fg transition-colors hover:bg-primary-hover",
+  secondaryButton:
+    "cursor-pointer rounded-md border border-border bg-surface px-3 py-1.5 text-sm text-fg transition-colors hover:bg-surface-hover",
+  dangerButton:
+    "cursor-pointer rounded-md border border-danger/40 bg-surface px-3 py-1.5 text-sm text-danger-fg transition-colors hover:bg-danger-bg",
+  muted: "text-sm italic text-fg-muted",
 };

@@ -1,0 +1,81 @@
+# Package and publish the kmail Helm chart as an OCI artifact in GHCR.
+#
+# Triggers on a chart release tag (`kmail-chart-v*`) or manual dispatch.
+# The pushed chart version is taken from Chart.yaml; the tag is only the
+# release trigger. Consumers install with:
+#   helm install kmail oci://ghcr.io/<owner>/charts/kmail --version X.Y.Z
+name: Helm chart release
+
+on:
+  push:
+    tags:
+      - "kmail-chart-v*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Lint + package only, do not push to GHCR.
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  release:
+    name: Package and push chart
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.2
+
+      - name: Lint chart
+        run: helm lint deploy/helm/kmail
+
+      - name: Template chart (render sanity, all features on)
+        run: |
+          helm template kmail deploy/helm/kmail \
+            --set networkPolicy.enabled=true \
+            --set serviceMonitor.enabled=true \
+            --set prometheusRule.enabled=true \
+            --set grafanaDashboards.enabled=true \
+            --set mtls.enabled=true \
+            --set mtls.issuerRef.name=kmail-internal-ca > /dev/null
+
+      - name: Package chart
+        id: pkg
+        run: |
+          mkdir -p dist
+          helm package deploy/helm/kmail --destination dist
+          pkg="$(ls dist/kmail-*.tgz)"
+          echo "package=$pkg" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        if: ${{ github.event_name != 'workflow_dispatch' || !inputs.dry_run }}
+        env:
+          HELM_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HELM_USER: ${{ github.actor }}
+        run: |
+          echo "$HELM_TOKEN" \
+            | helm registry login ghcr.io -u "$HELM_USER" --password-stdin
+
+      - name: Push chart to GHCR
+        if: ${{ github.event_name != 'workflow_dispatch' || !inputs.dry_run }}
+        env:
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+          CHART_PACKAGE: ${{ steps.pkg.outputs.package }}
+        run: |
+          owner="$(echo "$REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
+          helm push "$CHART_PACKAGE" "oci://ghcr.io/${owner}/charts"
+
+      - name: Upload chart artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kmail-helm-chart
+          path: ${{ steps.pkg.outputs.package }}
+          if-no-files-found: error

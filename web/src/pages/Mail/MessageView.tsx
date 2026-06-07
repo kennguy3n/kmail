@@ -190,54 +190,54 @@ export default function MessageView() {
   };
 
   return (
-    <section style={viewStyles.root}>
-      <div style={viewStyles.topBar}>
+    <section className={viewStyles.root}>
+      <div className={viewStyles.topBar}>
         <Link
           to={mailboxId ? `/mail/${mailboxId}` : "/mail"}
-          style={viewStyles.backLink}
+          className={viewStyles.backLink}
         >
           ← Back to inbox
         </Link>
       </div>
-      {isLoading && <p style={viewStyles.muted}>Loading message…</p>}
-      {error && <div style={viewStyles.error}>{error}</div>}
+      {isLoading && <p className={viewStyles.muted}>Loading message…</p>}
+      {error && <div className={viewStyles.error}>{error}</div>}
       {snoozeConfirmation && (
-        <div style={viewStyles.snoozeConfirmation}>{snoozeConfirmation}</div>
+        <div className={viewStyles.snoozeConfirmation}>{snoozeConfirmation}</div>
       )}
       {email && (
-        <article style={viewStyles.article}>
-          <header style={viewStyles.header}>
-            <div style={viewStyles.subjectRow}>
-              <h1 style={viewStyles.subject}>
+        <article className={viewStyles.article}>
+          <header className={viewStyles.header}>
+            <div className={viewStyles.subjectRow}>
+              <h1 className={viewStyles.subject}>
                 {email.subject ?? "(no subject)"}
               </h1>
-              <div style={viewStyles.actions}>
+              <div className={viewStyles.actions}>
                 <button
                   type="button"
                   onClick={() => handleReply(false)}
-                  style={viewStyles.actionButton}
+                  className={viewStyles.actionButton}
                 >
                   Reply
                 </button>
                 <button
                   type="button"
                   onClick={() => handleReply(true)}
-                  style={viewStyles.actionButton}
+                  className={viewStyles.actionButton}
                 >
                   Reply all
                 </button>
                 <button
                   type="button"
                   onClick={handleForward}
-                  style={viewStyles.actionButton}
+                  className={viewStyles.actionButton}
                 >
                   Forward
                 </button>
-                <div style={viewStyles.snoozeWrap}>
+                <div className={viewStyles.snoozeWrap}>
                   <button
                     type="button"
                     onClick={() => setSnoozePickerOpen((open) => !open)}
-                    style={viewStyles.actionButton}
+                    className={viewStyles.actionButton}
                     disabled={snoozeBusy}
                     aria-haspopup="dialog"
                     aria-expanded={snoozePickerOpen}
@@ -255,7 +255,7 @@ export default function MessageView() {
                 </div>
               </div>
             </div>
-            <dl style={viewStyles.headerList}>
+            <dl className={viewStyles.headerList}>
               <dt>From</dt>
               <dd>{formatAddresses(email.from)}</dd>
               <dt>To</dt>
@@ -277,16 +277,16 @@ export default function MessageView() {
             </dl>
           </header>
           <ReadReceiptPrompt email={email} />
-          <div style={viewStyles.body}>
+          <div className={viewStyles.body}>
             {htmlPart && email.bodyValues?.[htmlPart.partId!] ? (
               <HtmlMessageBody
                 html={email.bodyValues[htmlPart.partId!].value}
                 cidUrls={cidUrls}
               />
             ) : bodyText ? (
-              <pre style={viewStyles.bodyPre}>{bodyText}</pre>
+              <pre className={viewStyles.bodyPre}>{bodyText}</pre>
             ) : (
-              <p style={viewStyles.muted}>(empty message body)</p>
+              <p className={viewStyles.muted}>(empty message body)</p>
             )}
           </div>
           <AttachmentPanel attachments={attachments} />
@@ -295,13 +295,13 @@ export default function MessageView() {
 
       {/* WS7: smart reply chips */}
       {email && smartReplies.length > 0 && (
-        <div style={viewStyles.smartReplies}>
-          <span style={{ fontSize: "0.8rem", color: "#888", marginRight: 8 }}>Quick reply:</span>
+        <div className={viewStyles.smartReplies}>
+          <span className="mr-2 text-xs text-fg-muted">Quick reply:</span>
           {smartReplies.map((s, i) => (
             <button
               key={i}
               type="button"
-              style={viewStyles.smartReplyChip}
+              className={viewStyles.smartReplyChip}
               onClick={() =>
                 navigate("/mail/compose", {
                   state: {
@@ -325,12 +325,12 @@ export default function MessageView() {
 
       {/* WS7: unsubscribe helper */}
       {email && unsubInfo && unsubInfo.unsubscribe && !unsubInfo.already_done && (
-        <div style={{ padding: "8px 16px", background: "#fff8e1", borderRadius: 6, margin: "8px 0" }}>
-          <span style={{ marginRight: 8 }}>This looks like a mailing list.</span>
+        <div className="my-2 rounded-md bg-warning-bg px-4 py-2 text-warning-fg">
+          <span className="mr-2">This looks like a mailing list.</span>
           <button
             type="button"
             disabled={unsubBusy}
-            style={{ padding: "4px 12px", borderRadius: 4, border: "1px solid #ddd", cursor: "pointer" }}
+            className="cursor-pointer rounded-sm border border-border px-3 py-1"
             onClick={() => {
               setUnsubBusy(true);
               postUnsubscribe(email.id)
@@ -344,7 +344,7 @@ export default function MessageView() {
         </div>
       )}
       {email && unsubInfo?.already_done && (
-        <div style={{ padding: "8px 16px", background: "#e8f5e9", borderRadius: 6, margin: "8px 0", color: "#2e7d32" }}>
+        <div className="my-2 rounded-md bg-success-bg px-4 py-2 text-success-fg">
           You have unsubscribed from this list.
         </div>
       )}
@@ -435,134 +435,38 @@ function formatDate(iso: string | null | undefined): string {
   return d.toLocaleString();
 }
 
-const viewStyles: Record<string, React.CSSProperties> = {
-  root: {
-    padding: "1rem",
-    maxWidth: "900px",
-  },
-  topBar: {
-    marginBottom: "0.75rem",
-  },
-  backLink: {
-    color: "#2563eb",
-    textDecoration: "none",
-    fontSize: "0.9rem",
-  },
-  article: {
-    border: "1px solid #e5e7eb",
-    borderRadius: "0.5rem",
-    padding: "1.25rem",
-    background: "#fff",
-  },
-  header: {
-    borderBottom: "1px solid #e5e7eb",
-    paddingBottom: "0.75rem",
-    marginBottom: "1rem",
-  },
-  subjectRow: {
-    display: "flex",
-    alignItems: "flex-start",
-    justifyContent: "space-between",
-    gap: "0.75rem",
-    marginBottom: "0.75rem",
-  },
-  subject: {
-    margin: 0,
-    fontSize: "1.25rem",
-  },
-  actions: {
-    display: "flex",
-    gap: "0.25rem",
-    flexShrink: 0,
-  },
-  actionButton: {
-    padding: "0.3rem 0.6rem",
-    fontSize: "0.8rem",
-    background: "#fff",
-    border: "1px solid #d1d5db",
-    borderRadius: "0.25rem",
-    cursor: "pointer",
-    color: "#374151",
-  },
-  snoozeWrap: {
-    position: "relative",
-    display: "inline-block",
-  },
-  snoozeConfirmation: {
-    background: "#ecfdf5",
-    color: "#065f46",
-    border: "1px solid #a7f3d0",
-    borderRadius: "0.25rem",
-    padding: "0.5rem 0.75rem",
-    fontSize: "0.85rem",
-    marginBottom: "0.75rem",
-  },
-  attachmentsBox: {
-    marginTop: "1rem",
-    padding: "0.75rem",
-    borderTop: "1px solid #e5e7eb",
-  },
-  attachmentsTitle: {
-    margin: "0 0 0.5rem",
-    fontSize: "0.95rem",
-  },
-  attachmentsList: {
-    listStyle: "none",
-    margin: 0,
-    padding: 0,
-    display: "flex",
-    flexDirection: "column",
-    gap: "0.25rem",
-    fontSize: "0.85rem",
-  },
-  attachmentName: {
-    marginRight: "0.5rem",
-  },
-  attachmentMeta: {
-    color: "#6b7280",
-  },
-  headerList: {
-    display: "grid",
-    gridTemplateColumns: "80px 1fr",
-    rowGap: "0.25rem",
-    columnGap: "0.75rem",
-    margin: 0,
-    fontSize: "0.9rem",
-  },
-  body: {
-    lineHeight: 1.5,
-  },
-  bodyPre: {
-    whiteSpace: "pre-wrap",
-    fontFamily: "inherit",
-    fontSize: "0.95rem",
-    margin: 0,
-  },
-  error: {
-    padding: "0.5rem 0.75rem",
-    background: "#fee2e2",
-    color: "#991b1b",
-    borderRadius: "0.25rem",
-  },
-  muted: {
-    color: "#6b7280",
-    fontStyle: "italic",
-  },
-  smartReplies: {
-    display: "flex",
-    flexWrap: "wrap",
-    alignItems: "center",
-    gap: "0.5rem",
-    padding: "0.75rem 0",
-  },
-  smartReplyChip: {
-    padding: "6px 14px",
-    fontSize: "0.85rem",
-    background: "#e8f0fe",
-    color: "#1a73e8",
-    border: "1px solid #c2d9fd",
-    borderRadius: "16px",
-    cursor: "pointer",
-    whiteSpace: "nowrap",
-  },
+
+/**
+ * Tailwind class recipes for the message view. Mapped onto the
+ * semantic design tokens so the article, header grid and chips track
+ * the active light/dark theme.
+ */
+const viewStyles: Record<string, string> = {
+  root: "max-w-[900px] p-4",
+  topBar: "mb-3",
+  backLink: "text-sm text-primary no-underline hover:underline",
+  article: "rounded-lg border border-border bg-surface p-5",
+  header: "mb-4 border-b border-border pb-3",
+  subjectRow: "mb-3 flex items-start justify-between gap-3",
+  subject: "m-0 text-xl font-semibold",
+  actions: "flex shrink-0 gap-1",
+  actionButton:
+    "cursor-pointer rounded-md border border-border bg-surface px-2.5 py-1.5 text-xs text-fg transition-colors hover:bg-surface-hover",
+  snoozeWrap: "relative inline-block",
+  snoozeConfirmation:
+    "mb-3 rounded-md border border-success/40 bg-success-bg px-3 py-2 text-sm text-success-fg",
+  attachmentsBox: "mt-4 border-t border-border pt-3",
+  attachmentsTitle: "mb-2 mt-0 text-sm font-semibold",
+  attachmentsList: "m-0 flex list-none flex-col gap-1 p-0 text-sm",
+  attachmentName: "mr-2",
+  attachmentMeta: "text-fg-muted",
+  headerList:
+    "m-0 grid grid-cols-[80px_1fr] gap-x-3 gap-y-1 text-sm",
+  body: "leading-relaxed",
+  bodyPre: "m-0 whitespace-pre-wrap font-[inherit] text-sm",
+  error: "rounded-md bg-danger-bg px-3 py-2 text-danger-fg",
+  muted: "italic text-fg-muted",
+  smartReplies: "flex flex-wrap items-center gap-2 py-3",
+  smartReplyChip:
+    "cursor-pointer whitespace-nowrap rounded-pill border border-primary/30 bg-primary-subtle px-3.5 py-1.5 text-sm text-primary transition-colors hover:bg-primary-subtle/70",
 };

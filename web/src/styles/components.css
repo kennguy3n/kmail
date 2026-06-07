@@ -1,0 +1,287 @@
+/*
+ * KMail shared component classes.
+ *
+ * A number of pages (most Admin screens plus the Shared inbox, Vault,
+ * Protected folder and Secure portal Mail views) are authored with
+ * semantic `kmail-*` class names on plain elements rather than inline
+ * styles. Historically those classes had no stylesheet, so the pages
+ * rendered unstyled. We define them here once — in Tailwind's
+ * `components` layer via `@apply` against the semantic design tokens —
+ * so every consumer is styled consistently and tracks the active
+ * light/dark theme, without rewriting each page's markup. Utilities
+ * (the `utilities` layer) still win, so a page can override locally.
+ */
+@layer components {
+  /* ---- Page scaffolding ------------------------------------------ */
+  .kmail-admin-page,
+  .kmail-pricing-page,
+  .kmail-pricing-admin,
+  .kmail-slo-admin,
+  .kmail-dns-wizard,
+  .kmail-cmk,
+  .kmail-signature {
+    @apply mx-auto flex w-full max-w-[1100px] flex-col gap-4 p-6;
+  }
+
+  .kmail-admin-page > h2,
+  .kmail-pricing-page > h2,
+  .kmail-slo-admin > h2 {
+    @apply text-2xl font-semibold;
+  }
+
+  .kmail-admin-page h3 {
+    @apply text-lg font-semibold;
+  }
+
+  .kmail-admin-hint,
+  .kmail-admin-help,
+  .kmail-pricing-blurb,
+  .kmail-portal-hint,
+  .kmail-vault-note {
+    @apply text-sm text-fg-muted;
+  }
+
+  /* ---- Control rows (label + input/select groups) ---------------- */
+  .kmail-admin-controls,
+  .kmail-inbox-controls,
+  .kmail-admin-tenant-picker {
+    @apply flex flex-wrap items-end gap-3;
+  }
+
+  .kmail-admin-controls label,
+  .kmail-inbox-controls label,
+  .kmail-admin-tenant-picker label {
+    @apply flex flex-col gap-1 text-sm font-medium text-fg-muted;
+  }
+
+  /* Form controls inside admin scaffolding. Scoped to the page
+     wrappers so we don't restyle primitive-driven inputs elsewhere. */
+  .kmail-admin-page input:not([type="checkbox"]):not([type="radio"]),
+  .kmail-admin-page select,
+  .kmail-admin-page textarea,
+  .kmail-secure-portal input,
+  .kmail-cmk-form input,
+  .kmail-cmk-form select {
+    @apply rounded-md border border-border bg-surface px-2.5 py-1.5 text-sm text-fg outline-none transition-colors focus-visible:border-primary focus-visible:ring-2 focus-visible:ring-primary-subtle;
+  }
+
+  .kmail-admin-page textarea {
+    @apply min-h-20 resize-y;
+  }
+
+  /* Generic buttons inside admin pages get a subtle default; primary
+     intent is opt-in via .kmail-button / .kmail-admin-danger. */
+  .kmail-admin-page button:not([class*="kmail-"]),
+  .kmail-secure-portal button:not([class*="kmail-"]) {
+    @apply cursor-pointer rounded-md border border-border bg-surface px-3 py-1.5 text-sm font-medium text-fg transition-colors hover:bg-surface-hover;
+  }
+
+  .kmail-button {
+    @apply cursor-pointer rounded-md border-0 bg-primary px-3.5 py-1.5 text-sm font-medium text-primary-fg transition-colors hover:bg-primary-hover;
+  }
+
+  .kmail-admin-danger {
+    @apply cursor-pointer rounded-md border border-danger/40 bg-surface px-3 py-1.5 text-sm font-medium text-danger-fg transition-colors hover:bg-danger-bg;
+  }
+
+  .kmail-link {
+    @apply cursor-pointer text-primary hover:underline;
+  }
+
+  /* ---- Tables ---------------------------------------------------- */
+  .kmail-admin-table,
+  .kmail-admin-subtable,
+  .kmail-pricing-matrix {
+    @apply w-full border-collapse text-sm;
+  }
+
+  .kmail-admin-table th,
+  .kmail-pricing-matrix th {
+    @apply border-b-2 border-border bg-surface-muted px-3 py-2 text-left font-semibold;
+  }
+
+  .kmail-admin-table td,
+  .kmail-pricing-matrix td {
+    @apply border-b border-border px-3 py-2 align-top;
+  }
+
+  .kmail-admin-table tbody tr {
+    @apply transition-colors;
+  }
+
+  .kmail-admin-table tbody tr:hover {
+    @apply bg-surface-hover;
+  }
+
+  .kmail-admin-table tbody tr.selected {
+    @apply bg-primary-subtle;
+  }
+
+  /* ---- Cards / panels -------------------------------------------- */
+  .kmail-admin-card,
+  .kmail-admin-tenant,
+  .kmail-inbox-detail,
+  .kmail-vault-detail,
+  .kmail-protected-detail,
+  .kmail-slo-card,
+  .kmail-wizard-summary,
+  .kmail-pricing-summary,
+  .kmail-cmk-form {
+    @apply flex flex-col gap-3 rounded-lg border border-border bg-surface p-4;
+  }
+
+  /* ---- Alerts / status banners ----------------------------------- */
+  .kmail-error,
+  .kmail-admin-error {
+    @apply rounded-md bg-danger-bg px-3 py-2 text-sm text-danger-fg;
+  }
+
+  .kmail-info {
+    @apply rounded-md bg-info-bg px-3 py-2 text-sm text-info-fg;
+  }
+
+  .kmail-warning {
+    @apply rounded-md border border-warning/40 bg-warning-bg px-3 py-2 text-sm text-warning-fg;
+  }
+
+  .kmail-success {
+    @apply rounded-md bg-success-bg px-3 py-2 text-sm text-success-fg;
+  }
+
+  .kmail-accent {
+    @apply font-semibold text-primary;
+  }
+
+  /* ---- Status pills ---------------------------------------------- */
+  .kmail-slo-ok,
+  .kmail-flag-ok,
+  .kmail-cmk-active {
+    @apply inline-block rounded-pill bg-success-bg px-2 py-0.5 text-xs font-semibold text-success-fg;
+  }
+
+  .kmail-slo-breach,
+  .kmail-flag-pending {
+    @apply inline-block rounded-pill bg-warning-bg px-2 py-0.5 text-xs font-semibold text-warning-fg;
+  }
+
+  .kmail-vault-badge {
+    @apply inline-block rounded-pill bg-info-bg px-2 py-0.5 text-xs font-semibold text-info-fg;
+  }
+
+  .kmail-vault-badge-warning {
+    @apply inline-block rounded-pill bg-warning-bg px-2 py-0.5 text-xs font-semibold text-warning-fg;
+  }
+
+  /* ---- Lists ----------------------------------------------------- */
+  .kmail-list,
+  .kmail-vault-list,
+  .kmail-protected-list,
+  .kmail-cmk-list {
+    @apply flex flex-col gap-1.5;
+  }
+
+  .kmail-vault-row,
+  .kmail-protected-row {
+    @apply flex items-center gap-2 rounded-md border border-border bg-surface px-3 py-2;
+  }
+
+  /* ---- Modal / dialog -------------------------------------------- */
+  .kmail-modal-backdrop {
+    @apply fixed inset-0 z-modal flex items-center justify-center bg-overlay p-4;
+  }
+
+  .kmail-modal {
+    @apply z-modal grid w-[min(520px,92vw)] gap-3 rounded-lg border border-border bg-elevated p-6 shadow-lg;
+  }
+
+  .kmail-modal-content,
+  .kmail-modal-body {
+    @apply grid gap-3;
+  }
+
+  .kmail-modal-actions {
+    @apply mt-1 flex justify-end gap-2;
+  }
+
+  /* ---- Secure portal (public-facing) ----------------------------- */
+  .kmail-secure-portal {
+    @apply mx-auto flex min-h-screen w-full max-w-[560px] flex-col justify-center gap-4 p-6;
+  }
+
+  .kmail-portal-body {
+    @apply flex flex-col gap-3 rounded-xl border border-border bg-surface p-6 shadow-md;
+  }
+
+  .kmail-portal-meta {
+    @apply text-sm text-fg-muted;
+  }
+
+  /* ---- DNS wizard ------------------------------------------------ */
+  .kmail-wizard-steps {
+    @apply flex flex-wrap items-center gap-2;
+  }
+
+  .kmail-wizard-step {
+    @apply flex items-center gap-2 text-sm text-fg-muted;
+  }
+
+  .kmail-wizard-step-indicator {
+    @apply inline-flex size-6 items-center justify-center rounded-pill bg-surface-muted text-xs font-semibold;
+  }
+
+  .kmail-wizard-badge {
+    @apply inline-block rounded-pill bg-primary-subtle px-2 py-0.5 text-xs font-semibold text-primary;
+  }
+
+  .kmail-wizard-actions,
+  .kmail-wizard-nav,
+  .kmail-actions {
+    @apply flex flex-wrap gap-2;
+  }
+
+  .kmail-dns-record {
+    @apply rounded-md border border-border bg-surface-muted p-3 font-mono text-xs;
+  }
+
+  /* ---- Pricing / plan cards -------------------------------------- */
+  .kmail-pricing-grid {
+    @apply grid gap-4 sm:grid-cols-2 lg:grid-cols-3;
+  }
+
+  .kmail-plan-card {
+    @apply relative flex flex-col gap-3 rounded-xl border border-border bg-surface p-5 shadow-sm;
+  }
+
+  .kmail-plan-card-current {
+    @apply border-primary ring-2 ring-primary-subtle;
+  }
+
+  .kmail-plan-card-badge {
+    @apply inline-block w-fit rounded-pill bg-primary-subtle px-2 py-0.5 text-xs font-semibold text-primary;
+  }
+
+  .kmail-plan-card-price {
+    @apply text-3xl font-bold;
+  }
+
+  .kmail-plan-card-monthly {
+    @apply text-sm text-fg-muted;
+  }
+
+  .kmail-plan-card-features {
+    @apply flex flex-col gap-1.5 text-sm;
+  }
+
+  .kmail-plan-card-cta {
+    @apply mt-auto;
+  }
+
+  /* ---- Misc ------------------------------------------------------ */
+  .kmail-totp-recovery-codes {
+    @apply grid grid-cols-2 gap-1.5 rounded-md border border-border bg-surface-muted p-3 font-mono text-sm;
+  }
+
+  .kmail-dev {
+    @apply text-xs text-fg-subtle;
+  }
+}

@@ -232,9 +232,10 @@ data.
 
 A small number of endpoints are intentionally **public** (no bearer
 token): \`POST /api/v1/signup\` and its status polling route, the
-Confidential Send recipient portal (\`/api/v1/secure/{token}\`), open
-tracking links (\`/api/v1/send/{id}\`), and the \`/.well-known/*\`
-autodiscovery documents.
+Confidential Send recipient portal (\`/api/v1/secure/{token}\`), and the
+\`/.well-known/*\` autodiscovery documents. Everything under
+\`/api/v1/send/{id}\` (the undo-send status and cancel endpoints) is
+authenticated and requires a bearer token.
 
 ### SCIM tokens
 

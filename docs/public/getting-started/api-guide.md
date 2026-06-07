@@ -33,8 +33,8 @@ role get `403 Forbidden`. Every endpoint is tenant-scoped, so you only
 ever see your own tenant's data.
 
 A few endpoints are intentionally **public** (no token): the signup
-endpoint, the Confidential Send recipient portal, open tracking links,
-and the `/.well-known/*` autodiscovery documents.
+endpoint, the Confidential Send recipient portal, and the
+`/.well-known/*` autodiscovery documents.
 
 ### SCIM tokens
 

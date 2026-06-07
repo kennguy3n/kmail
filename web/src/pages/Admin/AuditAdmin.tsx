@@ -126,7 +126,7 @@ export default function AuditAdmin() {
           e.preventDefault();
           if (selectedTenantId) load(selectedTenantId, filters);
         }}
-        style={{ display: "flex", gap: 8, flexWrap: "wrap", margin: "8px 0" }}
+        className="my-2 flex flex-wrap gap-2"
       >
         <input
           placeholder="Action"

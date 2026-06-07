@@ -158,10 +158,7 @@ export default function PricingPage() {
       {error && <p className="kmail-error">{error}</p>}
       {info && <p className="kmail-info">{info}</p>}
 
-      <div
-        className="kmail-pricing-grid"
-        style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: "1rem" }}
-      >
+      <div className="kmail-pricing-grid">
         {PLAN_CATALOG.map((plan) => (
           <PlanCard
             key={plan.id}
@@ -174,7 +171,7 @@ export default function PricingPage() {
         ))}
       </div>
 
-      <h3 style={{ marginTop: "2rem" }}>Feature comparison</h3>
+      <h3 className="mt-8">Feature comparison</h3>
       <table className="kmail-pricing-matrix">
         <thead>
           <tr>
@@ -222,11 +219,6 @@ function PlanCard({ plan, seatCount, isCurrent, disabled, onSelect }: PlanCardPr
   return (
     <div
       className={`kmail-plan-card${isCurrent ? " kmail-plan-card-current" : ""}`}
-      style={{
-        border: isCurrent ? "2px solid var(--kmail-accent, #2563eb)" : "1px solid #d1d5db",
-        borderRadius: "0.5rem",
-        padding: "1rem",
-      }}
     >
       <h3>{plan.name}</h3>
       <p>
@@ -263,18 +255,9 @@ function ProrationModal({ plan, proration, committing, onCancel, onConfirm }: Pr
       className="kmail-modal-backdrop"
       role="dialog"
       aria-modal="true"
-      style={{
-        position: "fixed",
-        inset: 0,
-        background: "rgba(0,0,0,0.45)",
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-      }}
     >
       <div
         className="kmail-modal"
-        style={{ background: "white", padding: "1.5rem", borderRadius: "0.5rem", minWidth: 360 }}
       >
         <h3>Confirm plan change</h3>
         <p>
@@ -284,11 +267,11 @@ function ProrationModal({ plan, proration, committing, onCancel, onConfirm }: Pr
           {positive ? "Prorated charge" : "Prorated credit"} for the remaining billing period:{" "}
           <strong>${formatCents(Math.abs(cents))}</strong>
         </p>
-        <p style={{ fontSize: "0.85rem", color: "#6b7280" }}>
+        <p className="text-sm text-fg-muted">
           The full new monthly rate kicks in on the next billing cycle. Storage limits
           apply immediately — make sure the tenant is not over the new plan&rsquo;s quota.
         </p>
-        <div style={{ display: "flex", gap: "0.5rem", justifyContent: "flex-end" }}>
+        <div className="flex justify-end gap-2">
           <button type="button" onClick={onCancel} disabled={committing}>
             Cancel
           </button>
