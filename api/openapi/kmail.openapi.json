@@ -2982,7 +2982,7 @@
     "/api/v1/email-analytics": {
       "get": {
         "tags": [
-          "API"
+          "Mail"
         ],
         "summary": "List Email Analytics",
         "operationId": "get_api_v1_email-analytics",
@@ -3008,7 +3008,7 @@
     "/api/v1/emails/{id}/smart-replies": {
       "get": {
         "tags": [
-          "API"
+          "Mail"
         ],
         "summary": "List Smart Replies",
         "operationId": "get_api_v1_emails_id_smart-replies",
@@ -3045,7 +3045,7 @@
     "/api/v1/emails/{id}/unsubscribe": {
       "get": {
         "tags": [
-          "API"
+          "Mail"
         ],
         "summary": "List Unsubscribe",
         "operationId": "get_api_v1_emails_id_unsubscribe",
@@ -3080,7 +3080,7 @@
       },
       "post": {
         "tags": [
-          "API"
+          "Mail"
         ],
         "summary": "Create Unsubscribe",
         "operationId": "post_api_v1_emails_id_unsubscribe",
@@ -3131,7 +3131,7 @@
     "/api/v1/emails/categories": {
       "post": {
         "tags": [
-          "API"
+          "Mail"
         ],
         "summary": "Create Categories",
         "operationId": "post_api_v1_emails_categories",
@@ -3647,7 +3647,7 @@
     "/api/v1/priority-inbox": {
       "get": {
         "tags": [
-          "API"
+          "Mail"
         ],
         "summary": "List Priority Inbox",
         "operationId": "get_api_v1_priority-inbox",
@@ -4210,7 +4210,7 @@
     "/api/v1/sessions": {
       "get": {
         "tags": [
-          "API"
+          "Authentication"
         ],
         "summary": "List Sessions",
         "operationId": "get_api_v1_sessions",
@@ -4236,7 +4236,7 @@
     "/api/v1/sessions/revoke": {
       "post": {
         "tags": [
-          "API"
+          "Authentication"
         ],
         "summary": "Create Revoke",
         "operationId": "post_api_v1_sessions_revoke",
@@ -4712,7 +4712,7 @@
     "/api/v1/snooze": {
       "post": {
         "tags": [
-          "API"
+          "Mail"
         ],
         "summary": "Create Snooze",
         "operationId": "post_api_v1_snooze",
