@@ -1,0 +1,473 @@
+# KMail — production-grade single-host Compose stack.
+#
+# This is the hardened counterpart to docker-compose.yml (the local dev
+# stack). It targets an operator running the whole control plane on ONE
+# host (a bare-metal box or a single large VM) where Kubernetes + the
+# Helm chart (deploy/helm/kmail) would be overkill, while still applying
+# the production posture the dev stack deliberately skips:
+#
+#   * NO dev bypasses — KMAIL_DEV_BYPASS_TOKEN is never set, so the auth
+#     middleware has no static-token escape hatch; KMAIL_ENV=production.
+#   * Real OIDC — KMAIL_KCHAT_OIDC_ISSUER / _AUDIENCE are REQUIRED
+#     (`${VAR:?}`), so the stack refuses to start without a real IdP.
+#   * mTLS BFF→Stalwart — the api + worker present client certs and
+#     Stalwart presents a server cert; all four KMAIL_STALWART_TLS_*
+#     knobs are wired (see internal/config StalwartMTLSConfig).
+#   * Every secret is injected from the environment (`${VAR:?}`) — NO
+#     plaintext credentials live in this file. Supply them via an env
+#     file (.env.prod, gitignored) or your secret manager. A documented
+#     placeholder set lives in .env.prod.example.
+#   * Resource limits + reservations on every long-lived service.
+#   * The BFF and the background worker run as CONTAINERS here (the dev
+#     stack runs the BFF on the host); workers are always-on, not behind
+#     a profile.
+#   * Rate-limiting fails CLOSED (KMAIL_RATELIMIT_FAIL_CLOSED=true).
+#   * Grafana anonymous access is OFF; the admin password is required.
+#
+# Validate locally WITHOUT starting anything:
+#
+#   docker compose -f docker-compose.prod.yml --env-file .env.prod.example config
+#
+# TLS material: place the BFF/worker client cert + CA at
+# ${KMAIL_TLS_DIR:-./deploy/tls/client} and Stalwart's server cert at
+# ${KMAIL_STALWART_TLS_DIR:-./deploy/tls/stalwart}. In a real deployment
+# these come from your PKI / cert-manager; rotate them out of band and
+# `docker compose up -d` to pick up new material.
+
+x-kmail-app-env: &kmail-app-env
+  # --- environment & posture -------------------------------------------
+  KMAIL_ENV: "production"
+  KMAIL_LOG_FORMAT: "json"
+  KMAIL_METRICS_ENABLED: "true"
+  # Fail closed: if Valkey (the rate-limit backend) is unreachable we
+  # reject rather than fall open. The opposite of the dev default.
+  KMAIL_RATELIMIT_ENABLED: "true"
+  KMAIL_RATELIMIT_FAIL_CLOSED: "true"
+  # --- datastores (secrets injected from the environment) --------------
+  KMAIL_DATABASE_URL: "postgres://kmail:${KMAIL_POSTGRES_PASSWORD:?set KMAIL_POSTGRES_PASSWORD}@postgres:5432/kmail?sslmode=disable"
+  KMAIL_VALKEY_URL: "redis://:${KMAIL_VALKEY_PASSWORD:?set KMAIL_VALKEY_PASSWORD}@valkey:6379"
+  KMAIL_MEILISEARCH_URL: "http://meilisearch:7700"
+  KMAIL_MEILISEARCH_API_KEY: "${KMAIL_MEILI_MASTER_KEY:?set KMAIL_MEILI_MASTER_KEY}"
+  KMAIL_ZK_FABRIC_S3_URL: "http://zk-fabric:8080"
+  KMAIL_ZK_FABRIC_CONSOLE_URL: "http://zk-fabric:8081"
+  KMAIL_ZK_FABRIC_ACCESS_KEY: "${KMAIL_ZK_FABRIC_ACCESS_KEY:?set KMAIL_ZK_FABRIC_ACCESS_KEY}"
+  KMAIL_ZK_FABRIC_SECRET_KEY: "${KMAIL_ZK_FABRIC_SECRET_KEY:?set KMAIL_ZK_FABRIC_SECRET_KEY}"
+  # --- mail core over mTLS ---------------------------------------------
+  # HTTPS + the four mTLS knobs (see internal/config StalwartMTLSConfig).
+  # KMAIL_STALWART_TLS_CERT + _KEY both set => mTLS enabled.
+  KMAIL_STALWART_URL: "https://stalwart:8443"
+  KMAIL_STALWART_TLS_CERT: "/etc/kmail/tls/tls.crt"
+  KMAIL_STALWART_TLS_KEY: "/etc/kmail/tls/tls.key"
+  KMAIL_STALWART_TLS_CA: "/etc/kmail/tls/ca.crt"
+  KMAIL_STALWART_TLS_SERVER_NAME: "${KMAIL_STALWART_TLS_SERVER_NAME:-stalwart}"
+  KMAIL_STALWART_ADMIN_USER: "${KMAIL_STALWART_ADMIN_USER:?set KMAIL_STALWART_ADMIN_USER}"
+  KMAIL_STALWART_ADMIN_PASS: "${KMAIL_STALWART_ADMIN_PASS:?set KMAIL_STALWART_ADMIN_PASS}"
+  # --- real OIDC (no dev bypass) ---------------------------------------
+  KMAIL_KCHAT_OIDC_ISSUER: "${KMAIL_KCHAT_OIDC_ISSUER:?set KMAIL_KCHAT_OIDC_ISSUER}"
+  KMAIL_KCHAT_OIDC_AUDIENCE: "${KMAIL_KCHAT_OIDC_AUDIENCE:?set KMAIL_KCHAT_OIDC_AUDIENCE}"
+  KMAIL_PUBLIC_BASE_URL: "${KMAIL_PUBLIC_BASE_URL:?set KMAIL_PUBLIC_BASE_URL}"
+  # --- application secrets ---------------------------------------------
+  # Envelope-encryption key for secrets at rest + Stripe billing.
+  KMAIL_SECRETS_KEY: "${KMAIL_SECRETS_KEY:?set KMAIL_SECRETS_KEY}"
+  KMAIL_STRIPE_SECRET_KEY: "${KMAIL_STRIPE_SECRET_KEY:?set KMAIL_STRIPE_SECRET_KEY}"
+  KMAIL_STRIPE_WEBHOOK_SECRET: "${KMAIL_STRIPE_WEBHOOK_SECRET:?set KMAIL_STRIPE_WEBHOOK_SECRET}"
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: kmail-postgres
+    environment:
+      POSTGRES_USER: kmail
+      # No default — production refuses to boot without an explicit
+      # password (the dev stack hardcodes `kmail`).
+      POSTGRES_PASSWORD: "${KMAIL_POSTGRES_PASSWORD:?set KMAIL_POSTGRES_PASSWORD}"
+      POSTGRES_DB: kmail
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/postgres-init-stalwart.sql:/docker-entrypoint-initdb.d/10-stalwart.sql:ro
+    # Not published to the host in production — only the compose network
+    # reaches Postgres. Put a managed Postgres behind this name instead
+    # for anything beyond a single box.
+    expose:
+      - "5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kmail -d kmail"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+
+  meilisearch:
+    image: getmeili/meilisearch:v1.10
+    container_name: kmail-meilisearch
+    environment:
+      MEILI_ENV: production
+      MEILI_MASTER_KEY: "${KMAIL_MEILI_MASTER_KEY:?set KMAIL_MEILI_MASTER_KEY}"
+    volumes:
+      - meilisearch_data:/meili_data
+    expose:
+      - "7700"
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+
+  valkey:
+    image: valkey/valkey:8
+    container_name: kmail-valkey
+    # Require a password (the dev stack runs Valkey open). Persist with
+    # AOF so the rate-limit / cache state survives a restart.
+    command:
+      - "valkey-server"
+      - "--requirepass"
+      - "${KMAIL_VALKEY_PASSWORD:?set KMAIL_VALKEY_PASSWORD}"
+      - "--appendonly"
+      - "yes"
+    volumes:
+      - valkey_data:/data
+    expose:
+      - "6379"
+    healthcheck:
+      test: ["CMD-SHELL", "valkey-cli -a \"$$KMAIL_VALKEY_PASSWORD\" ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    environment:
+      KMAIL_VALKEY_PASSWORD: "${KMAIL_VALKEY_PASSWORD:?set KMAIL_VALKEY_PASSWORD}"
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+
+  zk-fabric:
+    # Published image only — no sibling build context in production.
+    image: ghcr.io/kennguy3n/zk-object-fabric:dev
+    container_name: kmail-zk-fabric
+    environment:
+      # The zk-object-fabric image authenticates S3 requests with the
+      # AWS_* credential pair (matches docker-compose.yml). The BFF /
+      # worker present the SAME key pair via KMAIL_ZK_FABRIC_* above.
+      AWS_ACCESS_KEY_ID: "${KMAIL_ZK_FABRIC_ACCESS_KEY:?set KMAIL_ZK_FABRIC_ACCESS_KEY}"
+      AWS_SECRET_ACCESS_KEY: "${KMAIL_ZK_FABRIC_SECRET_KEY:?set KMAIL_ZK_FABRIC_SECRET_KEY}"
+    volumes:
+      - zk_data:/data/objects
+    expose:
+      - "8080"
+      - "8081"
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "8080"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+
+  stalwart:
+    image: stalwartlabs/stalwart:v0.16.0
+    container_name: kmail-stalwart
+    hostname: stalwart
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+      zk-fabric:
+        condition: service_healthy
+      meilisearch:
+        condition: service_started
+    ports:
+      # Public mail listeners (SMTP / submission / IMAP). These are the
+      # only ports a production box exposes to the internet; JMAP (8443)
+      # stays on the internal compose network for the BFF.
+      - "25:25"
+      - "465:465"
+      - "587:587"
+      - "143:143"
+      - "993:993"
+    expose:
+      # JMAP-over-TLS — reached by the BFF + worker over the compose
+      # network, NOT published to the host.
+      - "8443"
+    environment:
+      # Bootstrap admin from the environment (the dev stack hardcodes
+      # `admin:kmail-dev`). Rotate after first boot; Stalwart ignores
+      # this once a permanent administrator exists.
+      STALWART_RECOVERY_ADMIN: "${KMAIL_STALWART_ADMIN_USER:?set KMAIL_STALWART_ADMIN_USER}:${KMAIL_STALWART_ADMIN_PASS:?set KMAIL_STALWART_ADMIN_PASS}"
+    volumes:
+      - ./configs/stalwart/config.json:/etc/stalwart/config.json:ro
+      # Server cert + key Stalwart presents on its TLS listeners,
+      # provided out of band (PKI / cert-manager). Read-only.
+      - ${KMAIL_STALWART_TLS_DIR:-./deploy/tls/stalwart}:/etc/stalwart/tls:ro
+      - stalwart_data:/opt/stalwart
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4G
+        reservations:
+          cpus: "0.5"
+          memory: 1G
+
+  kmail-api:
+    # The BFF runs as a container in production (dev runs it on the
+    # host). Built from the repo Dockerfile; pin to a released image
+    # (`image:`) in a real deployment so rollouts are reproducible.
+    image: "${KMAIL_IMAGE:-ghcr.io/kennguy3n/kmail}:${KMAIL_IMAGE_TAG:-latest}"
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: kmail-api
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+      stalwart:
+        condition: service_started
+    environment:
+      <<: *kmail-app-env
+      KMAIL_API_ADDR: ":8088"
+      # The BFF runs the HTTP surface only; the dedicated worker service
+      # below owns the background jobs.
+      KMAIL_DISABLE_WORKERS: "true"
+    ports:
+      # Front this with a TLS-terminating reverse proxy / LB; the BFF
+      # itself speaks plain HTTP on the internal port.
+      - "8088:8088"
+    volumes:
+      # mTLS client material (cert/key/CA) the BFF presents to Stalwart.
+      - ${KMAIL_TLS_DIR:-./deploy/tls/client}:/etc/kmail/tls:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8088/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+
+  kmail-worker:
+    image: "${KMAIL_IMAGE:-ghcr.io/kennguy3n/kmail}:${KMAIL_IMAGE_TAG:-latest}"
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: kmail-worker
+    # Override the image ENTRYPOINT (kmail-api) with the worker binary.
+    entrypoint: ["/usr/local/bin/kmail-worker"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+    environment:
+      <<: *kmail-app-env
+      KMAIL_WORKER_ADDR: ":8090"
+    volumes:
+      - ${KMAIL_TLS_DIR:-./deploy/tls/client}:/etc/kmail/tls:ro
+    expose:
+      - "8090"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8090/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 128M
+
+  # --- observability ----------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    container_name: kmail-prometheus
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      # 30d retention in production vs 15d in dev.
+      - "--storage.tsdb.retention.time=30d"
+    expose:
+      - "9090"
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 2G
+        reservations:
+          cpus: "0.25"
+          memory: 512M
+
+  # Renders the Alertmanager config TEMPLATE (envsubst) into a shared
+  # volume so the PagerDuty / Opsgenie integration keys are injected from
+  # the environment instead of being baked into the repo.
+  alertmanager-config:
+    image: alpine:3.20
+    container_name: kmail-alertmanager-config
+    environment:
+      PAGERDUTY_ROUTING_KEY: "${PAGERDUTY_ROUTING_KEY:?set PAGERDUTY_ROUTING_KEY}"
+      OPSGENIE_API_KEY: "${OPSGENIE_API_KEY:?set OPSGENIE_API_KEY}"
+    volumes:
+      - ./deploy/prometheus/alertmanager.tmpl.yml:/templates/alertmanager.tmpl.yml:ro
+      - alertmanager_config:/output
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        apk add --no-cache gettext >/dev/null &&
+        envsubst '$$PAGERDUTY_ROUTING_KEY $$OPSGENIE_API_KEY'
+        < /templates/alertmanager.tmpl.yml
+        > /output/alertmanager.yml &&
+        echo "rendered /output/alertmanager.yml"
+    restart: "no"
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    container_name: kmail-alertmanager
+    depends_on:
+      alertmanager-config:
+        condition: service_completed_successfully
+    volumes:
+      - alertmanager_config:/etc/alertmanager
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+    expose:
+      - "9093"
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+        reservations:
+          cpus: "0.1"
+          memory: 64M
+
+  loki:
+    image: grafana/loki:3.0.0
+    container_name: kmail-loki
+    volumes:
+      - ./deploy/loki/loki.yml:/etc/loki/local-config.yaml:ro
+      - loki_data:/loki
+    command:
+      - "-config.file=/etc/loki/local-config.yaml"
+    expose:
+      - "3100"
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+
+  promtail:
+    image: grafana/promtail:3.0.0
+    container_name: kmail-promtail
+    depends_on:
+      loki:
+        condition: service_started
+    environment:
+      LOKI_URL: http://loki:3100/loki/api/v1/push
+      KMAIL_ENV: prod
+    volumes:
+      - ./deploy/promtail/promtail.yml:/etc/promtail/promtail.yml:ro
+      - /var/lib/docker/containers:/var/log/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    command:
+      - "-config.file=/etc/promtail/promtail.yml"
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+        reservations:
+          cpus: "0.1"
+          memory: 64M
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    container_name: kmail-grafana
+    depends_on:
+      loki:
+        condition: service_started
+      prometheus:
+        condition: service_started
+    environment:
+      GF_SECURITY_ADMIN_USER: "${GRAFANA_ADMIN_USER:-admin}"
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD}"
+      # Anonymous access OFF in production (the dev stack enables it).
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_SERVER_ROOT_URL: "${GRAFANA_ROOT_URL:-http://localhost:3000}"
+    volumes:
+      - ./deploy/grafana/datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml:ro
+      - ./deploy/grafana/provisioning/dashboards.yml:/etc/grafana/provisioning/dashboards/dashboards.yml:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+        reservations:
+          cpus: "0.1"
+          memory: 128M
+
+volumes:
+  postgres_data:
+  meilisearch_data:
+  valkey_data:
+  zk_data:
+  stalwart_data:
+  prometheus_data:
+  alertmanager_config:
+  grafana_data:
+  loki_data:

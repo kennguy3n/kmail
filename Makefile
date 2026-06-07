@@ -1,4 +1,4 @@
-.PHONY: build test cover lint fmt vet tidy docker-build clean help migrate bench e2e scim-test helm-lint loadtest chaos screenshots storage-cost deliverability-check
+.PHONY: build test cover lint fmt vet tidy docker-build clean help migrate bench e2e scim-test helm-lint helm-template helm-sync-dashboards helm-check-dashboards loadtest chaos screenshots storage-cost deliverability-check
 
 # ---------------------------------------------------------------
 # KMail Go control plane — developer Makefile.
@@ -90,8 +90,31 @@ scim-test:
 # helm-lint runs `helm lint` against the deploy/helm/kmail chart.
 # Requires Helm 3.x to be on PATH; in CI set HELM=/path/to/helm.
 HELM ?= helm
-helm-lint:
+helm-lint: helm-check-dashboards
 	$(HELM) lint deploy/helm/kmail
+
+# helm-template renders the chart with every optional production
+# feature enabled (NetworkPolicy, ServiceMonitor, PrometheusRule,
+# Grafana dashboard ConfigMaps, mTLS) so a single command exercises
+# the full template surface without a cluster.
+helm-template: helm-check-dashboards
+	$(HELM) template deploy/helm/kmail \
+	  --set networkPolicy.enabled=true --set networkPolicy.restrictEgress=true \
+	  --set serviceMonitor.enabled=true --set prometheusRule.enabled=true \
+	  --set grafanaDashboards.enabled=true \
+	  --set mtls.enabled=true --set mtls.issuerRef.name=ca >/dev/null
+	@echo "helm template (all features) rendered OK"
+
+# helm-sync-dashboards mirrors the canonical Grafana dashboards
+# (deploy/grafana/dashboards/) into the chart so the dashboard
+# ConfigMap template can embed them. Run after editing a dashboard.
+helm-sync-dashboards:
+	./scripts/helm-sync-dashboards.sh
+
+# helm-check-dashboards fails if the chart's dashboard mirror has
+# drifted from the canonical source. A cheap CI guard.
+helm-check-dashboards:
+	./scripts/helm-sync-dashboards.sh --check
 
 # loadtest runs the Phase 7 JMAP / SMTP load harness from
 # scripts/loadtest/. Override LOADTEST_ITER / LOADTEST_TPS to

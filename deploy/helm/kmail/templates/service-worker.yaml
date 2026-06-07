@@ -1,0 +1,33 @@
+{{- /*
+  Headless metrics Service for the kmail-worker Deployment.
+
+  The worker serves NO tenant traffic (see worker-deployment.yaml), so
+  unlike the API it never needed a Service for routing. It does, however,
+  expose /metrics, /healthz, and /readyz on `kmailWorker.metricsPort`,
+  and the Prometheus Operator's ServiceMonitor selects scrape targets
+  via a Service's Endpoints. This headless Service (clusterIP: None)
+  gives the operator a stable selector over the worker pods without
+  allocating a virtual IP or implying the worker is load-balanced.
+
+  It is rendered unconditionally because a metrics Service is harmless
+  and useful for any scraper, not just the operator; the ServiceMonitor
+  itself stays gated on `serviceMonitor.enabled`.
+*/ -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "kmail.fullname" . }}-worker
+  labels:
+    {{- include "kmail.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  type: ClusterIP
+  clusterIP: None
+  ports:
+    - name: metrics
+      port: {{ .Values.kmailWorker.metricsPort }}
+      targetPort: metrics
+      protocol: TCP
+  selector:
+    {{- include "kmail.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: worker

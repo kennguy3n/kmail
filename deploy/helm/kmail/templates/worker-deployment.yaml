@@ -42,6 +42,10 @@ spec:
       {{- end }}
     spec:
       serviceAccountName: {{ include "kmail.serviceAccountName" . }}
+      {{- with .Values.kmailWorker.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- include "kmail.topologySpreadConstraints" (dict "root" $ "component" "worker" "constraints" .) | nindent 8 }}
+      {{- end }}
       containers:
         - name: kmail-worker
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
@@ -84,8 +88,16 @@ spec:
             - name: KMAIL_DISABLE_WORKERS
               value: "true"
             {{- if .Values.mtls.enabled }}
+            {{- $stalwartUrl := include "kmail.stalwartMtlsUrl" . }}
+            {{- if $stalwartUrl }}
+            # See deployment-api.yaml for the full rationale. The shared
+            # kmail.stalwartMtlsUrl helper synthesizes the SAN-covered HTTPS
+            # hostname for the in-chart fleet (stalwart.enabled) or an
+            # external fleet (stalwart.external.enabled, e.g. the canary),
+            # and returns "" to fall through to the ConfigMap value.
             - name: KMAIL_STALWART_URL
-              value: {{ printf "https://%s-stalwart-0.%s.%s.svc.cluster.local:8443" (include "kmail.fullname" .) .Values.stalwart.service.headlessName .Release.Namespace | quote }}
+              value: {{ $stalwartUrl | quote }}
+            {{- end }}
             - name: KMAIL_STALWART_TLS_CERT
               value: /etc/kmail/tls/stalwart-client/tls.crt
             - name: KMAIL_STALWART_TLS_KEY
