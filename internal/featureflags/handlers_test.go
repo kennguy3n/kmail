@@ -23,9 +23,10 @@ func discardLogger() *log.Logger { return log.New(io.Discard, "", 0) }
 
 // fakeStore is an in-memory adminStore for handler tests.
 type fakeStore struct {
-	flags     map[string]Flag
-	overrides map[string]Override // key: scopeKey on the (single) test flag set
-	loadErr   error               // when set, loadViews returns it (DB-outage simulation)
+	flags       map[string]Flag
+	overrides   map[string]Override // key: scopeKey on the (single) test flag set
+	loadErr     error               // when set, loadViews returns it (DB-outage simulation)
+	overrideErr error               // when set, SetOverride returns it (partial-write simulation)
 }
 
 func newFakeStore() *fakeStore {
@@ -65,6 +66,9 @@ func (f *fakeStore) DeleteFlag(_ context.Context, key string) error {
 }
 
 func (f *fakeStore) SetOverride(_ context.Context, o Override) (*Override, error) {
+	if f.overrideErr != nil {
+		return nil, f.overrideErr
+	}
 	f.overrides[ovKey(o.FlagKey, o.Scope, o.ScopeID)] = o
 	return &o, nil
 }
@@ -397,6 +401,41 @@ func TestHandlerDeleteDropsCacheWhenRefreshFails(t *testing.T) {
 	}
 	if got := rec.Header().Get("X-Kmail-Stale"); got != "" {
 		t.Errorf("must not serve stale after cache drop; got X-Kmail-Stale=%q", got)
+	}
+}
+
+// TestHandlerPutPartialWriteDropsStaleCache asserts that when a PUT
+// lands a flag upsert but a later override write fails, the
+// stale-serving cache is dropped rather than left holding the pre-write
+// snapshot — otherwise a subsequent outage read could serve a flag
+// state that no committed write matches. A drop is the safe outcome: a
+// later outage read returns 503 instead of stale-wrong data.
+func TestHandlerPutPartialWriteDropsStaleCache(t *testing.T) {
+	store := newFakeStore()
+	store.flags["a"] = Flag{Key: "a", DefaultEnabled: true}
+	h := &Handlers{store: store, logger: discardLogger()}
+
+	// Warm the cache.
+	h.list(httptest.NewRecorder(), authed(httptest.NewRequest(http.MethodGet, "/api/v1/admin/feature-flags", nil)))
+
+	// Upsert succeeds, the override write fails partway through.
+	store.overrideErr = errors.New("write conflict")
+	body := `{"key":"a","default_enabled":false,"overrides":[{"scope":"plan","scope_id":"pro","enabled":true}]}`
+	wrec := httptest.NewRecorder()
+	h.put(wrec, authed(httptest.NewRequest(http.MethodPut, "/api/v1/admin/feature-flags", bytes.NewBufferString(body))))
+	if wrec.Code != http.StatusInternalServerError {
+		t.Fatalf("put: status %d, want 500 on partial-write failure, body %s", wrec.Code, wrec.Body.String())
+	}
+
+	// A later outage read must NOT serve the pre-write snapshot.
+	store.loadErr = context.DeadlineExceeded
+	rec := httptest.NewRecorder()
+	h.list(rec, authed(httptest.NewRequest(http.MethodGet, "/api/v1/admin/feature-flags", nil)))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (cache dropped after partial write)", rec.Code)
+	}
+	if got := rec.Header().Get("X-Kmail-Stale"); got != "" {
+		t.Errorf("must not serve stale after partial-write cache drop; got X-Kmail-Stale=%q", got)
 	}
 }
 

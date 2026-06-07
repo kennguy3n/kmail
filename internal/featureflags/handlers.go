@@ -124,13 +124,29 @@ func (h *Handlers) dropCache() {
 	h.cacheMu.Unlock()
 }
 
+// cacheRefreshBudget bounds the post-write cache reconciliation read.
+// It mirrors the Store's default read deadline so the refresh fails
+// fast against a stalled DB even if the Store was built without its own
+// timeout; the Store's own readContext bounds it tighter when set.
+const cacheRefreshBudget = 5 * time.Second
+
 // refreshCacheAfterWrite reconciles the stale-serving cache with a
 // just-committed mutation. It reloads the view set and re-caches it on
 // success; if that reload fails (e.g. the DB went unavailable right
 // after the write), it drops the cache so a subsequent outage read
 // returns 503 instead of serving a snapshot that no longer matches the
 // committed state (e.g. a just-deleted flag resurfacing).
-func (h *Handlers) refreshCacheAfterWrite(ctx context.Context) {
+//
+// The reconciliation read is deliberately decoupled from the caller's
+// request context: it keeps the request's values (tracing, etc.) but
+// drops its cancellation/deadline and applies its own budget, so a
+// client that disconnects — or one whose deadline was nearly spent by
+// a slow write — doesn't needlessly force the cache to be dropped (and
+// thus degrade a later outage read to 503). The reconciliation already
+// committed; finishing it on the server's terms is correct.
+func (h *Handlers) refreshCacheAfterWrite(parent context.Context) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), cacheRefreshBudget)
+	defer cancel()
 	views, err := h.store.loadViews(ctx)
 	if err != nil {
 		if h.logger != nil {
@@ -220,10 +236,22 @@ func (h *Handlers) put(w http.ResponseWriter, r *http.Request) {
 	// TTL elapsed — surprising for an operator who just made a change
 	// and got an error. The deferred call runs on every return path
 	// below once `mutated` is set.
+	//
+	// The stale-serving cache gets the same treatment: if a write lands
+	// but we bail out before reconciling the cache with the new state
+	// (e.g. a later override op fails), drop it so a subsequent outage
+	// read can't serve the pre-write snapshot. The success and
+	// reload-failure paths set cacheReconciled once they've refreshed or
+	// deliberately dropped it, so this only fires on the partial-write
+	// error paths.
 	var mutated bool
+	var cacheReconciled bool
 	defer func() {
 		if mutated {
 			h.invalidate()
+			if !cacheReconciled {
+				h.dropCache()
+			}
 		}
 	}()
 
@@ -271,10 +299,12 @@ func (h *Handlers) put(w http.ResponseWriter, r *http.Request) {
 		// cached view set no longer reflects committed state. Drop it
 		// rather than risk serving it stale during a later outage.
 		h.dropCache()
+		cacheReconciled = true
 		writeJSON(w, http.StatusOK, map[string]string{"key": in.Key})
 		return
 	}
 	h.cacheViews(views)
+	cacheReconciled = true
 	for _, v := range views {
 		if v.Key == in.Key {
 			writeJSON(w, http.StatusOK, v)
