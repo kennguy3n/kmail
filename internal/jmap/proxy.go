@@ -909,6 +909,32 @@ func shardURLsFrom(ctx context.Context) []string {
 	return v
 }
 
+// shardResolveMemoKey carries a per-request memo so a tenant's
+// shard URLs are resolved from Postgres at most once per request.
+type shardResolveMemoKey struct{}
+
+// shardResolveMemo caches a single resolveShardURLs result for the
+// lifetime of one request. It is consulted by both the degradation
+// health check (ShardsAvailable) and ServeHTTP, which would
+// otherwise each issue the same GetTenantShard query.
+type shardResolveMemo struct {
+	mu     sync.Mutex
+	tenant string
+	urls   []string
+	done   bool
+}
+
+// WithShardResolveMemo installs a per-request shard-resolution memo
+// on the context. When graceful degradation is enabled, both the
+// health check and the proxy's own routing resolve the tenant's
+// shards; without this memo that doubles the per-request Postgres
+// load on every degradation-eligible read. Install it once, outside
+// the degradation middleware, so the seeded context is visible to
+// the health check and to ServeHTTP alike.
+func WithShardResolveMemo(ctx context.Context) context.Context {
+	return context.WithValue(ctx, shardResolveMemoKey{}, &shardResolveMemo{})
+}
+
 // NewProxy builds a Proxy pointed at the configured Stalwart URL.
 func NewProxy(cfg ProxyConfig) (*Proxy, error) {
 	if cfg.StalwartURL == "" {
@@ -1148,8 +1174,6 @@ func (t *shardFailoverTransport) RoundTrip(req *http.Request) (*http.Response, e
 	return nil, lastErr
 }
 
-
-
 // ServeHTTP implements http.Handler. It expects to run behind the
 // OIDC middleware: the acting tenant and KChat user are read from
 // the request context. Missing context values result in 500 because
@@ -1333,6 +1357,37 @@ func (p *Proxy) resolveShardURLs(ctx context.Context, tenantID string) []string 
 	if p.cfg.Shards == nil || tenantID == "" {
 		return nil
 	}
+	// Serve from the per-request memo when one is installed, so a
+	// degradation-eligible read resolves shards from Postgres once
+	// (health check) instead of twice (health check + ServeHTTP).
+	memo, _ := ctx.Value(shardResolveMemoKey{}).(*shardResolveMemo)
+	if memo != nil {
+		memo.mu.Lock()
+		if memo.done && memo.tenant == tenantID {
+			urls := memo.urls
+			memo.mu.Unlock()
+			return urls
+		}
+		memo.mu.Unlock()
+	}
+	urls := p.resolveShardURLsUncached(ctx, tenantID)
+	if memo != nil {
+		memo.mu.Lock()
+		// First resolver for this tenant wins; a later one reuses it
+		// so the memo never flaps within a request.
+		if !memo.done || memo.tenant != tenantID {
+			memo.tenant = tenantID
+			memo.urls = urls
+			memo.done = true
+		} else {
+			urls = memo.urls
+		}
+		memo.mu.Unlock()
+	}
+	return urls
+}
+
+func (p *Proxy) resolveShardURLsUncached(ctx context.Context, tenantID string) []string {
 	primary, err := p.cfg.Shards.GetTenantShard(ctx, tenantID)
 	if err != nil || primary == "" {
 		return nil

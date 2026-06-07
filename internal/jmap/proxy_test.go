@@ -468,6 +468,63 @@ func TestShardFailoverTransport_NonShardPathDrivesDefaultBreaker(t *testing.T) {
 	}
 }
 
+// countingShardResolver wraps a static map and counts GetTenantShard
+// calls so a test can assert the per-request memo collapses the
+// health-check + ServeHTTP double-resolve into one Postgres hit.
+type countingShardResolver struct {
+	primary string
+	calls   int
+}
+
+func (c *countingShardResolver) GetTenantShard(ctx context.Context, tenantID string) (string, error) {
+	c.calls++
+	return c.primary, nil
+}
+
+func (c *countingShardResolver) GetSecondaryShards(ctx context.Context, tenantID string) ([]string, error) {
+	return nil, nil
+}
+
+// TestShardResolveMemoDeduplicatesPerRequest verifies that with a
+// per-request memo installed, two resolveShardURLs calls in the same
+// request (as the degradation health check + ServeHTTP would make)
+// issue only a single GetTenantShard query, and that a fresh request
+// without the memo re-resolves.
+func TestShardResolveMemoDeduplicatesPerRequest(t *testing.T) {
+	p := newTestProxy(t)
+	res := &countingShardResolver{primary: "http://shard-1:8080"}
+	p.cfg.Shards = res
+
+	// Without a memo: each call hits the resolver.
+	bare := context.Background()
+	_ = p.resolveShardURLs(bare, "tenant-1")
+	_ = p.resolveShardURLs(bare, "tenant-1")
+	if res.calls != 2 {
+		t.Fatalf("no-memo: GetTenantShard calls = %d, want 2", res.calls)
+	}
+
+	// With a memo: the second resolve in the same request is served
+	// from the memo.
+	res.calls = 0
+	ctx := WithShardResolveMemo(context.Background())
+	a := p.resolveShardURLs(ctx, "tenant-1")
+	b := p.resolveShardURLs(ctx, "tenant-1")
+	if res.calls != 1 {
+		t.Fatalf("memo: GetTenantShard calls = %d, want 1", res.calls)
+	}
+	if len(a) != 1 || len(b) != 1 || a[0] != "http://shard-1:8080" || b[0] != a[0] {
+		t.Fatalf("memo returned inconsistent urls: a=%v b=%v", a, b)
+	}
+
+	// A new request (new memo) re-resolves.
+	res.calls = 0
+	ctx2 := WithShardResolveMemo(context.Background())
+	_ = p.resolveShardURLs(ctx2, "tenant-1")
+	if res.calls != 1 {
+		t.Fatalf("second request: GetTenantShard calls = %d, want 1", res.calls)
+	}
+}
+
 // fakeSendInterceptor returns a fixed (intercepted, err) pair and
 // optionally writes a canned body to the ResponseWriter. Used to
 // pin the proxy's handling of the four (intercepted, err) corners

@@ -433,7 +433,14 @@ func main() {
 		if degradation == nil {
 			logger.Printf("jmap: graceful degradation requested (KMAIL_DEGRADATION_ENABLED) but disabled — KMAIL_VALKEY_URL unset, no cache to serve from")
 		} else {
-			jmapHandler = degradation.Wrap(proxy)
+			// Install a per-request shard-resolution memo outside the
+			// degradation middleware so the health check (ShardsAvailable)
+			// and the proxy's own routing share one GetTenantShard query
+			// instead of each issuing their own on every eligible read.
+			degraded := degradation.Wrap(proxy)
+			jmapHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				degraded.ServeHTTP(w, r.WithContext(jmap.WithShardResolveMemo(r.Context())))
+			})
 			logger.Printf("jmap: graceful degradation enabled — read paths fall back to last-known-good Valkey cache during a Stalwart outage")
 		}
 	}

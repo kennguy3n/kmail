@@ -180,6 +180,14 @@ type recordingWriter struct {
 	truncated bool
 }
 
+// Unwrap exposes the underlying ResponseWriter so http.ResponseController
+// (used by httputil.ReverseProxy) can still discover Flusher/Hijacker
+// support through the wrapper, preserving response streaming on the
+// pass-through path.
+func (r *recordingWriter) Unwrap() http.ResponseWriter {
+	return r.ResponseWriter
+}
+
 func (r *recordingWriter) WriteHeader(status int) {
 	r.status = status
 	r.ResponseWriter.WriteHeader(status)
