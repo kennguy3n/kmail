@@ -79,12 +79,12 @@ export default function StoragePlacementAdmin() {
             e.preventDefault();
             void onSave();
           }}
-          style={{ display: "grid", gap: "0.5rem", maxWidth: 480 }}
+          className="grid max-w-[480px] gap-2"
         >
           <fieldset>
             <legend>Allowed regions</legend>
             {regions.map((r) => (
-              <label key={r.code} style={{ display: "block" }}>
+              <label key={r.code} className="block">
                 <input
                   type="checkbox"
                   checked={policy.countries.includes(r.code)}

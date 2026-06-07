@@ -60,7 +60,7 @@ export default function ExportAdmin() {
       {error && <p className="kmail-error">{error}</p>}
 
       {selectedTenantId && (
-        <form onSubmit={onSubmit} style={{ display: "grid", gap: "0.5rem", maxWidth: 480 }}>
+        <form onSubmit={onSubmit} className="grid max-w-[480px] gap-2">
           <h3>New export</h3>
           <label>
             Format
@@ -92,7 +92,7 @@ export default function ExportAdmin() {
         </form>
       )}
 
-      <h3 style={{ marginTop: "1.5rem" }}>Job history</h3>
+      <h3 className="mt-6">Job history</h3>
       <table>
         <thead>
           <tr><th>Format</th><th>Scope</th><th>Status</th><th>Created</th><th>Download</th></tr>

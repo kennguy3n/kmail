@@ -17,59 +17,25 @@
 
 import { useCallback, useEffect, useState } from "react";
 
+import { cn } from "../../lib/cn";
+
 import {
   getEmailAnalytics,
   type EmailAnalytics as AnalyticsData,
 } from "../../api/smart";
 import { useTenantSelection } from "./useTenantSelection";
 
-const PAGE_STYLE: React.CSSProperties = { padding: "1rem 2rem" };
-const TABLE_STYLE: React.CSSProperties = {
-  borderCollapse: "collapse",
-  width: "100%",
-  fontSize: "0.875rem",
-  marginTop: "0.5rem",
-};
-const TH_STYLE: React.CSSProperties = {
-  textAlign: "left",
-  borderBottom: "2px solid #ccc",
-  padding: "4px 8px",
-};
-const TD_STYLE: React.CSSProperties = {
-  padding: "4px 8px",
-  borderBottom: "1px solid #eee",
-};
-const CARD_STYLE: React.CSSProperties = {
-  display: "inline-block",
-  padding: "12px 20px",
-  border: "1px solid #ddd",
-  borderRadius: "8px",
-  marginRight: "12px",
-  marginBottom: "12px",
-  textAlign: "center",
-};
-const NUM_STYLE: React.CSSProperties = { fontSize: "1.5rem", fontWeight: 700 };
-const LABEL_STYLE: React.CSSProperties = {
-  fontSize: "0.75rem",
-  color: "#666",
-  marginTop: 2,
-};
-const BAR_BASE: React.CSSProperties = {
-  background: "#4c8bf5",
-  height: "12px",
-  borderRadius: "3px",
-  transition: "width 0.3s ease",
-};
-const BAR_RECV: React.CSSProperties = {
-  ...BAR_BASE,
-  background: "#34a853",
-};
-const GRID_STYLE: React.CSSProperties = {
-  display: "grid",
-  gridTemplateColumns: "1fr 1fr",
-  gap: "1rem",
-  marginTop: "1rem",
-};
+const PAGE_STYLE = "px-8 py-4";
+const TABLE_STYLE = "mt-2 w-full border-collapse text-sm";
+const TH_STYLE = "border-b-2 border-border px-2 py-1 text-left";
+const TD_STYLE = "border-b border-border px-2 py-1";
+const CARD_STYLE =
+  "mb-3 mr-3 inline-block rounded-lg border border-border bg-surface px-5 py-3 text-center";
+const NUM_STYLE = "text-2xl font-bold";
+const LABEL_STYLE = "mt-0.5 text-xs text-fg-muted";
+const BAR_BASE = "h-3 rounded-[3px] bg-info transition-[width] duration-300";
+const BAR_RECV = "h-3 rounded-[3px] bg-success transition-[width] duration-300";
+const GRID_STYLE = "mt-4 grid grid-cols-2 gap-4";
 
 export default function EmailAnalytics() {
   const { tenants, selectedTenantId, selectTenant } = useTenantSelection();
@@ -93,14 +59,14 @@ export default function EmailAnalytics() {
   }, [load]);
 
   return (
-    <section className="kmail-admin-page" style={PAGE_STYLE}>
+    <section className={cn("kmail-admin-page", PAGE_STYLE)}>
       <h2>Email Analytics</h2>
-      <p style={{ color: "#555", marginBottom: "0.5rem" }}>
+      <p className="mb-2 text-fg-muted">
         Activity dashboard for the authenticated user&rsquo;s mailbox.
         Tenant-wide rollups are a documented follow-up.
       </p>
 
-      <div style={{ display: "flex", gap: "1rem", alignItems: "center", marginBottom: "1rem" }}>
+      <div className="mb-4 flex items-center gap-4">
         <label>
           Tenant{" "}
           <select
@@ -131,47 +97,47 @@ export default function EmailAnalytics() {
         </button>
       </div>
 
-      {error && <p style={{ color: "red" }}>{error}</p>}
+      {error && <p className="text-danger-fg">{error}</p>}
 
       {data && (
         <>
           {/* ── KPI cards ──────────────────────────────────── */}
-          <div style={{ marginBottom: "1rem" }}>
-            <div style={CARD_STYLE}>
-              <div style={NUM_STYLE}>{data.total_sent}</div>
-              <div style={LABEL_STYLE}>Sent</div>
+          <div className="mb-4">
+            <div className={CARD_STYLE}>
+              <div className={NUM_STYLE}>{data.total_sent}</div>
+              <div className={LABEL_STYLE}>Sent</div>
             </div>
-            <div style={CARD_STYLE}>
-              <div style={NUM_STYLE}>{data.total_received}</div>
-              <div style={LABEL_STYLE}>Received</div>
+            <div className={CARD_STYLE}>
+              <div className={NUM_STYLE}>{data.total_received}</div>
+              <div className={LABEL_STYLE}>Received</div>
             </div>
-            <div style={CARD_STYLE}>
-              <div style={NUM_STYLE}>
+            <div className={CARD_STYLE}>
+              <div className={NUM_STYLE}>
                 {data.avg_response_seconds > 0
                   ? `${(data.avg_response_seconds / 3600).toFixed(1)}h`
                   : "—"}
               </div>
-              <div style={LABEL_STYLE}>
+              <div className={LABEL_STYLE}>
                 Avg response ({data.response_sample_size} threads)
               </div>
             </div>
-            <div style={CARD_STYLE}>
-              <div style={NUM_STYLE}>
+            <div className={CARD_STYLE}>
+              <div className={NUM_STYLE}>
                 {data.range_start} — {data.range_end}
               </div>
-              <div style={LABEL_STYLE}>Date range</div>
+              <div className={LABEL_STYLE}>Date range</div>
             </div>
           </div>
 
           {/* ── Daily chart ────────────────────────────────── */}
           <h3>Daily volume</h3>
-          <table style={TABLE_STYLE}>
+          <table className={TABLE_STYLE}>
             <thead>
               <tr>
-                <th style={TH_STYLE}>Date</th>
-                <th style={TH_STYLE}>Sent</th>
-                <th style={{ ...TH_STYLE, width: "40%" }}>Chart (blue=sent, green=recv)</th>
-                <th style={TH_STYLE}>Received</th>
+                <th className={TH_STYLE}>Date</th>
+                <th className={TH_STYLE}>Sent</th>
+                <th className={cn(TH_STYLE, "w-2/5")}>Chart (blue=sent, green=recv)</th>
+                <th className={TH_STYLE}>Received</th>
               </tr>
             </thead>
             <tbody>
@@ -184,41 +150,41 @@ export default function EmailAnalytics() {
                 const recvPct = (d.received / maxDay) * 100;
                 return (
                   <tr key={d.date}>
-                    <td style={TD_STYLE}>{d.date}</td>
-                    <td style={TD_STYLE}>{d.sent}</td>
-                    <td style={TD_STYLE}>
-                      <div style={{ display: "flex", gap: 2 }}>
-                        <div style={{ ...BAR_BASE, width: `${sentPct}%` }} />
-                        <div style={{ ...BAR_RECV, width: `${recvPct}%` }} />
+                    <td className={TD_STYLE}>{d.date}</td>
+                    <td className={TD_STYLE}>{d.sent}</td>
+                    <td className={TD_STYLE}>
+                      <div className="flex gap-0.5">
+                        <div className={BAR_BASE} style={{ width: `${sentPct}%` }} />
+                        <div className={BAR_RECV} style={{ width: `${recvPct}%` }} />
                       </div>
                     </td>
-                    <td style={TD_STYLE}>{d.received}</td>
+                    <td className={TD_STYLE}>{d.received}</td>
                   </tr>
                 );
               })}
             </tbody>
           </table>
 
-          <div style={GRID_STYLE}>
+          <div className={GRID_STYLE}>
             {/* ── Top recipients ──────────────────────────── */}
             <div>
               <h3>Top recipients</h3>
-              <table style={TABLE_STYLE}>
+              <table className={TABLE_STYLE}>
                 <thead>
                   <tr>
-                    <th style={TH_STYLE}>#</th>
-                    <th style={TH_STYLE}>Recipient</th>
-                    <th style={TH_STYLE}>Emails</th>
+                    <th className={TH_STYLE}>#</th>
+                    <th className={TH_STYLE}>Recipient</th>
+                    <th className={TH_STYLE}>Emails</th>
                   </tr>
                 </thead>
                 <tbody>
                   {data.top_recipients.map((r, i) => (
                     <tr key={r.email}>
-                      <td style={TD_STYLE}>{i + 1}</td>
-                      <td style={TD_STYLE}>
+                      <td className={TD_STYLE}>{i + 1}</td>
+                      <td className={TD_STYLE}>
                         {r.name ? `${r.name} <${r.email}>` : r.email}
                       </td>
-                      <td style={TD_STYLE}>{r.count}</td>
+                      <td className={TD_STYLE}>{r.count}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -228,22 +194,22 @@ export default function EmailAnalytics() {
             {/* ── Top senders ─────────────────────────────── */}
             <div>
               <h3>Top senders</h3>
-              <table style={TABLE_STYLE}>
+              <table className={TABLE_STYLE}>
                 <thead>
                   <tr>
-                    <th style={TH_STYLE}>#</th>
-                    <th style={TH_STYLE}>Sender</th>
-                    <th style={TH_STYLE}>Emails</th>
+                    <th className={TH_STYLE}>#</th>
+                    <th className={TH_STYLE}>Sender</th>
+                    <th className={TH_STYLE}>Emails</th>
                   </tr>
                 </thead>
                 <tbody>
                   {data.top_senders.map((s, i) => (
                     <tr key={s.email}>
-                      <td style={TD_STYLE}>{i + 1}</td>
-                      <td style={TD_STYLE}>
+                      <td className={TD_STYLE}>{i + 1}</td>
+                      <td className={TD_STYLE}>
                         {s.name ? `${s.name} <${s.email}>` : s.email}
                       </td>
-                      <td style={TD_STYLE}>{s.count}</td>
+                      <td className={TD_STYLE}>{s.count}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -253,7 +219,7 @@ export default function EmailAnalytics() {
 
           {/* ── Busiest hours ─────────────────────────────── */}
           <h3>Activity by hour (received messages)</h3>
-          <div style={{ display: "flex", alignItems: "flex-end", gap: 2, height: 120, marginTop: "0.5rem" }}>
+          <div className="mt-2 flex h-[120px] items-end gap-0.5">
             {data.busiest_hours.map((h) => {
               const maxHour = Math.max(...data.busiest_hours.map((hh) => hh.count), 1);
               const pct = (h.count / maxHour) * 100;
@@ -261,10 +227,8 @@ export default function EmailAnalytics() {
                 <div
                   key={h.hour}
                   title={`${h.hour}:00 — ${h.count} emails`}
+                  className="flex-1 rounded-t-[3px] bg-info"
                   style={{
-                    flex: 1,
-                    background: "#4c8bf5",
-                    borderRadius: "3px 3px 0 0",
                     height: `${pct}%`,
                     minHeight: h.count > 0 ? 4 : 0,
                   }}
@@ -272,16 +236,9 @@ export default function EmailAnalytics() {
               );
             })}
           </div>
-          <div
-            style={{
-              display: "flex",
-              gap: 2,
-              fontSize: "0.65rem",
-              color: "#888",
-            }}
-          >
+          <div className="flex gap-0.5 text-[0.65rem] text-fg-muted">
             {data.busiest_hours.map((h) => (
-              <div key={h.hour} style={{ flex: 1, textAlign: "center" }}>
+              <div key={h.hour} className="flex-1 text-center">
                 {h.hour}
               </div>
             ))}

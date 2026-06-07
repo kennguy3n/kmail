@@ -1,6 +1,8 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 
+import { cn } from "../../lib/cn";
+
 import { jmapClient } from "../../api/jmap";
 import type {
   Calendar,
@@ -171,17 +173,17 @@ export default function EventCreate() {
   const heading = isEdit ? "Edit event" : "New event";
 
   return (
-    <section style={styles.root}>
-      <header style={styles.header}>
-        <h2 style={styles.title}>{heading}</h2>
+    <section className={styles.root}>
+      <header className={styles.header}>
+        <h2 className={styles.title}>{heading}</h2>
       </header>
       {error && (
-        <div style={styles.error} role="alert">
+        <div className={styles.error} role="alert">
           <span>{error}</span>
           <button
             type="button"
             onClick={() => setError(null)}
-            style={styles.errorDismiss}
+            className={styles.errorDismiss}
             aria-label="Dismiss error"
           >
             ×
@@ -189,18 +191,18 @@ export default function EventCreate() {
         </div>
       )}
       {(loadingEvent || loadingCalendars) && (
-        <p style={styles.muted}>Loading…</p>
+        <p className={styles.muted}>Loading…</p>
       )}
-      <form onSubmit={handleSubmit} style={styles.form}>
-        <div style={styles.row}>
-          <label htmlFor="event-calendar" style={styles.label}>
+      <form onSubmit={handleSubmit} className={styles.form}>
+        <div className={styles.row}>
+          <label htmlFor="event-calendar" className={styles.label}>
             Calendar
           </label>
           <select
             id="event-calendar"
             value={calendarId}
             onChange={(e) => setCalendarId(e.target.value)}
-            style={styles.select}
+            className={styles.select}
             disabled={!calendars || calendars.length === 0}
             required
           >
@@ -216,8 +218,8 @@ export default function EventCreate() {
             )}
           </select>
         </div>
-        <div style={styles.row}>
-          <label htmlFor="event-title" style={styles.label}>
+        <div className={styles.row}>
+          <label htmlFor="event-title" className={styles.label}>
             Title
           </label>
           <input
@@ -225,12 +227,12 @@ export default function EventCreate() {
             type="text"
             value={title}
             onChange={(e) => setTitle(e.target.value)}
-            style={styles.input}
+            className={styles.input}
             required
           />
         </div>
-        <div style={styles.row}>
-          <label htmlFor="event-start" style={styles.label}>
+        <div className={styles.row}>
+          <label htmlFor="event-start" className={styles.label}>
             Start
           </label>
           <input
@@ -238,12 +240,12 @@ export default function EventCreate() {
             type="datetime-local"
             value={startLocal}
             onChange={(e) => setStartLocal(e.target.value)}
-            style={styles.input}
+            className={styles.input}
             required
           />
         </div>
-        <div style={styles.row}>
-          <label htmlFor="event-end" style={styles.label}>
+        <div className={styles.row}>
+          <label htmlFor="event-end" className={styles.label}>
             End
           </label>
           <input
@@ -251,12 +253,12 @@ export default function EventCreate() {
             type="datetime-local"
             value={endLocal}
             onChange={(e) => setEndLocal(e.target.value)}
-            style={styles.input}
+            className={styles.input}
             required
           />
         </div>
-        <div style={styles.row}>
-          <label htmlFor="event-location" style={styles.label}>
+        <div className={styles.row}>
+          <label htmlFor="event-location" className={styles.label}>
             Location
           </label>
           <input
@@ -264,12 +266,12 @@ export default function EventCreate() {
             type="text"
             value={location}
             onChange={(e) => setLocation(e.target.value)}
-            style={styles.input}
+            className={styles.input}
             placeholder="Room, URL, or address"
           />
         </div>
-        <div style={styles.row}>
-          <label htmlFor="event-participants" style={styles.label}>
+        <div className={styles.row}>
+          <label htmlFor="event-participants" className={styles.label}>
             Participants
           </label>
           <input
@@ -277,7 +279,7 @@ export default function EventCreate() {
             type="text"
             value={participantsRaw}
             onChange={(e) => setParticipantsRaw(e.target.value)}
-            style={styles.input}
+            className={styles.input}
             placeholder="name@example.com, Other Person <other@example.com>"
           />
         </div>
@@ -286,9 +288,9 @@ export default function EventCreate() {
           startLocal={startLocal}
           endLocal={endLocal}
         />
-        <div style={styles.row}>
-          <label style={styles.label}>RSVP</label>
-          <label style={styles.inlineCheckbox}>
+        <div className={styles.row}>
+          <label className={styles.label}>RSVP</label>
+          <label className={styles.inlineCheckbox}>
             <input
               type="checkbox"
               checked={rsvpRequired}
@@ -297,8 +299,8 @@ export default function EventCreate() {
             Require RSVP from participants
           </label>
         </div>
-        <div style={styles.row}>
-          <label htmlFor="event-status" style={styles.label}>
+        <div className={styles.row}>
+          <label htmlFor="event-status" className={styles.label}>
             Status
           </label>
           <select
@@ -307,34 +309,33 @@ export default function EventCreate() {
             onChange={(e) =>
               setStatus(e.target.value as typeof status)
             }
-            style={styles.select}
+            className={styles.select}
           >
             <option value="confirmed">Confirmed</option>
             <option value="tentative">Tentative</option>
             <option value="cancelled">Cancelled</option>
           </select>
         </div>
-        <div style={styles.bodyRow}>
-          <label htmlFor="event-description" style={styles.label}>
+        <div className={styles.bodyRow}>
+          <label htmlFor="event-description" className={styles.label}>
             Description
           </label>
           <textarea
             id="event-description"
             value={description}
             onChange={(e) => setDescription(e.target.value)}
-            style={styles.textarea}
+            className={styles.textarea}
             rows={6}
           />
         </div>
-        <div style={styles.buttonRow}>
+        <div className={styles.buttonRow}>
           <button
             type="submit"
             disabled={!canSubmit}
-            style={{
-              ...styles.primaryButton,
-              opacity: canSubmit ? 1 : 0.6,
-              cursor: canSubmit ? "pointer" : "not-allowed",
-            }}
+            className={cn(
+              styles.primaryButton,
+              !canSubmit && "cursor-not-allowed opacity-60",
+            )}
           >
             {isSubmitting
               ? isEdit
@@ -347,7 +348,7 @@ export default function EventCreate() {
           <button
             type="button"
             onClick={() => navigate(-1)}
-            style={styles.secondaryButton}
+            className={styles.secondaryButton}
             disabled={isSubmitting}
           >
             Cancel
@@ -483,118 +484,32 @@ function errorMessage(err: unknown): string {
   return "Unknown error";
 }
 
-const styles: Record<string, React.CSSProperties> = {
-  root: {
-    padding: "1rem",
-    maxWidth: "760px",
-  },
-  header: {
-    marginBottom: "0.75rem",
-  },
-  title: {
-    margin: 0,
-    fontSize: "1.25rem",
-  },
-  error: {
-    padding: "0.5rem 0.75rem",
-    background: "#fee2e2",
-    color: "#991b1b",
-    borderRadius: "0.25rem",
-    marginBottom: "0.75rem",
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "space-between",
-    gap: "0.5rem",
-  },
-  errorDismiss: {
-    background: "transparent",
-    border: "none",
-    color: "#991b1b",
-    fontSize: "1.1rem",
-    cursor: "pointer",
-    lineHeight: 1,
-    padding: "0 0.25rem",
-  },
-  muted: {
-    color: "#6b7280",
-    fontStyle: "italic",
-  },
-  form: {
-    display: "flex",
-    flexDirection: "column",
-    gap: "0.5rem",
-    border: "1px solid #e5e7eb",
-    borderRadius: "0.5rem",
-    padding: "1rem",
-    background: "#fff",
-  },
-  row: {
-    display: "grid",
-    gridTemplateColumns: "120px 1fr",
-    alignItems: "center",
-    gap: "0.5rem",
-  },
-  bodyRow: {
-    display: "grid",
-    gridTemplateColumns: "120px 1fr",
-    alignItems: "start",
-    gap: "0.5rem",
-  },
-  label: {
-    fontSize: "0.85rem",
-    color: "#374151",
-    fontWeight: 600,
-  },
-  input: {
-    padding: "0.4rem 0.6rem",
-    fontSize: "0.9rem",
-    border: "1px solid #d1d5db",
-    borderRadius: "0.25rem",
-  },
-  select: {
-    padding: "0.4rem 0.6rem",
-    fontSize: "0.9rem",
-    border: "1px solid #d1d5db",
-    borderRadius: "0.25rem",
-    background: "#fff",
-  },
-  textarea: {
-    padding: "0.4rem 0.6rem",
-    fontSize: "0.9rem",
-    border: "1px solid #d1d5db",
-    borderRadius: "0.25rem",
-    resize: "vertical",
-    minHeight: "6rem",
-    font: "inherit",
-  },
-  inlineCheckbox: {
-    display: "flex",
-    alignItems: "center",
-    gap: "0.4rem",
-    fontSize: "0.9rem",
-  },
-  buttonRow: {
-    display: "flex",
-    gap: "0.5rem",
-    marginTop: "0.5rem",
-  },
-  primaryButton: {
-    padding: "0.4rem 1rem",
-    fontSize: "0.9rem",
-    background: "#2563eb",
-    color: "#fff",
-    border: "none",
-    borderRadius: "0.25rem",
-  },
-  secondaryButton: {
-    padding: "0.4rem 1rem",
-    fontSize: "0.9rem",
-    background: "#fff",
-    color: "#374151",
-    border: "1px solid #d1d5db",
-    borderRadius: "0.25rem",
-    cursor: "pointer",
-  },
+/** Theme-aware Tailwind class recipes for the event create/edit form. */
+const styles: Record<string, string> = {
+  root: "max-w-[760px] p-4",
+  header: "mb-3",
+  title: "m-0 text-xl font-semibold",
+  error:
+    "mb-3 flex items-center justify-between gap-2 rounded-md bg-danger-bg px-3 py-2 text-danger-fg",
+  errorDismiss:
+    "cursor-pointer border-0 bg-transparent px-1 text-lg leading-none text-danger-fg",
+  muted: "italic text-fg-muted",
+  form: "flex flex-col gap-2 rounded-lg border border-border bg-surface p-4",
+  row: "grid grid-cols-[120px_1fr] items-center gap-2",
+  bodyRow: "grid grid-cols-[120px_1fr] items-start gap-2",
+  label: "text-sm font-semibold text-fg-muted",
+  input:
+    "rounded-md border border-border bg-surface px-2.5 py-1.5 text-sm text-fg outline-none focus-visible:border-primary focus-visible:ring-2 focus-visible:ring-primary-subtle",
+  select:
+    "rounded-md border border-border bg-surface px-2.5 py-1.5 text-sm text-fg outline-none focus-visible:border-primary focus-visible:ring-2 focus-visible:ring-primary-subtle",
+  textarea:
+    "min-h-24 resize-y rounded-md border border-border bg-surface px-2.5 py-1.5 font-[inherit] text-sm text-fg outline-none focus-visible:border-primary focus-visible:ring-2 focus-visible:ring-primary-subtle",
+  inlineCheckbox: "flex items-center gap-1.5 text-sm",
+  buttonRow: "mt-2 flex gap-2",
+  primaryButton:
+    "cursor-pointer rounded-md border-0 bg-primary px-4 py-1.5 text-sm font-medium text-primary-fg transition-colors hover:bg-primary-hover",
+  secondaryButton:
+    "cursor-pointer rounded-md border border-border bg-surface px-4 py-1.5 text-sm text-fg transition-colors hover:bg-surface-hover",
 };
 
 interface FreeBusyResp {
@@ -651,22 +566,27 @@ function FreeBusyCheck({
   };
 
   return (
-    <div style={styles.row}>
-      <label style={styles.label}>Availability</label>
+    <div className={styles.row}>
+      <label className={styles.label}>Availability</label>
       <div>
-        <button type="button" onClick={onClick} disabled={loading}>
+        <button
+          type="button"
+          onClick={onClick}
+          disabled={loading}
+          className={styles.secondaryButton}
+        >
           {loading ? "Checking…" : "Check availability"}
         </button>
-        {error && <span style={{ color: "#b91c1c", marginLeft: "0.5rem" }}>{error}</span>}
+        {error && <span className="ml-2 text-danger-fg">{error}</span>}
         {busy && busy.length === 0 && (
-          <span style={{ color: "#16a34a", marginLeft: "0.5rem" }}>
+          <span className="ml-2 text-success-fg">
             All clear in this window.
           </span>
         )}
         {busy && busy.length > 0 && (
-          <ul style={{ marginTop: "0.5rem" }}>
+          <ul className="mt-2">
             {busy.map((b, i) => (
-              <li key={i} style={{ color: "#b45309" }}>
+              <li key={i} className="text-warning-fg">
                 Busy: {new Date(b.start).toLocaleString()} – {new Date(b.end).toLocaleString()}
               </li>
             ))}

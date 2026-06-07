@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useId, useRef } from "react";
 import type { ReactNode } from "react";
 import { createPortal } from "react-dom";
+import { X } from "lucide-react";
 
-import styles from "./Modal.module.css";
+import { cn } from "../../lib/cn";
 
 export type ModalSize = "sm" | "md" | "lg";
 
@@ -23,6 +24,16 @@ export interface ModalProps {
 
 const FOCUSABLE =
   'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+// Explicit rem widths (24/32/48) rather than Tailwind's named scale
+// (max-w-sm/lg/3xl). The named values happen to match today, but the
+// literal widths come straight from the old Modal.module.css and can't
+// silently drift if the Tailwind max-width scale is ever themed.
+const sizeClass: Record<ModalSize, string> = {
+  sm: "max-w-[24rem]",
+  md: "max-w-[32rem]",
+  lg: "max-w-[48rem]",
+};
 
 // Ref-counted body scroll lock shared across all Modal instances. A
 // per-modal capture/restore breaks with two open modals: when the
@@ -86,7 +97,9 @@ export function Modal({
       if (!dialog) return;
       const focusable = Array.from(
         dialog.querySelectorAll<HTMLElement>(FOCUSABLE),
-      ).filter((el) => el.offsetParent !== null || el === document.activeElement);
+      ).filter(
+        (el) => el.offsetParent !== null || el === document.activeElement,
+      );
       if (focusable.length === 0) {
         event.preventDefault();
         return;
@@ -134,14 +147,17 @@ export function Modal({
 
   return createPortal(
     <div
-      className={styles.overlay}
+      className="fixed inset-0 z-modal flex items-start justify-center overflow-y-auto bg-overlay p-4 pt-[10vh] backdrop-blur-sm"
       onMouseDown={(e) => {
         if (closeOnOverlayClick && e.target === e.currentTarget) onClose();
       }}
     >
       <div
         ref={dialogRef}
-        className={`${styles.dialog} ${styles[size]}`}
+        className={cn(
+          "flex max-h-[calc(100vh-14vh)] w-full animate-scale-in flex-col rounded-xl border border-border bg-elevated shadow-lg",
+          sizeClass[size],
+        )}
         role="dialog"
         aria-modal="true"
         aria-labelledby={title ? titleId : undefined}
@@ -150,22 +166,26 @@ export function Modal({
         onKeyDown={handleKeyDown}
       >
         {title && (
-          <header className={styles.header}>
-            <h2 id={titleId} className={styles.title}>
+          <header className="flex shrink-0 items-center justify-between gap-4 border-b border-border px-5 py-4">
+            <h2 id={titleId} className="text-lg font-semibold text-fg">
               {title}
             </h2>
             <button
               type="button"
-              className={styles.close}
+              className="-mr-1 inline-flex size-8 shrink-0 items-center justify-center rounded-md text-fg-muted transition-colors hover:bg-surface-hover hover:text-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
               onClick={onClose}
               aria-label="Close dialog"
             >
-              ✕
+              <X className="size-5" aria-hidden="true" />
             </button>
           </header>
         )}
-        <div className={styles.body}>{children}</div>
-        {footer && <footer className={styles.footer}>{footer}</footer>}
+        <div className="flex-1 overflow-y-auto px-5 py-4">{children}</div>
+        {footer && (
+          <footer className="flex shrink-0 items-center justify-end gap-2 border-t border-border px-5 py-4">
+            {footer}
+          </footer>
+        )}
       </div>
     </div>,
     document.body,

@@ -32,6 +32,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 
+import { cn } from "../lib/cn";
+
 import {
   PLAN_CATALOG,
   SignupApiError,
@@ -199,10 +201,10 @@ function SignupForm({ onRedirect }: { onRedirect: (url: string) => void }) {
   const selectedPlan = planById(plan);
 
   return (
-    <main style={styles.page}>
-      <div style={styles.card}>
-        <h1 style={styles.h1}>Create your KMail workspace</h1>
-        <p style={styles.subtitle}>
+    <main className={styles.page}>
+      <div className={styles.card}>
+        <h1 className={styles.h1}>Create your KMail workspace</h1>
+        <p className={styles.subtitle}>
           Private, encrypted email and calendar for your team. Start your
           subscription in minutes.
         </p>
@@ -212,32 +214,32 @@ function SignupForm({ onRedirect }: { onRedirect: (url: string) => void }) {
         {/* Step 0 — account email */}
         {step === 0 && (
           <div>
-            <label style={styles.label} htmlFor="signup-email">
+            <label className={styles.label} htmlFor="signup-email">
               Work email
             </label>
             <input
               id="signup-email"
               type="email"
               autoComplete="email"
-              style={styles.input}
+              className={styles.input}
               value={email}
               onChange={(e) => setEmail(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && next()}
               placeholder="you@yourcompany.com"
               required
             />
-            <p style={styles.help}>
+            <p className={styles.help}>
               We&apos;ll send a verification and welcome email here after
               checkout.
             </p>
             {error && (
-              <p role="alert" style={styles.error}>
+              <p role="alert" className={styles.error}>
                 {error}
               </p>
             )}
-            <div style={styles.navRow}>
+            <div className={styles.navRow}>
               <span />
-              <button type="button" style={styles.submit} onClick={next}>
+              <button type="button" className={styles.submit} onClick={next}>
                 Continue
               </button>
             </div>
@@ -247,13 +249,13 @@ function SignupForm({ onRedirect }: { onRedirect: (url: string) => void }) {
         {/* Step 1 — company + domain */}
         {step === 1 && (
           <div>
-            <label style={styles.label} htmlFor="signup-org">
+            <label className={styles.label} htmlFor="signup-org">
               Organization name
             </label>
             <input
               id="signup-org"
               type="text"
-              style={styles.input}
+              className={styles.input}
               value={orgName}
               onChange={(e) => setOrgName(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && next()}
@@ -261,34 +263,34 @@ function SignupForm({ onRedirect }: { onRedirect: (url: string) => void }) {
               required
             />
 
-            <label style={styles.label} htmlFor="signup-domain">
-              Email domain <span style={styles.optional}>(optional)</span>
+            <label className={styles.label} htmlFor="signup-domain">
+              Email domain <span className={styles.optional}>(optional)</span>
             </label>
             <input
               id="signup-domain"
               type="text"
               autoComplete="off"
-              style={styles.input}
+              className={styles.input}
               value={domain}
               onChange={(e) => setDomain(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && next()}
               placeholder="acme.com"
             />
-            <p style={styles.help}>
+            <p className={styles.help}>
               The domain you&apos;ll send and receive mail from. You can add or
               change this later in the DNS setup wizard.
             </p>
 
             {error && (
-              <p role="alert" style={styles.error}>
+              <p role="alert" className={styles.error}>
                 {error}
               </p>
             )}
-            <div style={styles.navRow}>
-              <button type="button" style={styles.back} onClick={() => go(0)}>
+            <div className={styles.navRow}>
+              <button type="button" className={styles.back} onClick={() => go(0)}>
                 Back
               </button>
-              <button type="button" style={styles.submit} onClick={next}>
+              <button type="button" className={styles.submit} onClick={next}>
                 Continue
               </button>
             </div>
@@ -298,9 +300,9 @@ function SignupForm({ onRedirect }: { onRedirect: (url: string) => void }) {
         {/* Step 2 — plan */}
         {step === 2 && (
           <div>
-            <fieldset style={styles.fieldset}>
-              <legend style={styles.label}>Choose a plan</legend>
-              <div style={styles.planGrid} role="radiogroup" aria-label="Plan">
+            <fieldset className={styles.fieldset}>
+              <legend className={styles.label}>Choose a plan</legend>
+              <div className={styles.planGrid} role="radiogroup" aria-label="Plan">
                 {PLAN_CATALOG.map((tier) => {
                   const selected = tier.id === plan;
                   return (
@@ -310,14 +312,14 @@ function SignupForm({ onRedirect }: { onRedirect: (url: string) => void }) {
                       role="radio"
                       aria-checked={selected}
                       onClick={() => setPlan(tier.id)}
-                      style={{
-                        ...styles.planCard,
-                        ...(selected ? styles.planCardSelected : {}),
-                      }}
+                      className={cn(
+                        styles.planCard,
+                        selected && styles.planCardSelected,
+                      )}
                     >
-                      <span style={styles.planName}>{tier.name}</span>
-                      <span style={styles.planDesc}>{tier.description}</span>
-                      <ul style={styles.featureList}>
+                      <span className={styles.planName}>{tier.name}</span>
+                      <span className={styles.planDesc}>{tier.description}</span>
+                      <ul className={styles.featureList}>
                         {tier.features.map((f) => (
                           <li key={f}>{f}</li>
                         ))}
@@ -328,15 +330,15 @@ function SignupForm({ onRedirect }: { onRedirect: (url: string) => void }) {
               </div>
             </fieldset>
             {error && (
-              <p role="alert" style={styles.error}>
+              <p role="alert" className={styles.error}>
                 {error}
               </p>
             )}
-            <div style={styles.navRow}>
-              <button type="button" style={styles.back} onClick={() => go(1)}>
+            <div className={styles.navRow}>
+              <button type="button" className={styles.back} onClick={() => go(1)}>
                 Back
               </button>
-              <button type="button" style={styles.submit} onClick={next}>
+              <button type="button" className={styles.submit} onClick={next}>
                 Continue
               </button>
             </div>
@@ -346,7 +348,7 @@ function SignupForm({ onRedirect }: { onRedirect: (url: string) => void }) {
         {/* Step 3 — review + pay */}
         {step === 3 && (
           <form onSubmit={onSubmit} noValidate>
-            <dl style={styles.review}>
+            <dl className={styles.review}>
               <ReviewRow label="Work email" value={email.trim()} onEdit={() => go(0)} />
               <ReviewRow label="Organization" value={orgName.trim()} onEdit={() => go(1)} />
               {domain.trim() && (
@@ -362,26 +364,26 @@ function SignupForm({ onRedirect }: { onRedirect: (url: string) => void }) {
                 onEdit={() => go(2)}
               />
             </dl>
-            <p style={styles.help}>
+            <p className={styles.help}>
               You&apos;ll complete payment securely on Stripe. After checkout we
               provision your tenant and email you to verify and finish setup.
             </p>
 
             {error && (
-              <p role="alert" style={styles.error}>
+              <p role="alert" className={styles.error}>
                 {error}
               </p>
             )}
-            <div style={styles.navRow}>
+            <div className={styles.navRow}>
               <button
                 type="button"
-                style={styles.back}
+                className={styles.back}
                 onClick={() => go(2)}
                 disabled={submitting}
               >
                 Back
               </button>
-              <button type="submit" style={styles.submit} disabled={submitting}>
+              <button type="submit" className={styles.submit} disabled={submitting}>
                 {submitting ? "Redirecting to checkout…" : "Continue to payment"}
               </button>
             </div>
@@ -395,23 +397,23 @@ function SignupForm({ onRedirect }: { onRedirect: (url: string) => void }) {
 /** Stepper renders the horizontal progress rail for the wizard. */
 function Stepper({ current }: { current: number }) {
   return (
-    <ol style={styles.stepper} aria-label="Signup progress">
+    <ol className={styles.stepper} aria-label="Signup progress">
       {WIZARD_STEPS.map((label, i) => {
         const state =
           i < current ? "done" : i === current ? "current" : "todo";
         return (
-          <li key={label} style={styles.step}>
+          <li key={label} className={styles.step}>
             <span
               aria-current={state === "current" ? "step" : undefined}
-              style={{
-                ...styles.stepDot,
-                ...(state === "current" ? styles.stepDotCurrent : {}),
-                ...(state === "done" ? styles.stepDotDone : {}),
-              }}
+              className={cn(
+                styles.stepDot,
+                state === "current" && styles.stepDotCurrent,
+                state === "done" && styles.stepDotDone,
+              )}
             >
               {i + 1}
             </span>
-            <span style={styles.stepLabel}>{label}</span>
+            <span className={styles.stepLabel}>{label}</span>
           </li>
         );
       })}
@@ -430,11 +432,11 @@ function ReviewRow({
   onEdit: () => void;
 }) {
   return (
-    <div style={styles.reviewRow}>
-      <dt style={styles.reviewLabel}>{label}</dt>
-      <dd style={styles.reviewValue}>
+    <div className={styles.reviewRow}>
+      <dt className={styles.reviewLabel}>{label}</dt>
+      <dd className={styles.reviewValue}>
         <span>{value}</span>
-        <button type="button" style={styles.editLink} onClick={onEdit}>
+        <button type="button" className={styles.editLink} onClick={onEdit}>
           Edit
         </button>
       </dd>
@@ -536,20 +538,20 @@ function SignupProcessing({
   }, [id, pollIntervalMs, pollTimeoutMs, navigate]);
 
   return (
-    <main style={styles.page}>
-      <div style={styles.card}>
+    <main className={styles.page}>
+      <div className={styles.card}>
         {phase === "working" && (
           <>
-            <h1 style={styles.h1}>Setting up your workspace…</h1>
-            <p style={styles.subtitle}>
+            <h1 className={styles.h1}>Setting up your workspace…</h1>
+            <p className={styles.subtitle}>
               Payment received. We&apos;re provisioning your tenant and
               creating your admin account. This usually takes a few seconds.
             </p>
-            <div role="status" aria-live="polite" style={styles.spinner}>
+            <div role="status" aria-live="polite" className={styles.spinner}>
               Working…
             </div>
             {error && (
-              <p style={styles.softError}>
+              <p className={styles.softError}>
                 Still working ({error}). Retrying…
               </p>
             )}
@@ -557,38 +559,38 @@ function SignupProcessing({
         )}
         {phase === "failed" && (
           <>
-            <h1 style={styles.h1}>Payment didn&apos;t go through</h1>
-            <p style={styles.subtitle}>
+            <h1 className={styles.h1}>Payment didn&apos;t go through</h1>
+            <p className={styles.subtitle}>
               We couldn&apos;t complete your subscription. No charge was made.
               You can try signing up again.
             </p>
-            <a href="/signup" style={styles.linkButton}>
+            <a href="/signup" className={styles.linkButton}>
               Start over
             </a>
           </>
         )}
         {phase === "expired" && (
           <>
-            <h1 style={styles.h1}>Your checkout session expired</h1>
-            <p style={styles.subtitle}>
+            <h1 className={styles.h1}>Your checkout session expired</h1>
+            <p className={styles.subtitle}>
               The payment session timed out before it was completed. Please
               start a new signup.
             </p>
-            <a href="/signup" style={styles.linkButton}>
+            <a href="/signup" className={styles.linkButton}>
               Start over
             </a>
           </>
         )}
         {phase === "timeout" && (
           <>
-            <h1 style={styles.h1}>This is taking longer than expected</h1>
-            <p style={styles.subtitle}>
+            <h1 className={styles.h1}>This is taking longer than expected</h1>
+            <p className={styles.subtitle}>
               Your payment went through, but provisioning hasn&apos;t finished
               yet. It may still complete on its own — try refreshing in a few
               minutes. If the problem persists, please contact support and
               we&apos;ll finish setting up your workspace.
             </p>
-            <a href="mailto:support@kmail.kchat.dev" style={styles.linkButton}>
+            <a href="mailto:support@kmail.kchat.dev" className={styles.linkButton}>
               Contact support
             </a>
           </>
@@ -602,14 +604,14 @@ function SignupProcessing({
 
 function SignupCancelled() {
   return (
-    <main style={styles.page}>
-      <div style={styles.card}>
-        <h1 style={styles.h1}>Checkout cancelled</h1>
-        <p style={styles.subtitle}>
+    <main className={styles.page}>
+      <div className={styles.card}>
+        <h1 className={styles.h1}>Checkout cancelled</h1>
+        <p className={styles.subtitle}>
           You cancelled before completing payment, so no workspace was created
           and you weren&apos;t charged.
         </p>
-        <a href="/signup" style={styles.linkButton}>
+        <a href="/signup" className={styles.linkButton}>
           Back to signup
         </a>
       </div>
@@ -619,181 +621,44 @@ function SignupCancelled() {
 
 // --- styles --------------------------------------------------------
 
-const styles: Record<string, React.CSSProperties> = {
-  page: {
-    minHeight: "100vh",
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    background: "#0f172a",
-    padding: "2rem",
-  },
-  card: {
-    width: "100%",
-    maxWidth: 720,
-    background: "#ffffff",
-    borderRadius: 12,
-    padding: "2.5rem",
-    boxShadow: "0 10px 40px rgba(0,0,0,0.25)",
-  },
-  h1: { margin: "0 0 0.5rem", fontSize: "1.6rem", color: "#0f172a" },
-  subtitle: { margin: "0 0 1.5rem", color: "#475569", lineHeight: 1.5 },
-  label: {
-    display: "block",
-    fontWeight: 600,
-    margin: "1rem 0 0.35rem",
-    color: "#1e293b",
-  },
-  input: {
-    width: "100%",
-    padding: "0.65rem 0.75rem",
-    borderRadius: 8,
-    border: "1px solid #cbd5e1",
-    fontSize: "1rem",
-    boxSizing: "border-box",
-  },
-  fieldset: { border: "none", padding: 0, margin: "1.25rem 0 0" },
-  planGrid: {
-    display: "grid",
-    gridTemplateColumns: "repeat(3, 1fr)",
-    gap: "0.75rem",
-  },
-  planCard: {
-    textAlign: "left",
-    border: "2px solid #e2e8f0",
-    borderRadius: 10,
-    padding: "1rem",
-    background: "#f8fafc",
-    cursor: "pointer",
-    display: "flex",
-    flexDirection: "column",
-    gap: "0.4rem",
-  },
-  planCardSelected: { borderColor: "#2563eb", background: "#eff6ff" },
-  planName: { fontWeight: 700, fontSize: "1.1rem", color: "#0f172a" },
-  planDesc: { fontSize: "0.85rem", color: "#475569" },
-  featureList: {
-    margin: "0.25rem 0 0",
-    paddingLeft: "1.1rem",
-    fontSize: "0.8rem",
-    color: "#334155",
-  },
-  submit: {
-    padding: "0.8rem 1.4rem",
-    borderRadius: 8,
-    border: "none",
-    background: "#2563eb",
-    color: "#fff",
-    fontSize: "1rem",
-    fontWeight: 600,
-    cursor: "pointer",
-  },
-  back: {
-    padding: "0.8rem 1.4rem",
-    borderRadius: 8,
-    border: "1px solid #cbd5e1",
-    background: "#fff",
-    color: "#1e293b",
-    fontSize: "1rem",
-    fontWeight: 600,
-    cursor: "pointer",
-  },
-  navRow: {
-    marginTop: "1.5rem",
-    display: "flex",
-    justifyContent: "space-between",
-    alignItems: "center",
-    gap: "0.75rem",
-  },
-  help: {
-    margin: "0.5rem 0 0",
-    fontSize: "0.85rem",
-    color: "#64748b",
-    lineHeight: 1.5,
-  },
-  optional: { fontWeight: 400, color: "#94a3b8" },
-  stepper: {
-    display: "flex",
-    listStyle: "none",
-    padding: 0,
-    margin: "0 0 1.75rem",
-    gap: "0.5rem",
-  },
-  step: {
-    display: "flex",
-    alignItems: "center",
-    gap: "0.4rem",
-    flex: 1,
-    fontSize: "0.8rem",
-    color: "#64748b",
-    minWidth: 0,
-  },
-  stepDot: {
-    display: "inline-flex",
-    alignItems: "center",
-    justifyContent: "center",
-    width: 26,
-    height: 26,
-    borderRadius: "50%",
-    background: "#e2e8f0",
-    color: "#475569",
-    fontWeight: 700,
-    fontSize: "0.8rem",
-    flexShrink: 0,
-  },
-  stepDotCurrent: { background: "#2563eb", color: "#fff" },
-  stepDotDone: { background: "#16a34a", color: "#fff" },
-  stepLabel: { whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" },
-  review: { margin: "0.5rem 0 0", display: "grid", gap: "0.5rem" },
-  reviewRow: {
-    display: "flex",
-    flexDirection: "column",
-    gap: "0.15rem",
-    padding: "0.6rem 0",
-    borderBottom: "1px solid #e2e8f0",
-  },
-  reviewLabel: { fontSize: "0.8rem", color: "#64748b", fontWeight: 600 },
-  reviewValue: {
-    margin: 0,
-    display: "flex",
-    justifyContent: "space-between",
-    alignItems: "center",
-    gap: "0.5rem",
-    color: "#0f172a",
-    fontSize: "1rem",
-  },
-  editLink: {
-    border: "none",
-    background: "none",
-    color: "#2563eb",
-    cursor: "pointer",
-    fontSize: "0.85rem",
-    fontWeight: 600,
-    padding: 0,
-  },
-  error: {
-    color: "#b91c1c",
-    background: "#fef2f2",
-    border: "1px solid #fecaca",
-    borderRadius: 8,
-    padding: "0.6rem 0.75rem",
-    margin: "1rem 0 0",
-  },
-  softError: { color: "#92400e", marginTop: "1rem", fontSize: "0.9rem" },
-  spinner: {
-    marginTop: "1.5rem",
-    fontSize: "1.1rem",
-    color: "#2563eb",
-    fontWeight: 600,
-  },
-  linkButton: {
-    display: "inline-block",
-    marginTop: "1.5rem",
-    padding: "0.7rem 1.2rem",
-    borderRadius: 8,
-    background: "#2563eb",
-    color: "#fff",
-    textDecoration: "none",
-    fontWeight: 600,
-  },
+/** Theme-aware Tailwind class recipes for the signup wizard. */
+const styles: Record<string, string> = {
+  page: "flex min-h-screen items-center justify-center bg-[#0f172a] p-8",
+  card: "w-full max-w-[720px] rounded-xl bg-white p-10 shadow-[0_10px_40px_rgba(0,0,0,0.25)]",
+  h1: "mb-2 mt-0 text-2xl font-semibold text-[#0f172a]",
+  subtitle: "mb-6 mt-0 leading-relaxed text-[#475569]",
+  label: "mb-1.5 mt-4 block font-semibold text-[#1e293b]",
+  input:
+    "box-border w-full rounded-lg border border-[#cbd5e1] px-3 py-2.5 text-base outline-none focus-visible:border-[#2563eb] focus-visible:ring-2 focus-visible:ring-[#bfdbfe]",
+  fieldset: "m-0 mt-5 border-none p-0",
+  planGrid: "grid grid-cols-3 gap-3",
+  planCard:
+    "flex cursor-pointer flex-col gap-1.5 rounded-[10px] border-2 border-[#e2e8f0] bg-[#f8fafc] p-4 text-left transition-colors hover:border-[#cbd5e1]",
+  planCardSelected: "border-[#2563eb] bg-[#eff6ff]",
+  planName: "text-lg font-bold text-[#0f172a]",
+  planDesc: "text-sm text-[#475569]",
+  featureList: "ml-4 mt-1 list-disc text-xs text-[#334155]",
+  submit:
+    "cursor-pointer rounded-lg border-none bg-[#2563eb] px-5 py-3 text-base font-semibold text-white transition-colors hover:bg-[#1d4ed8]",
+  back: "cursor-pointer rounded-lg border border-[#cbd5e1] bg-white px-5 py-3 text-base font-semibold text-[#1e293b] transition-colors hover:bg-[#f1f5f9]",
+  navRow: "mt-6 flex items-center justify-between gap-3",
+  help: "mt-2 text-sm leading-relaxed text-[#64748b]",
+  optional: "font-normal text-[#94a3b8]",
+  stepper: "mb-7 flex list-none gap-2 p-0",
+  step: "flex min-w-0 flex-1 items-center gap-1.5 text-sm text-[#64748b]",
+  stepDot:
+    "inline-flex size-[26px] shrink-0 items-center justify-center rounded-full bg-[#e2e8f0] text-sm font-bold text-[#475569]",
+  stepDotCurrent: "bg-[#2563eb] text-white",
+  stepDotDone: "bg-[#16a34a] text-white",
+  stepLabel: "truncate",
+  review: "mt-2 grid gap-2",
+  reviewRow: "flex flex-col gap-0.5 border-b border-[#e2e8f0] py-2.5",
+  reviewLabel: "text-sm font-semibold text-[#64748b]",
+  reviewValue: "m-0 flex items-center justify-between gap-2 text-base text-[#0f172a]",
+  editLink: "cursor-pointer border-none bg-transparent p-0 text-sm font-semibold text-[#2563eb] hover:underline",
+  error: "mt-4 rounded-lg border border-[#fecaca] bg-[#fef2f2] px-3 py-2.5 text-[#b91c1c]",
+  softError: "mt-4 text-sm text-[#92400e]",
+  spinner: "mt-6 text-lg font-semibold text-[#2563eb]",
+  linkButton:
+    "mt-6 inline-block rounded-lg bg-[#2563eb] px-5 py-2.5 font-semibold text-white no-underline hover:bg-[#1d4ed8]",
 };

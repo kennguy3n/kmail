@@ -11,10 +11,53 @@
  * `aria-live` visually-hidden announcer region).
  */
 
+/* Design tokens + per-theme semantic colours load first so every
+   downstream layer (Tailwind theme mapping, reset, utilities) can
+   read the CSS custom properties. */
 @import "./tokens.css";
 @import "./themes/light.css";
 @import "./themes/dark.css";
-@import "./reset.css";
+
+/* Tailwind v4 — we import the `theme` and `utilities` layers but
+   intentionally skip Preflight: KMail already ships an opinionated,
+   token-aware reset (`reset.css`) and Preflight would clobber its
+   element defaults (link colour, heading rhythm, list styling). The
+   small base layer below restores the one Preflight behaviour that
+   utilities depend on (border defaults).
+
+   `reset.css` is imported into the `base` layer (not unlayered): an
+   unlayered import always outranks layered styles, so its element
+   defaults (e.g. `a { color: var(--color-primary) }`) would beat
+   Tailwind utilities like `text-fg-muted` / `hover:no-underline` on
+   `<a>`/`<Link>`. In `base` it sits below `utilities`, so utilities
+   win as intended. */
+@layer theme, base, components, utilities;
+@import "tailwindcss/theme.css" layer(theme);
+@import "tailwindcss/utilities.css" layer(utilities);
+@import "./reset.css" layer(base);
+
+/* Map the semantic design tokens onto Tailwind's theme namespaces. */
+@config "../../tailwind.config.ts";
+
+/* Shared `kmail-*` component classes (admin pages, secure portal, …). */
+@import "./components.css";
+
+/* `data-theme="dark"` is written to <html> by hooks/useTheme. Register
+   it as the `dark:` variant for explicit dark-only tweaks. */
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
+/* Tailwind border/ring/divide utilities assume Preflight's default of
+   `border-style: solid` + a default border colour. Restore just that
+   so `border`, `ring`, and `divide-*` render without Preflight. */
+@layer base {
+  *,
+  ::before,
+  ::after {
+    border-width: 0;
+    border-style: solid;
+    border-color: var(--color-border, currentColor);
+  }
+}
 
 /* Screen-reader-only: visually hidden but available to AT. */
 .visually-hidden {

@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 
+import { cn } from "../../lib/cn";
+
 import { jmapClient } from "../../api/jmap";
 import {
   createSignature,
@@ -96,47 +98,47 @@ export default function SignatureEditor() {
   );
 
   return (
-    <section style={styles.root}>
-      <header style={styles.header}>
-        <h2 style={styles.title}>Signatures</h2>
-        <Link to="/mail" style={styles.backLink}>
+    <section className={styles.root}>
+      <header className={styles.header}>
+        <h2 className={styles.title}>Signatures</h2>
+        <Link to="/mail" className={styles.backLink}>
           ← Back to mail
         </Link>
       </header>
 
-      <div style={styles.layout}>
-        <aside style={styles.list}>
-          <button type="button" onClick={startNew} style={styles.newButton}>
+      <div className={styles.layout}>
+        <aside className={styles.list}>
+          <button type="button" onClick={startNew} className={styles.newButton}>
             + New signature
           </button>
           {signatures.length === 0 && (
-            <p style={styles.muted}>No signatures yet.</p>
+            <p className={styles.muted}>No signatures yet.</p>
           )}
-          <ul style={styles.ul}>
+          <ul className={styles.ul}>
             {signatures.map((s) => (
               <li key={s.id}>
                 <button
                   type="button"
                   onClick={() => startEdit(s)}
-                  style={{
-                    ...styles.listItem,
-                    ...(editingId === s.id ? styles.listItemActive : {}),
-                  }}
+                  className={cn(
+                    styles.listItem,
+                    editingId === s.id && styles.listItemActive,
+                  )}
                 >
-                  <span style={styles.listItemName}>
+                  <span className={styles.listItemName}>
                     {s.name}
-                    {s.isDefault && <span style={styles.defaultBadge}>default</span>}
+                    {s.isDefault && <span className={styles.defaultBadge}>default</span>}
                   </span>
-                  <span style={styles.listItemScope}>{scopeLabel(s)}</span>
+                  <span className={styles.listItemScope}>{scopeLabel(s)}</span>
                 </button>
               </li>
             ))}
           </ul>
         </aside>
 
-        <div style={styles.editor}>
-          {info && <div style={styles.info}>{info}</div>}
-          <label style={styles.fieldLabel} htmlFor="sig-name">
+        <div className={styles.editor}>
+          {info && <div className={styles.info}>{info}</div>}
+          <label className={styles.fieldLabel} htmlFor="sig-name">
             Name
           </label>
           <input
@@ -145,10 +147,10 @@ export default function SignatureEditor() {
             value={draft.name}
             onChange={(e) => setDraft((d) => ({ ...d, name: e.target.value }))}
             placeholder="e.g. Work signature"
-            style={styles.input}
+            className={styles.input}
           />
 
-          <label style={styles.fieldLabel} htmlFor="sig-identity">
+          <label className={styles.fieldLabel} htmlFor="sig-identity">
             Scope (From identity)
           </label>
           <select
@@ -160,7 +162,7 @@ export default function SignatureEditor() {
                 identityEmail: e.target.value === "" ? null : e.target.value,
               }))
             }
-            style={styles.input}
+            className={styles.input}
           >
             <option value="">Any identity</option>
             {identities.map((id) => (
@@ -170,7 +172,7 @@ export default function SignatureEditor() {
             ))}
           </select>
 
-          <label style={styles.fieldLabel}>Content</label>
+          <label className={styles.fieldLabel}>Content</label>
           <RichTextEditor
             value={draft.html}
             onChange={(html) => setDraft((d) => ({ ...d, html }))}
@@ -179,7 +181,7 @@ export default function SignatureEditor() {
             minHeight={140}
           />
 
-          <label style={styles.checkboxRow}>
+          <label className={styles.checkboxRow}>
             <input
               type="checkbox"
               checked={draft.isDefault}
@@ -190,15 +192,15 @@ export default function SignatureEditor() {
             Default for this scope (auto-appended on compose/reply/forward)
           </label>
 
-          <div style={styles.buttonRow}>
-            <button type="button" onClick={onSave} style={styles.primaryButton}>
+          <div className={styles.buttonRow}>
+            <button type="button" onClick={onSave} className={styles.primaryButton}>
               {editingId ? "Save changes" : "Create signature"}
             </button>
             {editingId && (
               <button
                 type="button"
                 onClick={() => onDelete(editingId)}
-                style={styles.dangerButton}
+                className={styles.dangerButton}
               >
                 Delete
               </button>
@@ -210,100 +212,34 @@ export default function SignatureEditor() {
   );
 }
 
-const styles: Record<string, React.CSSProperties> = {
-  root: { padding: "1rem", maxWidth: "1000px" },
-  header: {
-    display: "flex",
-    alignItems: "baseline",
-    justifyContent: "space-between",
-    marginBottom: "1rem",
-  },
-  title: { margin: 0, fontSize: "1.25rem" },
-  backLink: { color: "#2563eb", textDecoration: "none", fontSize: "0.9rem" },
-  layout: { display: "grid", gridTemplateColumns: "240px 1fr", gap: "1rem" },
-  list: { borderRight: "1px solid #e5e7eb", paddingRight: "1rem" },
-  newButton: {
-    width: "100%",
-    padding: "0.4rem",
-    marginBottom: "0.5rem",
-    background: "#2563eb",
-    color: "#fff",
-    border: "none",
-    borderRadius: "0.25rem",
-    cursor: "pointer",
-    fontSize: "0.85rem",
-  },
-  ul: { listStyle: "none", margin: 0, padding: 0, display: "grid", gap: "0.25rem" },
-  listItem: {
-    display: "flex",
-    flexDirection: "column",
-    gap: "0.15rem",
-    width: "100%",
-    padding: "0.4rem 0.5rem",
-    background: "#fff",
-    border: "1px solid #e5e7eb",
-    borderRadius: "0.25rem",
-    cursor: "pointer",
-    textAlign: "left",
-  },
-  listItemActive: { background: "#eff6ff", borderColor: "#2563eb" },
-  listItemName: {
-    display: "flex",
-    alignItems: "center",
-    gap: "0.4rem",
-    fontSize: "0.9rem",
-    fontWeight: 600,
-    color: "#111827",
-  },
-  listItemScope: { fontSize: "0.75rem", color: "#6b7280" },
-  defaultBadge: {
-    fontSize: "0.65rem",
-    fontWeight: 700,
-    color: "#1d4ed8",
-    background: "#dbeafe",
-    padding: "0.05rem 0.3rem",
-    borderRadius: "999px",
-  },
-  editor: { display: "grid", gap: "0.5rem", alignContent: "start" },
-  fieldLabel: { fontSize: "0.8rem", fontWeight: 600, color: "#374151" },
-  input: {
-    padding: "0.4rem 0.6rem",
-    fontSize: "0.9rem",
-    border: "1px solid #d1d5db",
-    borderRadius: "0.25rem",
-  },
-  checkboxRow: {
-    display: "flex",
-    alignItems: "center",
-    gap: "0.4rem",
-    fontSize: "0.85rem",
-    color: "#374151",
-  },
-  buttonRow: { display: "flex", gap: "0.5rem", marginTop: "0.25rem" },
-  primaryButton: {
-    padding: "0.45rem 0.9rem",
-    background: "#2563eb",
-    color: "#fff",
-    border: "none",
-    borderRadius: "0.25rem",
-    cursor: "pointer",
-    fontSize: "0.85rem",
-  },
-  dangerButton: {
-    padding: "0.45rem 0.9rem",
-    background: "#fff",
-    color: "#991b1b",
-    border: "1px solid #fca5a5",
-    borderRadius: "0.25rem",
-    cursor: "pointer",
-    fontSize: "0.85rem",
-  },
-  info: {
-    padding: "0.4rem 0.6rem",
-    background: "#ecfdf5",
-    color: "#065f46",
-    borderRadius: "0.25rem",
-    fontSize: "0.85rem",
-  },
-  muted: { color: "#6b7280", fontStyle: "italic", fontSize: "0.85rem" },
+/** Theme-aware Tailwind class recipes for the Signature editor. */
+const styles: Record<string, string> = {
+  root: "max-w-[1000px] p-4",
+  header: "mb-4 flex items-baseline justify-between",
+  title: "m-0 text-xl font-semibold",
+  backLink: "text-sm text-primary no-underline hover:underline",
+  layout: "grid grid-cols-[240px_1fr] gap-4",
+  list: "border-r border-border pr-4",
+  newButton:
+    "mb-2 w-full cursor-pointer rounded-md border-0 bg-primary p-1.5 text-sm font-medium text-primary-fg transition-colors hover:bg-primary-hover",
+  ul: "m-0 grid list-none gap-1 p-0",
+  listItem:
+    "flex w-full cursor-pointer flex-col gap-0.5 rounded-md border border-border bg-surface px-2 py-1.5 text-left transition-colors hover:bg-surface-hover",
+  listItemActive: "border-primary bg-primary-subtle",
+  listItemName: "flex items-center gap-1.5 text-sm font-semibold text-fg",
+  listItemScope: "text-xs text-fg-muted",
+  defaultBadge:
+    "rounded-pill bg-primary-subtle px-1 py-px text-[0.65rem] font-bold text-primary",
+  editor: "grid content-start gap-2",
+  fieldLabel: "text-xs font-semibold text-fg-muted",
+  input:
+    "rounded-md border border-border bg-surface px-2.5 py-1.5 text-sm text-fg outline-none focus-visible:border-primary focus-visible:ring-2 focus-visible:ring-primary-subtle",
+  checkboxRow: "flex items-center gap-1.5 text-sm text-fg-muted",
+  buttonRow: "mt-1 flex gap-2",
+  primaryButton:
+    "cursor-pointer rounded-md border-0 bg-primary px-3.5 py-1.5 text-sm font-medium text-primary-fg transition-colors hover:bg-primary-hover",
+  dangerButton:
+    "cursor-pointer rounded-md border border-danger/40 bg-surface px-3.5 py-1.5 text-sm text-danger-fg transition-colors hover:bg-danger-bg",
+  info: "rounded-md bg-success-bg px-2.5 py-1.5 text-sm text-success-fg",
+  muted: "text-sm italic text-fg-muted",
 };

@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
 
+import { cn } from "../../lib/cn";
+
 import { jmapClient } from "../../api/jmap";
 import { snoozeEmail } from "../../api/snooze";
 import { categorize, formatAddresses, getPriorityInbox, type EmailCategory, type PriorityItem } from "../../api/smart";
@@ -27,27 +29,15 @@ const CATEGORY_TABS: { label: string; value: EmailCategory | "all" }[] = [
   { label: "Forums", value: "forums" },
 ];
 
-const CATEGORY_TAB_STYLE: React.CSSProperties = {
-  display: "flex",
-  gap: 0,
-  borderBottom: "2px solid #ddd",
-  marginBottom: 8,
-  padding: "0 8px",
-};
+const CATEGORY_TAB_STYLE = "flex border-b-2 border-border mb-2 px-2";
 
-function categoryTabBtn(
-  active: boolean,
-): React.CSSProperties {
-  return {
-    padding: "6px 14px",
-    cursor: "pointer",
-    border: "none",
-    background: "none",
-    borderBottom: active ? "2px solid #4c8bf5" : "2px solid transparent",
-    fontWeight: active ? 600 : 400,
-    color: active ? "#4c8bf5" : "#555",
-    marginBottom: -2,
-  };
+function categoryTabBtn(active: boolean): string {
+  return cn(
+    "-mb-0.5 cursor-pointer border-0 border-b-2 bg-transparent px-3.5 py-1.5 transition-colors",
+    active
+      ? "border-primary font-semibold text-primary"
+      : "border-transparent font-normal text-fg-muted hover:text-fg",
+  );
 }
 
 export default function Inbox() {
@@ -845,18 +835,18 @@ export default function Inbox() {
   const selectedCount = selectedIds.size;
 
   return (
-    <section style={layoutStyles.root}>
-      <aside style={layoutStyles.sidebar}>
-        <div style={layoutStyles.sidebarHeader}>
-          <h2 style={layoutStyles.sidebarTitle}>Mail</h2>
-          <Link to="/mail/compose" style={layoutStyles.composeButton}>
+    <section className={layoutStyles.root}>
+      <aside className={layoutStyles.sidebar}>
+        <div className={layoutStyles.sidebarHeader}>
+          <h2 className={layoutStyles.sidebarTitle}>Mail</h2>
+          <Link to="/mail/compose" className={layoutStyles.composeButton}>
             Compose
           </Link>
         </div>
         {isLoadingMailboxes ? (
-          <p style={layoutStyles.muted}>Loading mailboxes…</p>
+          <p className={layoutStyles.muted}>Loading mailboxes…</p>
         ) : (
-          <ul style={layoutStyles.mailboxList}>
+          <ul className={layoutStyles.mailboxList}>
             {sortedMailboxes.map((mb) => {
               const isSelected = mb.id === selectedMailbox;
               const isJunk = mb.role === "junk";
@@ -878,26 +868,24 @@ export default function Inbox() {
                       e.preventDefault();
                       handleDropOnTarget(mb.id);
                     }}
-                    style={{
-                      ...layoutStyles.mailboxItem,
-                      ...(isSelected ? layoutStyles.mailboxItemActive : {}),
-                      ...(isJunk ? layoutStyles.mailboxItemJunk : {}),
-                      ...(dropTarget === mb.id
-                        ? layoutStyles.dropTargetActive
-                        : {}),
-                    }}
+                    className={cn(
+                      layoutStyles.mailboxItem,
+                      isSelected && layoutStyles.mailboxItemActive,
+                      isJunk && layoutStyles.mailboxItemJunk,
+                      dropTarget === mb.id && layoutStyles.dropTargetActive,
+                    )}
                     title={isJunk ? "Spam / junk mail" : mb.name}
                   >
                     <span>
                       {isJunk && (
-                        <span aria-hidden="true" style={layoutStyles.junkIcon}>
+                        <span aria-hidden="true" className={layoutStyles.junkIcon}>
                           ⚠
                         </span>
                       )}
                       {mb.name}
                     </span>
                     {mb.unreadEmails > 0 && (
-                      <span style={layoutStyles.unreadBadge}>
+                      <span className={layoutStyles.unreadBadge}>
                         {mb.unreadEmails}
                       </span>
                     )}
@@ -907,23 +895,23 @@ export default function Inbox() {
             })}
           </ul>
         )}
-        <div style={layoutStyles.labelSection}>
-          <div style={layoutStyles.labelSectionHeader}>
-            <span style={layoutStyles.labelSectionTitle}>Labels</span>
-            <Link to="/mail/labels" style={layoutStyles.labelManageLink}>
+        <div className={layoutStyles.labelSection}>
+          <div className={layoutStyles.labelSectionHeader}>
+            <span className={layoutStyles.labelSectionTitle}>Labels</span>
+            <Link to="/mail/labels" className={layoutStyles.labelManageLink}>
               Manage
             </Link>
           </div>
           {labels.length === 0 ? (
-            <p style={layoutStyles.muted}>No labels yet.</p>
+            <p className={layoutStyles.muted}>No labels yet.</p>
           ) : (
-            <ul style={layoutStyles.mailboxList}>
+            <ul className={layoutStyles.mailboxList}>
               {labelFilter && (
                 <li>
                   <button
                     type="button"
                     onClick={() => setLabelFilter(null)}
-                    style={layoutStyles.labelClear}
+                    className={layoutStyles.labelClear}
                   >
                     Clear label filter
                   </button>
@@ -954,22 +942,18 @@ export default function Inbox() {
                         e.preventDefault();
                         handleDropOnTarget(target);
                       }}
-                      style={{
-                        ...layoutStyles.mailboxItem,
-                        ...(active ? layoutStyles.mailboxItemActive : {}),
-                        ...(dropTarget === target
-                          ? layoutStyles.dropTargetActive
-                          : {}),
-                      }}
+                      className={cn(
+                        layoutStyles.mailboxItem,
+                        active && layoutStyles.mailboxItemActive,
+                        dropTarget === target && layoutStyles.dropTargetActive,
+                      )}
                       title={`Filter by ${label.name} (drag an email here to apply)`}
                     >
-                      <span style={layoutStyles.labelNameWrap}>
+                      <span className={layoutStyles.labelNameWrap}>
                         <span
                           aria-hidden="true"
-                          style={{
-                            ...layoutStyles.labelDot,
-                            background: label.color,
-                          }}
+                          className={layoutStyles.labelDot}
+                          style={{ background: label.color }}
                         />
                         {label.name}
                       </span>
@@ -981,17 +965,17 @@ export default function Inbox() {
           )}
         </div>
       </aside>
-      <main style={layoutStyles.main}>
-        <form style={layoutStyles.searchBar} onSubmit={handleSubmitSearch}>
+      <main className={layoutStyles.main}>
+        <form className={layoutStyles.searchBar} onSubmit={handleSubmitSearch}>
           <input
             type="search"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder="Search mail…"
             aria-label="Search mail"
-            style={layoutStyles.searchInput}
+            className={layoutStyles.searchInput}
           />
-          <label style={layoutStyles.searchScopeLabel}>
+          <label className={layoutStyles.searchScopeLabel}>
             <input
               type="checkbox"
               checked={searchScope === "global"}
@@ -1001,26 +985,26 @@ export default function Inbox() {
             />
             All mailboxes
           </label>
-          <button type="submit" style={layoutStyles.searchButton}>
+          <button type="submit" className={layoutStyles.searchButton}>
             Search
           </button>
           {inSearchMode && (
             <button
               type="button"
               onClick={handleClearSearch}
-              style={layoutStyles.searchClear}
+              className={layoutStyles.searchClear}
             >
               Clear
             </button>
           )}
         </form>
         {error && (
-          <div style={layoutStyles.error}>
+          <div className={layoutStyles.error}>
             <span>{error}</span>
             <button
               type="button"
               onClick={() => setError(null)}
-              style={layoutStyles.errorDismiss}
+              className={layoutStyles.errorDismiss}
               aria-label="Dismiss error"
             >
               ×
@@ -1028,7 +1012,7 @@ export default function Inbox() {
           </div>
         )}
         {inSearchMode && (
-          <p style={layoutStyles.searchStatus}>
+          <p className={layoutStyles.searchStatus}>
             {isSearching
               ? `Searching for “${submittedQuery}”…`
               : `Results for “${submittedQuery}” (${
@@ -1041,28 +1025,28 @@ export default function Inbox() {
           </p>
         )}
         {!inSearchMode && isLoadingEmails && (
-          <p style={layoutStyles.muted}>Loading emails…</p>
+          <p className={layoutStyles.muted}>Loading emails…</p>
         )}
         {!inSearchMode &&
           !isLoadingEmails &&
           emails &&
           emails.length === 0 && (
-            <p style={layoutStyles.muted}>No messages.</p>
+            <p className={layoutStyles.muted}>No messages.</p>
           )}
         {inSearchMode &&
           !isSearching &&
           searchResults &&
           searchResults.length === 0 && (
-            <p style={layoutStyles.muted}>No matching messages.</p>
+            <p className={layoutStyles.muted}>No matching messages.</p>
           )}
         {/* WS7: category tabs — shown when viewing the normal inbox. */}
         {!inSearchMode && !isPriorityView && (
-          <div style={CATEGORY_TAB_STYLE}>
+          <div className={CATEGORY_TAB_STYLE}>
             {CATEGORY_TABS.map((tab) => (
               <button
                 key={tab.value}
                 type="button"
-                style={categoryTabBtn(activeCategory === tab.value)}
+                className={categoryTabBtn(activeCategory === tab.value)}
                 onClick={() => setActiveCategory(tab.value)}
               >
                 {tab.label}
@@ -1073,13 +1057,13 @@ export default function Inbox() {
         {/* WS7: priority view replaces the standard list when active. */}
         {isPriorityView && (
           <div>
-            <h3 style={{ margin: "0 0 8px" }}>Priority Inbox</h3>
-            {isPriorityLoading && <p style={{ color: "#888" }}>Loading…</p>}
+            <h3 className="mb-2 mt-0 text-base font-semibold">Priority Inbox</h3>
+            {isPriorityLoading && <p className="text-fg-muted">Loading…</p>}
             {!isPriorityLoading && priorityItems.length === 0 && (
-              <p style={{ color: "#888" }}>No priority messages.</p>
+              <p className="text-fg-muted">No priority messages.</p>
             )}
             {!isPriorityLoading && priorityItems.length > 0 && (
-              <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
+              <ul className="m-0 list-none p-0">
                 {priorityItems.map((item) => (
                   <li
                     key={item.email_id}
@@ -1092,19 +1076,15 @@ export default function Inbox() {
                         handleOpenPriority(item.email_id);
                       }
                     }}
-                    style={{
-                      padding: "8px 12px",
-                      borderBottom: "1px solid #eee",
-                      cursor: "pointer",
-                    }}
+                    className="cursor-pointer border-b border-border px-3 py-2 hover:bg-surface-hover"
                   >
-                    <div style={{ fontWeight: 500 }}>
+                    <div className="font-medium">
                       {item.subject || "(no subject)"}
                     </div>
-                    <div style={{ fontSize: "0.85rem", color: "#666" }}>
+                    <div className="text-sm text-fg-muted">
                       {formatAddresses(item.from)} — score {item.score}
                     </div>
-                    <div style={{ fontSize: "0.8rem", color: "#999" }}>
+                    <div className="text-xs text-fg-subtle">
                       {item.preview?.slice(0, 120)}
                     </div>
                   </li>
@@ -1114,8 +1094,8 @@ export default function Inbox() {
           </div>
         )}
         {!isPriorityView && filteredList.length > 0 && (
-          <div style={layoutStyles.listControls}>
-            <label style={layoutStyles.controlToggle}>
+          <div className={layoutStyles.listControls}>
+            <label className={layoutStyles.controlToggle}>
               <input
                 type="checkbox"
                 checked={
@@ -1134,7 +1114,7 @@ export default function Inbox() {
               />
               {selectedCount > 0 ? `${selectedCount} selected` : "Select all"}
             </label>
-            <label style={layoutStyles.controlToggle}>
+            <label className={layoutStyles.controlToggle}>
               <input
                 type="checkbox"
                 checked={groupThreads}
@@ -1143,13 +1123,13 @@ export default function Inbox() {
               Group by conversation
             </label>
             {labelFilter && (
-              <span style={layoutStyles.filterPill}>
+              <span className={layoutStyles.filterPill}>
                 {labelsForKeywords({ [labelFilter]: true })[0]?.name ??
                   "Label"}
                 <button
                   type="button"
                   onClick={() => setLabelFilter(null)}
-                  style={layoutStyles.filterPillClear}
+                  className={layoutStyles.filterPillClear}
                   aria-label="Clear label filter"
                 >
                   ×
@@ -1159,15 +1139,15 @@ export default function Inbox() {
           </div>
         )}
         {!isPriorityView && selectedCount > 0 && (
-          <div style={layoutStyles.bulkBar}>
-            <span style={layoutStyles.bulkCount}>{selectedCount} selected</span>
+          <div className={layoutStyles.bulkBar}>
+            <span className={layoutStyles.bulkCount}>{selectedCount} selected</span>
             <button
               type="button"
               disabled={bulkBusy}
               onClick={() =>
                 void runBulk((ids) => jmapClient.bulkSetSeen(ids, true))
               }
-              style={layoutStyles.bulkButton}
+              className={layoutStyles.bulkButton}
             >
               Mark read
             </button>
@@ -1177,7 +1157,7 @@ export default function Inbox() {
               onClick={() =>
                 void runBulk((ids) => jmapClient.bulkSetSeen(ids, false))
               }
-              style={layoutStyles.bulkButton}
+              className={layoutStyles.bulkButton}
             >
               Mark unread
             </button>
@@ -1190,7 +1170,7 @@ export default function Inbox() {
                     bulkMoveResolvingSource(ids, archiveMailboxId),
                   )
                 }
-                style={layoutStyles.bulkButton}
+                className={layoutStyles.bulkButton}
               >
                 Archive
               </button>
@@ -1200,7 +1180,7 @@ export default function Inbox() {
                 type="button"
                 disabled={bulkBusy}
                 onClick={() => void runBulk((ids) => bulkTrash(ids))}
-                style={layoutStyles.bulkButton}
+                className={layoutStyles.bulkButton}
               >
                 {inTrashView ? "Delete" : "Trash"}
               </button>
@@ -1219,7 +1199,7 @@ export default function Inbox() {
                   );
                   e.target.value = "";
                 }}
-                style={layoutStyles.bulkSelect}
+                className={layoutStyles.bulkSelect}
                 aria-label="Apply label to selected"
               >
                 <option value="">Apply label…</option>
@@ -1233,14 +1213,14 @@ export default function Inbox() {
             <button
               type="button"
               onClick={clearSelection}
-              style={layoutStyles.bulkButton}
+              className={layoutStyles.bulkButton}
             >
               Clear
             </button>
           </div>
         )}
         {!isPriorityView && filteredList.length > 0 && (
-          <ul style={layoutStyles.emailList} data-testid="email-list">
+          <ul className={layoutStyles.emailList} data-testid="email-list">
             {displayRows.map(({ head, emails: groupEmails }) => {
               const email = head;
               // Reuse the single-source-of-truth helpers (which now
@@ -1346,24 +1326,24 @@ function EmailRow({
           onDragStart();
         }}
         onDragEnd={onDragEnd}
-        style={{
-          ...layoutStyles.emailRow,
-          ...(isUnread ? layoutStyles.emailRowUnread : {}),
-          ...(inJunkView ? layoutStyles.emailRowJunk : {}),
-          ...(selected ? layoutStyles.emailRowSelected : {}),
-        }}
+        className={cn(
+          layoutStyles.emailRow,
+          isUnread && layoutStyles.emailRowUnread,
+          inJunkView && layoutStyles.emailRowJunk,
+          selected && layoutStyles.emailRowSelected,
+        )}
       >
         <input
           type="checkbox"
           checked={selected}
           onClick={(e) => e.stopPropagation()}
           onChange={onToggleSelected}
-          style={layoutStyles.rowCheckbox}
+          className={layoutStyles.rowCheckbox}
           aria-label={`Select message from ${sender}`}
         />
         {inJunkView && (
           <span
-            style={layoutStyles.junkRowBadge}
+            className={layoutStyles.junkRowBadge}
             title="Filed as spam by the server or by a user"
             aria-label="Junk"
           >
@@ -1373,37 +1353,38 @@ function EmailRow({
         <button
           type="button"
           onClick={onOpen}
-          style={layoutStyles.emailRowMain}
+          className={layoutStyles.emailRowMain}
         >
-          <span style={layoutStyles.emailSender}>
+          <span className={layoutStyles.emailSender}>
             {sender}
             {threadCount > 1 && (
-              <span style={layoutStyles.threadBadge} title={`${threadCount} messages in this conversation`}>
+              <span className={layoutStyles.threadBadge} title={`${threadCount} messages in this conversation`}>
                 {threadCount}
               </span>
             )}
           </span>
-          <span style={layoutStyles.emailSubjectWrap}>
-            <span style={layoutStyles.emailSubject}>{subject}</span>
+          <span className={layoutStyles.emailSubjectWrap}>
+            <span className={layoutStyles.emailSubject}>{subject}</span>
             {rowLabels.map((l) => (
               <span
                 key={l.id}
-                style={{ ...layoutStyles.rowLabelChip, background: l.color }}
+                className={layoutStyles.rowLabelChip}
+                style={{ background: l.color }}
               >
                 {l.name}
               </span>
             ))}
           </span>
-          <span style={layoutStyles.emailDate}>{dateLabel}</span>
+          <span className={layoutStyles.emailDate}>{dateLabel}</span>
         </button>
-        <div style={layoutStyles.emailActions}>
+        <div className={layoutStyles.emailActions}>
           <button
             type="button"
             onClick={(e) => {
               e.stopPropagation();
               onToggleRead();
             }}
-            style={layoutStyles.actionButton}
+            className={layoutStyles.actionButton}
             title={isUnread ? "Mark as read" : "Mark as unread"}
           >
             {isUnread ? "Mark read" : "Mark unread"}
@@ -1415,7 +1396,7 @@ function EmailRow({
                 e.stopPropagation();
                 onToggleSpam();
               }}
-              style={layoutStyles.actionButton}
+              className={layoutStyles.actionButton}
               title={
                 inJunkView
                   ? "Not spam — move back to Inbox and clear the junk flag"
@@ -1431,12 +1412,12 @@ function EmailRow({
               e.stopPropagation();
               onMoveToTrash();
             }}
-            style={layoutStyles.actionButton}
+            className={layoutStyles.actionButton}
             title={inTrashView ? "Delete permanently" : "Move to trash"}
           >
             {inTrashView ? "Delete" : "Trash"}
           </button>
-          <div style={layoutStyles.snoozeWrap}>
+          <div className={layoutStyles.snoozeWrap}>
             <button
               type="button"
               onClick={(e) => {
@@ -1444,7 +1425,7 @@ function EmailRow({
                 onOpenSnooze();
               }}
               disabled={snoozeBusy}
-              style={layoutStyles.actionButton}
+              className={layoutStyles.actionButton}
               title="Snooze this email until later"
               aria-haspopup="dialog"
               aria-expanded={snoozeOpen}
@@ -1483,375 +1464,88 @@ function formatDate(iso: string | null | undefined): string {
     : d.toLocaleDateString();
 }
 
-const layoutStyles: Record<string, React.CSSProperties> = {
-  root: {
-    display: "grid",
-    gridTemplateColumns: "220px 1fr",
-    minHeight: "calc(100vh - 4rem)",
-    gap: "1rem",
-  },
-  sidebar: {
-    borderRight: "1px solid #e5e7eb",
-    padding: "1rem",
-    background: "#f9fafb",
-  },
-  sidebarHeader: {
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "space-between",
-    marginBottom: "0.75rem",
-  },
-  sidebarTitle: {
-    margin: 0,
-    fontSize: "1.1rem",
-  },
-  composeButton: {
-    padding: "0.25rem 0.5rem",
-    fontSize: "0.85rem",
-    background: "#2563eb",
-    color: "#fff",
-    borderRadius: "0.25rem",
-    textDecoration: "none",
-  },
-  mailboxList: {
-    listStyle: "none",
-    margin: 0,
-    padding: 0,
-    display: "flex",
-    flexDirection: "column",
-    gap: "0.125rem",
-  },
-  mailboxItem: {
-    display: "flex",
-    justifyContent: "space-between",
-    alignItems: "center",
-    width: "100%",
-    padding: "0.35rem 0.5rem",
-    background: "transparent",
-    border: "none",
-    textAlign: "left",
-    cursor: "pointer",
-    borderRadius: "0.25rem",
-    fontSize: "0.9rem",
-  },
-  mailboxItemActive: {
-    background: "#dbeafe",
-    fontWeight: 600,
-  },
-  mailboxItemJunk: {
-    color: "#92400e",
-  },
-  junkIcon: {
-    marginRight: "0.35rem",
-    color: "#d97706",
-  },
-  unreadBadge: {
-    background: "#2563eb",
-    color: "#fff",
-    fontSize: "0.7rem",
-    padding: "0.05rem 0.35rem",
-    borderRadius: "999px",
-  },
-  main: {
-    padding: "1rem",
-  },
-  snoozeWrap: {
-    position: "relative",
-    display: "inline-block",
-  },
-  searchBar: {
-    display: "flex",
-    alignItems: "center",
-    gap: "0.5rem",
-    marginBottom: "0.75rem",
-  },
-  searchInput: {
-    flex: 1,
-    padding: "0.4rem 0.6rem",
-    fontSize: "0.9rem",
-    border: "1px solid #d1d5db",
-    borderRadius: "0.25rem",
-  },
-  searchScopeLabel: {
-    display: "flex",
-    alignItems: "center",
-    gap: "0.25rem",
-    fontSize: "0.8rem",
-    color: "#374151",
-  },
-  searchButton: {
-    padding: "0.4rem 0.75rem",
-    fontSize: "0.85rem",
-    background: "#2563eb",
-    color: "#fff",
-    border: "none",
-    borderRadius: "0.25rem",
-    cursor: "pointer",
-  },
-  searchClear: {
-    padding: "0.4rem 0.75rem",
-    fontSize: "0.85rem",
-    background: "#fff",
-    color: "#374151",
-    border: "1px solid #d1d5db",
-    borderRadius: "0.25rem",
-    cursor: "pointer",
-  },
-  searchStatus: {
-    fontSize: "0.85rem",
-    color: "#374151",
-    margin: "0 0 0.5rem 0",
-  },
-  error: {
-    padding: "0.5rem 0.75rem",
-    background: "#fee2e2",
-    color: "#991b1b",
-    borderRadius: "0.25rem",
-    marginBottom: "0.75rem",
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "space-between",
-    gap: "0.5rem",
-  },
-  errorDismiss: {
-    background: "transparent",
-    border: "none",
-    color: "#991b1b",
-    fontSize: "1.1rem",
-    cursor: "pointer",
-    lineHeight: 1,
-    padding: "0 0.25rem",
-  },
-  muted: {
-    color: "#6b7280",
-    fontStyle: "italic",
-  },
-  emailList: {
-    listStyle: "none",
-    margin: 0,
-    padding: 0,
-    borderTop: "1px solid #e5e7eb",
-  },
-  emailRow: {
-    display: "flex",
-    alignItems: "center",
-    gap: "0.5rem",
-    width: "100%",
-    padding: "0.6rem 0.5rem",
-    borderBottom: "1px solid #e5e7eb",
-    fontSize: "0.9rem",
-  },
-  emailRowMain: {
-    display: "grid",
-    gridTemplateColumns: "180px 1fr 120px",
-    alignItems: "center",
-    gap: "0.75rem",
-    flex: 1,
-    padding: 0,
-    background: "transparent",
-    border: "none",
-    textAlign: "left",
-    cursor: "pointer",
-    font: "inherit",
-    color: "inherit",
-  },
-  emailActions: {
-    display: "flex",
-    gap: "0.25rem",
-    flexShrink: 0,
-  },
-  actionButton: {
-    padding: "0.25rem 0.5rem",
-    fontSize: "0.75rem",
-    background: "#fff",
-    border: "1px solid #d1d5db",
-    borderRadius: "0.25rem",
-    cursor: "pointer",
-    color: "#374151",
-  },
-  emailRowUnread: {
-    fontWeight: 600,
-    background: "#eff6ff",
-  },
-  emailRowJunk: {
-    background: "#fef3c7",
-  },
-  junkRowBadge: {
-    display: "inline-flex",
-    alignItems: "center",
-    padding: "0.1rem 0.4rem",
-    fontSize: "0.65rem",
-    fontWeight: 700,
-    letterSpacing: "0.05em",
-    background: "#d97706",
-    color: "#fff",
-    borderRadius: "0.25rem",
-    flexShrink: 0,
-  },
-  emailSender: {
-    overflow: "hidden",
-    textOverflow: "ellipsis",
-    whiteSpace: "nowrap",
-  },
-  emailSubject: {
-    overflow: "hidden",
-    textOverflow: "ellipsis",
-    whiteSpace: "nowrap",
-    color: "#111827",
-  },
-  emailDate: {
-    textAlign: "right",
-    color: "#6b7280",
-    fontSize: "0.8rem",
-  },
-  dropTargetActive: {
-    outline: "2px dashed #2563eb",
-    background: "#eff6ff",
-  },
-  labelSection: {
-    marginTop: "1rem",
-    paddingTop: "0.75rem",
-    borderTop: "1px solid #e5e7eb",
-  },
-  labelSectionHeader: {
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "space-between",
-    marginBottom: "0.5rem",
-  },
-  labelSectionTitle: {
-    fontSize: "0.75rem",
-    fontWeight: 700,
-    textTransform: "uppercase",
-    letterSpacing: "0.05em",
-    color: "#6b7280",
-  },
-  labelManageLink: {
-    fontSize: "0.75rem",
-    color: "#2563eb",
-    textDecoration: "none",
-  },
-  labelClear: {
-    width: "100%",
-    padding: "0.25rem 0.5rem",
-    fontSize: "0.78rem",
-    background: "transparent",
-    border: "none",
-    textAlign: "left",
-    cursor: "pointer",
-    color: "#6b7280",
-  },
-  labelNameWrap: {
-    display: "inline-flex",
-    alignItems: "center",
-    gap: "0.4rem",
-  },
-  labelDot: {
-    width: "0.7rem",
-    height: "0.7rem",
-    borderRadius: "999px",
-    flexShrink: 0,
-  },
-  listControls: {
-    display: "flex",
-    alignItems: "center",
-    gap: "1rem",
-    flexWrap: "wrap",
-    padding: "0.25rem 0",
-    marginBottom: "0.25rem",
-  },
-  controlToggle: {
-    display: "inline-flex",
-    alignItems: "center",
-    gap: "0.35rem",
-    fontSize: "0.82rem",
-    color: "#374151",
-    cursor: "pointer",
-  },
-  filterPill: {
-    display: "inline-flex",
-    alignItems: "center",
-    gap: "0.35rem",
-    fontSize: "0.78rem",
-    background: "#e0e7ff",
-    color: "#3730a3",
-    padding: "0.1rem 0.5rem",
-    borderRadius: "999px",
-  },
-  filterPillClear: {
-    border: "none",
-    background: "none",
-    color: "#3730a3",
-    cursor: "pointer",
-    fontSize: "0.9rem",
-    lineHeight: 1,
-  },
-  bulkBar: {
-    display: "flex",
-    alignItems: "center",
-    gap: "0.5rem",
-    flexWrap: "wrap",
-    padding: "0.5rem 0.6rem",
-    background: "#f3f4f6",
-    border: "1px solid #e5e7eb",
-    borderRadius: "0.25rem",
-    marginBottom: "0.5rem",
-  },
-  bulkCount: {
-    fontSize: "0.82rem",
-    fontWeight: 600,
-    color: "#374151",
-  },
-  bulkButton: {
-    padding: "0.3rem 0.6rem",
-    fontSize: "0.78rem",
-    background: "#fff",
-    border: "1px solid #d1d5db",
-    borderRadius: "0.25rem",
-    cursor: "pointer",
-    color: "#374151",
-  },
-  bulkSelect: {
-    padding: "0.3rem 0.5rem",
-    fontSize: "0.78rem",
-    background: "#fff",
-    border: "1px solid #d1d5db",
-    borderRadius: "0.25rem",
-  },
-  emailRowSelected: {
-    background: "#eef2ff",
-  },
-  rowCheckbox: {
-    flexShrink: 0,
-    cursor: "pointer",
-  },
-  threadBadge: {
-    display: "inline-flex",
-    alignItems: "center",
-    justifyContent: "center",
-    minWidth: "1.1rem",
-    height: "1.1rem",
-    marginLeft: "0.4rem",
-    padding: "0 0.3rem",
-    fontSize: "0.7rem",
-    fontWeight: 700,
-    background: "#9ca3af",
-    color: "#fff",
-    borderRadius: "999px",
-  },
-  emailSubjectWrap: {
-    display: "flex",
-    alignItems: "center",
-    gap: "0.4rem",
-    overflow: "hidden",
-  },
-  rowLabelChip: {
-    flexShrink: 0,
-    fontSize: "0.65rem",
-    fontWeight: 600,
-    color: "#fff",
-    padding: "0.05rem 0.4rem",
-    borderRadius: "999px",
-    whiteSpace: "nowrap",
-  },
+
+/**
+ * Tailwind class recipes for the Inbox shell. Values resolve to the
+ * semantic design tokens (via `tailwind.config.ts`) so the list,
+ * sidebar and row chrome flip automatically with the active theme
+ * instead of being pinned to the old hard-coded hex palette.
+ */
+const layoutStyles: Record<string, string> = {
+  root: "grid grid-cols-[220px_1fr] gap-4 min-h-[calc(100vh-4rem)]",
+  sidebar: "border-r border-border bg-surface-muted p-4",
+  sidebarHeader: "mb-3 flex items-center justify-between",
+  sidebarTitle: "m-0 text-lg font-semibold",
+  composeButton:
+    "rounded-md bg-primary px-2 py-1 text-sm text-primary-fg no-underline transition-colors hover:bg-primary-hover hover:no-underline",
+  mailboxList: "m-0 flex list-none flex-col gap-0.5 p-0",
+  mailboxItem:
+    "flex w-full cursor-pointer items-center justify-between rounded-md border-0 bg-transparent px-2 py-1.5 text-left text-sm text-fg transition-colors hover:bg-surface-hover",
+  mailboxItemActive: "bg-primary-subtle font-semibold text-primary",
+  mailboxItemJunk: "text-warning-fg",
+  junkIcon: "mr-1.5 text-warning",
+  unreadBadge:
+    "rounded-pill bg-primary px-1.5 py-0.5 text-xs text-primary-fg",
+  main: "p-4",
+  snoozeWrap: "relative inline-block",
+  searchBar: "mb-3 flex items-center gap-2",
+  searchInput:
+    "flex-1 rounded-md border border-border bg-surface px-2.5 py-1.5 text-sm text-fg outline-none focus-visible:border-primary focus-visible:ring-2 focus-visible:ring-primary-subtle",
+  searchScopeLabel: "flex items-center gap-1 text-xs text-fg-muted",
+  searchButton:
+    "cursor-pointer rounded-md border-0 bg-primary px-3 py-1.5 text-sm text-primary-fg transition-colors hover:bg-primary-hover",
+  searchClear:
+    "cursor-pointer rounded-md border border-border bg-surface px-3 py-1.5 text-sm text-fg transition-colors hover:bg-surface-hover",
+  searchStatus: "mb-2 text-sm text-fg-muted",
+  error:
+    "mb-3 flex items-center justify-between gap-2 rounded-md bg-danger-bg px-3 py-2 text-danger-fg",
+  errorDismiss:
+    "cursor-pointer border-0 bg-transparent px-1 text-lg leading-none text-danger-fg",
+  muted: "italic text-fg-muted",
+  emailList: "m-0 list-none border-t border-border p-0",
+  emailRow:
+    "flex w-full items-center gap-2 border-b border-border px-2 py-2.5 text-sm",
+  emailRowMain:
+    "grid flex-1 cursor-pointer grid-cols-[180px_1fr_120px] items-center gap-3 border-0 bg-transparent p-0 text-left font-[inherit] text-inherit",
+  emailActions: "flex shrink-0 gap-1",
+  actionButton:
+    "cursor-pointer rounded-md border border-border bg-surface px-2 py-1 text-xs text-fg transition-colors hover:bg-surface-hover disabled:cursor-not-allowed disabled:opacity-60",
+  emailRowUnread: "bg-primary-subtle font-semibold",
+  emailRowJunk: "bg-warning-bg",
+  junkRowBadge:
+    "inline-flex shrink-0 items-center rounded-md bg-warning px-1.5 py-0.5 text-[0.65rem] font-bold tracking-wider text-white",
+  emailSender: "overflow-hidden text-ellipsis whitespace-nowrap",
+  emailSubject: "overflow-hidden text-ellipsis whitespace-nowrap text-fg",
+  emailDate: "text-right text-xs text-fg-muted",
+  dropTargetActive: "bg-primary-subtle outline-dashed outline-2 outline-primary",
+  labelSection: "mt-4 border-t border-border pt-3",
+  labelSectionHeader: "mb-2 flex items-center justify-between",
+  labelSectionTitle:
+    "text-xs font-bold uppercase tracking-wider text-fg-muted",
+  labelManageLink: "text-xs text-primary no-underline hover:underline",
+  labelClear:
+    "w-full cursor-pointer rounded-md border-0 bg-transparent px-2 py-1 text-left text-xs text-fg-muted transition-colors hover:bg-surface-hover",
+  labelNameWrap: "inline-flex items-center gap-1.5",
+  labelDot: "size-3 shrink-0 rounded-pill",
+  listControls: "mb-1 flex flex-wrap items-center gap-4 py-1",
+  controlToggle:
+    "inline-flex cursor-pointer items-center gap-1.5 text-xs text-fg-muted",
+  filterPill:
+    "inline-flex items-center gap-1.5 rounded-pill bg-primary-subtle px-2 py-0.5 text-xs text-on-accent",
+  filterPillClear:
+    "cursor-pointer border-0 bg-transparent text-sm leading-none text-on-accent",
+  bulkBar:
+    "mb-2 flex flex-wrap items-center gap-2 rounded-md border border-border bg-surface-muted px-2.5 py-2",
+  bulkCount: "text-xs font-semibold text-fg-muted",
+  bulkButton:
+    "cursor-pointer rounded-md border border-border bg-surface px-2.5 py-1.5 text-xs text-fg transition-colors hover:bg-surface-hover disabled:cursor-not-allowed disabled:opacity-60",
+  bulkSelect:
+    "rounded-md border border-border bg-surface px-2 py-1.5 text-xs text-fg",
+  emailRowSelected: "bg-surface-active",
+  rowCheckbox: "shrink-0 cursor-pointer",
+  threadBadge:
+    "ml-1.5 inline-flex h-[1.1rem] min-w-[1.1rem] items-center justify-center rounded-pill bg-fg-subtle px-1 text-[0.7rem] font-bold text-white",
+  emailSubjectWrap: "flex items-center gap-1.5 overflow-hidden",
+  rowLabelChip:
+    "shrink-0 whitespace-nowrap rounded-pill px-1.5 py-0.5 text-[0.65rem] font-semibold text-white",
 };

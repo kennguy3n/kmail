@@ -143,14 +143,7 @@ export default function PricingAdmin() {
         </p>
       )}
 
-      <div
-        className="kmail-pricing-grid"
-        style={{
-          display: "grid",
-          gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
-          gap: "1rem",
-        }}
-      >
+      <div className="kmail-pricing-grid">
         {PLAN_CATALOG.map((plan) => (
           <PlanCard
             key={plan.id}
@@ -188,12 +181,6 @@ function PlanCard({
   return (
     <div
       className={`kmail-plan-card${isCurrent ? " kmail-plan-card-current" : ""}`}
-      style={{
-        border: isCurrent ? "2px solid var(--kmail-accent, #2563eb)" : "1px solid #d1d5db",
-        borderRadius: "0.5rem",
-        padding: "1rem",
-        background: isCurrent ? "rgba(37, 99, 235, 0.05)" : undefined,
-      }}
     >
       <header>
         <h3>{plan.name}</h3>
