@@ -36,12 +36,16 @@ type DegradationConfig struct {
 	// Required.
 	HealthCheck func(ctx context.Context) bool
 
-	// ReadPaths is the list of URL prefixes the middleware
-	// considers eligible for cached fallback. Defaults to
-	// /jmap/session when empty — the small, bounded, per-user
-	// bootstrap document. Larger JMAP GETs (blob download) are
-	// deliberately excluded: buffering an attachment to cache it
-	// would blow up memory and Valkey value sizes.
+	// ReadPaths is the list of URL paths the middleware considers
+	// eligible for cached fallback. Each entry matches its exact
+	// path or any path in its subtree (`p` or `p/...`), so a
+	// sibling that merely shares a string prefix is not caught.
+	// Defaults to /jmap/session when empty — the small, bounded,
+	// per-user bootstrap document. Larger JMAP GETs (blob
+	// download) are deliberately excluded: buffering an attachment
+	// to cache it would blow up memory and Valkey value sizes. The
+	// bare /jmap endpoint is the JSON-RPC POST envelope, not a GET
+	// read, so it is intentionally uncovered by the default.
 	ReadPaths []string
 
 	// CacheTTL is the TTL applied to cached responses. Defaults
@@ -116,9 +120,17 @@ func (d *Degradation) Wrap(next http.Handler) http.Handler {
 	})
 }
 
+// matchesReadPath reports whether the request targets a configured
+// read path. A configured path matches the exact path or any path
+// in its subtree (`p` or `p/...`), so `/jmap/session` covers
+// `/jmap/session` and `/jmap/session/<id>` but not an unrelated
+// sibling like `/jmap/sessions-export`. This deliberately leaves
+// the bare `/jmap` JSON-RPC method-call endpoint uncovered by
+// default: it is the POST request envelope, not the GET session
+// document, so it is never a cacheable read.
 func (d *Degradation) matchesReadPath(r *http.Request) bool {
 	for _, p := range d.cfg.ReadPaths {
-		if strings.HasPrefix(r.URL.Path, p) {
+		if r.URL.Path == p || strings.HasPrefix(r.URL.Path, p+"/") {
 			return true
 		}
 	}

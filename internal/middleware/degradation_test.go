@@ -185,3 +185,32 @@ func TestDegradationSkipsOversizedBody(t *testing.T) {
 		t.Fatalf("oversized response was cached: code=%d len=%d want 503", rec.Code, rec.Body.Len())
 	}
 }
+
+// TestMatchesReadPathExactOrSubtree pins the read-path matcher to
+// exact-or-subtree semantics: a configured path covers itself and
+// its descendants but not a sibling that merely shares a string
+// prefix, and the default leaves the bare /jmap POST endpoint out.
+func TestMatchesReadPathExactOrSubtree(t *testing.T) {
+	d := NewDegradation(DegradationConfig{
+		Cache:       newDegradeCache(t),
+		HealthCheck: func(context.Context) bool { return true },
+		// empty → default /jmap/session
+	})
+	cases := []struct {
+		path string
+		want bool
+	}{
+		{"/jmap/session", true},
+		{"/jmap/session/abc", true},
+		{"/jmap/sessions-export", false}, // sibling, not a subtree
+		{"/jmap", false},                 // bare POST method-call endpoint
+		{"/jmap/upload", false},          // blob path deliberately excluded
+		{"/other", false},
+	}
+	for _, c := range cases {
+		r := httptest.NewRequest(http.MethodGet, c.path, nil)
+		if got := d.matchesReadPath(r); got != c.want {
+			t.Errorf("matchesReadPath(%q) = %v, want %v", c.path, got, c.want)
+		}
+	}
+}

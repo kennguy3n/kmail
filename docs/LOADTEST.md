@@ -156,10 +156,14 @@ It is **opt-in** and gated by these env vars on the BFF:
 - `KMAIL_DEGRADATION_TTL` (default `5m`) — how long a cached
   response stays servable.
 - `KMAIL_DEGRADATION_READ_PATHS` (default `/jmap/session`) —
-  space-separated path prefixes eligible for cached fallback.
-  Deliberately excludes blob download/upload: those are unbounded
-  and must never be buffered into the cache (the middleware also
-  caps any cached body at 256 KiB as a backstop).
+  space-separated paths eligible for cached fallback. Each entry
+  matches its exact path or its subtree (`p` or `p/...`), so it
+  never accidentally catches a sibling that merely shares a string
+  prefix. Deliberately excludes blob download/upload: those are
+  unbounded and must never be buffered into the cache (the
+  middleware also caps any cached body at 256 KiB as a backstop).
+  The bare `/jmap` endpoint is the JSON-RPC POST envelope (not a
+  GET read), so it is intentionally uncovered by the default.
 
 The cache key is scoped by tenant + user, so a degraded read is
 never served across identities. Health is the proxy's own
