@@ -53,9 +53,10 @@ const calendars: Calendar[] = [
 ];
 
 function eventInWindow(): CalendarEvent[] {
-  // The CalendarView fetches events for the current week. Anchor a
-  // sample event two hours from the (faked) mid-week clock so it always
-  // lands inside the requested range and the rendered week grid.
+  // The CalendarView fetches events for the current week. The suite pins
+  // the clock to a fixed mid-week Wednesday (see beforeEach), so anchoring
+  // the sample event two hours out always lands inside the requested range
+  // and the rendered week grid — no wall-clock/day-boundary flakiness.
   const start = new Date(Date.now() + 2 * 60 * 60 * 1000);
   const end = new Date(start.getTime() + 60 * 60 * 1000);
   return [

@@ -8,12 +8,19 @@
  * render an "internal error" / "Failed to fetch" banner instead
  * of realistic content.
  *
- * Every handler returns *static* sample data — no persistence,
- * no shared state across requests — so the screenshots are
+ * Most handlers return *static* sample data so the screenshots are
  * deterministic. The data is shaped to look like a polished
  * "Acme Corp" demo tenant with healthy metrics, all-verified DNS
  * records, a small set of users, and a handful of recent emails
  * and calendar events.
+ *
+ * A small number of surfaces are intentionally *stateful within a
+ * single page load* so the Playwright E2E suite can assert
+ * "create X, then see X" round-trips (shared-inbox notes, vault
+ * folders, and migration jobs — see `sharedInboxNotes`,
+ * `vaultFolders()`, and `migrationJobs()` below). These module-scoped
+ * stores reset on every page load, and each Playwright test runs in a
+ * fresh browser context, so determinism is preserved.
  *
  * Add a new handler whenever a UI page starts hitting a new
  * endpoint that the screenshot capture script visits — otherwise
@@ -24,12 +31,123 @@ import { http, HttpResponse } from "msw";
 
 const TENANT_ID = "00000000-0000-0000-0000-000000000001";
 const DOMAIN_ID = "00000000-0000-0000-0000-000000000010";
+const DOMAIN2_ID = "00000000-0000-0000-0000-000000000011";
 const ACCOUNT_ID = "acct-acme-demo";
 const CALENDAR_ACCOUNT_ID = "cal-acme-demo";
 const ADMIN_USER_ID = "user-admin-demo";
 const NOW = new Date("2026-04-28T09:00:00.000Z");
 
 // ─── Helpers ─────────────────────────────────────────────────────────
+
+/**
+ * In-memory store for shared-inbox internal notes so a note added via
+ * POST is returned by the subsequent GET, letting the E2E flow assert
+ * the note it just created actually appears. Keyed by
+ * `inboxId::emailId`. Module-scoped, so it resets on every page load
+ * (each Playwright test runs in a fresh browser context).
+ */
+interface StoredNote {
+  id: string;
+  author_user_id: string;
+  note_text: string;
+  created_at: string;
+}
+const sharedInboxNotes = new Map<string, StoredNote[]>();
+const noteKey = (inboxId: string, emailId: string) => `${inboxId}::${emailId}`;
+
+/**
+ * In-memory vault-folder store so a folder created via POST shows up in
+ * the subsequent GET reload, letting the E2E flow assert the folder it
+ * just created appears. Module-scoped, so it resets on every page load.
+ */
+interface StoredVaultFolder {
+  id: string;
+  tenant_id: string;
+  user_id: string;
+  folder_name: string;
+  encryption_mode: "StrictZK";
+  wrapped_dek?: string;
+  key_algorithm: string;
+  nonce?: string;
+  created_at: string;
+  updated_at: string;
+}
+let vaultFolderStore: StoredVaultFolder[] | null = null;
+function vaultFolders(): StoredVaultFolder[] {
+  if (vaultFolderStore === null) {
+    vaultFolderStore = [
+      {
+        id: "vault-1",
+        tenant_id: TENANT_ID,
+        user_id: ADMIN_USER_ID,
+        folder_name: "Personal — Health",
+        encryption_mode: "StrictZK",
+        wrapped_dek: "AAAA...DEMO",
+        key_algorithm: "XChaCha20-Poly1305",
+        nonce: "BBBB...DEMO",
+        created_at: relPast(45 * 24 * 60 * 60),
+        updated_at: relPast(7 * 24 * 60 * 60),
+      },
+      {
+        id: "vault-2",
+        tenant_id: TENANT_ID,
+        user_id: ADMIN_USER_ID,
+        folder_name: "Legal — Contracts",
+        encryption_mode: "StrictZK",
+        wrapped_dek: "CCCC...DEMO",
+        key_algorithm: "XChaCha20-Poly1305",
+        nonce: "DDDD...DEMO",
+        created_at: relPast(30 * 24 * 60 * 60),
+        updated_at: relPast(2 * 24 * 60 * 60),
+      },
+    ];
+  }
+  return vaultFolderStore;
+}
+
+/**
+ * In-memory migration-jobs store so a job created via POST shows up in
+ * the subsequent GET the wizard issues to refresh its jobs table. This
+ * lets the E2E flow assert on the job it *just created* (matched by the
+ * source mailbox it typed) rather than on the pre-seeded sample row.
+ * Module-scoped, so it resets on every page load.
+ */
+interface StoredMigrationJob {
+  id: string;
+  tenant_id: string;
+  source_type: string;
+  source_host: string;
+  source_user: string;
+  destination_user_id: string;
+  status: string;
+  messages_total: number;
+  messages_synced: number;
+  started_at?: string;
+  completed_at?: string;
+  created_at: string;
+}
+let migrationJobStore: StoredMigrationJob[] | null = null;
+function migrationJobs(): StoredMigrationJob[] {
+  if (migrationJobStore === null) {
+    migrationJobStore = [
+      {
+        id: "mig-1",
+        tenant_id: TENANT_ID,
+        source_type: "gmail_imap",
+        source_host: "imap.gmail.com",
+        source_user: "founder@oldcompany.com",
+        destination_user_id: ADMIN_USER_ID,
+        status: "completed",
+        messages_total: 12_540,
+        messages_synced: 12_540,
+        started_at: relPast(45 * 24 * 60 * 60),
+        completed_at: relPast(44 * 24 * 60 * 60),
+        created_at: relPast(45 * 24 * 60 * 60),
+      },
+    ];
+  }
+  return migrationJobStore;
+}
 
 type Json = Record<string, unknown>;
 type JmapInvocation = [method: string, args: Json, callId: string];
@@ -466,17 +584,42 @@ function jmapDispatch(method: string, args: Json): MethodResult {
         },
       };
     case "Email/set":
-    case "CalendarEvent/set":
+    case "EmailSubmission/set":
+    case "CalendarEvent/set": {
+      // Echo a successful write back to the client. JMAP `/set`
+      // returns a `created` map keyed by the same client-supplied
+      // creation ids (e.g. `draft`, `submission`, `event`), an
+      // `updated` map keyed by the real object ids, and a
+      // `destroyed` array. The transport layer in `api/jmap.ts`
+      // keys off these maps to resolve sendEmail/createEvent/RSVP,
+      // so we synthesise plausible ids per request rather than
+      // returning the static `created: null` a read-only fixture
+      // would.
+      const create = (args.create ?? null) as Record<string, unknown> | null;
+      const update = (args.update ?? null) as Record<string, unknown> | null;
+      const destroy = (args.destroy ?? null) as string[] | null;
+      const created: Record<string, { id: string }> | null = create
+        ? Object.fromEntries(
+            Object.keys(create).map((key) => [
+              key,
+              { id: `${key}-${Math.random().toString(36).slice(2, 10)}` },
+            ]),
+          )
+        : null;
+      const updated: Record<string, null> | null = update
+        ? Object.fromEntries(Object.keys(update).map((id) => [id, null]))
+        : null;
       return {
         result: {
           accountId: args.accountId,
           oldState: "demo-state-1",
           newState: "demo-state-2",
-          created: null,
-          updated: null,
-          destroyed: null,
+          created,
+          updated,
+          destroyed: destroy ?? null,
         },
       };
+    }
     default:
       return {
         result: {
@@ -537,19 +680,43 @@ export const handlers = [
         created_at: relPast(180 * 24 * 60 * 60),
         updated_at: relPast(24 * 60 * 60),
       },
+      {
+        // A freshly-added domain whose DNS has not fully propagated
+        // yet. The DNS wizard shows it under "Outstanding records"
+        // until the admin runs Verify, which the verify handler
+        // below resolves to a fully-verified result. This gives the
+        // golden-path E2E a domain it can actually take from
+        // unverified -> verified.
+        id: DOMAIN2_ID,
+        tenant_id: TENANT_ID,
+        domain: "acme.eu",
+        verified: false,
+        mx_verified: true,
+        spf_verified: false,
+        dkim_verified: false,
+        dmarc_verified: false,
+        created_at: relPast(2 * 24 * 60 * 60),
+        updated_at: relPast(60 * 60),
+      },
     ]),
   ),
 
-  http.post("/api/v1/tenants/:tenantId/domains/:domainId/verify", () =>
-    HttpResponse.json({
-      domain_id: DOMAIN_ID,
-      domain: "acme.com",
-      mx_verified: true,
-      spf_verified: true,
-      dkim_verified: true,
-      dmarc_verified: true,
-      verified: true,
-    }),
+  http.post(
+    "/api/v1/tenants/:tenantId/domains/:domainId/verify",
+    ({ params }) =>
+      HttpResponse.json({
+        // Echo the domain that was actually requested so verifying
+        // the not-yet-propagated domain flips *that* row to verified
+        // rather than always reporting on the primary domain.
+        domain_id: String(params.domainId),
+        domain:
+          String(params.domainId) === DOMAIN2_ID ? "acme.eu" : "acme.com",
+        mx_verified: true,
+        spf_verified: true,
+        dkim_verified: true,
+        dmarc_verified: true,
+        verified: true,
+      }),
   ),
 
   http.get("/api/v1/tenants/:tenantId/domains/:domainId/dns-records", () =>
@@ -1122,32 +1289,7 @@ export const handlers = [
 
   // ─── Vault / Protected folders ─────────────────────────────────────
   http.get("/api/v1/tenants/:tenantId/vault/folders", () =>
-    HttpResponse.json([
-      {
-        id: "vault-1",
-        tenant_id: TENANT_ID,
-        user_id: ADMIN_USER_ID,
-        folder_name: "Personal — Health",
-        encryption_mode: "StrictZK",
-        wrapped_dek: "AAAA...DEMO",
-        key_algorithm: "XChaCha20-Poly1305",
-        nonce: "BBBB...DEMO",
-        created_at: relPast(45 * 24 * 60 * 60),
-        updated_at: relPast(7 * 24 * 60 * 60),
-      },
-      {
-        id: "vault-2",
-        tenant_id: TENANT_ID,
-        user_id: ADMIN_USER_ID,
-        folder_name: "Legal — Contracts",
-        encryption_mode: "StrictZK",
-        wrapped_dek: "CCCC...DEMO",
-        key_algorithm: "XChaCha20-Poly1305",
-        nonce: "DDDD...DEMO",
-        created_at: relPast(30 * 24 * 60 * 60),
-        updated_at: relPast(2 * 24 * 60 * 60),
-      },
-    ]),
+    HttpResponse.json(vaultFolders()),
   ),
 
   http.get("/api/v1/tenants/:tenantId/protected-folders", () =>
@@ -1396,24 +1538,7 @@ export const handlers = [
 
   // ─── Migrations / Resource calendars ───────────────────────────────
   http.get("/api/v1/migrations", () =>
-    HttpResponse.json({
-      jobs: [
-        {
-          id: "mig-1",
-          tenant_id: TENANT_ID,
-          source_type: "gmail_imap",
-          source_host: "imap.gmail.com",
-          source_user: "founder@oldcompany.com",
-          destination_user_id: ADMIN_USER_ID,
-          status: "completed",
-          messages_total: 12_540,
-          messages_synced: 12_540,
-          started_at: relPast(45 * 24 * 60 * 60),
-          completed_at: relPast(44 * 24 * 60 * 60),
-          created_at: relPast(45 * 24 * 60 * 60),
-        },
-      ],
-    }),
+    HttpResponse.json({ jobs: migrationJobs() }),
   ),
 
   http.get("/api/v1/resource-calendars", () =>
@@ -1618,13 +1743,20 @@ export const handlers = [
     HttpResponse.json({ ok: true }),
   ),
   http.get("/api/v1/email-analytics", () => {
+    // Deterministic pseudo-variation seeded by the bucket index instead of
+    // Math.random(), so the data looks lively but is identical across runs
+    // — the analytics screenshot must be reproducible like every other mock.
+    const seededInt = (seed: number, span: number) => {
+      const f = Math.abs(Math.sin(seed * 12.9898) * 43758.5453);
+      return Math.floor((f - Math.floor(f)) * span);
+    };
     const daily = Array.from({ length: 14 }, (_, i) => {
       const d = new Date(NOW);
       d.setUTCDate(d.getUTCDate() - 13 + i);
       return {
         date: d.toISOString().slice(0, 10),
-        sent: 3 + Math.floor(Math.random() * 12),
-        received: 8 + Math.floor(Math.random() * 25),
+        sent: 3 + seededInt(i + 1, 12),
+        received: 8 + seededInt(i + 101, 25),
       };
     });
     return HttpResponse.json({
@@ -1648,12 +1780,237 @@ export const handlers = [
       ],
       busiest_hours: Array.from({ length: 24 }, (_, h) => ({
         hour: h,
-        count: h >= 8 && h <= 18 ? 5 + Math.floor(Math.random() * 20) : Math.floor(Math.random() * 3),
+        count: h >= 8 && h <= 18 ? 5 + seededInt(h + 201, 20) : seededInt(h + 301, 3),
       })),
       avg_response_seconds: 4320,
       response_sample_size: 42,
     });
   }),
+
+  // ─── Golden-path writes (E2E) ──────────────────────────────────────
+  // The handlers below back the Playwright E2E suite. Each echoes the
+  // request payload the way the real BFF does so the client's
+  // response-driven UI updates fire deterministically (no reliance on
+  // a re-GET reflecting the write, which a stateless mock cannot do).
+
+  // Migration wizard: test IMAP creds, then create the import job.
+  http.post("/api/v1/migrations/test-connection", () =>
+    HttpResponse.json({ ok: true }),
+  ),
+  http.post("/api/v1/migrations", async ({ request }) => {
+    const body = (await request.json().catch(() => ({}))) as Record<
+      string,
+      unknown
+    >;
+    const job: StoredMigrationJob = {
+      id: `mig-${Math.random().toString(36).slice(2, 8)}`,
+      tenant_id: TENANT_ID,
+      source_type: String(body.source_type ?? "generic_imap"),
+      source_host: String(body.source_host ?? ""),
+      source_user: String(body.source_user ?? ""),
+      destination_user_id: String(body.destination_user_id ?? ADMIN_USER_ID),
+      status: "pending",
+      messages_total: 0,
+      messages_synced: 0,
+      created_at: NOW.toISOString(),
+    };
+    // Newest first so the freshly-created job is the top row when the
+    // wizard reloads the jobs table.
+    migrationJobs().unshift(job);
+    return HttpResponse.json(job, { status: 201 });
+  }),
+
+  // User admin: PATCH echoes the merged user so the row re-renders
+  // with the new quota/role/status.
+  http.patch(
+    "/api/v1/tenants/:tenantId/users/:userId",
+    async ({ params, request }) => {
+      const patch = (await request.json().catch(() => ({}))) as Record<
+        string,
+        unknown
+      >;
+      return HttpResponse.json({
+        id: String(params.userId),
+        tenant_id: String(params.tenantId),
+        kchat_user_id: "kchat-alice",
+        stalwart_account_id: "stalwart-alice",
+        email: "alice@acme.com",
+        display_name: "Alice Nguyen",
+        role: "member",
+        status: "active",
+        account_type: "user",
+        quota_bytes: 25 * 1024 ** 3,
+        created_at: relPast(150 * 24 * 60 * 60),
+        updated_at: NOW.toISOString(),
+        ...patch,
+      });
+    },
+  ),
+
+  // Shared inbox workflow: list assignments, assign, set status, notes.
+  http.get(
+    "/api/v1/shared-inboxes/:inboxId/assignments",
+    () =>
+      HttpResponse.json({
+        assignments: [
+          {
+            id: "asg-1",
+            inbox_id: "shared-support",
+            email_id: "msg-2",
+            assignee_user_id: "",
+            status: "open",
+            created_at: relPast(2 * 60 * 60),
+            updated_at: relPast(60 * 60),
+          },
+        ],
+      }),
+  ),
+  http.post(
+    "/api/v1/shared-inboxes/:inboxId/emails/:emailId/assign",
+    async ({ params, request }) => {
+      const body = (await request.json().catch(() => ({}))) as {
+        assignee_user_id?: string;
+      };
+      return HttpResponse.json({
+        id: "asg-1",
+        inbox_id: String(params.inboxId),
+        email_id: String(params.emailId),
+        assignee_user_id: body.assignee_user_id ?? "",
+        status: "in_progress",
+        created_at: relPast(2 * 60 * 60),
+        updated_at: NOW.toISOString(),
+      });
+    },
+  ),
+  http.put(
+    "/api/v1/shared-inboxes/:inboxId/emails/:emailId/status",
+    async ({ params, request }) => {
+      const body = (await request.json().catch(() => ({}))) as {
+        status?: string;
+      };
+      return HttpResponse.json({
+        id: "asg-1",
+        inbox_id: String(params.inboxId),
+        email_id: String(params.emailId),
+        assignee_user_id: "user-alice",
+        status: body.status ?? "open",
+        created_at: relPast(2 * 60 * 60),
+        updated_at: NOW.toISOString(),
+      });
+    },
+  ),
+  http.get(
+    "/api/v1/shared-inboxes/:inboxId/emails/:emailId/notes",
+    ({ params }) =>
+      HttpResponse.json({
+        notes:
+          sharedInboxNotes.get(
+            noteKey(String(params.inboxId), String(params.emailId)),
+          ) ?? [],
+      }),
+  ),
+  http.post(
+    "/api/v1/shared-inboxes/:inboxId/emails/:emailId/notes",
+    async ({ params, request }) => {
+      const body = (await request.json().catch(() => ({}))) as {
+        note_text?: string;
+      };
+      const note: StoredNote = {
+        id: `note-${Math.random().toString(36).slice(2, 8)}`,
+        author_user_id: ADMIN_USER_ID,
+        note_text: body.note_text ?? "",
+        created_at: NOW.toISOString(),
+      };
+      const key = noteKey(String(params.inboxId), String(params.emailId));
+      sharedInboxNotes.set(key, [...(sharedInboxNotes.get(key) ?? []), note]);
+      return HttpResponse.json(note, { status: 201 });
+    },
+  ),
+
+  // Vault: create a StrictZK folder (echo so the form's success path
+  // clears its inputs).
+  http.post(
+    "/api/v1/tenants/:tenantId/vault/folders",
+    async ({ params, request }) => {
+      const body = (await request.json().catch(() => ({}))) as {
+        user_id?: string;
+        folder_name?: string;
+      };
+      const folder: StoredVaultFolder = {
+        id: `vault-${Math.random().toString(36).slice(2, 8)}`,
+        tenant_id: String(params.tenantId),
+        user_id: body.user_id ?? "user-1",
+        folder_name: body.folder_name ?? "Untitled",
+        encryption_mode: "StrictZK",
+        key_algorithm: "XChaCha20-Poly1305",
+        created_at: NOW.toISOString(),
+        updated_at: NOW.toISOString(),
+      };
+      vaultFolders().push(folder);
+      return HttpResponse.json(folder, { status: 201 });
+    },
+  ),
+
+  // WebAuthn registration challenge + credential removal.
+  http.post("/api/v1/auth/webauthn/register/begin", () =>
+    HttpResponse.json({
+      rp: { id: "kmail.dev", name: "KMail" },
+      challenge: "ZGVtby1jaGFsbGVuZ2U",
+      user: { id: "dXNlci1kZW1v", name: "demo@kmail.dev", displayName: "Demo Admin" },
+      pubKeyCredParams: [{ type: "public-key", alg: -7 }],
+    }),
+  ),
+  http.delete("/api/v1/auth/webauthn/credentials/:id", () =>
+    HttpResponse.json({ ok: true }),
+  ),
+
+  // TOTP enrolment lifecycle.
+  http.post("/api/v1/auth/totp/enroll", () =>
+    HttpResponse.json({
+      otpauth_uri:
+        "otpauth://totp/KMail:demo@kmail.dev?secret=JBSWY3DPEHPK3PXP&issuer=KMail",
+      secret: "JBSWY3DPEHPK3PXP",
+    }),
+  ),
+  http.post("/api/v1/auth/totp/verify", () =>
+    HttpResponse.json({
+      recovery_codes: [
+        "aaaa-bbbb-cccc",
+        "dddd-eeee-ffff",
+        "gggg-hhhh-iiii",
+        "jjjj-kkkk-llll",
+      ],
+    }),
+  ),
+
+  // Self-service signup funnel: initiate (redirects back same-origin
+  // so the E2E can follow it without leaving the app) + status poll.
+  http.post("/api/v1/signup", async ({ request }) => {
+    const body = (await request.json().catch(() => ({}))) as {
+      email?: string;
+      org_name?: string;
+      plan?: string;
+    };
+    const id = `signup-${Math.random().toString(36).slice(2, 8)}`;
+    return HttpResponse.json({
+      id,
+      email: body.email ?? "founder@example.com",
+      org_name: body.org_name ?? "Example Inc",
+      plan: body.plan ?? "pro",
+      status: "pending",
+      checkout_url: `/signup?status=success&id=${id}`,
+      created_at: NOW.toISOString(),
+    });
+  }),
+  http.get("/api/v1/signup/:id/status", ({ params }) =>
+    HttpResponse.json({
+      id: String(params.id),
+      plan: "pro",
+      status: "active",
+      created_at: NOW.toISOString(),
+      completed_at: NOW.toISOString(),
+    }),
+  ),
 
   // Anything unmocked above returns an empty success so the UI shows
   // "no data" rather than a "failed to fetch" banner.
