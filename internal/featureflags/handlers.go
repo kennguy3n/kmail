@@ -124,6 +124,30 @@ func (h *Handlers) dropCache() {
 	h.cacheMu.Unlock()
 }
 
+// removeFlagFromCache reconciles the stale-serving cache with a
+// just-committed whole-flag delete by dropping that flag's view from
+// the snapshot in place (copy-on-write swap), without a DB round-trip.
+// A delete's effect on the cache is fully known from the key alone, so
+// there's no reason to reload: this keeps the delete response from
+// blocking on a reconciliation read and makes the reconciliation immune
+// to a client disconnect. Other entries stay as stale as the last full
+// read, so cachedAt is intentionally left unchanged. A nil (cold) cache
+// stays cold.
+func (h *Handlers) removeFlagFromCache(key string) {
+	h.cacheMu.Lock()
+	defer h.cacheMu.Unlock()
+	if h.lastGood == nil {
+		return
+	}
+	filtered := make([]FlagView, 0, len(h.lastGood))
+	for _, v := range h.lastGood {
+		if v.Key != key {
+			filtered = append(filtered, v)
+		}
+	}
+	h.lastGood = filtered
+}
+
 // cacheRefreshBudget bounds the post-write cache reconciliation read.
 // It mirrors the Store's default read deadline so the refresh fails
 // fast against a stalled DB even if the Store was built without its own
@@ -131,19 +155,24 @@ func (h *Handlers) dropCache() {
 const cacheRefreshBudget = 5 * time.Second
 
 // refreshCacheAfterWrite reconciles the stale-serving cache with a
-// just-committed mutation. It reloads the view set and re-caches it on
-// success; if that reload fails (e.g. the DB went unavailable right
-// after the write), it drops the cache so a subsequent outage read
-// returns 503 instead of serving a snapshot that no longer matches the
-// committed state (e.g. a just-deleted flag resurfacing).
+// just-committed flag upsert whose convenience reload (the one that
+// builds the response body) failed. It reloads the view set and
+// re-caches it on success; if that reload also fails (e.g. the DB went
+// unavailable right after the write), it drops the cache so a
+// subsequent outage read returns 503 instead of serving a snapshot that
+// no longer matches the committed state.
 //
 // The reconciliation read is deliberately decoupled from the caller's
 // request context: it keeps the request's values (tracing, etc.) but
-// drops its cancellation/deadline and applies its own budget, so a
-// client that disconnects — or one whose deadline was nearly spent by
-// a slow write — doesn't needlessly force the cache to be dropped (and
-// thus degrade a later outage read to 503). The reconciliation already
-// committed; finishing it on the server's terms is correct.
+// drops its cancellation/deadline and applies its own budget. The most
+// common reason the convenience reload fails is the client
+// disconnecting — decoupling lets the reconciliation still succeed on
+// the server's terms and re-cache, rather than a mere disconnect
+// needlessly dropping a usable snapshot (and degrading a later outage
+// read to 503). The write already committed; finishing the read here is
+// correct. Whole-flag deletes don't use this path: their cache effect
+// is fully known from the key, so removeFlagFromCache reconciles them
+// in memory without a reload.
 func (h *Handlers) refreshCacheAfterWrite(parent context.Context) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), cacheRefreshBudget)
 	defer cancel()
@@ -204,8 +233,11 @@ func (h *Handlers) put(w http.ResponseWriter, r *http.Request) {
 		}
 		h.invalidate()
 		// Keep the stale-serving cache consistent with the delete so a
-		// later outage read can't resurface the removed flag.
-		h.refreshCacheAfterWrite(r.Context())
+		// later outage read can't resurface the removed flag. The cache
+		// effect is fully known from the key, so reconcile in memory —
+		// no reload, so the response isn't blocked and a client
+		// disconnect can't affect it.
+		h.removeFlagFromCache(in.Key)
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -295,10 +327,13 @@ func (h *Handlers) put(w http.ResponseWriter, r *http.Request) {
 		if h.logger != nil {
 			h.logger.Printf("featureflags: put reload: %v", err)
 		}
-		// The write landed but we couldn't refresh the snapshot, so the
-		// cached view set no longer reflects committed state. Drop it
-		// rather than risk serving it stale during a later outage.
-		h.dropCache()
+		// The write landed but the convenience reload (on the client's
+		// context) failed — most often a client disconnect. Reconcile
+		// the cache out of band on a decoupled context: a transient
+		// disconnect still re-caches the committed state, and only a
+		// genuine outage drops the snapshot (→ later read 503). Either
+		// way the cache never keeps a snapshot the write contradicted.
+		h.refreshCacheAfterWrite(r.Context())
 		cacheReconciled = true
 		writeJSON(w, http.StatusOK, map[string]string{"key": in.Key})
 		return

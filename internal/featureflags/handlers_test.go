@@ -26,6 +26,7 @@ type fakeStore struct {
 	flags       map[string]Flag
 	overrides   map[string]Override // key: scopeKey on the (single) test flag set
 	loadErr     error               // when set, loadViews returns it (DB-outage simulation)
+	loadErrOnce bool                // when true, loadErr fires once then clears (client-disconnect-then-recover)
 	overrideErr error               // when set, SetOverride returns it (partial-write simulation)
 }
 
@@ -37,7 +38,11 @@ func ovKey(flag string, scope Scope, id string) string { return flag + "|" + sco
 
 func (f *fakeStore) loadViews(context.Context) ([]FlagView, error) {
 	if f.loadErr != nil {
-		return nil, f.loadErr
+		err := f.loadErr
+		if f.loadErrOnce {
+			f.loadErr = nil
+		}
+		return nil, err
 	}
 	flags := make([]Flag, 0, len(f.flags))
 	for _, fl := range f.flags {
@@ -332,20 +337,24 @@ func TestHandlerListServerErrorNotServedStale(t *testing.T) {
 	}
 }
 
-// TestHandlerDeleteRefreshesStaleCache asserts that a confirmed DELETE
-// reconciles the stale-serving cache: a flag removed while the DB is
-// healthy must not resurface in a later stale read once Postgres goes
-// unavailable. Without the post-delete refresh the GET would happily
-// serve the warmed snapshot that still contained the deleted flag.
-func TestHandlerDeleteRefreshesStaleCache(t *testing.T) {
+// TestHandlerDeleteReconcilesStaleCacheInMemory asserts that a
+// confirmed DELETE reconciles the stale-serving cache in memory: the
+// removed flag must not resurface in a later stale read, while the other
+// warmed flags survive. The reconciliation needs no DB reload, so it
+// holds even if Postgres is already unavailable for reads (and is immune
+// to a client disconnect).
+func TestHandlerDeleteReconcilesStaleCacheInMemory(t *testing.T) {
 	store := newFakeStore()
 	store.flags["a"] = Flag{Key: "a", DefaultEnabled: true}
+	store.flags["b"] = Flag{Key: "b", DefaultEnabled: false}
 	h := &Handlers{store: store, logger: discardLogger()}
 
-	// Warm the cache with the flag present.
+	// Warm the cache with both flags present.
 	h.list(httptest.NewRecorder(), authed(httptest.NewRequest(http.MethodGet, "/api/v1/admin/feature-flags", nil)))
 
-	// Delete it (DB still healthy, so the post-write refresh succeeds).
+	// Reads are already failing, but the delete write still lands and
+	// reconciles the cache in memory — no reload needed.
+	store.loadErr = context.DeadlineExceeded
 	del := authed(httptest.NewRequest(http.MethodPut, "/api/v1/admin/feature-flags", bytes.NewBufferString(`{"key":"a","delete":true}`)))
 	delRec := httptest.NewRecorder()
 	h.put(delRec, del)
@@ -353,8 +362,7 @@ func TestHandlerDeleteRefreshesStaleCache(t *testing.T) {
 		t.Fatalf("delete: status %d, body %s", delRec.Code, delRec.Body.String())
 	}
 
-	// Postgres now goes away; the stale read must reflect the delete.
-	store.loadErr = context.DeadlineExceeded
+	// The stale read must drop "a" but keep "b".
 	rec := httptest.NewRecorder()
 	h.list(rec, authed(httptest.NewRequest(http.MethodGet, "/api/v1/admin/feature-flags", nil)))
 	if rec.Code != http.StatusOK {
@@ -366,32 +374,90 @@ func TestHandlerDeleteRefreshesStaleCache(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
+	var sawB bool
 	for _, v := range resp.Flags {
 		if v.Key == "a" {
 			t.Fatalf("deleted flag resurfaced in stale read: %+v", resp.Flags)
 		}
+		if v.Key == "b" {
+			sawB = true
+		}
+	}
+	if !sawB {
+		t.Fatalf("surviving flag \"b\" missing from stale read: %+v", resp.Flags)
 	}
 }
 
-// TestHandlerDeleteDropsCacheWhenRefreshFails asserts that if the DB
-// becomes unavailable immediately after a delete (so the post-write
-// refresh can't reload), the stale cache is dropped rather than left
-// holding the just-deleted flag — a subsequent outage read then returns
-// the retryable 503 instead of serving contradicted data.
-func TestHandlerDeleteDropsCacheWhenRefreshFails(t *testing.T) {
+// TestHandlerPutReloadFailureReconcilesDecoupled asserts that when an
+// upsert's convenience reload fails only because the client's context
+// went away (disconnect), the decoupled post-write reconcile still
+// re-caches the committed state rather than dropping the snapshot — so a
+// later outage read serves the new value, not a 503.
+func TestHandlerPutReloadFailureReconcilesDecoupled(t *testing.T) {
+	store := newFakeStore()
+	store.flags["a"] = Flag{Key: "a", Description: "old", DefaultEnabled: true}
+	h := &Handlers{store: store, logger: discardLogger()}
+
+	// Warm the cache.
+	h.list(httptest.NewRecorder(), authed(httptest.NewRequest(http.MethodGet, "/api/v1/admin/feature-flags", nil)))
+
+	// The writes land; the convenience reload fails once (as a client
+	// disconnect would), but the decoupled reconcile read recovers.
+	store.loadErr = context.Canceled
+	store.loadErrOnce = true
+	body := `{"key":"a","description":"new","default_enabled":false}`
+	wrec := httptest.NewRecorder()
+	h.put(wrec, authed(httptest.NewRequest(http.MethodPut, "/api/v1/admin/feature-flags", bytes.NewBufferString(body))))
+	if wrec.Code != http.StatusOK {
+		t.Fatalf("put: status %d, want 200, body %s", wrec.Code, wrec.Body.String())
+	}
+
+	// A later outage read must serve the reconciled (new) state, not 503.
+	store.loadErr = context.DeadlineExceeded
+	rec := httptest.NewRecorder()
+	h.list(rec, authed(httptest.NewRequest(http.MethodGet, "/api/v1/admin/feature-flags", nil)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (reconciled stale snapshot), body %s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Flags []FlagView `json:"flags"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	var found bool
+	for _, v := range resp.Flags {
+		if v.Key == "a" {
+			found = true
+			if v.Description != "new" || v.DefaultEnabled {
+				t.Fatalf("stale read did not reflect the committed upsert: %+v", v)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("flag \"a\" missing from reconciled stale read: %+v", resp.Flags)
+	}
+}
+
+// TestHandlerPutReloadFailureDropsCacheOnOutage asserts that when an
+// upsert's writes land but both the convenience reload and the decoupled
+// reconcile fail (a genuine DB outage), the stale cache is dropped so a
+// later outage read returns the retryable 503 instead of contradicted
+// data.
+func TestHandlerPutReloadFailureDropsCacheOnOutage(t *testing.T) {
 	store := newFakeStore()
 	store.flags["a"] = Flag{Key: "a", DefaultEnabled: true}
 	h := &Handlers{store: store, logger: discardLogger()}
 
 	h.list(httptest.NewRecorder(), authed(httptest.NewRequest(http.MethodGet, "/api/v1/admin/feature-flags", nil)))
 
-	// The delete itself succeeds, but the reload right after it fails.
+	// Writes land, but every reload (convenience + decoupled) fails.
 	store.loadErr = context.DeadlineExceeded
-	del := authed(httptest.NewRequest(http.MethodPut, "/api/v1/admin/feature-flags", bytes.NewBufferString(`{"key":"a","delete":true}`)))
-	delRec := httptest.NewRecorder()
-	h.put(delRec, del)
-	if delRec.Code != http.StatusNoContent {
-		t.Fatalf("delete: status %d, body %s", delRec.Code, delRec.Body.String())
+	body := `{"key":"a","default_enabled":false}`
+	wrec := httptest.NewRecorder()
+	h.put(wrec, authed(httptest.NewRequest(http.MethodPut, "/api/v1/admin/feature-flags", bytes.NewBufferString(body))))
+	if wrec.Code != http.StatusOK {
+		t.Fatalf("put: status %d, want 200, body %s", wrec.Code, wrec.Body.String())
 	}
 
 	rec := httptest.NewRecorder()
