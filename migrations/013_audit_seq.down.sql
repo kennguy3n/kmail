@@ -1,4 +1,4 @@
--- Rollback for 011_audit_seq.sql.
+-- Rollback for 013_audit_seq.sql.
 BEGIN;
 
 DROP INDEX IF EXISTS audit_log_tenant_seq;

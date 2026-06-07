@@ -94,7 +94,7 @@ func seedTenantWithUser(t *testing.T, pool *pgxpool.Pool, slugPrefix string) (st
 // TestRLS_ForcedOnEveryEnabledTable asserts the schema invariant
 // that underpins tenant isolation: a table that enables RLS but
 // does not force it leaves the policy unenforced for the table
-// owner. Migration 008 forces RLS on every such table; this test
+// owner. Migration 010 forces RLS on every such table; this test
 // fails if a future migration enables RLS without forcing it.
 func TestRLS_ForcedOnEveryEnabledTable(t *testing.T) {
 	pool := testAdminPool(t)

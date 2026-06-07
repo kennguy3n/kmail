@@ -1,4 +1,4 @@
--- Rollback for 008_force_rls.sql.
+-- Rollback for 010_force_rls.sql.
 --
 -- Reverts FORCE back to ENABLE-only (RLS stays enabled; only the
 -- "policies also apply to the table owner" behaviour is dropped).

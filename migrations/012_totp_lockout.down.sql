@@ -1,4 +1,4 @@
--- Rollback for 010_totp_lockout.sql.
+-- Rollback for 012_totp_lockout.sql.
 BEGIN;
 
 ALTER TABLE totp_credentials
