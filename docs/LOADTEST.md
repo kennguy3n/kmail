@@ -79,13 +79,13 @@ scripts/loadtest/load-smtp.sh 25 60   # 25 TPS for 60 seconds
 | Script                    | Failure injected     | Expected behaviour |
 |---------------------------|----------------------|--------------------|
 | `chaos-shard.sh`          | Stalwart shard kill  | Circuit breaker opens, secondary shard takes over within the 99.95 % SLO window. |
-| `chaos-postgres.sh`       | Postgres pause       | Control-plane reads fail fast (retryable `503` within `KMAIL_FLAGS_READ_TIMEOUT`, default 5 s) instead of hanging — bounded liveness enforced at 100 % by default. Served ratio is report-only (no cached fallback yet); set `KMAIL_CHAOS_PG_MIN_SUCCESS_PCT=50` to enforce an availability SLO once one is added. |
+| `chaos-postgres.sh`       | Postgres pause       | Control-plane reads stay **bounded** (no hang, via `KMAIL_FLAGS_READ_TIMEOUT`, default 5 s) **and served**: the admin GET serves its last-known-good snapshot (`200` + `X-Kmail-Stale: true`) during the outage, falling back to a retryable `503` only on a cold process. Both ratios enforced at 100 % by default. |
 | `chaos-valkey.sh`         | Valkey kill          | Rate-limit middleware fails open; success rate stays ≥ 95 %. |
 
 Each script sets a non-zero exit code if its SLO target is missed.
-`chaos-postgres.sh` enforces **bounded liveness** (no hang) by default
-but treats the **served** ratio as report-only — see the note below.
-Run them inside the compose stack:
+`chaos-postgres.sh` enforces **both** bounded liveness (no hang) and the
+**served** ratio (stale-snapshot fallback) at 100 % by default — see the
+note below. Run them inside the compose stack:
 
 ```bash
 docker compose up -d
@@ -107,19 +107,22 @@ The chaos scripts probe `/api/v1/admin/feature-flags` and the
     probe ceiling rather than hanging. This is now guaranteed:
     `featureflags.Store` applies a per-read deadline
     (`KMAIL_FLAGS_READ_TIMEOUT`, default 5 s) and the admin handler
-    maps the timeout to `503 + Retry-After`. The harness enforces
+    maps the timeout to a bounded response. The harness enforces
     `KMAIL_CHAOS_PG_MIN_BOUNDED_PCT` (default 100 %), so a build that
     regresses to hanging reads fails. Keep the probe's `--max-time`
-    (default 8 s) above the server read timeout so it observes the
-    server's `503`, not its own client cutoff.
-  - **served** — the read returned 2xx/3xx. This stays ~0 % during a
-    full outage because control-plane reads have **no cached
-    fallback** (flag *evaluation* stays up via the resolver's
-    in-memory snapshot, but the admin *read* has nothing to fall back
-    to). It is therefore report-only; set
-    `KMAIL_CHAOS_PG_MIN_SUCCESS_PCT=50` to enforce an availability SLO
-    once a cached-read fallback is added. See `docs/BENCHMARKS.md` →
-    "Session 7" for the full finding.
+    (default 10 s) above the server read timeout plus serve-stale
+    overhead (measured ~7.1 s/req) so it observes the server's
+    response, not its own client cutoff.
+  - **served** — the read returned 2xx/3xx. The admin GET now keeps a
+    **last-known-good snapshot** and serves it (`200`, tagged
+    `X-Kmail-Stale: true` + `Warning: 110`) when the read finds
+    Postgres unavailable, so a *warmed* endpoint stays served through
+    the outage (the warmup loop primes the snapshot). Only a cold
+    process with no snapshot yet degrades to a retryable `503`. The
+    harness enforces `KMAIL_CHAOS_PG_MIN_SUCCESS_PCT` (default 100 %);
+    set it to `0` for report-only. Writes are never served from cache
+    — a PUT against a down DB still fails honestly. See
+    `docs/BENCHMARKS.md` → "Session 7" for the full finding.
 - **`chaos-shard.sh`** needs a provisioned Stalwart mailbox for the
   authenticated principal; otherwise the BFF returns `404
   accountNotFound` before reaching a shard and the circuit-breaker
@@ -150,8 +153,10 @@ Container names default to the compose `container_name:` values
   server stopped enforcing its read deadline: confirm the control-plane
   read timeout is in effect (`KMAIL_FLAGS_READ_TIMEOUT` not set to `0`)
   and that the probe's `--max-time` is above it. A *served* shortfall
-  (the report-only metric) is expected until a cached-read fallback is
-  added — fast `503`s are correct-but-unavailable, not a regression.
+  now means the stale-snapshot fallback regressed (or the endpoint was
+  never warmed, so the snapshot is empty) — check that the warmup loop
+  ran and that `Handlers.cacheViews` is being populated on successful
+  reads.
 - **Valkey chaos failure** — the rate limiter is the suspect.
   Confirm the middleware logs the Valkey error and admits the
   request.

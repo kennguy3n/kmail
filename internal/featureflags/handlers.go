@@ -6,6 +6,9 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"strconv"
+	"sync"
+	"time"
 
 	"github.com/kennguy3n/kmail/internal/middleware"
 )
@@ -24,6 +27,17 @@ type Handlers struct {
 	store  adminStore
 	svc    *Service
 	logger *log.Logger
+
+	// lastGood is the last successful loadViews result, served stale
+	// (with staleness headers) when a later read finds Postgres
+	// unavailable. This closes the control-plane read gap: rather than
+	// returning 503 the moment the DB stalls, the admin GET keeps
+	// serving the last-known-good snapshot — the same graceful-
+	// degradation guarantee the resolver Service already has for flag
+	// evaluation. Writes never read from here; only the GET degrades.
+	cacheMu  sync.RWMutex
+	lastGood []FlagView
+	cachedAt time.Time
 }
 
 // adminStore is the write+read surface the handlers need. The pgx
@@ -56,10 +70,45 @@ func (h *Handlers) Register(mux *http.ServeMux, authMW *middleware.OIDC) {
 func (h *Handlers) list(w http.ResponseWriter, r *http.Request) {
 	views, err := h.store.loadViews(r.Context())
 	if err != nil {
+		// Postgres is momentarily unavailable. Prefer serving the
+		// last-known-good snapshot (clearly marked stale) over a 503:
+		// an operator reading flags during a DB blip still sees the
+		// real state, and only a cold start (no snapshot yet) degrades
+		// to the retryable error.
+		if isStoreUnavailable(err) {
+			if cached, age, ok := h.cachedViews(); ok {
+				if h.logger != nil {
+					h.logger.Printf("featureflags: store unavailable (%v); serving snapshot aged %s", err, age.Round(time.Second))
+				}
+				writeStaleJSON(w, age, map[string]any{"flags": cached})
+				return
+			}
+		}
 		h.writeStoreErr(w, err)
 		return
 	}
+	h.cacheViews(views)
 	writeJSON(w, http.StatusOK, map[string]any{"flags": views})
+}
+
+// cacheViews records the latest successful read as the last-known-good
+// snapshot served during a subsequent DB outage.
+func (h *Handlers) cacheViews(views []FlagView) {
+	h.cacheMu.Lock()
+	h.lastGood = views
+	h.cachedAt = time.Now()
+	h.cacheMu.Unlock()
+}
+
+// cachedViews returns the last-known-good snapshot and its age, or
+// ok=false if nothing has been cached yet (cold start).
+func (h *Handlers) cachedViews() (views []FlagView, age time.Duration, ok bool) {
+	h.cacheMu.RLock()
+	defer h.cacheMu.RUnlock()
+	if h.lastGood == nil {
+		return nil, 0, false
+	}
+	return h.lastGood, time.Since(h.cachedAt), true
 }
 
 // overrideOp is one override mutation in a PUT body. Delete=true
@@ -187,6 +236,7 @@ func (h *Handlers) put(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"key": in.Key})
 		return
 	}
+	h.cacheViews(views)
 	for _, v := range views {
 		if v.Key == in.Key {
 			writeJSON(w, http.StatusOK, v)
@@ -203,15 +253,22 @@ func (h *Handlers) invalidate() {
 	}
 }
 
-func (h *Handlers) writeStoreErr(w http.ResponseWriter, err error) {
-	// A missing pool, a read that hit its deadline, or a cancelled
-	// request all mean the control plane is momentarily unavailable
-	// rather than the request being malformed — surface them as a
-	// retryable 503 (with Retry-After) instead of a 500 so callers and
-	// the chaos harness see a fast, honest "try again", not a hang.
-	if errors.Is(err, ErrNoPool) ||
+// isStoreUnavailable reports whether err means the control plane is
+// momentarily unavailable (a missing pool, a read that hit its
+// deadline, or a cancelled request) rather than a malformed request or
+// a genuine bug. These are retryable and, for reads, eligible for the
+// stale-snapshot fallback.
+func isStoreUnavailable(err error) bool {
+	return errors.Is(err, ErrNoPool) ||
 		errors.Is(err, context.DeadlineExceeded) ||
-		errors.Is(err, context.Canceled) {
+		errors.Is(err, context.Canceled)
+}
+
+func (h *Handlers) writeStoreErr(w http.ResponseWriter, err error) {
+	// Surface a momentarily-unavailable control plane as a retryable
+	// 503 (with Retry-After) instead of a 500 so callers and the chaos
+	// harness see a fast, honest "try again", not a hang.
+	if isStoreUnavailable(err) {
 		if h.logger != nil {
 			h.logger.Printf("featureflags: store unavailable: %v", err)
 		}
@@ -223,6 +280,22 @@ func (h *Handlers) writeStoreErr(w http.ResponseWriter, err error) {
 		h.logger.Printf("featureflags: store error: %v", err)
 	}
 	writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+}
+
+// writeStaleJSON serves a last-known-good payload during a DB outage,
+// tagged so a client can tell it is not fresh: a standard `Warning:
+// 110` ("Response is Stale"), an `Age` in whole seconds, and an
+// explicit `X-Kmail-Stale` flag. Status stays 200 — the data is real,
+// just not guaranteed current.
+func writeStaleJSON(w http.ResponseWriter, age time.Duration, payload any) {
+	secs := int(age.Seconds())
+	if secs < 0 {
+		secs = 0
+	}
+	w.Header().Set("Age", strconv.Itoa(secs))
+	w.Header().Set("Warning", `110 - "Response is Stale"`)
+	w.Header().Set("X-Kmail-Stale", "true")
+	writeJSON(w, http.StatusOK, payload)
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {

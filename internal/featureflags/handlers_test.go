@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -212,6 +213,71 @@ func TestHandlerListDBUnavailableReturns503(t *testing.T) {
 				t.Errorf("missing Retry-After header")
 			}
 		})
+	}
+}
+
+// TestHandlerListServesStaleSnapshotWhenDBUnavailable asserts the
+// cached-read fallback: once a GET has succeeded, a later GET that finds
+// Postgres unavailable serves the last-known-good snapshot (200) tagged
+// stale instead of returning 503. This is the control-plane analogue of
+// the resolver's in-memory snapshot, closing the chaos-postgres
+// "served = 0%" gap.
+func TestHandlerListServesStaleSnapshotWhenDBUnavailable(t *testing.T) {
+	store := newFakeStore()
+	store.flags["a"] = Flag{Key: "a", DefaultEnabled: true}
+	h := &Handlers{store: store, logger: discardLogger()}
+
+	// First read succeeds and warms the last-known-good cache.
+	warm := authed(httptest.NewRequest(http.MethodGet, "/api/v1/admin/feature-flags", nil))
+	h.list(httptest.NewRecorder(), warm)
+
+	// Now Postgres goes away mid-flight.
+	store.loadErr = context.DeadlineExceeded
+	rec := httptest.NewRecorder()
+	h.list(rec, authed(httptest.NewRequest(http.MethodGet, "/api/v1/admin/feature-flags", nil)))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (stale snapshot), body %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("X-Kmail-Stale"); got != "true" {
+		t.Errorf("X-Kmail-Stale = %q, want \"true\"", got)
+	}
+	if got := rec.Header().Get("Warning"); got == "" {
+		t.Errorf("missing Warning header on stale response")
+	}
+	if _, ok := rec.Header()["Age"]; !ok {
+		t.Errorf("missing Age header on stale response")
+	}
+	var resp struct {
+		Flags []FlagView `json:"flags"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Flags) != 1 || resp.Flags[0].Key != "a" {
+		t.Fatalf("stale body did not carry the cached flag: %+v", resp.Flags)
+	}
+}
+
+// TestHandlerListGenuineErrorNotServedStale asserts the fallback is
+// scoped to transient unavailability only: a non-retryable store error
+// still surfaces as 500 even when a warm snapshot exists, so real bugs
+// are never masked by stale data.
+func TestHandlerListGenuineErrorNotServedStale(t *testing.T) {
+	store := newFakeStore()
+	store.flags["a"] = Flag{Key: "a"}
+	h := &Handlers{store: store, logger: discardLogger()}
+	h.list(httptest.NewRecorder(), authed(httptest.NewRequest(http.MethodGet, "/api/v1/admin/feature-flags", nil)))
+
+	store.loadErr = errors.New("scan: malformed row")
+	rec := httptest.NewRecorder()
+	h.list(rec, authed(httptest.NewRequest(http.MethodGet, "/api/v1/admin/feature-flags", nil)))
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 for a genuine error", rec.Code)
+	}
+	if got := rec.Header().Get("X-Kmail-Stale"); got != "" {
+		t.Errorf("genuine error must not be served stale; got X-Kmail-Stale=%q", got)
 	}
 }
 
