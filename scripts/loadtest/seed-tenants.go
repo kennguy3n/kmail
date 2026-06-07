@@ -570,8 +570,17 @@ func (c *apiClient) listSharedInboxes(ctx context.Context, tenantID string) (map
 }
 
 func (c *apiClient) createSharedInbox(ctx context.Context, tenantID, address, displayName string) error {
+	// CreateSharedInbox requires a non-empty mls_group_id (the MLS
+	// group backing the shared mailbox). The harness has no live MLS
+	// service, so it supplies a deterministic synthetic group id
+	// derived from the address — stable across idempotent re-runs and
+	// unique per inbox, which is all the column (free-text) requires.
 	return c.do(ctx, http.MethodPost, "/api/v1/tenants/"+tenantID+"/shared-inboxes", tenantID, "",
-		map[string]string{"address": address, "display_name": displayName}, nil)
+		map[string]string{
+			"address":      address,
+			"display_name": displayName,
+			"mls_group_id": "loadtest-mls-" + address,
+		}, nil)
 }
 
 func (c *apiClient) countRetention(ctx context.Context, tenantID string) (int, error) {
