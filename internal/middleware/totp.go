@@ -190,6 +190,14 @@ func (h *TOTPHandlers) verify(w http.ResponseWriter, r *http.Request) {
 		h.cfg.MaxFailedAttempts, h.cfg.LockoutDuration,
 		false, // enrollment confirmation: the row exists but is not yet enabled
 		func(cred *TOTPCredential) TOTPVerification {
+			// verify is enrollment confirmation only. If the credential
+			// is already enabled, refuse rather than re-minting (and
+			// overwriting) the recovery bundle — that would silently
+			// invalidate codes the user already saved. Aborts via Err so
+			// no attempt is spent and nothing is written.
+			if cred.Enabled {
+				return TOTPVerification{Err: ErrTOTPAlreadyEnabled}
+			}
 			secret, uerr := h.unwrapSecret(cred.EncryptedSecret)
 			if uerr != nil {
 				return TOTPVerification{Err: uerr}
@@ -202,6 +210,10 @@ func (h *TOTPHandlers) verify(w http.ResponseWriter, r *http.Request) {
 	)
 	if errors.Is(err, ErrTOTPNotFound) {
 		http.Error(w, "not enrolled", http.StatusBadRequest)
+		return
+	}
+	if errors.Is(err, ErrTOTPAlreadyEnabled) {
+		http.Error(w, "already enrolled", http.StatusConflict)
 		return
 	}
 	if err != nil {

@@ -45,7 +45,7 @@ the latest go1.25 patch release.** CI already uses
 `go-version: "1.25.x"`, which resolves to the newest patch at run
 time, so CI builds pick up the fixes automatically; the advisories
 surface locally only when an older 1.25.0 toolchain is installed.
-Keeping the toolchain current (and letting Dependabot's `gomod`
+Keeping the toolchain current (and letting Renovate's `gomod`
 updates raise the `go` directive) closes these out. No application
 code change is warranted — rewriting around stdlib functions would
 be a band-aid.
@@ -54,13 +54,13 @@ be a band-aid.
 
 | Package | Severity | Shipped to prod? | Disposition |
 |---------|----------|------------------|-------------|
-| `vitest`, `@vitest/ui`, `vite-node`, `@vitest/mocker` | critical/moderate | No (test/dev tooling) | Upgrade tracked via Dependabot; not in the production bundle, so not a runtime exposure. Major bump (vitest 4.x) staged separately to avoid destabilising the 182-test suite. |
+| `vitest`, `@vitest/ui`, `vite-node`, `@vitest/mocker` | critical/moderate | No (test/dev tooling) | Upgrade tracked via Renovate; not in the production bundle, so not a runtime exposure. Major bump (vitest 4.x) staged separately to avoid destabilising the 182-test suite. |
 | `esbuild` (via `vite`) | moderate | No (dev server only) | Advisory is the dev-server request bug; not reachable in production. Resolved by the same `vite`/`vitest` major bump. |
 | `react-router` / `react-router-dom` | moderate | Yes | Open-redirect via protocol-relative `//` path. Non-major fix available (`npm audit fix`); scheduled — low exposure because redirects in-app are server-anchored, but worth patching. |
 | `ws` | moderate | Yes | Uninitialized-memory disclosure. Non-major fix available; scheduled. |
 
 Approach: the runtime-affecting, non-breaking fixes
-(`react-router`, `ws`) are queued via Dependabot grouped updates;
+(`react-router`, `ws`) are queued via Renovate grouped updates;
 the dev-only criticals are not a production risk and are bundled
 into a deliberate major-version upgrade PR so the test/build tooling
 migration is reviewed on its own.

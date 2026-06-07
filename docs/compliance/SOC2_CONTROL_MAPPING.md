@@ -62,7 +62,7 @@ runbook.
 | TSC | Control | Evidence |
 |-----|---------|----------|
 | CC7.1 | Capacity / availability | `internal/monitoring/` SLO tracker |
-| CC7.1 | Dependency vulnerability scanning | `.github/workflows/security-scan.yml` (govulncheck / npm audit / cargo audit) + `.github/dependabot.yml`; findings in [`SECURITY_FINDINGS.md`](./SECURITY_FINDINGS.md) |
+| CC7.1 | Dependency vulnerability scanning | `.github/workflows/security-scan.yml` (govulncheck / npm audit / cargo audit) + `.github/renovate.json` (automated update + vulnerability-alert PRs); findings in [`SECURITY_FINDINGS.md`](./SECURITY_FINDINGS.md) |
 | CC7.2 | Incident response | Pager runbook + audit log |
 | CC7.3 | Detection of security events | `internal/deliverability/` + audit chain verification |
 | CC7.4 | Recovery from incidents | DB PITR, zk-object-fabric versioning |

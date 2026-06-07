@@ -353,3 +353,60 @@ func TestTOTPLockout_RecoveryCodeConsumeAtomic(t *testing.T) {
 		t.Fatalf("second recovery code: want 200, got %d", rec)
 	}
 }
+
+// TestTOTPVerify_AlreadyEnabledRefusesRegeneration guards the fix for
+// /verify (enrollment confirmation) doubling as an implicit
+// recovery-code regenerator. /verify is only meant to flip a freshly
+// enrolled (disabled) credential live; calling it again with a valid
+// TOTP code on an already-enabled credential must NOT mint and persist
+// a fresh recovery bundle (which would silently invalidate the codes
+// the user already saved). It returns 409 and leaves the stored
+// recovery hash untouched. Re-running enroll is the supported way to
+// rotate.
+func TestTOTPVerify_AlreadyEnabledRefusesRegeneration(t *testing.T) {
+	admin := testAdminPool(t)
+	tenantID, userID := seedTenantWithUser(t, admin, "totp-reverify")
+
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return now }
+
+	h := NewTOTPHandlers(TOTPConfig{
+		Pool:              admin,
+		Now:               clock,
+		MaxFailedAttempts: 5,
+		LockoutDuration:   15 * time.Minute,
+	})
+
+	// Seed an ALREADY-ENABLED credential with a known recovery hash.
+	const originalHash = "original-recovery-bundle-hash"
+	secret := []byte("12345678901234567890")
+	if err := h.store.Upsert(t.Context(), tenantID, userID, secret, originalHash, true, clock()); err != nil {
+		t.Fatalf("seed totp credential: %v", err)
+	}
+
+	validCode := generateHOTP(secret, clock().Unix()/30)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/totp/verify",
+		bytes.NewReader([]byte(`{"code":"`+validCode+`"}`)))
+	req.Header.Set("X-KMail-Dev-Tenant-Id", tenantID)
+	req.Header.Set("X-KMail-Dev-User-Id", userID)
+	rec := httptest.NewRecorder()
+	h.verify(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("re-verify on enabled credential: want 409, got %d (body=%q)", rec.Code, rec.Body.String())
+	}
+
+	// The stored recovery bundle must be byte-for-byte unchanged: the
+	// guard aborted before the success UPDATE could overwrite it.
+	cred, err := h.store.Get(t.Context(), tenantID, userID)
+	if err != nil {
+		t.Fatalf("get credential: %v", err)
+	}
+	if cred.RecoveryCodesHash != originalHash {
+		t.Fatalf("recovery hash was overwritten: got %q, want %q", cred.RecoveryCodesHash, originalHash)
+	}
+	// No attempt was spent either (failure counter untouched).
+	if cred.FailedAttempts != 0 {
+		t.Fatalf("failed_attempts = %d, want 0 (guard must not spend an attempt)", cred.FailedAttempts)
+	}
+}

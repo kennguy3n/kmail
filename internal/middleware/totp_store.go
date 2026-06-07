@@ -47,6 +47,15 @@ func NewTOTPStore(pool *pgxpool.Pool) *TOTPStore {
 // ErrTOTPNotFound is returned when no credential row exists.
 var ErrTOTPNotFound = errors.New("totp: not found")
 
+// ErrTOTPAlreadyEnabled is returned when enrollment confirmation
+// (verify) is attempted against a credential that is already enabled.
+// Re-running verify would silently mint and persist a fresh recovery
+// bundle, invalidating the codes the user already saved — so the
+// verify closure refuses it and the handler maps this to 409. A user
+// who wants to rotate their secret/codes re-runs enroll, which resets
+// the row.
+var ErrTOTPAlreadyEnabled = errors.New("totp: already enabled")
+
 // Get returns the credential row for (tenant, user). When the
 // pool is nil the helper returns ErrTOTPNotFound — useful for
 // keeping handler control flow simple in tests.
