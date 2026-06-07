@@ -1,4 +1,4 @@
-.PHONY: build test cover lint fmt vet tidy docker-build clean help migrate bench e2e scim-test helm-lint loadtest chaos screenshots openapi
+.PHONY: build test cover lint fmt vet tidy docker-build clean help migrate bench e2e scim-test helm-lint loadtest chaos screenshots openapi storage-cost deliverability-check
 
 # ---------------------------------------------------------------
 # KMail Go control plane — developer Makefile.
@@ -183,3 +183,22 @@ scale-test-multishard:
 	  --rampup $(SCALE_RAMPUP) --steady $(DURATION) --cooldown $(SCALE_COOLDOWN) \
 	  --json-out $(SCALE_OUT)/multishard-report.json \
 	  $(SCALE_DISCOVER) $(SCALE_DRILL_FLAGS) $(SCALE_DRY_FLAG)
+
+# storage-cost models the object-storage $/user/mo against the
+# ~$$0.12/user/mo projection in docs/PROPOSAL.md. Deterministic — no
+# infra needed. Override the tier distribution / price via flags (see
+# the script header). Writes Markdown + JSON into $(SCALE_OUT).
+storage-cost:
+	@mkdir -p $(SCALE_OUT)
+	$(GO) run ./scripts/loadtest/storage-cost.go \
+	  --md-out $(SCALE_OUT)/storage-cost.md --json-out $(SCALE_OUT)/storage-cost.json
+
+# deliverability-check validates the local half of the email-auth
+# stack: real DKIM keygen, SPF/DKIM/DMARC record generation, and a
+# DKIM key-consistency proof. No IP pool / provider mailbox needed.
+# Inbox-placement measurement is the documented real-infra follow-up.
+DELIV_DOMAIN ?= acme.example
+deliverability-check:
+	@mkdir -p $(SCALE_OUT)
+	$(GO) run ./scripts/loadtest/deliverability-check.go \
+	  --domain $(DELIV_DOMAIN) --md-out $(SCALE_OUT)/deliverability.md
