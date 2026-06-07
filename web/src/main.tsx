@@ -25,8 +25,13 @@ initTheme();
 async function prepare(): Promise<void> {
   if (import.meta.env.VITE_MOCK_API === "true") {
     try {
-      const { worker } = await import("./mocks/browser");
+      const { worker, resetMockState } = await import("./mocks/browser");
       await worker.start({ onUnhandledRequest: "bypass" });
+      // Escape hatch for long-lived manual mock sessions: clear the
+      // in-memory stores (notes, vault folders, migration jobs) created
+      // while poking around, without a hard reload. Mock builds only.
+      (window as Window & { __resetMockState?: () => void }).__resetMockState =
+        resetMockState;
     } catch (err) {
       // Surface the failure but still render the app — a broken
       // MSW boot must not produce a blank page.

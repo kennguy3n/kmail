@@ -1,0 +1,67 @@
+# KMail — canary values overlay.
+#
+# Layered on top of the chart's base values.yaml by
+# .github/workflows/deploy-canary.yml. The canary is a small, SEPARATE
+# release (release name `kmail-canary`) running the NEW image in the
+# production cluster behind a small replica count, so a bad build is
+# caught on a sliver of traffic before the full production rollout.
+#
+#   helm upgrade --install kmail-canary deploy/helm/kmail \
+#     -f deploy/helm/kmail/values-canary.yaml
+#
+# This overlay is self-contained (it does NOT require layering
+# values-production.yaml) so the deploy workflow can pass a single -f.
+
+# Minimal footprint: a single API replica, no autoscaling.
+kmailApi:
+  replicaCount: 1
+  hpa:
+    enabled: false
+
+# Canary does not own mailbox storage; it exercises the BFF/control
+# plane against the EXISTING production Stalwart fleet. Disabling the
+# in-chart StatefulSet avoids provisioning duplicate mailbox volumes.
+stalwart:
+  enabled: false
+  # Point the canary at the EXISTING production Stalwart fleet. The
+  # api/worker deployments synthesize KMAIL_STALWART_URL from these fields
+  # (via kmail.stalwartMtlsUrl) using the same hostname shape the owning
+  # release uses, so it matches a SAN on the production server cert and the
+  # canary's client cert (issued by the same kmail-internal-ca) completes the
+  # mTLS handshake. These MUST match the production release: deploy-production.yml
+  # installs release `kmail` in namespace `kmail`, whose kmail.fullname is
+  # `kmail-kmail` and whose headless Service is `kmail-stalwart`. Adjust if
+  # your production release name / namespace differ.
+  external:
+    enabled: true
+    fullname: kmail-kmail
+    headlessName: kmail-stalwart
+    namespace: kmail
+    ordinal: 0
+
+# Same hardening posture as production so the canary is a faithful
+# preview. mTLS still needs the client cert to reach prod Stalwart.
+mtls:
+  enabled: true
+  issuerRef:
+    name: kmail-internal-ca
+
+networkPolicy:
+  enabled: true
+
+# Label the canary's metrics so its error-budget burn rate can be
+# evaluated independently from the stable production release.
+serviceMonitor:
+  enabled: true
+  labels:
+    kmail.deploy/track: canary
+
+prometheusRule:
+  enabled: true
+  labels:
+    kmail.deploy/track: canary
+  slo:
+    availabilityTarget: 0.999
+
+grafanaDashboards:
+  enabled: true

@@ -526,3 +526,76 @@ automatically by the provisioner at
 To edit a dashboard locally, change the JSON on disk; the
 provisioner re-reads `/var/lib/grafana/dashboards` every 30
 seconds, so the change shows up without restarting Grafana.
+
+
+## 10. Building, testing & tooling
+
+All Go work is driven by the repo-root [`Makefile`](../Makefile)
+(`make help` lists every target). The most common ones:
+
+| Command | What it does |
+| ------- | ------------ |
+| `make build` | Build every `cmd/*` binary into `./bin/`. |
+| `make test` | `go test -race ./...` — the Go unit suite. |
+| `make cover` | Run the suite with a coverage gate (`scripts/check-coverage.sh`). |
+| `make vet` | `go vet ./...`. |
+| `make fmt` | `gofmt -s -w .`. |
+| `make lint` | `golangci-lint run ./...` (requires `golangci-lint`). |
+| `make tidy` | `go mod tidy`. |
+| `make migrate` | Apply `migrations/*.sql` via the `kmail-migrate` runner. |
+| `make openapi` | Regenerate `api/openapi/kmail.openapi.json` from the Go routes. |
+| `make helm-lint` | `helm lint deploy/helm/kmail` (requires Helm 3.x). |
+| `make docker-build` | Build the multi-stage Docker image. |
+| `make e2e` | Run `scripts/test-e2e.sh` against the compose stack. |
+| `make scim-test` | Run the SCIM 2.0 conformance harness. |
+| `make screenshots` | Regenerate `docs/screenshots/` (Vite + MSW). |
+
+The repo targets **Go 1.25** (see [`go.mod`](../go.mod)) — the same
+toolchain the [`Dockerfile`](../Dockerfile) builds with
+(`golang:1.25-alpine`, `CGO_ENABLED=0`).
+
+### Web (React) app
+
+The frontend lives in [`web/`](../web/) and uses npm:
+
+```bash
+cd web
+npm install
+npm run dev        # Vite dev server (see §3)
+npm run build      # production build
+npm run test:run   # Vitest unit suite (run mode)
+npm run typecheck  # tsc type check
+```
+
+### Load, chaos & scale harnesses
+
+`make loadtest`, `make chaos`, `make bench`, and
+`make scale-test` / `make scale-test-multishard` drive the
+Phase 7/8 harnesses under `scripts/loadtest/` and `scripts/bench/`.
+The scale targets accept `SCALE_DRY=1` for an offline dry run (the
+build self-check). See [`LOADTEST.md`](./LOADTEST.md) and
+[`BENCHMARKS.md`](./BENCHMARKS.md).
+
+
+## 11. SDK build pipeline
+
+The Rust client SDK lives in [`sdk/`](../sdk/) and ships as native
+bindings for iOS, Android, and the desktop (Electron) client. The full
+reference — workspace layout, the build matrix, UniFFI binding
+generation, and the encryption bridge — is in [`SDK.md`](./SDK.md).
+The build entry points:
+
+| Target | Driver |
+| ------ | ------ |
+| iOS XCFramework + Swift bindings | [`sdk/scripts/build-ios-xcframework.sh`](../sdk/scripts/build-ios-xcframework.sh) (macOS-only) |
+| Android AAR | [`sdk/scripts/build-android-aar.sh`](../sdk/scripts/build-android-aar.sh) |
+| Desktop native addon (`.node`) | `napi build` in [`sdk/kmail-napi/`](../sdk/kmail-napi/) (vendored `@napi-rs/cli`) |
+
+CI wires these up per platform: `.github/workflows/sdk-build-ios.yml`
+(macOS runner), `sdk-build-android.yml` (Linux + NDK), and
+`sdk-build-napi.yml` (multi-target `.node` fan-out). The `sdk` job in
+`.github/workflows/ci.yml` runs `cargo test --workspace` on Ubuntu with
+wiremock-backed stubs, and `sdk-nightly.yml` exercises the SDK's debug
+CLI against the full compose stack to catch BFF↔SDK wire-format drift
+the stubs can't. See [`SDK.md`](./SDK.md) §"Build matrix" and §"CI" for
+the per-target detail.

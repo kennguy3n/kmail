@@ -1,0 +1,44 @@
+{{- /*
+  Grafana dashboard ConfigMaps for sidecar auto-import.
+
+  Gated on `grafanaDashboards.enabled`. Emits one ConfigMap per JSON
+  file in this chart's `dashboards/` directory, each labeled for the
+  Grafana dashboard sidecar (kube-prometheus-stack / the Grafana Helm
+  chart) so the dashboards load with no manual import.
+
+  SOURCE OF TRUTH: the canonical dashboards live in
+  deploy/grafana/dashboards/ (mounted directly by the docker-compose
+  stack). This chart keeps a MIRROR under deploy/helm/kmail/dashboards/
+  because Helm's .Files can only read files inside the chart root.
+  Re-sync the mirror after editing a dashboard with:
+
+      make helm-sync-dashboards
+
+  (a CI-friendly `--check` mode of the same script guards against drift).
+*/ -}}
+{{- if .Values.grafanaDashboards.enabled }}
+{{- $root := . }}
+{{- $files := .Files.Glob "dashboards/*.json" }}
+{{- if not $files }}
+{{- fail "grafanaDashboards.enabled=true but no dashboards/*.json found in the chart — run `make helm-sync-dashboards`" }}
+{{- end }}
+{{- range $path, $bytes := $files }}
+{{- $name := base $path | trimSuffix ".json" }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "kmail.fullname" $root }}-dashboard-{{ $name }}
+  labels:
+    {{- include "kmail.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: grafana-dashboard
+    {{ $root.Values.grafanaDashboards.sidecarLabel }}: {{ $root.Values.grafanaDashboards.sidecarLabelValue | quote }}
+  {{- if $root.Values.grafanaDashboards.folderAnnotation }}
+  annotations:
+    grafana_folder: {{ $root.Values.grafanaDashboards.folderAnnotation | quote }}
+  {{- end }}
+data:
+  {{ base $path }}: |-
+{{ $root.Files.Get $path | indent 4 }}
+---
+{{- end }}
+{{- end }}

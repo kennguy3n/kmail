@@ -5,6 +5,8 @@
 
 import { useCallback, useEffect, useState } from "react";
 
+import { cn } from "../../lib/cn";
+
 import {
   createRetentionPolicy,
   deleteRetentionPolicy,
@@ -76,15 +78,15 @@ export default function RetentionAdmin() {
 
       {selectedTenantId && status && (
         <div
-          className="kmail-admin-card"
-          style={{
-            borderLeft: `4px solid ${status.dry_run ? "#d97706" : "#16a34a"}`,
-          }}
+          className={cn(
+            "kmail-admin-card border-l-4",
+            status.dry_run ? "border-l-warning" : "border-l-success",
+          )}
         >
           <h3>Enforcement status</h3>
           <p>
             <strong>Mode:</strong>{" "}
-            <span style={{ color: status.dry_run ? "#d97706" : "#16a34a" }}>
+            <span className={status.dry_run ? "text-warning-fg" : "text-success-fg"}>
               {status.dry_run ? "DRY RUN (no rows mutated)" : "LIVE (deleting / archiving)"}
             </span>
           </p>
@@ -100,7 +102,7 @@ export default function RetentionAdmin() {
             {status.errors} errors
           </p>
           {status.dry_run && (
-            <p style={{ fontSize: 13, color: "#92400e" }}>
+            <p className="text-sm text-warning-fg">
               The worker is in dry-run mode (<code>KMAIL_RETENTION_DRY_RUN=true</code>).
               Live enforcement is the Phase 6 default — set the env var to <code>false</code>{" "}
               or unset it to switch on.
@@ -111,7 +113,7 @@ export default function RetentionAdmin() {
 
       {selectedTenantId && (
         <>
-          <form onSubmit={onCreate} style={{ display: "grid", gap: "0.5rem", maxWidth: 480 }}>
+          <form onSubmit={onCreate} className="grid max-w-[480px] gap-2">
             <h3>New policy</h3>
             <label>
               Action
@@ -155,7 +157,7 @@ export default function RetentionAdmin() {
             <button type="submit">Add policy</button>
           </form>
 
-          <h3 style={{ marginTop: "1.5rem" }}>Existing policies</h3>
+          <h3 className="mt-6">Existing policies</h3>
           <table>
             <thead>
               <tr>

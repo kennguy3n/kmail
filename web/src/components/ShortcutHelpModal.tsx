@@ -1,6 +1,5 @@
 import { Modal } from "./ui/Modal";
 import type { KeyboardShortcut } from "../hooks/useKeyboardShortcuts";
-import styles from "./ShortcutHelpModal.module.css";
 
 export interface ShortcutHelpModalProps {
   open: boolean;
@@ -12,9 +11,12 @@ export interface ShortcutHelpModalProps {
 function renderKeys(keys: string): JSX.Element {
   const steps = keys.trim().split(/\s+/);
   return (
-    <span className={styles.keys}>
+    <span className="inline-flex items-center gap-1">
       {steps.map((step, i) => (
-        <kbd key={i} className={styles.kbd}>
+        <kbd
+          key={i}
+          className="inline-flex min-w-6 items-center justify-center rounded-md border border-border bg-surface-muted px-1.5 py-0.5 font-mono text-xs font-medium text-fg shadow-sm"
+        >
           {step}
         </kbd>
       ))}
@@ -42,19 +44,20 @@ export function ShortcutHelpModal({
 
   return (
     <Modal open={open} onClose={onClose} title="Keyboard shortcuts" size="md">
-      <div className={styles.groups}>
+      <div className="flex flex-col gap-5">
         {Array.from(groups.entries()).map(([group, list]) => (
-          <section key={group} className={styles.group}>
-            <h3 className={styles.groupTitle}>{group}</h3>
-            <dl className={styles.list}>
+          <section key={group}>
+            <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-fg-muted">
+              {group}
+            </h3>
+            <dl className="flex flex-col">
               {list.map((shortcut) => (
-                <div key={shortcut.keys} className={styles.row}>
-                  <dt className={styles.description}>
-                    {shortcut.description}
-                  </dt>
-                  <dd className={styles.keyCell}>
-                    {renderKeys(shortcut.keys)}
-                  </dd>
+                <div
+                  key={shortcut.keys}
+                  className="flex items-center justify-between gap-4 border-b border-border/70 py-2 last:border-0"
+                >
+                  <dt className="text-sm text-fg">{shortcut.description}</dt>
+                  <dd className="flex-none">{renderKeys(shortcut.keys)}</dd>
                 </div>
               ))}
             </dl>

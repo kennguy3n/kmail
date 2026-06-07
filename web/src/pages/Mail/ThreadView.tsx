@@ -83,30 +83,30 @@ export default function ThreadView() {
   };
 
   return (
-    <section style={styles.root}>
-      <div style={styles.topBar}>
-        <Link to="/mail" style={styles.backLink}>
+    <section className={styles.root}>
+      <div className={styles.topBar}>
+        <Link to="/mail" className={styles.backLink}>
           ← Back to inbox
         </Link>
         {emails.length > 0 && (
-          <button type="button" onClick={replyToLast} style={styles.replyButton}>
+          <button type="button" onClick={replyToLast} className={styles.replyButton}>
             Reply
           </button>
         )}
       </div>
 
-      {loading && <p style={styles.muted}>Loading conversation…</p>}
-      {error && <div style={styles.error}>{error}</div>}
+      {loading && <p className={styles.muted}>Loading conversation…</p>}
+      {error && <div className={styles.error}>{error}</div>}
 
       {!loading && !error && (
         <>
-          <h1 style={styles.subject}>
+          <h1 className={styles.subject}>
             {subject}{" "}
-            <span style={styles.count}>
+            <span className={styles.count}>
               ({emails.length} message{emails.length === 1 ? "" : "s"})
             </span>
           </h1>
-          <div style={styles.stack}>
+          <div className={styles.stack}>
             {emails.map((email, i) => (
               <MessageCard
                 key={email.id}
@@ -137,20 +137,20 @@ function MessageCard({
   const fromLabel = formatAddresses(email.from);
 
   return (
-    <article style={styles.card}>
+    <article className={styles.card}>
       <button
         type="button"
         onClick={() => setExpanded((v) => !v)}
-        style={styles.cardHeader}
+        className={styles.cardHeader}
         aria-expanded={expanded}
       >
-        <span style={styles.fromName}>{fromLabel}</span>
-        {!expanded && <span style={styles.previewText}>{email.preview}</span>}
-        <span style={styles.date}>{formatDate(email.receivedAt)}</span>
+        <span className={styles.fromName}>{fromLabel}</span>
+        {!expanded && <span className={styles.previewText}>{email.preview}</span>}
+        <span className={styles.date}>{formatDate(email.receivedAt)}</span>
       </button>
       {expanded && (
-        <div style={styles.cardBody}>
-          <dl style={styles.headerList}>
+        <div className={styles.cardBody}>
+          <dl className={styles.headerList}>
             <dt>To</dt>
             <dd>{formatAddresses(email.to)}</dd>
             {email.cc && email.cc.length > 0 && (
@@ -166,9 +166,9 @@ function MessageCard({
               cidUrls={cidUrls}
             />
           ) : plain ? (
-            <pre style={styles.bodyPre}>{plain}</pre>
+            <pre className={styles.bodyPre}>{plain}</pre>
           ) : (
-            <p style={styles.muted}>(empty message body)</p>
+            <p className={styles.muted}>(empty message body)</p>
           )}
           <AttachmentPanel attachments={files} />
         </div>
@@ -193,76 +193,26 @@ function formatDate(iso: string | null | undefined): string {
   return d.toLocaleString();
 }
 
-const styles: Record<string, React.CSSProperties> = {
-  root: { padding: "1rem", maxWidth: "900px" },
-  topBar: {
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "space-between",
-    marginBottom: "0.75rem",
-  },
-  backLink: { color: "#2563eb", textDecoration: "none", fontSize: "0.9rem" },
-  replyButton: {
-    padding: "0.3rem 0.8rem",
-    fontSize: "0.8rem",
-    background: "#2563eb",
-    color: "#fff",
-    border: "none",
-    borderRadius: "0.25rem",
-    cursor: "pointer",
-  },
-  subject: { fontSize: "1.3rem", margin: "0 0 0.75rem" },
-  count: { fontSize: "0.9rem", fontWeight: 400, color: "#6b7280" },
-  stack: { display: "grid", gap: "0.5rem" },
-  card: {
-    border: "1px solid #e5e7eb",
-    borderRadius: "0.5rem",
-    background: "#fff",
-    overflow: "hidden",
-  },
-  cardHeader: {
-    display: "flex",
-    alignItems: "center",
-    gap: "0.5rem",
-    width: "100%",
-    padding: "0.6rem 0.8rem",
-    background: "#f9fafb",
-    border: "none",
-    borderBottom: "1px solid #f3f4f6",
-    cursor: "pointer",
-    textAlign: "left",
-    fontSize: "0.85rem",
-  },
-  fromName: { fontWeight: 600, color: "#111827", flexShrink: 0 },
-  previewText: {
-    color: "#6b7280",
-    overflow: "hidden",
-    textOverflow: "ellipsis",
-    whiteSpace: "nowrap",
-    flex: 1,
-  },
-  date: { color: "#9ca3af", marginLeft: "auto", flexShrink: 0 },
-  cardBody: { padding: "0.8rem" },
-  headerList: {
-    display: "grid",
-    gridTemplateColumns: "60px 1fr",
-    rowGap: "0.2rem",
-    columnGap: "0.6rem",
-    margin: "0 0 0.6rem",
-    fontSize: "0.82rem",
-    color: "#374151",
-  },
-  bodyPre: {
-    whiteSpace: "pre-wrap",
-    fontFamily: "inherit",
-    fontSize: "0.92rem",
-    margin: 0,
-  },
-  muted: { color: "#6b7280", fontStyle: "italic" },
-  error: {
-    padding: "0.5rem 0.75rem",
-    background: "#fee2e2",
-    color: "#991b1b",
-    borderRadius: "0.25rem",
-  },
+/** Theme-aware Tailwind class recipes for the conversation ThreadView. */
+const styles: Record<string, string> = {
+  root: "max-w-[900px] p-4",
+  topBar: "mb-3 flex items-center justify-between",
+  backLink: "text-sm text-primary no-underline hover:underline",
+  replyButton:
+    "cursor-pointer rounded-md border-0 bg-primary px-3 py-1.5 text-xs font-medium text-primary-fg transition-colors hover:bg-primary-hover",
+  subject: "mb-3 mt-0 text-xl font-semibold",
+  count: "text-sm font-normal text-fg-muted",
+  stack: "grid gap-2",
+  card: "overflow-hidden rounded-lg border border-border bg-surface",
+  cardHeader:
+    "flex w-full cursor-pointer items-center gap-2 border-0 border-b border-border bg-surface-muted px-3 py-2.5 text-left text-sm",
+  fromName: "shrink-0 font-semibold text-fg",
+  previewText: "flex-1 overflow-hidden text-ellipsis whitespace-nowrap text-fg-muted",
+  date: "ml-auto shrink-0 text-fg-subtle",
+  cardBody: "p-3",
+  headerList:
+    "mb-2.5 grid grid-cols-[60px_1fr] gap-x-2.5 gap-y-1 text-xs text-fg-muted",
+  bodyPre: "m-0 whitespace-pre-wrap font-[inherit] text-sm",
+  muted: "italic text-fg-muted",
+  error: "rounded-md bg-danger-bg px-3 py-2 text-danger-fg",
 };

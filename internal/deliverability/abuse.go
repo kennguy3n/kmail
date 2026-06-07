@@ -92,8 +92,8 @@ func (a *AbuseScorer) ScoreTenant(ctx context.Context, tenantID string) (*AbuseS
 		}
 		return tx.QueryRow(ctx, `
 			INSERT INTO abuse_scores (tenant_id, user_id, score, signals, updated_at)
-			VALUES ($1::uuid, '00000000-0000-0000-0000-000000000000'::uuid, $2, $3::jsonb, now())
-			ON CONFLICT (tenant_id, user_id)
+			VALUES ($1::uuid, NULL, $2, $3::jsonb, now())
+			ON CONFLICT (tenant_id) WHERE user_id IS NULL
 			DO UPDATE SET score = EXCLUDED.score, signals = EXCLUDED.signals, updated_at = now()
 			RETURNING score, signals, updated_at
 		`, tenantID, total, payload).Scan(&score.Score, &score.Signals, &score.UpdatedAt)
@@ -132,7 +132,7 @@ func (a *AbuseScorer) ScoreUser(ctx context.Context, tenantID, userID string) (*
 		return tx.QueryRow(ctx, `
 			INSERT INTO abuse_scores (tenant_id, user_id, score, signals, updated_at)
 			VALUES ($1::uuid, $2::uuid, $3, $4::jsonb, now())
-			ON CONFLICT (tenant_id, user_id)
+			ON CONFLICT (tenant_id, user_id) WHERE user_id IS NOT NULL
 			DO UPDATE SET score = EXCLUDED.score, signals = EXCLUDED.signals, updated_at = now()
 			RETURNING score, signals, updated_at
 		`, tenantID, userID, total, payload).Scan(&score.Score, &score.Signals, &score.UpdatedAt)

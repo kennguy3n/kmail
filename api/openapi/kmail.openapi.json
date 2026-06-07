@@ -4,7 +4,7 @@
     "title": "KMail API",
     "version": "1.0.0",
     "summary": "Tenant-scoped administrative, provisioning, and discovery API for KMail.",
-    "description": "# KMail API\n\nThe KMail API is a tenant-scoped REST API for administering mail,\ncalendars, contacts, billing, deliverability, and security. Mailbox\ndata access (reading/sending mail, syncing folders) uses **JMAP** at\n`/jmap`; this reference covers the `/api/v1` administrative surface,\nthe **SCIM 2.0** provisioning API at `/scim/v2`, and autodiscovery\nendpoints under `/.well-known`.\n\nAll responses include an `X-KMail-Correlation-Id` header for tracing.\n\n## Authentication\n\nMost endpoints require an **OIDC bearer token**:\n\n```\nAuthorization: Bearer <access_token>\n```\n\nObtain a token from your configured OIDC provider (the token's claims\nidentify the tenant and user). Requests without a valid token receive\n`401 Unauthorized`; valid tokens lacking the required role receive\n`403 Forbidden`. Every endpoint is tenant-scoped and isolated with\nPostgreSQL row-level security — you can only ever see your own tenant's\ndata.\n\nA small number of endpoints are intentionally **public** (no bearer\ntoken): `POST /api/v1/signup` and its status polling route, the\nConfidential Send recipient portal (`/api/v1/secure/{token}`), open\ntracking links (`/api/v1/send/{id}`), and the `/.well-known/*`\nautodiscovery documents.\n\n### SCIM tokens\n\nThe SCIM provisioning API (`/scim/v2`) authenticates with a dedicated\nbearer token you mint per tenant (`POST /api/v1/tenants/{id}/scim/tokens`)\nand configure in your identity provider. See the\n[SCIM provisioning guide](/help/admin/scim-provisioning).\n\n## Webhooks\n\nRegister HTTPS endpoints (`POST /api/v1/integ/webhooks`) to receive\nevents: `email.received`, `email.bounced`, `email.complaint`,\n`calendar.event_created`, `calendar.event_updated`,\n`migration.completed`, plus a `webhook.ping` test delivery. Each\ndelivery is signed with HMAC-SHA256 in the `X-KMail-Signature` header.\nSee the full [webhook event catalog](/help/admin/webhook-events) for the\nsignature scheme and verification examples.\n\n## Errors\n\nErrors use standard HTTP status codes with a JSON body:\n\n```json\n{ \"error\": \"human readable message\", \"code\": \"machine_code\" }\n```\n\n## Versioning\n\nThe base path is `/api/v1`. Breaking changes bump the major version;\nadditive changes (new fields, new endpoints) do not.",
+    "description": "# KMail API\n\nThe KMail API is a tenant-scoped REST API for administering mail,\ncalendars, contacts, billing, deliverability, and security. Mailbox\ndata access (reading/sending mail, syncing folders) uses **JMAP** at\n`/jmap`; this reference covers the `/api/v1` administrative surface,\nthe **SCIM 2.0** provisioning API at `/scim/v2`, and autodiscovery\nendpoints under `/.well-known`.\n\nAll responses include an `X-KMail-Correlation-Id` header for tracing.\n\n## Authentication\n\nMost endpoints require an **OIDC bearer token**:\n\n```\nAuthorization: Bearer <access_token>\n```\n\nObtain a token from your configured OIDC provider (the token's claims\nidentify the tenant and user). Requests without a valid token receive\n`401 Unauthorized`; valid tokens lacking the required role receive\n`403 Forbidden`. Every endpoint is tenant-scoped and isolated with\nPostgreSQL row-level security — you can only ever see your own tenant's\ndata.\n\nA small number of endpoints are intentionally **public** (no bearer\ntoken): `POST /api/v1/signup` and its status polling route, the\nConfidential Send recipient portal (`/api/v1/secure/{token}`), and the\n`/.well-known/*` autodiscovery documents. Everything under\n`/api/v1/send/{id}` (the undo-send status and cancel endpoints) is\nauthenticated and requires a bearer token.\n\n### SCIM tokens\n\nThe SCIM provisioning API (`/scim/v2`) authenticates with a dedicated\nbearer token you mint per tenant (`POST /api/v1/tenants/{id}/scim/tokens`)\nand configure in your identity provider. See the\n[SCIM provisioning guide](/help/admin/scim-provisioning).\n\n## Webhooks\n\nRegister HTTPS endpoints (`POST /api/v1/integ/webhooks`) to receive\nevents: `email.received`, `email.bounced`, `email.complaint`,\n`calendar.event_created`, `calendar.event_updated`,\n`migration.completed`, plus a `webhook.ping` test delivery. Each\ndelivery is signed with HMAC-SHA256 in the `X-KMail-Signature` header.\nSee the full [webhook event catalog](/help/admin/webhook-events) for the\nsignature scheme and verification examples.\n\n## Errors\n\nErrors use standard HTTP status codes with a JSON body:\n\n```json\n{ \"error\": \"human readable message\", \"code\": \"machine_code\" }\n```\n\n## Versioning\n\nThe base path is `/api/v1`. Breaking changes bump the major version;\nadditive changes (new fields, new endpoints) do not.",
     "contact": {
       "name": "KMail API support",
       "email": "support@kmail.kchat.dev"
@@ -137,6 +137,70 @@
           }
         },
         "security": []
+      }
+    },
+    "/api/v1/admin/feature-flags": {
+      "get": {
+        "tags": [
+          "Platform Admin"
+        ],
+        "summary": "List Feature Flags",
+        "operationId": "get_api_v1_admin_feature-flags",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "Platform Admin"
+        ],
+        "summary": "Replace Feature Flags",
+        "operationId": "put_api_v1_admin_feature-flags",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          },
+          "201": {
+            "description": "Created"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        }
       }
     },
     "/api/v1/admin/ip-pools": {
@@ -697,6 +761,32 @@
                 "additionalProperties": true
               }
             }
+          }
+        }
+      }
+    },
+    "/api/v1/admin/shards/health": {
+      "get": {
+        "tags": [
+          "Platform Admin"
+        ],
+        "summary": "List Health",
+        "operationId": "get_api_v1_admin_shards_health",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
           }
         }
       }
@@ -2705,6 +2795,32 @@
         }
       }
     },
+    "/api/v1/contacts/frequent": {
+      "get": {
+        "tags": [
+          "Contacts"
+        ],
+        "summary": "List Frequent",
+        "operationId": "get_api_v1_contacts_frequent",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
     "/api/v1/contacts/gal": {
       "get": {
         "tags": [
@@ -2764,6 +2880,261 @@
         ],
         "summary": "Create Sync",
         "operationId": "post_api_v1_contacts_gal_sync",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          },
+          "201": {
+            "description": "Created"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/contacts/record": {
+      "post": {
+        "tags": [
+          "Contacts"
+        ],
+        "summary": "Create Record",
+        "operationId": "post_api_v1_contacts_record",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          },
+          "201": {
+            "description": "Created"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/contacts/suggestions": {
+      "get": {
+        "tags": [
+          "Contacts"
+        ],
+        "summary": "List Suggestions",
+        "operationId": "get_api_v1_contacts_suggestions",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/api/v1/email-analytics": {
+      "get": {
+        "tags": [
+          "Mail"
+        ],
+        "summary": "List Email Analytics",
+        "operationId": "get_api_v1_email-analytics",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/api/v1/emails/{id}/smart-replies": {
+      "get": {
+        "tags": [
+          "Mail"
+        ],
+        "summary": "List Smart Replies",
+        "operationId": "get_api_v1_emails_id_smart-replies",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "`id` path parameter.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/api/v1/emails/{id}/unsubscribe": {
+      "get": {
+        "tags": [
+          "Mail"
+        ],
+        "summary": "List Unsubscribe",
+        "operationId": "get_api_v1_emails_id_unsubscribe",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "`id` path parameter.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Mail"
+        ],
+        "summary": "Create Unsubscribe",
+        "operationId": "post_api_v1_emails_id_unsubscribe",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "`id` path parameter.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          },
+          "201": {
+            "description": "Created"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/emails/categories": {
+      "post": {
+        "tags": [
+          "Mail"
+        ],
+        "summary": "Create Categories",
+        "operationId": "post_api_v1_emails_categories",
         "responses": {
           "200": {
             "description": "Successful response"
@@ -3273,6 +3644,32 @@
         }
       }
     },
+    "/api/v1/priority-inbox": {
+      "get": {
+        "tags": [
+          "Mail"
+        ],
+        "summary": "List Priority Inbox",
+        "operationId": "get_api_v1_priority-inbox",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
     "/api/v1/push/preferences": {
       "get": {
         "tags": [
@@ -3756,8 +4153,7 @@
           "404": {
             "$ref": "#/components/responses/NotFound"
           }
-        },
-        "security": []
+        }
       }
     },
     "/api/v1/send/{id}/cancel": {
@@ -3808,8 +4204,73 @@
               }
             }
           }
+        }
+      }
+    },
+    "/api/v1/sessions": {
+      "get": {
+        "tags": [
+          "Authentication"
+        ],
+        "summary": "List Sessions",
+        "operationId": "get_api_v1_sessions",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/api/v1/sessions/revoke": {
+      "post": {
+        "tags": [
+          "Authentication"
+        ],
+        "summary": "Create Revoke",
+        "operationId": "post_api_v1_sessions_revoke",
+        "responses": {
+          "200": {
+            "description": "Successful response"
+          },
+          "201": {
+            "description": "Created"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
         },
-        "security": []
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        }
       }
     },
     "/api/v1/shared-inboxes/{inboxId}/assignments": {
@@ -4251,7 +4712,7 @@
     "/api/v1/snooze": {
       "post": {
         "tags": [
-          "API"
+          "Mail"
         ],
         "summary": "Create Snooze",
         "operationId": "post_api_v1_snooze",

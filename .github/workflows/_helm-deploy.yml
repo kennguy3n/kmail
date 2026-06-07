@@ -1,0 +1,148 @@
+# Reusable workflow: deploy the kmail Helm chart to one environment.
+#
+# The `environment` input binds the job to a GitHub Environment, so
+# protection rules (required reviewers / wait timers) configured there
+# gate the run — this is how canary and production get manual approval
+# without any secrets in the repo. The kubeconfig is supplied by the
+# caller as the KUBE_CONFIG secret and written to a temp file.
+name: Helm deploy
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: GitHub Environment to deploy to (drives approval gates).
+        required: true
+        type: string
+      namespace:
+        description: Kubernetes namespace.
+        required: true
+        type: string
+      release_name:
+        description: Helm release name.
+        required: false
+        default: kmail
+        type: string
+      image:
+        description: Fully-qualified image reference to deploy.
+        required: true
+        type: string
+      values_file:
+        description: Path to the environment values overlay, relative to the repo root.
+        required: true
+        type: string
+      extra_args:
+        description: Extra `helm upgrade` args (e.g. canary --set overrides).
+        required: false
+        default: ""
+        type: string
+      dry_run:
+        description: Render/diff only — do not apply.
+        required: false
+        default: false
+        type: boolean
+    secrets:
+      KUBE_CONFIG:
+        description: base64-encoded kubeconfig for the target cluster.
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy to ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: ${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.2
+
+      # SECURITY: every step below consumes its `${{ inputs.* }}` /
+      # `${{ secrets.* }}` values through `env:` bindings and then
+      # references the resulting shell variables, rather than
+      # interpolating the expressions directly into the `run:` script.
+      # Direct interpolation lets an attacker-controlled input (e.g. the
+      # free-form `stalwart_partition` that flows in as `extra_args`)
+      # break out of the intended command — the classic GitHub Actions
+      # script-injection sink. With the value living in an env var the
+      # shell treats it as inert data (no re-parsing of `;`, `$()`, &c.).
+      - name: Write kubeconfig
+        env:
+          KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/.kube"
+          printf '%s' "$KUBE_CONFIG" | base64 -d > "$RUNNER_TEMP/.kube/config"
+          chmod 600 "$RUNNER_TEMP/.kube/config"
+          echo "KUBECONFIG=$RUNNER_TEMP/.kube/config" >> "$GITHUB_ENV"
+
+      - name: Resolve image repository and tag
+        id: img
+        env:
+          IMAGE_REF: ${{ inputs.image }}
+        run: |
+          ref="$IMAGE_REF"
+          # Split "repo@sha256:..." or "repo:tag" into repository + tag/digest.
+          case "$ref" in
+            *@*) repo="${ref%@*}"; tag="${ref#*@}" ;;
+            *:*) repo="${ref%:*}"; tag="${ref##*:}" ;;
+            *)   repo="$ref"; tag="latest" ;;
+          esac
+          echo "repository=$repo" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Helm lint (env overlay)
+        env:
+          VALUES_FILE: ${{ inputs.values_file }}
+        run: helm lint deploy/helm/kmail --values "$VALUES_FILE"
+
+      - name: Helm diff (dry-run render)
+        env:
+          RELEASE_NAME: ${{ inputs.release_name }}
+          NAMESPACE: ${{ inputs.namespace }}
+          VALUES_FILE: ${{ inputs.values_file }}
+          IMAGE_REPOSITORY: ${{ steps.img.outputs.repository }}
+          IMAGE_TAG: ${{ steps.img.outputs.tag }}
+          EXTRA_ARGS: ${{ inputs.extra_args }}
+        run: |
+          # $EXTRA_ARGS is intentionally unquoted so the caller can pass
+          # multiple `--set` flags; word-splitting on a variable's value
+          # does NOT re-interpret shell metacharacters, so this is safe.
+          helm template "$RELEASE_NAME" deploy/helm/kmail \
+            --namespace "$NAMESPACE" \
+            --values "$VALUES_FILE" \
+            --set image.repository="$IMAGE_REPOSITORY" \
+            --set image.tag="$IMAGE_TAG" \
+            $EXTRA_ARGS > /tmp/rendered.yaml
+          echo "Rendered $(grep -c '^kind:' /tmp/rendered.yaml) resources."
+
+      - name: Helm upgrade --install
+        if: ${{ !inputs.dry_run }}
+        env:
+          RELEASE_NAME: ${{ inputs.release_name }}
+          NAMESPACE: ${{ inputs.namespace }}
+          VALUES_FILE: ${{ inputs.values_file }}
+          IMAGE_REPOSITORY: ${{ steps.img.outputs.repository }}
+          IMAGE_TAG: ${{ steps.img.outputs.tag }}
+          EXTRA_ARGS: ${{ inputs.extra_args }}
+        run: |
+          helm upgrade --install "$RELEASE_NAME" deploy/helm/kmail \
+            --namespace "$NAMESPACE" --create-namespace \
+            --values "$VALUES_FILE" \
+            --set image.repository="$IMAGE_REPOSITORY" \
+            --set image.tag="$IMAGE_TAG" \
+            $EXTRA_ARGS \
+            --atomic --wait --timeout 10m
+
+      - name: Rollout status
+        if: ${{ !inputs.dry_run }}
+        env:
+          RELEASE_NAME: ${{ inputs.release_name }}
+          NAMESPACE: ${{ inputs.namespace }}
+        run: |
+          helm status "$RELEASE_NAME" --namespace "$NAMESPACE"

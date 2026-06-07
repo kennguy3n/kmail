@@ -1,0 +1,48 @@
+# Deploy to staging.
+#
+# Fires automatically after a push to main (post-merge) and on manual
+# dispatch. Builds the image from the merged commit and rolls it out to
+# the `staging` GitHub Environment. Staging has no required reviewers,
+# so this is fully automated — it's the gate that must look healthy
+# before a human promotes the same image to canary / production.
+name: Deploy staging
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Render/diff only, do not apply.
+        type: boolean
+        default: false
+
+concurrency:
+  group: deploy-staging
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    uses: ./.github/workflows/_build-and-push.yml
+    with:
+      image_tag: ${{ github.sha }}
+    permissions:
+      contents: read
+      packages: write
+
+  deploy:
+    needs: build
+    uses: ./.github/workflows/_helm-deploy.yml
+    with:
+      environment: staging
+      namespace: kmail-staging
+      release_name: kmail
+      image: ${{ needs.build.outputs.image }}
+      values_file: deploy/helm/kmail/values-staging.yaml
+      dry_run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
+    secrets:
+      KUBE_CONFIG: ${{ secrets.KUBE_CONFIG_STAGING }}

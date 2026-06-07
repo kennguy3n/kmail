@@ -179,6 +179,27 @@ jobs:
       needs.changes.outputs.ci_workflows == 'true' ||
       github.event_name == 'push'
     runs-on: ubuntu-latest
+    # Postgres service for the coverage gate. The bulk of the suite's
+    # coverage comes from DB integration tests (internal/testsupport
+    # dials KMAIL_TEST_DATABASE_URL and SKIPS when it is unset), so
+    # without a database the gate would only see ~42% and the 60%
+    # floor below could never pass. `make test` above still runs with
+    # no DB env, so those tests skip there and only execute (once,
+    # under -race) in the coverage step.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: kmail_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
 
@@ -210,13 +231,26 @@ jobs:
         env:
           BASE_BRANCH: ${{ github.base_ref || 'main' }}
 
-      # WS4 Task 5 — coverage gate. Floor is just below the current
-      # measured baseline (~35%) and is meant to ratchet UP toward
-      # 60%→80% as the suite grows, never down.
+      # Apply migrations to the coverage Postgres service so the DB
+      # integration tests in the coverage step have a real schema to
+      # run against. Uses the kmail-migrate runner (go run), same as
+      # the integration job.
+      - name: Apply test-database migrations
+        run: ./scripts/migrate.sh
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/kmail_test?sslmode=disable
+
+      # WS4 Task 5 — coverage gate. Ratcheted up to 60% after the
+      # Session 2 test-coverage expansion. The gate only ever moves
+      # UP toward the 60%→80% target as the suite grows, never down.
+      # KMAIL_TEST_DATABASE_URL points the suite at the Postgres
+      # service so DB integration tests run (rather than skip).
       - name: Test coverage gate
         run: make cover
         env:
-          MIN_COVERAGE: "30"
+          MIN_COVERAGE: "60"
+          KMAIL_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/kmail_test?sslmode=disable
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/kmail_test?sslmode=disable
 
   sdk:
     name: SDK

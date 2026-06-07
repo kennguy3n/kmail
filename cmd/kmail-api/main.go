@@ -1322,6 +1322,19 @@ func main() {
 	// kmail-worker. The admin API (GET/PUT /api/v1/admin/feature-flags)
 	// sits behind the OIDC middleware like the other admin surfaces.
 	flagStore := featureflags.NewStore(pool)
+	// Bound the control-plane read so a stalled Postgres fails fast
+	// (retryable 503) instead of hanging the admin GET / resolver
+	// refresh; the Service keeps serving its cached snapshot meanwhile.
+	// KMAIL_FLAGS_READ_TIMEOUT overrides the default; "0" disables it
+	// (e.g. when the pool enforces its own statement_timeout).
+	if v := os.Getenv("KMAIL_FLAGS_READ_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			flagStore = flagStore.WithReadTimeout(d)
+			logger.Printf("featureflags: control-plane read timeout set to %s", d)
+		} else {
+			logger.Printf("featureflags: ignoring invalid KMAIL_FLAGS_READ_TIMEOUT %q: %v", v, err)
+		}
+	}
 	flagSvc := featureflags.NewStoreService(flagStore, logger)
 	featureflags.SetDefault(flagSvc)
 	featureflags.NewHandlers(flagStore, flagSvc, logger).Register(mux, authMW)

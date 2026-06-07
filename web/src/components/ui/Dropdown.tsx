@@ -8,7 +8,7 @@ import {
 } from "react";
 import type { KeyboardEvent, ReactElement, ReactNode } from "react";
 
-import styles from "./Dropdown.module.css";
+import { cn } from "../../lib/cn";
 
 export interface DropdownItem {
   id: string;
@@ -30,10 +30,6 @@ export interface DropdownProps {
   /** Accessible label for the menu. */
   ariaLabel?: string;
   className?: string;
-}
-
-function cx(...classes: Array<string | false | undefined>): string {
-  return classes.filter(Boolean).join(" ");
 }
 
 /**
@@ -137,20 +133,23 @@ export function Dropdown({
   });
 
   return (
-    <div ref={containerRef} className={cx(styles.dropdown, className)}>
+    <div ref={containerRef} className={cn("relative inline-block", className)}>
       {triggerNode}
       {open && (
         <div
           role="menu"
           id={menuId}
           aria-label={ariaLabel}
-          className={cx(styles.menu, align === "end" && styles.alignEnd)}
+          className={cn(
+            "absolute top-[calc(100%+0.375rem)] z-dropdown min-w-44 origin-top animate-scale-in rounded-lg border border-border bg-elevated p-1 shadow-lg",
+            align === "end" ? "right-0" : "left-0",
+          )}
           onKeyDown={onMenuKeyDown}
         >
           {items.map((item, i) => (
-            <div key={item.id} className={styles.itemWrap}>
+            <div key={item.id}>
               {item.separatorBefore && (
-                <div className={styles.separator} role="separator" />
+                <div className="my-1 h-px bg-border" role="separator" />
               )}
               <button
                 ref={(el) => {
@@ -160,18 +159,28 @@ export function Dropdown({
                 role="menuitem"
                 tabIndex={-1}
                 disabled={item.disabled}
-                className={cx(styles.item, item.danger && styles.danger)}
+                className={cn(
+                  "flex w-full items-center gap-2.5 rounded-md px-2.5 py-2 text-left text-sm text-fg outline-none transition-colors hover:bg-surface-hover focus-visible:bg-surface-hover disabled:cursor-not-allowed disabled:opacity-50 [&>span>svg]:size-4",
+                  item.danger &&
+                    "text-danger-fg hover:bg-danger-bg focus-visible:bg-danger-bg",
+                )}
                 onClick={() => {
                   item.onSelect?.();
                   close(true);
                 }}
               >
                 {item.icon && (
-                  <span className={styles.icon} aria-hidden="true">
+                  <span
+                    className={cn(
+                      "inline-flex w-5 shrink-0 justify-center",
+                      item.danger ? "text-danger-fg" : "text-fg-muted",
+                    )}
+                    aria-hidden="true"
+                  >
                     {item.icon}
                   </span>
                 )}
-                <span className={styles.itemLabel}>{item.label}</span>
+                <span className="flex-1 truncate">{item.label}</span>
               </button>
             </div>
           ))}

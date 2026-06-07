@@ -1,7 +1,7 @@
 import { useId, useRef, useState } from "react";
 import type { KeyboardEvent, ReactNode } from "react";
 
-import styles from "./Tabs.module.css";
+import { cn } from "../../lib/cn";
 
 export interface TabItem {
   id: string;
@@ -20,10 +20,6 @@ export interface TabsProps {
   /** Accessible label for the tablist. */
   ariaLabel?: string;
   className?: string;
-}
-
-function cx(...classes: Array<string | false | undefined>): string {
-  return classes.filter(Boolean).join(" ");
 }
 
 /**
@@ -83,8 +79,12 @@ export function Tabs({
   const activeItem = items.find((t) => t.id === active);
 
   return (
-    <div className={cx(styles.tabs, className)}>
-      <div role="tablist" aria-label={ariaLabel} className={styles.tablist}>
+    <div className={cn("flex flex-col", className)}>
+      <div
+        role="tablist"
+        aria-label={ariaLabel}
+        className="flex items-center gap-1 border-b border-border"
+      >
         {items.map((tab) => {
           const selected = tab.id === active;
           return (
@@ -100,7 +100,12 @@ export function Tabs({
               aria-controls={`${baseId}-panel-${tab.id}`}
               tabIndex={selected ? 0 : -1}
               disabled={tab.disabled}
-              className={cx(styles.tab, selected && styles.active)}
+              className={cn(
+                "-mb-px border-b-2 px-3.5 py-2.5 text-sm font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset disabled:cursor-not-allowed disabled:opacity-50",
+                selected
+                  ? "border-primary text-primary"
+                  : "border-transparent text-fg-muted hover:border-border-strong hover:text-fg",
+              )}
               onClick={() => select(tab.id)}
               onKeyDown={onKeyDown}
             >
@@ -115,7 +120,7 @@ export function Tabs({
           id={`${baseId}-panel-${activeItem.id}`}
           aria-labelledby={`${baseId}-tab-${activeItem.id}`}
           tabIndex={0}
-          className={styles.panel}
+          className="pt-4 outline-none focus-visible:ring-2 focus-visible:ring-ring"
         >
           {activeItem.content}
         </div>

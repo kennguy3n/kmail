@@ -1,0 +1,145 @@
+{
+  "annotations": {"list": []},
+  "description": "Self-service tenant onboarding funnel — initiated -> completed conversion, failures, rate-limited attempts, idempotent replays, and signups by plan. Sourced entirely from the kmail_signup_* counters (internal/tenant/signup.go).",
+  "editable": false,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "uid": "kmail-onboarding-funnel",
+  "title": "KMail — Onboarding Funnel",
+  "tags": ["kmail", "onboarding", "signup", "funnel"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": {"from": "now-24h", "to": "now"},
+  "templating": {"list": []},
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Initiated (range)",
+      "id": 1,
+      "gridPos": {"h": 5, "w": 6, "x": 0, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "sum(increase(kmail_signup_initiated_total[$__range]))"}
+      ],
+      "options": {"colorMode": "value", "reduceOptions": {"calcs": ["lastNotNull"]}}
+    },
+    {
+      "type": "stat",
+      "title": "Completed (range)",
+      "id": 2,
+      "gridPos": {"h": 5, "w": 6, "x": 6, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "sum(increase(kmail_signup_completed_total[$__range]))"}
+      ],
+      "options": {"colorMode": "value", "reduceOptions": {"calcs": ["lastNotNull"]}}
+    },
+    {
+      "type": "gauge",
+      "title": "Conversion rate (completed / initiated, range)",
+      "id": 3,
+      "gridPos": {"h": 5, "w": 6, "x": 12, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "sum(increase(kmail_signup_completed_total[$__range])) / clamp_min(sum(increase(kmail_signup_initiated_total[$__range])), 1)"}
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"value": null, "color": "red"},
+              {"value": 0.6, "color": "yellow"},
+              {"value": 0.8, "color": "green"}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Failed (range)",
+      "id": 4,
+      "gridPos": {"h": 5, "w": 6, "x": 18, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "sum(increase(kmail_signup_failed_total[$__range]))"}
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"value": null, "color": "green"},
+              {"value": 1, "color": "yellow"}
+            ]
+          }
+        }
+      },
+      "options": {"colorMode": "value", "reduceOptions": {"calcs": ["lastNotNull"]}}
+    },
+    {
+      "type": "timeseries",
+      "title": "Signup rate (initiated / completed / failed, per s)",
+      "id": 5,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 5},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "sum(rate(kmail_signup_initiated_total[5m]))", "legendFormat": "initiated/s"},
+        {"refId": "B", "expr": "sum(rate(kmail_signup_completed_total[5m]))", "legendFormat": "completed/s"},
+        {"refId": "C", "expr": "rate(kmail_signup_failed_total[5m])", "legendFormat": "failed/s"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "reqps"}}
+    },
+    {
+      "type": "timeseries",
+      "title": "Initiated by plan (per s)",
+      "id": 6,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 5},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "sum by (plan) (rate(kmail_signup_initiated_total[5m]))", "legendFormat": "{{plan}}"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "reqps"}}
+    },
+    {
+      "type": "timeseries",
+      "title": "Rate-limited signups & idempotent replays (per s)",
+      "id": 7,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 13},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "rate(kmail_signup_rate_limited_total[5m])", "legendFormat": "rate-limited/s"},
+        {"refId": "B", "expr": "rate(kmail_signup_completion_replays_total[5m])", "legendFormat": "replays/s"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "reqps"}}
+    },
+    {
+      "type": "timeseries",
+      "title": "Completed by plan (per s)",
+      "id": 8,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 13},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "sum by (plan) (rate(kmail_signup_completed_total[5m]))", "legendFormat": "{{plan}}"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "reqps"}}
+    },
+    {
+      "type": "logs",
+      "title": "Recent signup events (Loki)",
+      "id": 9,
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 21},
+      "datasource": {"type": "loki", "uid": "loki"},
+      "targets": [
+        {"refId": "A", "expr": "{job=\"kmail-api\"} |~ \"(?i)signup|checkout|provision\""}
+      ]
+    }
+  ]
+}

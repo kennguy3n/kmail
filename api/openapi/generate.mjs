@@ -90,16 +90,21 @@ function tagFor(p) {
     admin: "Platform Admin",
     signup: "Signup",
     auth: "Authentication",
+    sessions: "Authentication", // session ledger: list/revoke OIDC sessions
     calendars: "Calendars",
     "resource-calendars": "Calendars",
     contacts: "Contacts",
     migrations: "Migration",
     push: "Push",
     snoozed: "Mail",
+    snooze: "Mail",
     "scheduled-sends": "Mail",
     "shared-inboxes": "Shared Inboxes",
     attachments: "Mail",
     send: "Mail",
+    emails: "Mail", // smart-replies, unsubscribe, categories (smartfeatures)
+    "email-analytics": "Mail",
+    "priority-inbox": "Mail",
     secure: "Confidential Send",
     search: "Search",
     storage: "Storage",
@@ -116,7 +121,12 @@ function isPublic(method, p) {
   if (p === "/api/v1/signup" && method === "POST") return true;
   if (p.startsWith("/api/v1/signup/")) return true; // status polling
   if (p.startsWith("/api/v1/secure/")) return true; // recipient portal token
-  if (p.startsWith("/api/v1/send/")) return true; // tracking pixel/link
+  // NOTE: do NOT treat "/api/v1/send/" as public. The only routes under
+  // that prefix are the undo-send endpoints (POST /api/v1/send/{id}/cancel
+  // and GET /api/v1/send/{id}), both wrapped with authMW.Wrap in
+  // internal/undosend/handlers.go — they require an OIDC bearer token. A
+  // broad prefix match here previously emitted `security: []` for them,
+  // telling clients no auth was needed (causing spurious 401s).
   return false;
 }
 
@@ -227,9 +237,10 @@ data.
 
 A small number of endpoints are intentionally **public** (no bearer
 token): \`POST /api/v1/signup\` and its status polling route, the
-Confidential Send recipient portal (\`/api/v1/secure/{token}\`), open
-tracking links (\`/api/v1/send/{id}\`), and the \`/.well-known/*\`
-autodiscovery documents.
+Confidential Send recipient portal (\`/api/v1/secure/{token}\`), and the
+\`/.well-known/*\` autodiscovery documents. Everything under
+\`/api/v1/send/{id}\` (the undo-send status and cancel endpoints) is
+authenticated and requires a bearer token.
 
 ### SCIM tokens
 

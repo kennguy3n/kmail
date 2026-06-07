@@ -101,7 +101,7 @@ export default function DmarcAdmin() {
       {loading && <p>Loading…</p>}
 
       {summary && (
-        <div style={{ margin: "12px 0" }}>
+        <div className="my-3">
           <h3>Last {summary.window_days} days</h3>
           <p>
             <strong>Pass rate:</strong> {(summary.pass_rate * 100).toFixed(1)}% (
@@ -154,7 +154,7 @@ export default function DmarcAdmin() {
               {expanded === r.id && (
                 <tr>
                   <td colSpan={7}>
-                    <pre style={{ whiteSpace: "pre-wrap", fontSize: 12 }}>
+                    <pre className="whitespace-pre-wrap text-xs">
                       {JSON.stringify(r.records, null, 2)}
                     </pre>
                   </td>

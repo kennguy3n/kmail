@@ -1,4 +1,4 @@
-.PHONY: build test cover lint fmt vet tidy docker-build clean help migrate bench e2e scim-test helm-lint loadtest chaos screenshots
+.PHONY: build test cover lint fmt vet tidy docker-build clean help migrate bench e2e scim-test helm-lint helm-template helm-sync-dashboards helm-check-dashboards loadtest chaos screenshots openapi storage-cost deliverability-check
 
 # ---------------------------------------------------------------
 # KMail Go control plane — developer Makefile.
@@ -26,6 +26,7 @@ help:
 	@echo "  docker-build   Build the multi-stage Docker image"
 	@echo "  e2e            Run the scripts/test-e2e.sh smoke harness"
 	@echo "  screenshots    Capture demo PNGs for docs/screenshots/ (Vite + MSW)"
+	@echo "  openapi        Regenerate api/openapi/kmail.openapi.json from the Go routes"
 	@echo "  clean          Remove built binaries"
 
 build:
@@ -42,6 +43,16 @@ cover:
 
 lint:
 	golangci-lint run $(PKG)
+
+# openapi regenerates the committed OpenAPI 3.1 spec by scanning the Go
+# route literals (see api/openapi/generate.mjs for how routes are
+# extracted). The result is committed and consumed by the marketing
+# site's Redoc page (site/src/pages/docs/api.astro); sync-content.mjs
+# copies it into site/public/openapi/ at build time. Run this whenever
+# you add or change an `"<METHOD> /path"` mux pattern.
+NODE ?= node
+openapi:
+	$(NODE) api/openapi/generate.mjs
 
 fmt:
 	gofmt -s -w .
@@ -90,8 +101,31 @@ scim-test:
 # helm-lint runs `helm lint` against the deploy/helm/kmail chart.
 # Requires Helm 3.x to be on PATH; in CI set HELM=/path/to/helm.
 HELM ?= helm
-helm-lint:
+helm-lint: helm-check-dashboards
 	$(HELM) lint deploy/helm/kmail
+
+# helm-template renders the chart with every optional production
+# feature enabled (NetworkPolicy, ServiceMonitor, PrometheusRule,
+# Grafana dashboard ConfigMaps, mTLS) so a single command exercises
+# the full template surface without a cluster.
+helm-template: helm-check-dashboards
+	$(HELM) template deploy/helm/kmail \
+	  --set networkPolicy.enabled=true --set networkPolicy.restrictEgress=true \
+	  --set serviceMonitor.enabled=true --set prometheusRule.enabled=true \
+	  --set grafanaDashboards.enabled=true \
+	  --set mtls.enabled=true --set mtls.issuerRef.name=ca >/dev/null
+	@echo "helm template (all features) rendered OK"
+
+# helm-sync-dashboards mirrors the canonical Grafana dashboards
+# (deploy/grafana/dashboards/) into the chart so the dashboard
+# ConfigMap template can embed them. Run after editing a dashboard.
+helm-sync-dashboards:
+	./scripts/helm-sync-dashboards.sh
+
+# helm-check-dashboards fails if the chart's dashboard mirror has
+# drifted from the canonical source. A cheap CI guard.
+helm-check-dashboards:
+	./scripts/helm-sync-dashboards.sh --check
 
 # loadtest runs the Phase 7 JMAP / SMTP load harness from
 # scripts/loadtest/. Override LOADTEST_ITER / LOADTEST_TPS to
@@ -172,3 +206,22 @@ scale-test-multishard:
 	  --rampup $(SCALE_RAMPUP) --steady $(DURATION) --cooldown $(SCALE_COOLDOWN) \
 	  --json-out $(SCALE_OUT)/multishard-report.json \
 	  $(SCALE_DISCOVER) $(SCALE_DRILL_FLAGS) $(SCALE_DRY_FLAG)
+
+# storage-cost models the object-storage $/user/mo against the
+# ~$$0.12/user/mo projection in docs/PROPOSAL.md. Deterministic — no
+# infra needed. Override the tier distribution / price via flags (see
+# the script header). Writes Markdown + JSON into $(SCALE_OUT).
+storage-cost:
+	@mkdir -p $(SCALE_OUT)
+	$(GO) run ./scripts/loadtest/storage-cost.go \
+	  --md-out $(SCALE_OUT)/storage-cost.md --json-out $(SCALE_OUT)/storage-cost.json
+
+# deliverability-check validates the local half of the email-auth
+# stack: real DKIM keygen, SPF/DKIM/DMARC record generation, and a
+# DKIM key-consistency proof. No IP pool / provider mailbox needed.
+# Inbox-placement measurement is the documented real-infra follow-up.
+DELIV_DOMAIN ?= acme.example
+deliverability-check:
+	@mkdir -p $(SCALE_OUT)
+	$(GO) run ./scripts/loadtest/deliverability-check.go \
+	  --domain $(DELIV_DOMAIN) --md-out $(SCALE_OUT)/deliverability.md

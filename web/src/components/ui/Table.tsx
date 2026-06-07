@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 
-import styles from "./Table.module.css";
+import { cn } from "../../lib/cn";
 
 export interface TableColumn<Row> {
   /** Stable key; also used as React key for header/cells. */
@@ -28,10 +28,6 @@ export interface TableProps<Row> {
   className?: string;
 }
 
-function cx(...classes: Array<string | false | undefined>): string {
-  return classes.filter(Boolean).join(" ");
-}
-
 /** Table — a themed, generic data table with semantic markup. */
 export function Table<Row>({
   columns,
@@ -43,16 +39,24 @@ export function Table<Row>({
   className,
 }: TableProps<Row>): JSX.Element {
   return (
-    <div className={styles.wrap}>
-      <table className={cx(styles.table, className)}>
-        {caption && <caption className={styles.caption}>{caption}</caption>}
+    <div className="w-full overflow-x-auto">
+      <table className={cn("w-full border-collapse text-sm", className)}>
+        {caption && (
+          <caption className="px-3 py-2 text-left text-xs text-fg-muted">
+            {caption}
+          </caption>
+        )}
         <thead>
-          <tr>
+          <tr className="border-b border-border">
             {columns.map((col) => (
               <th
                 key={col.key}
                 scope="col"
-                style={{ width: col.width, textAlign: col.align }}
+                className="px-3 py-2.5 text-xs font-semibold uppercase tracking-wide text-fg-muted"
+                style={{
+                  width: col.width,
+                  textAlign: col.align ?? "left",
+                }}
               >
                 {col.header}
               </th>
@@ -62,7 +66,10 @@ export function Table<Row>({
         <tbody>
           {rows.length === 0 ? (
             <tr>
-              <td colSpan={columns.length} className={styles.empty}>
+              <td
+                colSpan={columns.length}
+                className="px-3 py-10 text-center text-fg-muted"
+              >
                 {emptyContent ?? "No data"}
               </td>
             </tr>
@@ -70,11 +77,19 @@ export function Table<Row>({
             rows.map((row, rowIndex) => (
               <tr
                 key={rowKey(row, rowIndex)}
-                className={onRowClick ? styles.clickable : undefined}
+                className={cn(
+                  "border-b border-border/70 transition-colors last:border-0",
+                  onRowClick &&
+                    "cursor-pointer hover:bg-surface-hover",
+                )}
                 onClick={onRowClick ? () => onRowClick(row, rowIndex) : undefined}
               >
                 {columns.map((col) => (
-                  <td key={col.key} style={{ textAlign: col.align }}>
+                  <td
+                    key={col.key}
+                    className="px-3 py-2.5 text-fg"
+                    style={{ textAlign: col.align ?? "left" }}
+                  >
                     {col.render(row, rowIndex)}
                   </td>
                 ))}

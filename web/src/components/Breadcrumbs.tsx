@@ -1,7 +1,7 @@
 import { Fragment } from "react";
 import { Link } from "react-router-dom";
 
-import styles from "./Breadcrumbs.module.css";
+import { cn } from "../lib/cn";
 
 export interface Crumb {
   label: string;
@@ -12,10 +12,6 @@ export interface Crumb {
 export interface BreadcrumbsProps {
   items: Crumb[];
   className?: string;
-}
-
-function cx(...classes: Array<string | false | undefined>): string {
-  return classes.filter(Boolean).join(" ");
 }
 
 /**
@@ -29,20 +25,23 @@ export function Breadcrumbs({
 }: BreadcrumbsProps): JSX.Element | null {
   if (items.length === 0) return null;
   return (
-    <nav aria-label="Breadcrumb" className={cx(styles.breadcrumbs, className)}>
-      <ol className={styles.list}>
+    <nav aria-label="Breadcrumb" className={cn("text-sm", className)}>
+      <ol className="flex flex-wrap items-center gap-1.5">
         {items.map((crumb, i) => {
           const isLast = i === items.length - 1;
           return (
             <Fragment key={`${crumb.label}-${i}`}>
-              <li className={styles.item}>
+              <li className="inline-flex items-center">
                 {crumb.to && !isLast ? (
-                  <Link to={crumb.to} className={styles.link}>
+                  <Link
+                    to={crumb.to}
+                    className="text-fg-muted transition-colors hover:text-fg hover:underline"
+                  >
                     {crumb.label}
                   </Link>
                 ) : (
                   <span
-                    className={styles.current}
+                    className={cn(isLast ? "font-medium text-fg" : "text-fg-muted")}
                     aria-current={isLast ? "page" : undefined}
                   >
                     {crumb.label}
@@ -50,7 +49,7 @@ export function Breadcrumbs({
                 )}
               </li>
               {!isLast && (
-                <li className={styles.sep} aria-hidden="true">
+                <li className="select-none text-fg-subtle" aria-hidden="true">
                   /
                 </li>
               )}

@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Copy, Inbox, Moon, Pencil, Sun, Trash2 } from "lucide-react";
 
 import {
   Avatar,
@@ -17,7 +18,6 @@ import {
 } from "./ui";
 import { useTheme } from "../hooks/useTheme";
 import { useToast } from "./ToastProvider";
-import styles from "./Showcase.module.css";
 
 interface DemoRow {
   domain: string;
@@ -43,39 +43,45 @@ export default function Showcase(): JSX.Element {
   const [modalOpen, setModalOpen] = useState(false);
 
   return (
-    <div className={styles.page}>
-      <header className={styles.pageHeader}>
+    <div className="flex flex-col gap-6">
+      <header className="flex flex-wrap items-start justify-between gap-4">
         <div>
-          <h1 className={styles.h1}>KMail Design System</h1>
-          <p className={styles.subtitle}>
+          <h1 className="text-2xl font-semibold">KMail Design System</h1>
+          <p className="mt-1 text-fg-muted">
             Shared component library &amp; design tokens (WS1).
           </p>
         </div>
-        <Button onClick={toggleTheme} variant="secondary">
-          {resolvedTheme === "dark" ? "☀ Light mode" : "🌙 Dark mode"}
+        <Button
+          onClick={toggleTheme}
+          variant="secondary"
+          iconLeft={resolvedTheme === "dark" ? <Sun /> : <Moon />}
+        >
+          {resolvedTheme === "dark" ? "Light mode" : "Dark mode"}
         </Button>
       </header>
 
-      <div className={styles.grid}>
+      <div className="grid grid-cols-[repeat(auto-fill,minmax(20rem,1fr))] items-start gap-4">
         <Card title="Buttons">
-          <div className={styles.row}>
-            <Button variant="primary">Primary</Button>
-            <Button variant="secondary">Secondary</Button>
-            <Button variant="ghost">Ghost</Button>
-            <Button variant="danger">Danger</Button>
-            <Button variant="link">Link</Button>
-          </div>
-          <div className={styles.row}>
-            <Button size="sm">Small</Button>
-            <Button size="md">Medium</Button>
-            <Button size="lg">Large</Button>
-            <Button loading>Loading</Button>
-            <Button disabled>Disabled</Button>
+          <div className="flex flex-col gap-3">
+            <div className="flex flex-wrap items-center gap-3">
+              <Button variant="primary">Primary</Button>
+              <Button variant="secondary">Secondary</Button>
+              <Button variant="ghost">Ghost</Button>
+              <Button variant="danger">Danger</Button>
+              <Button variant="link">Link</Button>
+            </div>
+            <div className="flex flex-wrap items-center gap-3">
+              <Button size="sm">Small</Button>
+              <Button size="md">Medium</Button>
+              <Button size="lg">Large</Button>
+              <Button loading>Loading</Button>
+              <Button disabled>Disabled</Button>
+            </div>
           </div>
         </Card>
 
         <Card title="Badges">
-          <div className={styles.row}>
+          <div className="flex flex-wrap items-center gap-3">
             <Badge variant="neutral">Neutral</Badge>
             <Badge variant="primary">Primary</Badge>
             <Badge variant="success" dot>
@@ -88,7 +94,7 @@ export default function Showcase(): JSX.Element {
         </Card>
 
         <Card title="Form controls">
-          <div className={styles.stack}>
+          <div className="flex flex-col gap-3">
             <Input label="Email" placeholder="you@example.com" />
             <Input
               label="Password"
@@ -107,7 +113,7 @@ export default function Showcase(): JSX.Element {
         </Card>
 
         <Card title="Avatars & overlays">
-          <div className={styles.row}>
+          <div className="flex flex-wrap items-center gap-3">
             <Avatar name="Ada Lovelace" size="sm" />
             <Avatar name="Grace Hopper" size="md" />
             <Avatar name="alan@example.com" size="lg" />
@@ -118,12 +124,12 @@ export default function Showcase(): JSX.Element {
               ariaLabel="Demo menu"
               trigger={<Button variant="secondary">Menu ▾</Button>}
               items={[
-                { id: "1", label: "Edit", icon: "✏" },
-                { id: "2", label: "Duplicate", icon: "⧉" },
+                { id: "1", label: "Edit", icon: <Pencil /> },
+                { id: "2", label: "Duplicate", icon: <Copy /> },
                 {
                   id: "3",
                   label: "Delete",
-                  icon: "🗑",
+                  icon: <Trash2 />,
                   danger: true,
                   separatorBefore: true,
                 },
@@ -133,7 +139,7 @@ export default function Showcase(): JSX.Element {
         </Card>
 
         <Card title="Toasts">
-          <div className={styles.row}>
+          <div className="flex flex-wrap items-center gap-3">
             <Button
               variant="secondary"
               onClick={() => toast.success("Saved successfully")}
@@ -227,7 +233,7 @@ export default function Showcase(): JSX.Element {
 
         <Card title="Empty state">
           <EmptyState
-            icon="📭"
+            icon={<Inbox />}
             title="No messages"
             description="Your inbox is empty. New mail will appear here."
             action={<Button variant="primary">Compose</Button>}

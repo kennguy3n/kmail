@@ -1,0 +1,149 @@
+{
+  "annotations": {"list": []},
+  "description": "Availability SLO error-budget burn-rate view. Mirrors the multi-window multi-burn-rate alerts in the chart PrometheusRule (deploy/helm/kmail/templates/prometheusrule.yaml): burn rate = error_ratio / (1 - SLO). Burn rate > 1 means the budget is being consumed faster than the SLO allows. Built only from kmail_http_requests_total. Set the SLO target via the $slo variable.",
+  "editable": false,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "uid": "kmail-error-budget",
+  "title": "KMail — Error Budget & Burn Rate",
+  "tags": ["kmail", "slo", "error-budget", "burn-rate"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": {"from": "now-6h", "to": "now"},
+  "templating": {
+    "list": [
+      {
+        "name": "slo",
+        "label": "SLO target",
+        "type": "custom",
+        "query": "0.999,0.9995,0.995,0.99",
+        "current": {"text": "0.999", "value": "0.999"},
+        "options": [
+          {"text": "0.999", "value": "0.999", "selected": true},
+          {"text": "0.9995", "value": "0.9995", "selected": false},
+          {"text": "0.995", "value": "0.995", "selected": false},
+          {"text": "0.99", "value": "0.99", "selected": false}
+        ]
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "gauge",
+      "title": "Availability (rolling 30d)",
+      "id": 1,
+      "gridPos": {"h": 7, "w": 8, "x": 0, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "1 - (sum(rate(kmail_http_requests_total{status=~\"5..\"}[30d])) / clamp_min(sum(rate(kmail_http_requests_total[30d])), 1))"}
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0.99,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"value": null, "color": "red"},
+              {"value": 0.999, "color": "yellow"},
+              {"value": 0.9995, "color": "green"}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Error budget remaining (30d)",
+      "id": 2,
+      "gridPos": {"h": 7, "w": 8, "x": 8, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "1 - ((sum(rate(kmail_http_requests_total{status=~\"5..\"}[30d])) / clamp_min(sum(rate(kmail_http_requests_total[30d])), 1)) / (1 - $slo))"}
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"value": null, "color": "red"},
+              {"value": 0.1, "color": "yellow"},
+              {"value": 0.25, "color": "green"}
+            ]
+          }
+        }
+      },
+      "options": {"colorMode": "value", "reduceOptions": {"calcs": ["lastNotNull"]}}
+    },
+    {
+      "type": "stat",
+      "title": "Fast burn (1h) — page at >14.4",
+      "id": 3,
+      "gridPos": {"h": 7, "w": 8, "x": 16, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "(sum(rate(kmail_http_requests_total{status=~\"5..\"}[1h])) / clamp_min(sum(rate(kmail_http_requests_total[1h])), 1)) / (1 - $slo)"}
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"value": null, "color": "green"},
+              {"value": 1, "color": "yellow"},
+              {"value": 14.4, "color": "red"}
+            ]
+          }
+        }
+      },
+      "options": {"colorMode": "background", "reduceOptions": {"calcs": ["lastNotNull"]}}
+    },
+    {
+      "type": "timeseries",
+      "title": "Burn rate by window (fast 5m/1h, slow 6h/3d)",
+      "id": 4,
+      "gridPos": {"h": 9, "w": 24, "x": 0, "y": 7},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "(sum(rate(kmail_http_requests_total{status=~\"5..\"}[5m])) / clamp_min(sum(rate(kmail_http_requests_total[5m])), 1)) / (1 - $slo)", "legendFormat": "5m burn"},
+        {"refId": "B", "expr": "(sum(rate(kmail_http_requests_total{status=~\"5..\"}[1h])) / clamp_min(sum(rate(kmail_http_requests_total[1h])), 1)) / (1 - $slo)", "legendFormat": "1h burn"},
+        {"refId": "C", "expr": "(sum(rate(kmail_http_requests_total{status=~\"5..\"}[6h])) / clamp_min(sum(rate(kmail_http_requests_total[6h])), 1)) / (1 - $slo)", "legendFormat": "6h burn"},
+        {"refId": "D", "expr": "(sum(rate(kmail_http_requests_total{status=~\"5..\"}[3d])) / clamp_min(sum(rate(kmail_http_requests_total[3d])), 1)) / (1 - $slo)", "legendFormat": "3d burn"}
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {"thresholdsStyle": {"mode": "line"}},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"value": null, "color": "green"},
+              {"value": 1, "color": "yellow"},
+              {"value": 14.4, "color": "red"}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "5xx error ratio by window",
+      "id": 5,
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 16},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "sum(rate(kmail_http_requests_total{status=~\"5..\"}[5m])) / clamp_min(sum(rate(kmail_http_requests_total[5m])), 1)", "legendFormat": "5m"},
+        {"refId": "B", "expr": "sum(rate(kmail_http_requests_total{status=~\"5..\"}[1h])) / clamp_min(sum(rate(kmail_http_requests_total[1h])), 1)", "legendFormat": "1h"},
+        {"refId": "C", "expr": "sum(rate(kmail_http_requests_total{status=~\"5..\"}[6h])) / clamp_min(sum(rate(kmail_http_requests_total[6h])), 1)", "legendFormat": "6h"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "percentunit"}}
+    }
+  ]
+}

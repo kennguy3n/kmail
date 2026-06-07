@@ -51,6 +51,13 @@ spec:
     name: {{ .Values.mtls.issuerRef.name }}
     kind: {{ .Values.mtls.issuerRef.kind | default "ClusterIssuer" }}
     group: cert-manager.io
+{{- if .Values.stalwart.enabled }}
+{{- /*
+  Server cert is only issued when this release renders its own Stalwart
+  StatefulSet. A control-plane-only install (stalwart.enabled=false, e.g.
+  the canary) still needs the client cert above to reach the existing
+  production Stalwart, but must NOT mint a competing server cert.
+*/}}
 ---
 apiVersion: cert-manager.io/v1
 kind: Certificate
@@ -100,4 +107,5 @@ spec:
     name: {{ .Values.mtls.issuerRef.name }}
     kind: {{ .Values.mtls.issuerRef.kind | default "ClusterIssuer" }}
     group: cert-manager.io
+{{- end }}
 {{- end }}

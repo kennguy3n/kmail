@@ -98,7 +98,7 @@ need-to-know basis, by exposure surface:
 The wrapping key alone does not reveal message content: without the
 encrypted DEK and the StrictZK ciphertext blob (both stored in
 zk-object-fabric) it cannot decrypt anything. See
-`internal/confidentialsend/service.go` and `migrations/006_confidential_send_mls.sql`.
+`internal/confidentialsend/service.go` and `migrations/007_confidential_send_mls.sql`.
 
 ## 5. Authentication and Authorisation
 
