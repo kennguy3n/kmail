@@ -423,6 +423,51 @@ func TestShardFailoverTransport_LastShardBreaker(t *testing.T) {
 	}
 }
 
+// TestShardFailoverTransport_NonShardPathDrivesDefaultBreaker covers
+// the single-target / no-shard-assignment path: when no shard URLs
+// are stamped on the request, the transport must still record the
+// default target's health against the breaker. Otherwise
+// ShardsAvailable (which consults that same host) would always
+// report healthy and graceful degradation could never engage for
+// these tenants.
+func TestShardFailoverTransport_NonShardPathDrivesDefaultBreaker(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	p, err := NewProxy(ProxyConfig{
+		StalwartURL: srv.URL,
+		Pool:        newDummyPool(t),
+		Logger:      log.New(io.Discard, "", 0),
+	})
+	if err != nil {
+		t.Fatalf("NewProxy: %v", err)
+	}
+	tr := &shardFailoverTransport{proxy: p, base: http.DefaultTransport}
+
+	if !p.ShardsAvailable(context.Background(), "tenant-1") {
+		t.Fatal("default target should be available before any failures")
+	}
+
+	// Drive non-shard requests (no withShardURLs) at the 500 target.
+	for i := 0; i < 3; i++ {
+		req, err := http.NewRequest(http.MethodPost, srv.URL+"/jmap", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := tr.RoundTrip(req)
+		if err != nil {
+			t.Fatalf("RoundTrip[%d]: %v", i, err)
+		}
+		resp.Body.Close()
+	}
+
+	if p.ShardsAvailable(context.Background(), "tenant-1") {
+		t.Fatal("default-target breaker never tripped on the non-shard path — degradation would never engage")
+	}
+}
+
 // fakeSendInterceptor returns a fixed (intercepted, err) pair and
 // optionally writes a canned body to the ResponseWriter. Used to
 // pin the proxy's handling of the four (intercepted, err) corners

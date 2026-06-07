@@ -1031,8 +1031,28 @@ type shardFailoverTransport struct {
 func (t *shardFailoverTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	urls := shardURLsFrom(req.Context())
 	if len(urls) == 0 {
-		// No shard wiring; behave as the unmodified proxy.
-		return t.base.RoundTrip(req)
+		// No per-tenant shard wiring — a single-target deployment or
+		// a tenant without a shard assignment (e.g. mid-provisioning
+		// or dev). Forward to the default target as the unmodified
+		// proxy would, but still drive that target's breaker: it's
+		// the same host ShardsAvailable consults, so without this the
+		// breaker would never trip on the non-shard path and graceful
+		// degradation could never engage for these tenants.
+		if t.proxy.target == nil {
+			return t.base.RoundTrip(req)
+		}
+		host := t.proxy.target.Host
+		resp, err := t.base.RoundTrip(req)
+		if err != nil {
+			t.proxy.breaker.RecordFailure(req.Context(), host)
+			return nil, err
+		}
+		if resp.StatusCode >= 500 {
+			t.proxy.breaker.RecordFailure(req.Context(), host)
+			return resp, nil
+		}
+		t.proxy.breaker.RecordSuccess(req.Context(), host)
+		return resp, nil
 	}
 	// Threshold comes from the breaker implementation, not the
 	// transport. The transport only consults `Open` per retry,
