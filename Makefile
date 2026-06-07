@@ -1,4 +1,4 @@
-.PHONY: build test cover lint fmt vet tidy docker-build clean help migrate bench e2e scim-test helm-lint helm-template helm-sync-dashboards helm-check-dashboards loadtest chaos screenshots storage-cost deliverability-check
+.PHONY: build test cover lint fmt vet tidy docker-build clean help migrate bench e2e scim-test helm-lint helm-template helm-sync-dashboards helm-check-dashboards loadtest chaos screenshots openapi storage-cost deliverability-check
 
 # ---------------------------------------------------------------
 # KMail Go control plane — developer Makefile.
@@ -26,6 +26,7 @@ help:
 	@echo "  docker-build   Build the multi-stage Docker image"
 	@echo "  e2e            Run the scripts/test-e2e.sh smoke harness"
 	@echo "  screenshots    Capture demo PNGs for docs/screenshots/ (Vite + MSW)"
+	@echo "  openapi        Regenerate api/openapi/kmail.openapi.json from the Go routes"
 	@echo "  clean          Remove built binaries"
 
 build:
@@ -42,6 +43,16 @@ cover:
 
 lint:
 	golangci-lint run $(PKG)
+
+# openapi regenerates the committed OpenAPI 3.1 spec by scanning the Go
+# route literals (see api/openapi/generate.mjs for how routes are
+# extracted). The result is committed and consumed by the marketing
+# site's Redoc page (site/src/pages/docs/api.astro); sync-content.mjs
+# copies it into site/public/openapi/ at build time. Run this whenever
+# you add or change an `"<METHOD> /path"` mux pattern.
+NODE ?= node
+openapi:
+	$(NODE) api/openapi/generate.mjs
 
 fmt:
 	gofmt -s -w .

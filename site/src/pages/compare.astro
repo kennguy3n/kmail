@@ -1,0 +1,110 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import CTA from "../components/CTA.astro";
+import { COMPETITORS } from "../data/site";
+---
+
+<BaseLayout
+  title="KMail vs. Gmail & Microsoft 365"
+  description="How KMail compares to Gmail/Google Workspace and Microsoft 365 — private business email with zero-access vaults, customer-managed keys, shared inboxes, and an open JMAP API."
+>
+  <section class="section">
+    <div class="container">
+      <div class="center">
+        <p class="eyebrow">How we compare</p>
+        <h1>KMail vs. Gmail &amp; Microsoft 365</h1>
+        <p class="lead mx-auto">
+          The big suites are built around advertising and lock-in. KMail is
+          private business email and calendar on open standards — so your team
+          gets privacy, control, and no surprises on the bill.
+        </p>
+      </div>
+
+      <div class="cmp-wrap" style="margin-top:2.5rem">
+        <table class="cmp">
+          <thead>
+            <tr>
+              <th scope="col">Capability</th>
+              <th scope="col">KMail</th>
+              <th scope="col">Gmail / Workspace</th>
+              <th scope="col">Microsoft 365</th>
+            </tr>
+          </thead>
+          <tbody>
+            {
+              COMPETITORS.map((row) => (
+                <tr>
+                  <th scope="row">{row.feature}</th>
+                  <td class="cmp__yes">{row.kmail}</td>
+                  <td>{row.gmail}</td>
+                  <td>{row.m365}</td>
+                </tr>
+              ))
+            }
+          </tbody>
+        </table>
+      </div>
+
+      <p class="center" style="margin-top:1.5rem">
+        <a href="/features">See everything KMail does →</a>
+        &nbsp;·&nbsp;
+        <a href="/pricing">Compare plans &amp; pricing →</a>
+      </p>
+    </div>
+  </section>
+
+  <section class="section section--soft">
+    <div class="container prose">
+      <h2>Why teams switch to KMail</h2>
+      <ul>
+        <li>
+          <strong>Private by default.</strong> Encrypted mailboxes, zero-access
+          vaults, and customer-managed keys — your mail is never mined for ads
+          or used to train a model.
+        </li>
+        <li>
+          <strong>Built for teams.</strong> Shared inboxes without paying for
+          extra seats, delegated calendars, a global address list, and SCIM
+          provisioning.
+        </li>
+        <li>
+          <strong>No lock-in.</strong> Open standards — JMAP, IMAP, SMTP,
+          CalDAV, CardDAV — plus an open API, so you can use any client and
+          leave whenever you want.
+        </li>
+        <li>
+          <strong>Transparent pricing.</strong> Simple per-seat plans from
+          $3–$9, with no enterprise add-ons hidden behind a sales call.
+        </li>
+      </ul>
+    </div>
+  </section>
+
+  <CTA />
+
+  <style>
+    .cmp-wrap {
+      overflow-x: auto;
+    }
+    .cmp {
+      width: 100%;
+      border-collapse: collapse;
+    }
+    .cmp th,
+    .cmp td {
+      text-align: left;
+      padding: 0.75rem 1rem;
+      border-bottom: 1px solid var(--c-border);
+      vertical-align: top;
+    }
+    .cmp thead th {
+      color: var(--c-text-soft);
+      font-weight: 600;
+      white-space: nowrap;
+    }
+    .cmp__yes {
+      color: var(--c-success);
+      font-weight: 700;
+    }
+  </style>
+</BaseLayout>
