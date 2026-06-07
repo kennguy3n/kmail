@@ -63,7 +63,7 @@ nest under each prefix).
 | `/jmap`, `/jmap/` | OIDC + session + rate-limit (`wrapAuthRL`) | `internal/jmap` (proxy) | Mail data plane to per-tenant Stalwart shard over mTLS. |
 | `/api/v1/tenants/**` | OIDC | `internal/tenant` | Largest group; tenant/user/mailbox config, calendars, contacts nested under tenant scope. |
 | `/api/v1/admin/**` | OIDC (+ approval) | `internal/adminproxy`, `internal/approval`, `internal/featureflags` | Privileged ops; reverse-access proxy + approval workflow; all writes audit-logged. |
-| `/api/v1/auth/**` | OIDC | `internal/middleware` (TOTP, WebAuthn) | TOTP `verify`/`check` now per-account lockout-protected. |
+| `/api/v1/auth/**` | OIDC | `internal/middleware` (TOTP, WebAuthn) | TOTP `verify`/`check` per-account lockout-protected; `enroll` requires the current second factor (TOTP/recovery code) to rotate an already-enabled credential, through the same lockout path. |
 | `/api/v1/sessions*` | OIDC + rate-limit (`wrapSessionAPI`) | `internal/middleware/session_handlers.go` | Session list/revoke. |
 | `/api/v1/calendars/**`, `/api/v1/resource-calendars/**` | OIDC | `internal/*` (calendar) | Includes `/freebusy`. |
 | `/api/v1/contacts/**` | OIDC | contact bridge | CardDAV-backed. |
@@ -83,5 +83,6 @@ nest under each prefix).
 ## Notes for pentesters
 - **Tenant isolation** is the highest-value target: attempt cross-tenant reads/writes on every `/api/v1/tenants/**` and `/jmap` route. Forced RLS (migration 008) + `WITH CHECK` should make all such attempts return no rows or a policy error.
 - **TOTP** `verify`/`check`: confirm the per-account lockout (5 failures → 15-min 429) cannot be reset by rotating IPs or parallel requests (lockout is keyed on `(tenant_id, user_id)`, incremented atomically).
+- **TOTP** `enroll`: confirm it cannot be used to bypass the lockout — re-enrolling an already-enabled credential must require a valid current TOTP/recovery code and must be refused with 429 while the account is locked (first-time/unconfirmed enrollment is intentionally frictionless).
 - **Confidential-Send portal** (`/api/v1/secure/{token}`): test token guessing, reuse after consumption, and password brute-force.
 - **Signup** and **Stripe webhook**: test rate-limit evasion and webhook signature bypass respectively.

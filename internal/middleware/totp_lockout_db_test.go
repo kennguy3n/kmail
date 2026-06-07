@@ -410,3 +410,245 @@ func TestTOTPVerify_AlreadyEnabledRefusesRegeneration(t *testing.T) {
 		t.Fatalf("failed_attempts = %d, want 0 (guard must not spend an attempt)", cred.FailedAttempts)
 	}
 }
+
+// doEnroll posts to /api/v1/auth/totp/enroll for (tenantID, userID).
+// A blank code sends an empty body (first-time / unconfirmed
+// enrollment); a non-blank code sends {"code":...} to authorize a
+// re-enrollment of an already-enabled credential.
+func doEnroll(h *TOTPHandlers, tenantID, userID, code string) *httptest.ResponseRecorder {
+	var body []byte
+	if code != "" {
+		body = []byte(`{"code":"` + code + `"}`)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/totp/enroll", bytes.NewReader(body))
+	req.Header.Set("X-KMail-Dev-Tenant-Id", tenantID)
+	req.Header.Set("X-KMail-Dev-User-Id", userID)
+	rec := httptest.NewRecorder()
+	h.enroll(rec, req)
+	return rec
+}
+
+// TestTOTPEnroll_FirstEnrollmentFrictionless confirms a first-time
+// enrollment (no existing credential row) needs no second factor and
+// lands a fresh, not-yet-confirmed (disabled) credential.
+func TestTOTPEnroll_FirstEnrollmentFrictionless(t *testing.T) {
+	admin := testAdminPool(t)
+	tenantID, userID := seedTenantWithUser(t, admin, "totp-enroll-first")
+
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	h := NewTOTPHandlers(TOTPConfig{Pool: admin, Now: func() time.Time { return now }})
+
+	if rec := doEnroll(h, tenantID, userID, ""); rec.Code != http.StatusOK {
+		t.Fatalf("first enroll: want 200, got %d (body=%q)", rec.Code, rec.Body.String())
+	}
+	cred, err := h.store.Get(t.Context(), tenantID, userID)
+	if err != nil {
+		t.Fatalf("get after first enroll: %v", err)
+	}
+	if cred.Enabled {
+		t.Fatal("first enrollment must land disabled (awaiting /verify)")
+	}
+	if len(cred.EncryptedSecret) == 0 {
+		t.Fatal("first enrollment must store a secret")
+	}
+}
+
+// TestTOTPEnroll_ReenrollEnabledRequiresFactor is the core
+// lockout-bypass hardening: re-enrolling an ALREADY-ENABLED credential
+// without proving the current second factor is refused (401), spends a
+// failed attempt, and leaves the live secret untouched. Otherwise a
+// caller holding only the first factor could mint a new secret and
+// sidestep the standing TOTP credential.
+func TestTOTPEnroll_ReenrollEnabledRequiresFactor(t *testing.T) {
+	admin := testAdminPool(t)
+	tenantID, userID := seedTenantWithUser(t, admin, "totp-enroll-noauth")
+
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	h := NewTOTPHandlers(TOTPConfig{
+		Pool:              admin,
+		Now:               func() time.Time { return now },
+		MaxFailedAttempts: 5,
+		LockoutDuration:   15 * time.Minute,
+	})
+
+	secret := []byte("12345678901234567890")
+	if err := h.store.Upsert(t.Context(), tenantID, userID, secret, "recov-hash", true, now); err != nil {
+		t.Fatalf("seed enabled credential: %v", err)
+	}
+
+	// No code → refused.
+	if rec := doEnroll(h, tenantID, userID, ""); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("re-enroll without factor: want 401, got %d (body=%q)", rec.Code, rec.Body.String())
+	}
+	// Wrong code → also refused.
+	wrong := "654321"
+	if wrong == generateHOTP(secret, now.Unix()/30) {
+		wrong = "123456"
+	}
+	if rec := doEnroll(h, tenantID, userID, wrong); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("re-enroll with wrong code: want 401, got %d", rec.Code)
+	}
+
+	cred, err := h.store.Get(t.Context(), tenantID, userID)
+	if err != nil {
+		t.Fatalf("get after refused re-enroll: %v", err)
+	}
+	if !cred.Enabled {
+		t.Fatal("refused re-enroll must leave the credential enabled")
+	}
+	if !bytes.Equal(cred.EncryptedSecret, secret) {
+		t.Fatal("refused re-enroll must not rotate the live secret")
+	}
+	if cred.RecoveryCodesHash != "recov-hash" {
+		t.Fatalf("refused re-enroll must not touch recovery bundle: got %q", cred.RecoveryCodesHash)
+	}
+	if cred.FailedAttempts != 2 {
+		t.Fatalf("two refused re-enroll attempts must each spend one: failed_attempts=%d, want 2", cred.FailedAttempts)
+	}
+}
+
+// TestTOTPEnroll_ReenrollWithValidTOTP confirms the happy path: a live
+// TOTP code authorizes secret rotation. The new secret is written
+// atomically and the credential drops back to disabled (the user
+// re-confirms via /verify).
+func TestTOTPEnroll_ReenrollWithValidTOTP(t *testing.T) {
+	admin := testAdminPool(t)
+	tenantID, userID := seedTenantWithUser(t, admin, "totp-enroll-totp")
+
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	h := NewTOTPHandlers(TOTPConfig{
+		Pool:              admin,
+		Now:               func() time.Time { return now },
+		MaxFailedAttempts: 5,
+		LockoutDuration:   15 * time.Minute,
+	})
+
+	secret := []byte("12345678901234567890")
+	if err := h.store.Upsert(t.Context(), tenantID, userID, secret, "old-recov", true, now); err != nil {
+		t.Fatalf("seed enabled credential: %v", err)
+	}
+
+	valid := generateHOTP(secret, now.Unix()/30)
+	if rec := doEnroll(h, tenantID, userID, valid); rec.Code != http.StatusOK {
+		t.Fatalf("re-enroll with valid TOTP: want 200, got %d (body=%q)", rec.Code, rec.Body.String())
+	}
+
+	cred, err := h.store.Get(t.Context(), tenantID, userID)
+	if err != nil {
+		t.Fatalf("get after rotation: %v", err)
+	}
+	if cred.Enabled {
+		t.Fatal("rotated credential must be disabled pending /verify")
+	}
+	if bytes.Equal(cred.EncryptedSecret, secret) {
+		t.Fatal("re-enroll must rotate the stored secret")
+	}
+	if cred.RecoveryCodesHash != "" {
+		t.Fatalf("re-enroll must clear the old recovery bundle: got %q", cred.RecoveryCodesHash)
+	}
+}
+
+// TestTOTPEnroll_ReenrollWithRecoveryCode confirms the escape hatch for
+// a lost authenticator: an unused recovery code authorizes rotation.
+func TestTOTPEnroll_ReenrollWithRecoveryCode(t *testing.T) {
+	admin := testAdminPool(t)
+	tenantID, userID := seedTenantWithUser(t, admin, "totp-enroll-recov")
+
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	h := NewTOTPHandlers(TOTPConfig{
+		Pool:              admin,
+		Now:               func() time.Time { return now },
+		MaxFailedAttempts: 5,
+		LockoutDuration:   15 * time.Minute,
+	})
+
+	codes, hashed, err := newRecoveryCodes(5)
+	if err != nil {
+		t.Fatalf("newRecoveryCodes: %v", err)
+	}
+	secret := []byte("12345678901234567890")
+	if err := h.store.Upsert(t.Context(), tenantID, userID, secret, hashed, true, now); err != nil {
+		t.Fatalf("seed enabled credential: %v", err)
+	}
+
+	if rec := doEnroll(h, tenantID, userID, codes[0]); rec.Code != http.StatusOK {
+		t.Fatalf("re-enroll with recovery code: want 200, got %d (body=%q)", rec.Code, rec.Body.String())
+	}
+
+	cred, err := h.store.Get(t.Context(), tenantID, userID)
+	if err != nil {
+		t.Fatalf("get after recovery rotation: %v", err)
+	}
+	if cred.Enabled {
+		t.Fatal("rotated credential must be disabled pending /verify")
+	}
+	if bytes.Equal(cred.EncryptedSecret, secret) {
+		t.Fatal("re-enroll must rotate the stored secret")
+	}
+	// The whole bundle is cleared on rotation, so the old codes are
+	// dead even though only one was presented.
+	if cred.RecoveryCodesHash != "" {
+		t.Fatalf("re-enroll must clear the recovery bundle: got %q", cred.RecoveryCodesHash)
+	}
+}
+
+// TestTOTPEnroll_ReenrollWhileLockedRefused proves /enroll honours the
+// same lockout gate as /check: while an account is locked, even a valid
+// current code cannot rotate the secret — closing the door on using
+// re-enrollment to clear a standing lockout.
+func TestTOTPEnroll_ReenrollWhileLockedRefused(t *testing.T) {
+	admin := testAdminPool(t)
+	tenantID, userID := seedTenantWithUser(t, admin, "totp-enroll-locked")
+
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	const maxAttempts = 3
+	h := NewTOTPHandlers(TOTPConfig{
+		Pool:              admin,
+		Now:               func() time.Time { return now },
+		MaxFailedAttempts: maxAttempts,
+		LockoutDuration:   15 * time.Minute,
+	})
+
+	secret := []byte("12345678901234567890")
+	if err := h.store.Upsert(t.Context(), tenantID, userID, secret, "", true, now); err != nil {
+		t.Fatalf("seed enabled credential: %v", err)
+	}
+
+	wrong := "654321"
+	if wrong == generateHOTP(secret, now.Unix()/30) {
+		wrong = "123456"
+	}
+	doCheck := func(code string) int {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/totp/check",
+			bytes.NewReader([]byte(`{"code":"`+code+`"}`)))
+		req.Header.Set("X-KMail-Dev-Tenant-Id", tenantID)
+		req.Header.Set("X-KMail-Dev-User-Id", userID)
+		rec := httptest.NewRecorder()
+		h.check(rec, req)
+		return rec.Code
+	}
+	for i := 0; i < maxAttempts; i++ {
+		doCheck(wrong)
+	}
+
+	// Even a valid current code is refused with 429 while locked.
+	valid := generateHOTP(secret, now.Unix()/30)
+	if rec := doEnroll(h, tenantID, userID, valid); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("re-enroll while locked: want 429, got %d (body=%q)", rec.Code, rec.Body.String())
+	}
+	if rec := doEnroll(h, tenantID, userID, valid); rec.Header().Get("Retry-After") == "" {
+		t.Error("locked re-enroll response missing Retry-After header")
+	}
+
+	// The live secret survived the lockout — no rotation slipped through.
+	cred, err := h.store.Get(t.Context(), tenantID, userID)
+	if err != nil {
+		t.Fatalf("get after locked re-enroll: %v", err)
+	}
+	if !bytes.Equal(cred.EncryptedSecret, secret) {
+		t.Fatal("locked re-enroll must not rotate the secret")
+	}
+	if !cred.Enabled {
+		t.Fatal("locked re-enroll must not disable the live credential")
+	}
+}

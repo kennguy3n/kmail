@@ -10,7 +10,11 @@
 //
 //   POST /api/v1/auth/totp/enroll   — mints a fresh secret + QR
 //        URI, returns the otpauth:// URI and base32 secret. The
-//        client renders a QR code.
+//        client renders a QR code. Re-enrolling an already-enabled
+//        credential (secret rotation) requires proving the current
+//        second factor (a live TOTP code or an unused recovery code)
+//        in the body, checked through the same brute-force lockout
+//        path as /check so it cannot be used to bypass the cooldown.
 //   POST /api/v1/auth/totp/verify   — accepts a 6-digit code; on
 //        success flips the credential to `enabled=true` and
 //        returns 10 recovery codes (one-time view).
@@ -33,6 +37,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -114,6 +119,16 @@ func (h *TOTPHandlers) Register(mux *http.ServeMux, authMW *OIDC) {
 	mux.Handle("DELETE /api/v1/auth/totp", authMW.Wrap(http.HandlerFunc(h.disable)))
 }
 
+// EnrollRequest is the (optional) body of /enroll. The `code` field
+// is only consulted when re-enrolling an already-enabled credential
+// (secret rotation): the caller must prove possession of the current
+// second factor — a live TOTP code or an unused recovery code — before
+// a new secret is issued. A first-time or not-yet-confirmed enrollment
+// may send an empty body.
+type EnrollRequest struct {
+	Code string `json:"code"`
+}
+
 // EnrollResponse is the body of /enroll.
 type EnrollResponse struct {
 	OTPAuthURI string `json:"otpauth_uri"`
@@ -142,6 +157,16 @@ func (h *TOTPHandlers) enroll(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
 	}
+	// Optional current-factor proof. Required only to rotate the
+	// secret of an already-enabled credential; empty for a first-time
+	// or not-yet-confirmed enrollment.
+	var in EnrollRequest
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil && !errors.Is(err, io.EOF) {
+		http.Error(w, "invalid body", http.StatusBadRequest)
+		return
+	}
+	code := strings.TrimSpace(in.Code)
+
 	secret := make([]byte, 20) // 160-bit per RFC 4226 §4
 	if _, err := rand.Read(secret); err != nil {
 		http.Error(w, "rand: "+err.Error(), http.StatusInternalServerError)
@@ -152,11 +177,83 @@ func (h *TOTPHandlers) enroll(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "envelope: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	if err := h.store.Upsert(r.Context(), tenantID, userID, wrapped, "", false, h.cfg.Now()); err != nil {
+
+	// Re-enrollment guard. An already-enabled credential may only be
+	// rotated after proving possession of the *current* second factor,
+	// verified through the same SELECT ... FOR UPDATE lockout path as
+	// /check — otherwise /enroll would be a free way to clear a standing
+	// lockout (the rotation resets failed_attempts/locked_until). The
+	// recovery code is the escape hatch for a lost authenticator. On
+	// success the new (disabled) secret is written atomically in that
+	// same locked transaction and the old recovery bundle is cleared;
+	// the user re-confirms via /verify, which mints a fresh bundle.
+	//
+	// requireEnabled=true means a first-time (no row) or unconfirmed
+	// (disabled) credential never reaches the verify closure — those
+	// enroll without a second factor.
+	emptyRecovery := ""
+	disabled := false
+	newSecret := wrapped
+	res, err := h.store.EvaluateAttempt(
+		r.Context(), tenantID, userID, h.cfg.Now(),
+		h.cfg.MaxFailedAttempts, h.cfg.LockoutDuration,
+		true,
+		func(cred *TOTPCredential) TOTPVerification {
+			sec, uerr := h.unwrapSecret(cred.EncryptedSecret)
+			if uerr != nil {
+				return TOTPVerification{Err: uerr}
+			}
+			if verifyCode(sec, code, h.cfg.Now()) {
+				return TOTPVerification{
+					OK: true, Method: "totp",
+					SetEncryptedSecret: &newSecret,
+					SetRecoveryHash:    &emptyRecovery,
+					SetEnabled:         &disabled,
+				}
+			}
+			if _, ok := consumeRecoveryCode(cred.RecoveryCodesHash, code); ok {
+				return TOTPVerification{
+					OK: true, Method: "recovery",
+					SetEncryptedSecret: &newSecret,
+					SetRecoveryHash:    &emptyRecovery,
+					SetEnabled:         &disabled,
+				}
+			}
+			return TOTPVerification{}
+		},
+	)
+	switch {
+	case errors.Is(err, ErrTOTPNotFound):
+		// No credential yet — first enrollment, no factor required.
+		if uerr := h.store.Upsert(r.Context(), tenantID, userID, wrapped, "", false, h.cfg.Now()); uerr != nil {
+			h.cfg.Logger.Printf("totp.enroll: %v", uerr)
+			http.Error(w, "store: "+uerr.Error(), http.StatusInternalServerError)
+			return
+		}
+	case err != nil:
 		h.cfg.Logger.Printf("totp.enroll: %v", err)
-		http.Error(w, "store: "+err.Error(), http.StatusInternalServerError)
+		http.Error(w, "store error", http.StatusInternalServerError)
+		return
+	case res.NotEnabled:
+		// Row exists but enrollment was never confirmed — let the user
+		// restart enrollment without a second factor.
+		if uerr := h.store.Upsert(r.Context(), tenantID, userID, wrapped, "", false, h.cfg.Now()); uerr != nil {
+			h.cfg.Logger.Printf("totp.enroll: %v", uerr)
+			http.Error(w, "store: "+uerr.Error(), http.StatusInternalServerError)
+			return
+		}
+	case res.Locked:
+		h.writeLocked(w, res.RetryAfter)
+		return
+	case !res.Verified:
+		// Enabled credential, but no valid current factor supplied.
+		http.Error(w, "current TOTP or recovery code required to re-enroll", http.StatusUnauthorized)
 		return
 	}
+	// res.Verified == true: EvaluateAttempt already persisted the
+	// rotated (disabled) secret atomically — fall through to hand back
+	// the new provisioning URI.
+
 	uri := h.otpauthURI(tenantID, userID, secret)
 	writeJSON(w, http.StatusOK, EnrollResponse{
 		OTPAuthURI: uri,

@@ -134,6 +134,12 @@ type TOTPVerification struct {
 	// used by enrollment confirmation to flip the credential live.
 	// Ignored on failure.
 	SetEnabled *bool
+	// SetEncryptedSecret, when non-nil, replaces encrypted_secret on
+	// success — used by re-enrollment to rotate the shared secret in
+	// the same locked transaction that verified the *current* factor,
+	// so a secret rotation cannot be used to sidestep the lockout.
+	// Ignored on failure.
+	SetEncryptedSecret *[]byte
 	// Err, when non-nil, aborts the attempt without spending one
 	// (e.g. a secret-envelope failure). The transaction rolls back
 	// and the error is surfaced to the caller; no counter changes.
@@ -169,8 +175,8 @@ type TOTPAttemptResult struct {
 //     attempt spent);
 //  4. run verify() against the locked row;
 //  5. on success: reset failed_attempts/locked_until, bump
-//     last_used_at, and apply any SetRecoveryHash / SetEnabled —
-//     all in the same statement;
+//     last_used_at, and apply any SetRecoveryHash / SetEnabled /
+//     SetEncryptedSecret — all in the same statement;
 //  6. on failure: increment failed_attempts and apply the lockout
 //     once the ceiling is reached (counter resets to 0 at lock time
 //     so the post-cooldown window starts fresh).
@@ -252,9 +258,10 @@ func (s *TOTPStore) EvaluateAttempt(
 			    failed_attempts     = 0,
 			    locked_until        = NULL,
 			    recovery_codes_hash = COALESCE($4::text, recovery_codes_hash),
-			    enabled             = COALESCE($5::boolean, enabled)
+			    enabled             = COALESCE($5::boolean, enabled),
+			    encrypted_secret    = COALESCE($6::bytea, encrypted_secret)
 			WHERE tenant_id = $1::uuid AND user_id = $2
-		`, tenantID, userID, now, v.SetRecoveryHash, v.SetEnabled)
+		`, tenantID, userID, now, v.SetRecoveryHash, v.SetEnabled, v.SetEncryptedSecret)
 		return err
 	})
 	if err != nil {

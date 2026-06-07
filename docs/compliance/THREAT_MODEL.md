@@ -33,7 +33,8 @@ inventory) and [`SECURITY_OVERVIEW.md`](./SECURITY_OVERVIEW.md)
 
 ### Spoofing
 - **Forged identity / token replay.** Mitigation: OIDC verification against KChat JWKS, fail-closed on missing/invalid claims (`internal/middleware/auth.go`); short-lived sessions with idle timeout and max-concurrent caps (`internal/middleware/session.go`).
-- **Second-factor bypass.** Mitigation: TOTP verify/check now rate-limited with durable per-account lockout (migration 010); WebAuthn available.
+- **Second-factor bypass.** Mitigation: TOTP verify/check enforce a durable per-account brute-force lockout evaluated atomically under `SELECT … FOR UPDATE` (migration 010, `TOTPStore.EvaluateAttempt`); WebAuthn available.
+- **Lockout bypass via re-enrollment.** Mitigation: re-enrolling an already-enabled credential (which would otherwise reset the lockout/replace the secret) goes through the same `FOR UPDATE` lockout path and requires proving the current second factor — a live TOTP code or an unused recovery code (lost-authenticator escape hatch); refused with 429 while locked. First-time/unconfirmed enrollment is unaffected.
 - **Webhook spoofing (Stripe).** Mitigation: Stripe signature verification (`KMAIL_STRIPE_WEBHOOK_SECRET`) on the public webhook route.
 
 ### Tampering
