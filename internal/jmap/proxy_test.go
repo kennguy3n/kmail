@@ -56,6 +56,36 @@ func TestNewProxy_RequiresStalwartURL(t *testing.T) {
 	}
 }
 
+// TestShardsAvailable verifies the graceful-degradation health
+// signal: a single-shard proxy (no resolver) reports its default
+// Target host as available until that host's breaker trips, and
+// recovers once a probe succeeds. The verdict must track the same
+// breaker the failover transport consults so degradation kicks in
+// exactly when the proxy would otherwise 502.
+func TestShardsAvailable(t *testing.T) {
+	p := newTestProxy(t)
+	ctx := context.Background()
+	host := p.Target().Host
+
+	if !p.ShardsAvailable(ctx, "tenant-1") {
+		t.Fatal("fresh proxy should report shard available")
+	}
+
+	// Default breaker trips after 3 consecutive failures (Cooldown=0
+	// → stays open until a success).
+	for i := 0; i < 3; i++ {
+		p.breaker.RecordFailure(ctx, host)
+	}
+	if p.ShardsAvailable(ctx, "tenant-1") {
+		t.Fatal("shard should be unavailable after breaker trips")
+	}
+
+	p.breaker.RecordSuccess(ctx, host)
+	if !p.ShardsAvailable(ctx, "tenant-1") {
+		t.Fatal("shard should recover after a successful probe closes the breaker")
+	}
+}
+
 func TestNewProxy_RequiresPool(t *testing.T) {
 	_, err := NewProxy(ProxyConfig{StalwartURL: "http://stalwart.test"})
 	if err == nil {
@@ -390,6 +420,108 @@ func TestShardFailoverTransport_LastShardBreaker(t *testing.T) {
 	srvURL, _ := url.Parse(srv.URL)
 	if !p.breaker.Open(context.Background(), srvURL.Host) {
 		t.Errorf("breaker for %s did not open after 3 consecutive 5xx", srvURL.Host)
+	}
+}
+
+// TestShardFailoverTransport_NonShardPathDrivesDefaultBreaker covers
+// the single-target / no-shard-assignment path: when no shard URLs
+// are stamped on the request, the transport must still record the
+// default target's health against the breaker. Otherwise
+// ShardsAvailable (which consults that same host) would always
+// report healthy and graceful degradation could never engage for
+// these tenants.
+func TestShardFailoverTransport_NonShardPathDrivesDefaultBreaker(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	p, err := NewProxy(ProxyConfig{
+		StalwartURL: srv.URL,
+		Pool:        newDummyPool(t),
+		Logger:      log.New(io.Discard, "", 0),
+	})
+	if err != nil {
+		t.Fatalf("NewProxy: %v", err)
+	}
+	tr := &shardFailoverTransport{proxy: p, base: http.DefaultTransport}
+
+	if !p.ShardsAvailable(context.Background(), "tenant-1") {
+		t.Fatal("default target should be available before any failures")
+	}
+
+	// Drive non-shard requests (no withShardURLs) at the 500 target.
+	for i := 0; i < 3; i++ {
+		req, err := http.NewRequest(http.MethodPost, srv.URL+"/jmap", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := tr.RoundTrip(req)
+		if err != nil {
+			t.Fatalf("RoundTrip[%d]: %v", i, err)
+		}
+		resp.Body.Close()
+	}
+
+	if p.ShardsAvailable(context.Background(), "tenant-1") {
+		t.Fatal("default-target breaker never tripped on the non-shard path — degradation would never engage")
+	}
+}
+
+// countingShardResolver wraps a static map and counts GetTenantShard
+// calls so a test can assert the per-request memo collapses the
+// health-check + ServeHTTP double-resolve into one Postgres hit.
+type countingShardResolver struct {
+	primary string
+	calls   int
+}
+
+func (c *countingShardResolver) GetTenantShard(ctx context.Context, tenantID string) (string, error) {
+	c.calls++
+	return c.primary, nil
+}
+
+func (c *countingShardResolver) GetSecondaryShards(ctx context.Context, tenantID string) ([]string, error) {
+	return nil, nil
+}
+
+// TestShardResolveMemoDeduplicatesPerRequest verifies that with a
+// per-request memo installed, two resolveShardURLs calls in the same
+// request (as the degradation health check + ServeHTTP would make)
+// issue only a single GetTenantShard query, and that a fresh request
+// without the memo re-resolves.
+func TestShardResolveMemoDeduplicatesPerRequest(t *testing.T) {
+	p := newTestProxy(t)
+	res := &countingShardResolver{primary: "http://shard-1:8080"}
+	p.cfg.Shards = res
+
+	// Without a memo: each call hits the resolver.
+	bare := context.Background()
+	_ = p.resolveShardURLs(bare, "tenant-1")
+	_ = p.resolveShardURLs(bare, "tenant-1")
+	if res.calls != 2 {
+		t.Fatalf("no-memo: GetTenantShard calls = %d, want 2", res.calls)
+	}
+
+	// With a memo: the second resolve in the same request is served
+	// from the memo.
+	res.calls = 0
+	ctx := WithShardResolveMemo(context.Background())
+	a := p.resolveShardURLs(ctx, "tenant-1")
+	b := p.resolveShardURLs(ctx, "tenant-1")
+	if res.calls != 1 {
+		t.Fatalf("memo: GetTenantShard calls = %d, want 1", res.calls)
+	}
+	if len(a) != 1 || len(b) != 1 || a[0] != "http://shard-1:8080" || b[0] != a[0] {
+		t.Fatalf("memo returned inconsistent urls: a=%v b=%v", a, b)
+	}
+
+	// A new request (new memo) re-resolves.
+	res.calls = 0
+	ctx2 := WithShardResolveMemo(context.Background())
+	_ = p.resolveShardURLs(ctx2, "tenant-1")
+	if res.calls != 1 {
+		t.Fatalf("second request: GetTenantShard calls = %d, want 1", res.calls)
 	}
 }
 

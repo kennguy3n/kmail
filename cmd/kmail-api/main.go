@@ -412,12 +412,44 @@ func main() {
 	if err != nil {
 		logger.Fatalf("jmap.NewProxy: %v", err)
 	}
+	// Graceful degradation (Phase 5, opt-in via KMAIL_DEGRADATION_ENABLED).
+	// When the tenant's Stalwart shards are all tripped, a GET on a
+	// read path (default /jmap/session) is served from the last
+	// successful Valkey-cached response with X-KMail-Degraded:true
+	// instead of a 502/503, so the client can still bootstrap during
+	// an outage. Writes on those paths return a clean 503. Health is
+	// the proxy's own per-tenant breaker view, so the verdict matches
+	// its routing decision. Wrapped inside wrapAuthRL so the cache
+	// key can scope by the tenant/user the auth layer populates.
+	jmapHandler := http.Handler(proxy)
+	if config.GetenvBool("KMAIL_DEGRADATION_ENABLED", false) {
+		degradation := middleware.NewDegradation(middleware.DegradationConfig{
+			Cache:       valkeyClient,
+			HealthCheck: func(ctx context.Context) bool { return proxy.ShardsAvailable(ctx, middleware.TenantIDFrom(ctx)) },
+			ReadPaths:   strings.Fields(os.Getenv("KMAIL_DEGRADATION_READ_PATHS")),
+			CacheTTL:    getenvDuration("KMAIL_DEGRADATION_TTL", 5*time.Minute),
+			Logger:      logger,
+		})
+		if degradation == nil {
+			logger.Printf("jmap: graceful degradation requested (KMAIL_DEGRADATION_ENABLED) but disabled — KMAIL_VALKEY_URL unset, no cache to serve from")
+		} else {
+			// Install a per-request shard-resolution memo outside the
+			// degradation middleware so the health check (ShardsAvailable)
+			// and the proxy's own routing share one GetTenantShard query
+			// instead of each issuing their own on every eligible read.
+			degraded := degradation.Wrap(proxy)
+			jmapHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				degraded.ServeHTTP(w, r.WithContext(jmap.WithShardResolveMemo(r.Context())))
+			})
+			logger.Printf("jmap: graceful degradation enabled — read paths fall back to last-known-good Valkey cache during a Stalwart outage")
+		}
+	}
 	// Everything under /jmap is authenticated and forwarded to
 	// Stalwart. The trailing-slash pattern owns every path below
 	// /jmap/ so subpaths like /jmap/session and /jmap/upload route
 	// here, while the bare /jmap lands on the session endpoint.
-	mux.Handle("/jmap", wrapAuthRL(proxy))
-	mux.Handle("/jmap/", wrapAuthRL(proxy))
+	mux.Handle("/jmap", wrapAuthRL(jmapHandler))
+	mux.Handle("/jmap/", wrapAuthRL(jmapHandler))
 
 	// Billing / Quota Service — constructed early so the Tenant
 	// Service can consume it as a SeatAccounter for CreateUser /

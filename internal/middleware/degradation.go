@@ -36,15 +36,29 @@ type DegradationConfig struct {
 	// Required.
 	HealthCheck func(ctx context.Context) bool
 
-	// ReadPaths is the list of URL prefixes the middleware
-	// considers eligible for cached fallback. Defaults to the
-	// JMAP read endpoints when empty.
+	// ReadPaths is the list of URL paths the middleware considers
+	// eligible for cached fallback. Each entry matches its exact
+	// path or any path in its subtree (`p` or `p/...`), so a
+	// sibling that merely shares a string prefix is not caught.
+	// Defaults to /jmap/session when empty — the small, bounded,
+	// per-user bootstrap document. Larger JMAP GETs (blob
+	// download) are deliberately excluded: buffering an attachment
+	// to cache it would blow up memory and Valkey value sizes. The
+	// bare /jmap endpoint is the JSON-RPC POST envelope, not a GET
+	// read, so it is intentionally uncovered by the default.
 	ReadPaths []string
 
 	// CacheTTL is the TTL applied to cached responses. Defaults
 	// to 5 minutes — short enough that stale data is rare,
 	// long enough that a 30s outage doesn't fall through.
 	CacheTTL time.Duration
+
+	// MaxCacheBytes caps the response size the middleware will
+	// buffer and cache. A larger response is streamed to the
+	// client untouched and never cached, so an unexpectedly large
+	// read can't exhaust memory or overflow a Valkey value.
+	// Defaults to 256 KiB.
+	MaxCacheBytes int
 
 	// Logger is used for transient-error diagnostics.
 	Logger *log.Logger
@@ -67,8 +81,11 @@ func NewDegradation(cfg DegradationConfig) *Degradation {
 	if cfg.Logger == nil {
 		cfg.Logger = log.Default()
 	}
+	if cfg.MaxCacheBytes <= 0 {
+		cfg.MaxCacheBytes = 256 << 10
+	}
 	if len(cfg.ReadPaths) == 0 {
-		cfg.ReadPaths = []string{"/jmap"}
+		cfg.ReadPaths = []string{"/jmap/session"}
 	}
 	return &Degradation{cfg: cfg}
 }
@@ -103,17 +120,31 @@ func (d *Degradation) Wrap(next http.Handler) http.Handler {
 	})
 }
 
+// matchesReadPath reports whether the request targets a configured
+// read path. A configured path matches the exact path or any path
+// in its subtree (`p` or `p/...`), so `/jmap/session` covers
+// `/jmap/session` and `/jmap/session/<id>` but not an unrelated
+// sibling like `/jmap/sessions-export`. This deliberately leaves
+// the bare `/jmap` JSON-RPC method-call endpoint uncovered by
+// default: it is the POST request envelope, not the GET session
+// document, so it is never a cacheable read.
 func (d *Degradation) matchesReadPath(r *http.Request) bool {
 	for _, p := range d.cfg.ReadPaths {
-		if strings.HasPrefix(r.URL.Path, p) {
+		if r.URL.Path == p || strings.HasPrefix(r.URL.Path, p+"/") {
 			return true
 		}
 	}
 	return false
 }
 
+// cacheKey scopes the cached response by tenant and user so a
+// degraded read is never served across identities — JMAP session
+// and read responses are per-user, and the populated auth context
+// (TenantIDFrom / KChatUserIDFrom) is available because this
+// middleware runs inside the OIDC layer.
 func (d *Degradation) cacheKey(r *http.Request) string {
-	return "kmail:degrade:" + r.Method + ":" + r.URL.Path + "?" + r.URL.RawQuery
+	return "kmail:degrade:" + TenantIDFrom(r.Context()) + ":" + KChatUserIDFrom(r.Context()) +
+		":" + r.Method + ":" + r.URL.Path + "?" + r.URL.RawQuery
 }
 
 func (d *Degradation) serveAndCache(w http.ResponseWriter, r *http.Request, next http.Handler) {
@@ -121,9 +152,12 @@ func (d *Degradation) serveAndCache(w http.ResponseWriter, r *http.Request, next
 		next.ServeHTTP(w, r)
 		return
 	}
-	rec := &recordingWriter{ResponseWriter: w, body: &bytes.Buffer{}, status: http.StatusOK}
+	rec := &recordingWriter{ResponseWriter: w, body: &bytes.Buffer{}, status: http.StatusOK, limit: d.cfg.MaxCacheBytes}
 	next.ServeHTTP(rec, r)
-	if rec.status >= 200 && rec.status < 300 && rec.body.Len() > 0 {
+	// Only cache a bounded, successful, non-empty response. An
+	// over-limit body is marked truncated so we never persist a
+	// partial snapshot that would later be served as if complete.
+	if rec.status >= 200 && rec.status < 300 && rec.body.Len() > 0 && !rec.truncated {
 		_ = d.cfg.Cache.Set(r.Context(), d.cacheKey(r), rec.body.Bytes(), d.cfg.CacheTTL).Err()
 	}
 }
@@ -146,11 +180,24 @@ func (d *Degradation) serveFromCache(w http.ResponseWriter, r *http.Request) err
 var errCacheMiss = errors.New("degradation: cache miss")
 
 // recordingWriter captures the response body for caching while
-// also forwarding it to the underlying ResponseWriter.
+// also forwarding it to the underlying ResponseWriter. Buffering
+// stops once the body exceeds limit (truncated is set) so the
+// client still streams the full response but an oversized read is
+// never cached.
 type recordingWriter struct {
 	http.ResponseWriter
-	body   *bytes.Buffer
-	status int
+	body      *bytes.Buffer
+	status    int
+	limit     int
+	truncated bool
+}
+
+// Unwrap exposes the underlying ResponseWriter so http.ResponseController
+// (used by httputil.ReverseProxy) can still discover Flusher/Hijacker
+// support through the wrapper, preserving response streaming on the
+// pass-through path.
+func (r *recordingWriter) Unwrap() http.ResponseWriter {
+	return r.ResponseWriter
 }
 
 func (r *recordingWriter) WriteHeader(status int) {
@@ -159,6 +206,13 @@ func (r *recordingWriter) WriteHeader(status int) {
 }
 
 func (r *recordingWriter) Write(p []byte) (int, error) {
-	r.body.Write(p)
+	if !r.truncated {
+		if r.limit > 0 && r.body.Len()+len(p) > r.limit {
+			r.truncated = true
+			r.body.Reset()
+		} else {
+			r.body.Write(p)
+		}
+	}
 	return r.ResponseWriter.Write(p)
 }

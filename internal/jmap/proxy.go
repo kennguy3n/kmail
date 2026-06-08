@@ -871,6 +871,31 @@ func (p *Proxy) ResolveShardURLs(ctx context.Context, tenantID string) []string 
 	return p.resolveShardURLs(ctx, tenantID)
 }
 
+// ShardsAvailable reports whether at least one candidate Stalwart
+// shard for the tenant is currently serving — i.e. its circuit
+// breaker is not open. It keys the breaker on the same `u.Host`
+// the failover transport uses, so the verdict matches the proxy's
+// own routing decision: when every candidate is tripped the proxy
+// would surface a 502/503, which is exactly when a read should
+// fall back to a last-known-good cache instead. Single-shard
+// deployments (no resolver) consult the default Target host.
+func (p *Proxy) ShardsAvailable(ctx context.Context, tenantID string) bool {
+	urls := p.resolveShardURLs(ctx, tenantID)
+	if len(urls) == 0 && p.target != nil {
+		urls = []string{p.target.String()}
+	}
+	for _, raw := range urls {
+		u, err := url.Parse(raw)
+		if err != nil || u.Host == "" {
+			continue
+		}
+		if !p.breaker.Open(ctx, u.Host) {
+			return true
+		}
+	}
+	return false
+}
+
 // shardCtxKey carries the resolved shard URL list (primary first)
 // to the custom transport so retries can switch hosts without
 // re-querying Postgres on every attempt.
@@ -882,6 +907,32 @@ func withShardURLs(ctx context.Context, urls []string) context.Context {
 func shardURLsFrom(ctx context.Context) []string {
 	v, _ := ctx.Value(shardCtxKey{}).([]string)
 	return v
+}
+
+// shardResolveMemoKey carries a per-request memo so a tenant's
+// shard URLs are resolved from Postgres at most once per request.
+type shardResolveMemoKey struct{}
+
+// shardResolveMemo caches a single resolveShardURLs result for the
+// lifetime of one request. It is consulted by both the degradation
+// health check (ShardsAvailable) and ServeHTTP, which would
+// otherwise each issue the same GetTenantShard query.
+type shardResolveMemo struct {
+	mu     sync.Mutex
+	tenant string
+	urls   []string
+	done   bool
+}
+
+// WithShardResolveMemo installs a per-request shard-resolution memo
+// on the context. When graceful degradation is enabled, both the
+// health check and the proxy's own routing resolve the tenant's
+// shards; without this memo that doubles the per-request Postgres
+// load on every degradation-eligible read. Install it once, outside
+// the degradation middleware, so the seeded context is visible to
+// the health check and to ServeHTTP alike.
+func WithShardResolveMemo(ctx context.Context) context.Context {
+	return context.WithValue(ctx, shardResolveMemoKey{}, &shardResolveMemo{})
 }
 
 // NewProxy builds a Proxy pointed at the configured Stalwart URL.
@@ -1006,8 +1057,28 @@ type shardFailoverTransport struct {
 func (t *shardFailoverTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	urls := shardURLsFrom(req.Context())
 	if len(urls) == 0 {
-		// No shard wiring; behave as the unmodified proxy.
-		return t.base.RoundTrip(req)
+		// No per-tenant shard wiring — a single-target deployment or
+		// a tenant without a shard assignment (e.g. mid-provisioning
+		// or dev). Forward to the default target as the unmodified
+		// proxy would, but still drive that target's breaker: it's
+		// the same host ShardsAvailable consults, so without this the
+		// breaker would never trip on the non-shard path and graceful
+		// degradation could never engage for these tenants.
+		if t.proxy.target == nil {
+			return t.base.RoundTrip(req)
+		}
+		host := t.proxy.target.Host
+		resp, err := t.base.RoundTrip(req)
+		if err != nil {
+			t.proxy.breaker.RecordFailure(req.Context(), host)
+			return nil, err
+		}
+		if resp.StatusCode >= 500 {
+			t.proxy.breaker.RecordFailure(req.Context(), host)
+			return resp, nil
+		}
+		t.proxy.breaker.RecordSuccess(req.Context(), host)
+		return resp, nil
 	}
 	// Threshold comes from the breaker implementation, not the
 	// transport. The transport only consults `Open` per retry,
@@ -1102,8 +1173,6 @@ func (t *shardFailoverTransport) RoundTrip(req *http.Request) (*http.Response, e
 	}
 	return nil, lastErr
 }
-
-
 
 // ServeHTTP implements http.Handler. It expects to run behind the
 // OIDC middleware: the acting tenant and KChat user are read from
@@ -1288,6 +1357,37 @@ func (p *Proxy) resolveShardURLs(ctx context.Context, tenantID string) []string 
 	if p.cfg.Shards == nil || tenantID == "" {
 		return nil
 	}
+	// Serve from the per-request memo when one is installed, so a
+	// degradation-eligible read resolves shards from Postgres once
+	// (health check) instead of twice (health check + ServeHTTP).
+	memo, _ := ctx.Value(shardResolveMemoKey{}).(*shardResolveMemo)
+	if memo != nil {
+		memo.mu.Lock()
+		if memo.done && memo.tenant == tenantID {
+			urls := memo.urls
+			memo.mu.Unlock()
+			return urls
+		}
+		memo.mu.Unlock()
+	}
+	urls := p.resolveShardURLsUncached(ctx, tenantID)
+	if memo != nil {
+		memo.mu.Lock()
+		// First resolver for this tenant wins; a later one reuses it
+		// so the memo never flaps within a request.
+		if !memo.done || memo.tenant != tenantID {
+			memo.tenant = tenantID
+			memo.urls = urls
+			memo.done = true
+		} else {
+			urls = memo.urls
+		}
+		memo.mu.Unlock()
+	}
+	return urls
+}
+
+func (p *Proxy) resolveShardURLsUncached(ctx context.Context, tenantID string) []string {
 	primary, err := p.cfg.Shards.GetTenantShard(ctx, tenantID)
 	if err != nil || primary == "" {
 		return nil
