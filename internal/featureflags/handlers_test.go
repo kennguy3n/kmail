@@ -628,6 +628,47 @@ func TestHandlerPutPartialWriteDropsStaleCache(t *testing.T) {
 	}
 }
 
+// TestHandlersDrainAwaitsInFlightReconcile pins the graceful-shutdown
+// contract of Drain: it returns immediately when nothing is in flight,
+// blocks while a post-write reconcile is still running (honouring its
+// own context deadline as a backstop), and returns nil once the
+// reconcile completes. It drives reconcileWG exactly as
+// reconcileCacheAfterWriteAsync does.
+func TestHandlersDrainAwaitsInFlightReconcile(t *testing.T) {
+	h := &Handlers{store: newFakeStore(), logger: discardLogger()}
+
+	// Nothing in flight: Drain returns at once.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := h.Drain(ctx); err != nil {
+		t.Fatalf("Drain with nothing in flight: %v", err)
+	}
+
+	// Simulate an in-flight reconcile holding the WaitGroup.
+	release := make(chan struct{})
+	h.reconcileWG.Add(1)
+	go func() {
+		defer h.reconcileWG.Done()
+		<-release
+	}()
+
+	// While the reconcile is blocked, Drain must wait — a short deadline
+	// fires first and surfaces as the context error.
+	short, cancelShort := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancelShort()
+	if err := h.Drain(short); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Drain should honour its deadline while a reconcile is in flight, got %v", err)
+	}
+
+	// Once the reconcile finishes, Drain returns nil within its budget.
+	close(release)
+	done, cancelDone := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelDone()
+	if err := h.Drain(done); err != nil {
+		t.Fatalf("Drain after reconcile completed: %v", err)
+	}
+}
+
 // wrap mirrors how the Store wraps query errors (fmt.Errorf %w), so the
 // test verifies errors.Is unwraps through the Store's error chain.
 func wrap(err error) error { return errWrap{err} }

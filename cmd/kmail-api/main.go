@@ -1628,6 +1628,15 @@ func main() {
 		logger.Printf("graceful shutdown error: %v", err)
 	}
 
+	// The feature-flag admin handlers kick post-write cache
+	// reconciliations off the response path, so one can still be running
+	// after Shutdown drained the request goroutines. Wait for any
+	// in-flight reconcile to finish (bounded by the same shutdown
+	// deadline) so it isn't orphaned on exit.
+	if err := flagHandlers.Drain(shutdownCtx); err != nil {
+		logger.Printf("featureflags: reconcile drain did not finish before shutdown deadline: %v", err)
+	}
+
 	// Drain ListenAndServe's return so deferred cleanups run in a
 	// predictable order.
 	<-serverErr
