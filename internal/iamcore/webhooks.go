@@ -251,6 +251,20 @@ func (rec *WebhookReceiver) handleUserCreate(ctx context.Context, evt Event) err
 	if d.TenantID == "" || d.UserID == "" {
 		return fmt.Errorf("user.create: tenant_id and user_id are required")
 	}
+	// iam-core webhook delivery is not ordered, so a user.create can
+	// arrive before its tenant.create. Without ensuring the tenant
+	// row first, CreateUser would trip the users.tenant_id foreign
+	// key and return 500 on every delivery until the tenant.create
+	// webhook (or a lazy provision) lands — a retry storm for a burst
+	// of users. EnsureTenant with id only is the cheap, idempotent
+	// placeholder path (a SELECT on the hot case; one ON CONFLICT
+	// insert otherwise); it deliberately does NOT run the provisioning
+	// hooks (EnsureProvisioned stays unset) — the authoritative
+	// tenant.create webhook reconciles the real slug/name/plan and
+	// drives the zk-fabric/billing hooks when it arrives.
+	if _, _, err := rec.tenant.EnsureTenant(ctx, tenant.EnsureTenantInput{ID: d.TenantID}); err != nil {
+		return fmt.Errorf("user.create: ensure tenant: %w", err)
+	}
 	d = rec.enrichUser(ctx, d)
 	display := firstNonEmpty(d.DisplayName, d.Name, d.Email, d.UserID)
 	in := tenant.CreateUserInput{
@@ -292,6 +306,16 @@ func (rec *WebhookReceiver) handleUserUpdate(ctx context.Context, evt Event) err
 			return rec.handleUserCreate(ctx, evt)
 		}
 		return fmt.Errorf("user.update: resolve user: %w", err)
+	}
+	// A user's email is the mailbox's primary address. KMail does not
+	// auto-rename a mailbox from a metadata webhook (that is a
+	// side-effectful Stalwart/alias operation, not a metadata update,
+	// and UpdateUserInput intentionally exposes no Email field), but a
+	// silent divergence between iam-core and KMail is worse than a
+	// visible one — surface it so operators can reconcile the address
+	// deliberately rather than discovering the drift later.
+	if d.Email != "" && !strings.EqualFold(d.Email, u.Email) {
+		rec.logger.Printf("iamcore webhook: user.update for %q in tenant %q reports email %q but KMail mailbox address is %q — mailbox addresses are not auto-renamed from webhooks; reconcile manually if the change is intended", d.UserID, d.TenantID, d.Email, u.Email)
 	}
 	display := firstNonEmpty(d.DisplayName, d.Name)
 	if display == "" {

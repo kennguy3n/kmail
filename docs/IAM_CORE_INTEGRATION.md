@@ -218,6 +218,31 @@ Mailbox account ids are derived deterministically from the iam-core
 user id (`iam-<user_id>`) so redelivered `user.create` events resolve
 to the same Stalwart account.
 
+`user.create` ensures the tenant row exists (id-only `EnsureTenant`)
+before inserting the mailbox, so an out-of-order delivery (a
+`user.create` arriving before its `tenant.create`) does not fail the
+`users.tenant_id` foreign key and retry-storm. The placeholder it
+leaves is reconciled by the authoritative `tenant.create` as above.
+
+**Mailbox addresses are immutable from webhooks.** A user's email is
+the mailbox's primary address; renaming it is a side-effectful
+Stalwart/alias operation, not a metadata update, so `user.update`
+does **not** auto-apply email changes (`UpdateUserInput` exposes no
+`Email` field). If iam-core reports an email that differs from KMail's
+stored address, the handler logs a warning identifying the user and
+both addresses so operators can reconcile the rename deliberately; the
+`display_name` metadata is still updated.
+
+### Development without a real issuer
+
+When `KMAIL_ENV=development` and no OIDC issuer/JWKS is configured,
+KMail accepts an unverified bearer JWT so contributors can hit
+endpoints without a live issuer. This dev path applies the **same
+iam-core claim fallbacks** as production (the namespaced
+`https://kmail.io/tenant_id` claim and the standard `sub`), so an
+iam-core-style token is accepted locally exactly as it would be once
+verified in production. This path is closed outside development.
+
 ## Example `.env`
 
 ```bash

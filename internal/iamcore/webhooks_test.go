@@ -367,6 +367,58 @@ func TestDispatch_UserUpdateMutatesDisplayName(t *testing.T) {
 	}
 }
 
+// TestDispatch_UserCreateEnsuresTenantFirst verifies user.create
+// provisions the tenant row before inserting the user, so an
+// out-of-order delivery (user.create before tenant.create) does not
+// trip the users.tenant_id foreign key. The ensure is the id-only
+// placeholder path: it must not carry authoritative metadata and
+// must leave EnsureProvisioned unset so the hot path stays off the
+// zk-fabric/billing hooks (the later tenant.create reconciles them).
+func TestDispatch_UserCreateEnsuresTenantFirst(t *testing.T) {
+	st := newStubTenant()
+	rec := NewWebhookReceiver("shh", st, quietLogger())
+	evt := mustEvent(t, EventUserCreate, UserEventData{
+		TenantID: "t-new", UserID: "u1", Email: "a@b.com", DisplayName: "A",
+	})
+	if err := rec.Dispatch(context.Background(), evt); err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	if _, ok := st.tenants["t-new"]; !ok {
+		t.Fatal("user.create should ensure the tenant row exists first")
+	}
+	got := st.lastEnsureInput
+	if got != (tenant.EnsureTenantInput{ID: "t-new"}) {
+		t.Errorf("ensure input = %+v, want id-only {ID:t-new}", got)
+	}
+}
+
+// TestDispatch_UserUpdateSurfacesEmailDivergence verifies that an
+// iam-core email change is surfaced (logged) but NOT silently applied
+// to the mailbox address: mailbox renames are a side-effectful
+// operation KMail does not perform from a metadata webhook.
+func TestDispatch_UserUpdateSurfacesEmailDivergence(t *testing.T) {
+	st := newStubTenant()
+	var buf bytes.Buffer
+	rec := NewWebhookReceiver("shh", st, log.New(&buf, "", 0))
+	create := mustEvent(t, EventUserCreate, UserEventData{TenantID: "t1", UserID: "u1", Email: "old@b.com", DisplayName: "Old"})
+	if err := rec.Dispatch(context.Background(), create); err != nil {
+		t.Fatalf("seed create: %v", err)
+	}
+	update := mustEvent(t, EventUserUpdate, UserEventData{TenantID: "t1", UserID: "u1", Email: "new@b.com", DisplayName: "New"})
+	if err := rec.Dispatch(context.Background(), update); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if got := st.users["t1"]["u1"].Email; got != "old@b.com" {
+		t.Errorf("email = %q, want unchanged old@b.com (mailbox not auto-renamed)", got)
+	}
+	if got := st.users["t1"]["u1"].DisplayName; got != "New" {
+		t.Errorf("display name = %q, want New (metadata still updated)", got)
+	}
+	if !bytes.Contains(buf.Bytes(), []byte("new@b.com")) || !bytes.Contains(buf.Bytes(), []byte("not auto-renamed")) {
+		t.Errorf("expected email-divergence warning, got log: %q", buf.String())
+	}
+}
+
 func TestDispatch_UserDeleteUnknownIsNoOp(t *testing.T) {
 	st := newStubTenant()
 	rec := NewWebhookReceiver("shh", st, quietLogger())

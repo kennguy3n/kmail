@@ -330,7 +330,7 @@ func (o *OIDC) authenticate(r *http.Request) (*Claims, error) {
 		// and the bare form both work — see `getenvKMail`).
 		return nil, errors.New("no JWKS issuer configured (set KMAIL_KCHAT_OIDC_ISSUER or KCHAT_OIDC_ISSUER)")
 	}
-	claims, err := decodeJWTClaims(token)
+	claims, err := o.decodeUnverifiedClaims(token)
 	if err != nil {
 		return nil, fmt.Errorf("invalid JWT: %w", err)
 	}
@@ -465,10 +465,16 @@ func audienceContains(aud jwt.ClaimStrings, want string) bool {
 	return false
 }
 
-// decodeJWTClaims parses the unverified payload of a compact JWT.
-// Retained for the no-issuer fallback path; production traffic
-// flows through verifyAndExtract instead.
-func decodeJWTClaims(token string) (*Claims, error) {
+// decodeUnverifiedClaims parses the unverified payload of a compact
+// JWT and applies the same iam-core claim fallbacks as the verified
+// path (resolveIdentity), so the development no-issuer fallback
+// accepts iam-core-style tokens (the namespaced tenant claim and the
+// standard `sub`) exactly like production rather than only tokens
+// carrying the bare `tenant_id` / `kchat_user_id` claims. Reachable
+// only in development (authenticate gates it behind isDevEnv);
+// production traffic flows through verifyAndExtract, which
+// cryptographically verifies the token before resolving identity.
+func (o *OIDC) decodeUnverifiedClaims(token string) (*Claims, error) {
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
 		return nil, errors.New("token is not a well-formed JWT")
@@ -477,11 +483,16 @@ func decodeJWTClaims(token string) (*Claims, error) {
 	if err != nil {
 		return nil, fmt.Errorf("decode payload: %w", err)
 	}
-	var c Claims
+	var c oidcTokenClaims
 	if err := json.Unmarshal(payload, &c); err != nil {
 		return nil, fmt.Errorf("decode claims: %w", err)
 	}
-	return &c, nil
+	tenantID, kchatUserID := o.resolveIdentity(c.TenantID, c.KChatUserID, c.NamespacedTenantID, c.Subject)
+	return &Claims{
+		TenantID:          tenantID,
+		KChatUserID:       kchatUserID,
+		StalwartAccountID: c.StalwartAccountID,
+	}, nil
 }
 
 // devClaimsFromHeaders synthesizes Claims for dev-bypass requests.
