@@ -9,7 +9,6 @@ import (
 	"testing"
 
 	"github.com/alicebob/miniredis/v2"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/kennguy3n/kmail/internal/config"
@@ -70,11 +69,11 @@ func TestBuildInternalJMAPMalwareAndHTTPSWarn(t *testing.T) {
 // fail-closed behaviour: a partial mTLS config in a non-dev env is
 // a fatal construction error.
 func TestBuildInternalJMAPPartialMTLSFailClosed(t *testing.T) {
-	pool, err := pgxpool.New(context.Background(), "postgres://kmail:kmail@127.0.0.1:5432/kmail")
-	if err != nil {
-		t.Fatalf("pgxpool.New: %v", err)
-	}
-	defer pool.Close()
+	// Use the shared test pool helper (skips when no test DB is
+	// configured) rather than a hardcoded DSN, for parity with the
+	// rest of the suite. The fail-closed path returns before the pool
+	// is ever queried, but a valid pool keeps construction realistic.
+	pool := testsupport.Pool(t)
 	logger := log.New(io.Discard, "", 0)
 	shardSvc := tenant.NewShardService(pool, logger)
 
