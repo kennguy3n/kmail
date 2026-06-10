@@ -109,12 +109,13 @@ type Service struct {
 	cancels map[string]context.CancelFunc
 	pausing map[string]struct{}
 
-	// imapsyncCmd starts the imapsync subprocess. It is set once
-	// at construction (defaulting to defaultRunImapsyncCmd) and
-	// only ever read afterwards by worker goroutines, so it needs
-	// no synchronisation. Tests inject a fake here instead of
-	// mutating package-level state, which previously raced with
-	// in-flight workers under -race.
+	// imapsyncCmd starts the imapsync subprocess. NewService sets it
+	// to defaultRunImapsyncCmd; tests may reassign it once, before
+	// starting any job, to inject a fake. After the first job starts
+	// it is only ever read (by worker goroutines), so it needs no
+	// synchronisation. This replaced a mutable package-level var that
+	// raced with in-flight workers under -race when a test's cleanup
+	// restored it.
 	imapsyncCmd imapsyncRunner
 }
 
