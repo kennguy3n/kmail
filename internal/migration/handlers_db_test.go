@@ -15,14 +15,15 @@ import (
 	"github.com/kennguy3n/kmail/internal/middleware"
 )
 
-// stubImapsync swaps the package-level runImapsyncCmd with a fake that
-// shells out to `sh -c <script>` so runWorker/runImapsync run their
-// real scan + cmd.Wait paths deterministically (no real imapsync
-// binary, no network). Returns a restore func.
-func stubImapsync(t *testing.T, script string) {
-	t.Helper()
-	orig := runImapsyncCmd
-	runImapsyncCmd = func(ctx context.Context, _ string, _ *MigrationJob, _ string) (io.ReadCloser, *exec.Cmd, error) {
+// stubImapsync injects a fake imapsync runner on the given Service so
+// runWorker/runImapsync run their real scan + cmd.Wait paths
+// deterministically (no real imapsync binary, no network). It sets the
+// per-Service field rather than mutating package-level state, so it is
+// race-free even when in-flight workers are still reading the runner.
+// Call it immediately after constructing the Service, before any job
+// is started.
+func stubImapsync(svc *Service, script string) {
+	svc.imapsyncCmd = func(ctx context.Context, _ string, _ *MigrationJob, _ string) (io.ReadCloser, *exec.Cmd, error) {
 		cmd := exec.CommandContext(ctx, "sh", "-c", script)
 		stdout, err := cmd.StdoutPipe()
 		if err != nil {
@@ -34,7 +35,6 @@ func stubImapsync(t *testing.T, script string) {
 		}
 		return stdout, cmd, nil
 	}
-	t.Cleanup(func() { runImapsyncCmd = orig })
 }
 
 func migrationRouter(svc *Service) *http.ServeMux {
@@ -63,8 +63,8 @@ func authedReq(method, target, tenant, body string) *http.Request {
 // TestMigrationHandlersCRUDDB drives the full REST surface against a
 // live DB: create (which kicks the worker), list, get, then cancel.
 func TestMigrationHandlersCRUDDB(t *testing.T) {
-	stubImapsync(t, "printf '++++ Statistics : Folder [INBOX] Messages 10 of 10 done\\n'; exit 0")
 	svc, tenant := newDBService(t)
+	stubImapsync(svc, "printf '++++ Statistics : Folder [INBOX] Messages 10 of 10 done\\n'; exit 0")
 	mux := migrationRouter(svc)
 
 	// create → 202 (job persisted + StartJob fired).
@@ -210,8 +210,8 @@ func TestMigrationTestConnectionHandlerDB(t *testing.T) {
 // TestMigrationPauseResumeHandlersDB covers the pauseJob/resumeJob
 // happy paths (204) and Register mounting all routes on a real mux.
 func TestMigrationPauseResumeHandlersDB(t *testing.T) {
-	stubImapsync(t, "printf 'Messages 1 of 1 done\\n'; exit 0")
 	svc, tenant := newDBService(t)
+	stubImapsync(svc, "printf 'Messages 1 of 1 done\\n'; exit 0")
 
 	// Register on a real mux behind a dev-bypass OIDC to cover Register.
 	authMW, err := middleware.NewOIDC(middleware.OIDCConfig{DevBypassToken: "x", Env: middleware.EnvDevelopment})
@@ -250,14 +250,30 @@ func TestMigrationPauseResumeHandlersDB(t *testing.T) {
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("resume=%d body=%s", rec.Code, rec.Body.String())
 	}
+
+	// Drain the resumed worker to a terminal state before returning
+	// so it is not still touching the pool when the test teardown
+	// closes it.
+	deadline := time.After(3 * time.Second)
+	for {
+		got, err := svc.GetJob(context.Background(), tenant, job.ID)
+		if err == nil && got.Terminal() {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("resumed worker did not reach terminal state in time")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
 }
 
 // TestMigrationStartJobFailureDB covers runWorker's failure branch:
 // an imapsync that exits non-zero flips the job to failed with the
 // error recorded.
 func TestMigrationStartJobFailureDB(t *testing.T) {
-	stubImapsync(t, "echo boom >&2; exit 7")
 	svc, tenant := newDBService(t)
+	stubImapsync(svc, "echo boom >&2; exit 7")
 	ctx := context.Background()
 	job, err := svc.CreateJob(ctx, tenant, CreateJobInput{
 		SourceHost: "h", SourceUser: "u", SourcePassword: "p", DestUser: "d@x.com",

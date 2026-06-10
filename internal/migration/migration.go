@@ -108,7 +108,24 @@ type Service struct {
 	mu      sync.Mutex
 	cancels map[string]context.CancelFunc
 	pausing map[string]struct{}
+
+	// imapsyncCmd starts the imapsync subprocess. It is set once
+	// at construction (defaulting to defaultRunImapsyncCmd) and
+	// only ever read afterwards by worker goroutines, so it needs
+	// no synchronisation. Tests inject a fake here instead of
+	// mutating package-level state, which previously raced with
+	// in-flight workers under -race.
+	imapsyncCmd imapsyncRunner
 }
+
+// imapsyncRunner starts the imapsync subprocess and returns its
+// stdout pipe plus the *exec.Cmd so the caller can Wait on it.
+type imapsyncRunner func(
+	ctx context.Context,
+	bin string,
+	job *MigrationJob,
+	stdinPassword string,
+) (io.ReadCloser, *exec.Cmd, error)
 
 // NewService constructs a Service with sensible defaults.
 func NewService(cfg Config) *Service {
@@ -122,10 +139,11 @@ func NewService(cfg Config) *Service {
 		cfg.Now = time.Now
 	}
 	return &Service{
-		cfg:     cfg,
-		sema:    make(chan struct{}, cfg.MaxConcurrent),
-		cancels: make(map[string]context.CancelFunc),
-		pausing: make(map[string]struct{}),
+		cfg:         cfg,
+		sema:        make(chan struct{}, cfg.MaxConcurrent),
+		cancels:     make(map[string]context.CancelFunc),
+		pausing:     make(map[string]struct{}),
+		imapsyncCmd: defaultRunImapsyncCmd,
 	}
 }
 
@@ -587,13 +605,14 @@ func (s *Service) runWorker(
 	}
 }
 
-// runImapsync shells out to `imapsync`. The `--password1`
+// defaultRunImapsyncCmd shells out to `imapsync`. The `--password1`
 // environment variable / `--passfile` flag would normally receive
 // the decrypted source password; for Phase 2 we pass via stdin
 // to avoid leaking it onto the argv list visible to /proc/PID/cmdline.
 //
-// Exported as a package-level var so tests can swap it out.
-var runImapsyncCmd = func(
+// It is the default value of Service.imapsyncCmd; tests inject a fake
+// via that field rather than mutating package-level state.
+func defaultRunImapsyncCmd(
 	ctx context.Context,
 	bin string,
 	job *MigrationJob,
@@ -659,7 +678,7 @@ func (s *Service) runImapsync(
 		return fmt.Errorf("decrypt source password: %w", err)
 	}
 
-	stdout, cmd, err := runImapsyncCmd(ctx, s.cfg.ImapsyncBin, job, pwd)
+	stdout, cmd, err := s.imapsyncCmd(ctx, s.cfg.ImapsyncBin, job, pwd)
 	if err != nil {
 		return fmt.Errorf("start imapsync: %w", err)
 	}
