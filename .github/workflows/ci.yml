@@ -240,15 +240,16 @@ jobs:
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/kmail_test?sslmode=disable
 
-      # WS4 Task 5 — coverage gate. Ratcheted up to 60% after the
-      # Session 2 test-coverage expansion. The gate only ever moves
-      # UP toward the 60%→80% target as the suite grows, never down.
+      # WS4 Task 5 — coverage gate. Ratcheted up to 80% (the WS4
+      # destination) after the test-coverage expansion brought every
+      # tested package and the global total above the target. The gate
+      # only ever moves UP as the suite grows, never down.
       # KMAIL_TEST_DATABASE_URL points the suite at the Postgres
       # service so DB integration tests run (rather than skip).
       - name: Test coverage gate
         run: make cover
         env:
-          MIN_COVERAGE: "60"
+          MIN_COVERAGE: "80"
           KMAIL_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/kmail_test?sslmode=disable
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/kmail_test?sslmode=disable
 

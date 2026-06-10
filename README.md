@@ -10,10 +10,10 @@
 **License**: Proprietary — All Rights Reserved. See [LICENSE](LICENSE).
 
 [![CI](https://github.com/kennguy3n/kmail/actions/workflows/ci.yml/badge.svg)](https://github.com/kennguy3n/kmail/actions/workflows/ci.yml)
-[![Go coverage](https://img.shields.io/badge/go%20coverage-%E2%89%A530%25-blue)](scripts/check-coverage.sh)
+[![Go coverage](https://img.shields.io/badge/go%20coverage-%E2%89%A580%25-brightgreen)](scripts/check-coverage.sh)
 
 > Coverage is enforced in CI by `make cover` (see [`scripts/check-coverage.sh`](scripts/check-coverage.sh)).
-> The floor ratchets up over time toward the 60%→80% target; run `make cover` locally to reproduce the gate.
+> The floor ratchets up over time and has now reached the 80% target; run `make cover` locally to reproduce the gate.
 
 ## What it is
 

@@ -363,8 +363,8 @@ func TestQuoteIMAP(t *testing.T) {
 		// RFC 3501 §4.3 — CR, LF, NUL must be stripped so they
 		// can't terminate the LOGIN line and let a crafted
 		// password inject a follow-up IMAP command.
-		"foo\r\nbar":   `"foobar"`,
-		"a\x00b":       `"ab"`,
+		"foo\r\nbar": `"foobar"`,
+		"a\x00b":     `"ab"`,
 	}
 	for in, want := range cases {
 		if got := quoteIMAP(in); got != want {
