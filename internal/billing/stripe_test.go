@@ -6,14 +6,21 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 )
 
 func newMockStripe(t *testing.T) (*StripeClient, *httptest.Server, *[]string) {
 	t.Helper()
 	calls := []string{}
+	// The handler runs in the httptest server's own goroutine. Guard the
+	// recorder so concurrent requests can't race on the slice; callers
+	// read it only after their requests have returned.
+	var mu sync.Mutex
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
 		calls = append(calls, r.Method+" "+r.URL.Path)
+		mu.Unlock()
 		_ = r.ParseForm()
 		w.Header().Set("Content-Type", "application/json")
 		switch {
