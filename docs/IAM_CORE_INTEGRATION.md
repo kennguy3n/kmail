@@ -170,9 +170,12 @@ POST https://mail.<your-domain>/api/v1/webhooks/iam-core
   the Management API when the M2M client is configured.
 
 KMail responds `200` on success, `400` on a malformed body, `401` on
-a bad/missing signature, and `500` when a downstream provisioning
-call fails — so iam-core should **retry on 5xx** (at-least-once
-delivery is safe: all handlers are idempotent).
+a bad/missing signature, `413` when the body exceeds the 1 MiB cap,
+and `500` when a downstream provisioning call fails — so iam-core
+should **retry on 5xx** (at-least-once delivery is safe: all handlers
+are idempotent). A `413` is terminal for that payload (retrying the
+same oversized body won't help); it's logged distinctly so an
+oversized delivery isn't misdiagnosed as a signature failure.
 
 ## Claims mapping & fallback
 
@@ -303,11 +306,20 @@ Secrets.
 
 - **Disabling the internal OAuth2 server**: when iam-core is enabled,
   KMail does not mount its own authorization-server endpoints
-  (`/api/v1/oauth/authorize|token|revoke`) — iam-core is the
+  (`/api/v1/oauth/authorize|token|revoke` → `404`) — iam-core is the
   authority. KMail's TOTP step-up endpoints (Confidential Send, Vault
   unlock) stay active. Previously-issued tokens for installed
   third-party integrations are still validated by the integration
-  gateway.
+  gateway, so existing apps keep working **until their tokens
+  expire** — but no *new* tokens can be issued through KMail's flow.
+  > **Migration note**: before enabling iam-core on an existing
+  > deployment, migrate every active third-party integration to
+  > iam-core's authorization flow (re-register the app in iam-core and
+  > re-issue its tokens there). Otherwise an app loses the ability to
+  > re-authorize once its current token expires, since KMail's
+  > `/api/v1/oauth/authorize` no longer responds. This is a one-way
+  > switch for token issuance, not a reversible feature flag for
+  > already-issued credentials.
 - **Token caching**: the M2M client caches the access token and
   refreshes 30s before expiry under a mutex, so concurrent callers
   share a single in-flight refresh.

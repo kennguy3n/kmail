@@ -134,8 +134,9 @@ func (rec *WebhookReceiver) Register(mux *http.ServeMux) {
 
 // ServeHTTP buffers the body, verifies the signature, decodes the
 // envelope, and dispatches. It returns 200 on success, 400 for a
-// malformed body, 401 for a bad/missing signature, and 500 when a
-// downstream provisioning call fails (so iam-core retries).
+// malformed body, 401 for a bad/missing signature, 413 when the body
+// exceeds the size cap, and 500 when a downstream provisioning call
+// fails (so iam-core retries).
 func (rec *WebhookReceiver) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if rec.secret == "" {
 		// Fail closed: an unconfigured secret means we cannot
@@ -144,9 +145,19 @@ func (rec *WebhookReceiver) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "webhook receiver not configured", http.StatusServiceUnavailable)
 		return
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxWebhookBodyBytes))
+	// Read one byte past the cap so an oversized body is detected
+	// explicitly rather than silently truncated. A truncated body
+	// would fail HMAC verification and surface as a misleading 401
+	// "invalid signature" that retries forever; returning a distinct
+	// 413 with a clear log lets an operator diagnose the real cause.
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxWebhookBodyBytes+1))
 	if err != nil {
 		http.Error(w, "read body", http.StatusBadRequest)
+		return
+	}
+	if len(body) > maxWebhookBodyBytes {
+		rec.logger.Printf("iamcore webhook: rejected delivery — body exceeds %d-byte limit (signature not checked); raise maxWebhookBodyBytes if iam-core legitimately sends larger payloads", maxWebhookBodyBytes)
+		http.Error(w, "payload too large", http.StatusRequestEntityTooLarge)
 		return
 	}
 	sig := r.Header.Get(signatureHeader)

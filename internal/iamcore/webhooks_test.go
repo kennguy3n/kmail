@@ -216,6 +216,24 @@ func TestServeHTTP_RejectsBadSignature(t *testing.T) {
 	}
 }
 
+// TestServeHTTP_OversizedBodyRejectedWith413 verifies a body past the
+// size cap is rejected with a distinct 413 rather than being silently
+// truncated and surfacing as a misleading 401. The body is correctly
+// signed so the test proves the size guard fires before (and instead
+// of) signature verification.
+func TestServeHTTP_OversizedBodyRejectedWith413(t *testing.T) {
+	secret := "shh"
+	rec := NewWebhookReceiver(secret, newStubTenant(), quietLogger())
+	big := bytes.Repeat([]byte("a"), maxWebhookBodyBytes+10)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/webhooks/iam-core", bytes.NewReader(big))
+	req.Header.Set(signatureHeader, SignPayload(secret, time.Now(), big))
+	w := httptest.NewRecorder()
+	rec.ServeHTTP(w, req)
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413", w.Code)
+	}
+}
+
 func TestServeHTTP_UnconfiguredSecretFailsClosed(t *testing.T) {
 	rec := NewWebhookReceiver("", newStubTenant(), quietLogger())
 	evt := mustEvent(t, EventTenantCreate, TenantEventData{TenantID: "x"})
