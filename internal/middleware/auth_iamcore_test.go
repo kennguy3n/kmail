@@ -122,3 +122,87 @@ func TestAuthenticate_RejectsTokenMissingTenant(t *testing.T) {
 		t.Fatal("expected rejection when no tenant claim is present")
 	}
 }
+
+// PostAuthMiddleware (the chokepoint lazy provisioning hangs off)
+// must run AFTER authentication has populated the tenant id in the
+// request context, and BEFORE the wrapped handler. This is the
+// ordering main.go relies on to provision the authenticated tenant.
+func TestWrap_PostAuthMiddlewareSeesAuthenticatedTenant(t *testing.T) {
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate rsa key: %v", err)
+	}
+	issuer, stop := newTestJWKSServer(t, priv, "iam-kid")
+	defer stop()
+
+	var seenTenant string
+	var handlerRan bool
+	postAuth := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			seenTenant = TenantIDFrom(r.Context())
+			next.ServeHTTP(w, r)
+		})
+	}
+	o, err := NewOIDC(OIDCConfig{
+		Issuer:             issuer,
+		Audience:           "https://api.kmail.io",
+		PostAuthMiddleware: postAuth,
+	})
+	if err != nil {
+		t.Fatalf("NewOIDC: %v", err)
+	}
+
+	handler := o.Wrap(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		handlerRan = true
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	token := issueToken(t, priv, "iam-kid", jwt.MapClaims{
+		"iss":                        issuer,
+		"aud":                        []string{"https://api.kmail.io"},
+		"exp":                        time.Now().Add(time.Hour).Unix(),
+		"sub":                        "u1",
+		"https://kmail.io/tenant_id": "tenant-postauth",
+	})
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK || !handlerRan {
+		t.Fatalf("status = %d, handlerRan = %v; want handler to run", w.Code, handlerRan)
+	}
+	if seenTenant != "tenant-postauth" {
+		t.Errorf("PostAuthMiddleware saw tenant %q, want tenant-postauth (must run after auth)", seenTenant)
+	}
+}
+
+// An unauthenticated request must be rejected before
+// PostAuthMiddleware runs — provisioning must never fire for a
+// request that failed authentication.
+func TestWrap_PostAuthMiddlewareSkippedOnAuthFailure(t *testing.T) {
+	priv, _ := rsa.GenerateKey(rand.Reader, 2048)
+	issuer, stop := newTestJWKSServer(t, priv, "iam-kid")
+	defer stop()
+
+	postAuthRan := false
+	postAuth := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			postAuthRan = true
+			next.ServeHTTP(w, r)
+		})
+	}
+	o, _ := NewOIDC(OIDCConfig{Issuer: issuer, Audience: "https://api.kmail.io", PostAuthMiddleware: postAuth})
+	handler := o.Wrap(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil) // no Authorization
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", w.Code)
+	}
+	if postAuthRan {
+		t.Error("PostAuthMiddleware ran for an unauthenticated request")
+	}
+}
