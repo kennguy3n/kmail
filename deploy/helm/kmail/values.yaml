@@ -180,6 +180,40 @@ kmailApi:
     KMAIL_KCHAT_OIDC_AUDIENCE: ""
     KMAIL_LOKI_ENV: "prod"
 
+# iam-core OIDC integration. Inert unless `enabled: true` (which sets
+# KMAIL_IAM_CORE_MGMT_URL). When enabled, iam-core is KMail's identity
+# provider: KMail validates iam-core tokens (point
+# kmailApi.config.KMAIL_KCHAT_OIDC_ISSUER/_AUDIENCE at iam-core),
+# provisions tenants/mailboxes from iam-core webhooks, and skips its
+# own internal OAuth2 authorization server. See
+# docs/IAM_CORE_INTEGRATION.md for the full setup (SPA + M2M app
+# registration, custom claims, webhook signing).
+iamCore:
+  # Master switch. false leaves KMail on the legacy KChat OIDC path
+  # and emits no KMAIL_IAM_CORE_* env vars.
+  enabled: false
+  # iam-core base URL. Token endpoint is <mgmtURL>/oauth2/token;
+  # management API under <mgmtURL>/api/v1/management/.
+  mgmtURL: ""
+  # Client Credentials client_id for KMail's M2M application. Leave
+  # empty to run the webhook receiver without Management API
+  # enrichment (events provisioned from payload only).
+  m2mClientID: ""
+  # Token audience for the management API (its host names the
+  # management tenant KMail's M2M client is registered in).
+  m2mAudience: ""
+  # Provision a KMail tenant on first authenticated request when a
+  # webhook has not already created it (handles missed deliveries).
+  lazyProvision: false
+  # Names of EXISTING Kubernetes Secrets holding the sensitive
+  # values. Each Secret must store its value under a key equal to the
+  # env var name (KMAIL_IAM_CORE_M2M_CLIENT_SECRET /
+  # KMAIL_IAM_CORE_WEBHOOK_SECRET). Leave a ref empty to omit that env
+  # var — e.g. an empty webhookSecretRef disables the webhook
+  # receiver (it returns 503).
+  m2mClientSecretRef: ""
+  webhookSecretRef: ""
+
 # kmail-worker — background-worker process (Session 6 decomposition).
 # Runs every background worker that kmail-api used to start in-process
 # (calendar reminders, undo/scheduled/snooze dispatch, billing quota

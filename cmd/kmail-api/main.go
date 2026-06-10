@@ -35,6 +35,7 @@ import (
 	"github.com/kennguy3n/kmail/internal/dns"
 	"github.com/kennguy3n/kmail/internal/export"
 	"github.com/kennguy3n/kmail/internal/featureflags"
+	"github.com/kennguy3n/kmail/internal/iamcore"
 	"github.com/kennguy3n/kmail/internal/integrations"
 	"github.com/kennguy3n/kmail/internal/jmap"
 	"github.com/kennguy3n/kmail/internal/malware"
@@ -100,14 +101,35 @@ func main() {
 	mux.HandleFunc("GET /healthz", healthzHandler)
 	mux.HandleFunc("GET /readyz", readyzHandler(pool))
 
-	authMW, err := middleware.NewOIDC(middleware.OIDCConfig{
+	// lazyProvision is wired after the tenant Service is constructed
+	// (further down in main). The OIDC PostAuthMiddleware closure
+	// below captures this pointer and reads it at request time, so
+	// every authenticated route — including those registered before
+	// the tenant Service exists — picks up lazy provisioning once it
+	// is assigned. All writes happen during single-threaded startup,
+	// strictly before the HTTP server starts serving, so the
+	// closure's read is race-free.
+	var lazyProvision *middleware.LazyProvision
+	oidcCfg := middleware.OIDCConfig{
 		Issuer:         cfg.KChatOIDCIssuer,
 		Audience:       cfg.KChatOIDCAudience,
 		DevBypassToken: cfg.DevBypassToken,
 		Env:            cfg.Env,
 		Pool:           pool,
 		Logger:         logger,
-	})
+	}
+	if cfg.IAMCore.Enabled() && cfg.IAMCore.LazyProvision {
+		oidcCfg.PostAuthMiddleware = func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if lazyProvision != nil {
+					lazyProvision.Handle(w, r, next)
+					return
+				}
+				next.ServeHTTP(w, r)
+			})
+		}
+	}
+	authMW, err := middleware.NewOIDC(oidcCfg)
 	if err != nil {
 		logger.Fatalf("middleware.NewOIDC: %v", err)
 	}
@@ -576,6 +598,60 @@ func main() {
 	} else {
 		logger.Printf("stalwart alias sync disabled: KMAIL_STALWART_ADMIN_USER not set")
 	}
+
+	// --- iam-core OIDC integration (optional) ---
+	// Enabled when KMAIL_IAM_CORE_MGMT_URL is set. Wires three
+	// things, each independently gated:
+	//   1. an M2M Management API client (token-cached) used to
+	//      enrich webhook events;
+	//   2. a signature-verified webhook receiver at
+	//      POST /api/v1/webhooks/iam-core that provisions /
+	//      deprovisions tenants and mailboxes from iam-core events;
+	//   3. lazy tenant provisioning, attached via the OIDC
+	//      PostAuthMiddleware chokepoint declared above, which
+	//      provisions a tenant on first authenticated request when
+	//      the webhook has not already (KMAIL_IAM_CORE_LAZY_PROVISION).
+	// See docs/IAM_CORE_INTEGRATION.md.
+	if cfg.IAMCore.Enabled() {
+		var iamClient *iamcore.Client
+		if cfg.IAMCore.M2MClientID != "" {
+			c, err := iamcore.New(iamcore.Config{
+				MgmtURL:      cfg.IAMCore.MgmtURL,
+				ClientID:     cfg.IAMCore.M2MClientID,
+				ClientSecret: cfg.IAMCore.M2MClientSecret,
+				Audience:     cfg.IAMCore.M2MAudience,
+				Logger:       logger,
+			})
+			if err != nil {
+				logger.Fatalf("iamcore client: %v", err)
+			}
+			iamClient = c
+		} else {
+			logger.Printf("iam-core: M2M client disabled (KMAIL_IAM_CORE_M2M_CLIENT_ID unset); webhook events provisioned from payload only")
+		}
+
+		if cfg.IAMCore.WebhookSecret != "" {
+			rec := iamcore.NewWebhookReceiver(cfg.IAMCore.WebhookSecret, tenantSvc, logger)
+			if iamClient != nil {
+				rec = rec.WithClient(iamClient)
+			}
+			rec.Register(mux)
+			logger.Printf("iam-core: webhook receiver mounted at POST /api/v1/webhooks/iam-core")
+		} else {
+			logger.Printf("iam-core: webhook receiver disabled (KMAIL_IAM_CORE_WEBHOOK_SECRET unset)")
+		}
+
+		if cfg.IAMCore.LazyProvision {
+			lazyProvision = middleware.NewLazyProvision(middleware.LazyProvisionConfig{
+				Provisioner: tenantSvc.LazyProvisioner(),
+				Cache:       valkeyClient,
+				Logger:      logger,
+			})
+			logger.Printf("iam-core: lazy tenant provisioning enabled")
+		}
+		logger.Printf("iam-core: integration active (mgmt=%s)", cfg.IAMCore.MgmtURL)
+	}
+
 	dnsSvc := dns.NewService(dns.Config{
 		Pool:                pool,
 		MailHost:            cfg.DNS.MailHost,
@@ -1470,7 +1546,23 @@ func main() {
 	// applying OIDC there would 401 every token exchange. See the
 	// RegisterRoutes doc comment in internal/oauth/handlers.go for
 	// the full split rationale.
-	oauthHandlers.RegisterRoutes(mux, "/api/v1/oauth", authMW.Wrap)
+	//
+	// When iam-core is the active OIDC provider it owns the
+	// authorization-server surface (login, consent, token issuance),
+	// so KMail's own /api/v1/oauth authorize/token/revoke endpoints
+	// are NOT mounted — running a second authorization server would
+	// be a confusing, attackable duplicate. The oauthSvc itself is
+	// still constructed: the integrations framework below validates
+	// Bearer tokens KMail previously issued to installed third-party
+	// apps, which is an API-gateway concern independent of where
+	// end users log in. TOTP step-up endpoints (Confidential Send,
+	// Vault unlock) are registered elsewhere and likewise remain
+	// active regardless.
+	if cfg.IAMCore.Enabled() {
+		logger.Printf("iam-core: internal OAuth2 authorization server disabled (iam-core is the OIDC provider); /api/v1/oauth authorize/token/revoke not mounted")
+	} else {
+		oauthHandlers.RegisterRoutes(mux, "/api/v1/oauth", authMW.Wrap)
+	}
 
 	// Phase E #15-17 — Integration framework. Wraps webhookSvc
 	// with OAuth2-client scope filtering and per-client rate-
