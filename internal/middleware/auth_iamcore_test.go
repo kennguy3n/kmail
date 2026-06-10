@@ -1,10 +1,13 @@
 package middleware
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/rsa"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -58,6 +61,32 @@ func TestResolveIdentity(t *testing.T) {
 				t.Errorf("resolveIdentity = (%q, %q), want (%q, %q)", gotTenant, gotUser, tc.wantTenant, tc.wantUser)
 			}
 		})
+	}
+}
+
+// TestResolveIdentity_FallbackWarningsLoggedOnce verifies each
+// claim-fallback warning is emitted at most once per OIDC instance,
+// even when every request uses the fallback path. Without the
+// sync.Once guard a deployment whose iam-core tokens always carry
+// the namespaced/sub claims would log on every authenticated
+// request and flood log aggregation.
+func TestResolveIdentity_FallbackWarningsLoggedOnce(t *testing.T) {
+	var buf bytes.Buffer
+	o := MustNewOIDC(OIDCConfig{Env: EnvDevelopment, Logger: log.New(&buf, "", 0)})
+
+	for i := 0; i < 5; i++ {
+		gotTenant, gotUser := o.resolveIdentity("", "", "tenant-ns", "sub-iam")
+		if gotTenant != "tenant-ns" || gotUser != "sub-iam" {
+			t.Fatalf("resolveIdentity = (%q, %q), want (tenant-ns, sub-iam)", gotTenant, gotUser)
+		}
+	}
+
+	out := buf.String()
+	if got := strings.Count(out, "tenant_id claim missing"); got != 1 {
+		t.Errorf("tenant fallback warning logged %d times, want 1\n%s", got, out)
+	}
+	if got := strings.Count(out, "kchat_user_id claim missing"); got != 1 {
+		t.Errorf("user fallback warning logged %d times, want 1\n%s", got, out)
 	}
 }
 

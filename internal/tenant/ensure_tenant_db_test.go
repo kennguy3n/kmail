@@ -34,16 +34,34 @@ func TestEnsureTenantDB(t *testing.T) {
 		t.Errorf("unexpected tenant: %+v", tn)
 	}
 
-	// Second call is a no-op returning the existing row.
-	again, created2, err := svc.EnsureTenant(ctx, EnsureTenantInput{ID: id, Name: "Different", Slug: "different", Plan: "core"})
+	// An id-only call (the lazy-provisioning hot path) is a pure
+	// no-op: it must not mutate the authoritative metadata an
+	// earlier webhook persisted.
+	again, created2, err := svc.EnsureTenant(ctx, EnsureTenantInput{ID: id})
 	if err != nil {
-		t.Fatalf("EnsureTenant (idempotent): %v", err)
+		t.Fatalf("EnsureTenant (id-only no-op): %v", err)
 	}
 	if created2 {
-		t.Error("created = true on second call, want false (idempotent)")
+		t.Error("created = true on id-only call, want false (idempotent)")
 	}
-	if again.ID != id || again.Slug != tn.Slug {
-		t.Errorf("idempotent call returned a different row: %+v vs %+v", again, tn)
+	if again.ID != id || again.Slug != tn.Slug || again.Name != tn.Name || again.Plan != tn.Plan {
+		t.Errorf("id-only call mutated the row: %+v vs %+v", again, tn)
+	}
+
+	// A subsequent authoritative call (e.g. a tenant.create webhook
+	// arriving after a placeholder lazy provision) reconciles the
+	// changed metadata onto the existing row while still reporting
+	// created=false.
+	newSlug := "renamed-" + id
+	reconciled, created3, err := svc.EnsureTenant(ctx, EnsureTenantInput{ID: id, Name: "Acme Renamed", Slug: newSlug, Plan: "privacy"})
+	if err != nil {
+		t.Fatalf("EnsureTenant (reconcile): %v", err)
+	}
+	if created3 {
+		t.Error("created = true on reconcile call, want false")
+	}
+	if reconciled.Name != "Acme Renamed" || reconciled.Slug != newSlug || reconciled.Plan != "privacy" {
+		t.Errorf("reconcile did not update metadata: %+v", reconciled)
 	}
 }
 

@@ -18,6 +18,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/jackc/pgx/v5"
@@ -167,6 +168,14 @@ func (c OIDCConfig) isKnownEnv() bool {
 // struct so one fetcher is shared across every request.
 type OIDC struct {
 	cfg OIDCConfig
+
+	// warnTenantFallback / warnUserFallback gate the iam-core
+	// claim-fallback warnings in resolveIdentity to one emission per
+	// process. Without this a deployment whose iam-core tokens always
+	// use the namespaced/sub claims would log on every authenticated
+	// request, flooding aggregation. See resolveIdentity.
+	warnTenantFallback sync.Once
+	warnUserFallback   sync.Once
 }
 
 // NewOIDC returns an OIDC middleware with the provided configuration.
@@ -421,12 +430,16 @@ func (o *OIDC) verifyAndExtract(ctx context.Context, tokenStr string) (*Claims, 
 func (o *OIDC) resolveIdentity(tenantID, kchatUserID, namespacedTenantID, sub string) (string, string) {
 	effTenant := tenantID
 	if effTenant == "" && namespacedTenantID != "" {
-		o.logf("auth: tenant_id claim missing; using namespaced %q claim — configure a Custom Token Claim in iam-core to emit tenant_id directly", namespacedTenantIDClaim)
+		o.warnTenantFallback.Do(func() {
+			o.logf("auth: tenant_id claim missing; using namespaced %q claim — configure a Custom Token Claim in iam-core to emit tenant_id directly (warning logged once per process)", namespacedTenantIDClaim)
+		})
 		effTenant = namespacedTenantID
 	}
 	effUser := kchatUserID
 	if effUser == "" && sub != "" {
-		o.logf("auth: kchat_user_id claim missing; falling back to standard sub claim — configure a Custom Token Claim in iam-core to emit kchat_user_id")
+		o.warnUserFallback.Do(func() {
+			o.logf("auth: kchat_user_id claim missing; falling back to standard sub claim — configure a Custom Token Claim in iam-core to emit kchat_user_id (warning logged once per process)")
+		})
 		effUser = sub
 	}
 	return effTenant, effUser

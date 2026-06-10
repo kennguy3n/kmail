@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/kennguy3n/kmail/internal/tenant"
 )
 
@@ -208,12 +209,17 @@ func (rec *WebhookReceiver) handleTenantCreate(ctx context.Context, evt Event) e
 	// EnsureTenant is idempotent on the tenant UUID, so redelivered
 	// tenant.create events (iam-core delivers at-least-once)
 	// converge on the same control-plane row instead of wedging on a
-	// duplicate-key 500.
+	// duplicate-key 500. The authoritative name/slug/plan are passed
+	// through verbatim (not pre-defaulted here): EnsureTenant fills
+	// the NOT NULL columns with sensible defaults on first insert and
+	// reconciles them onto a row that a prior lazy provision created
+	// with placeholder values, so the iam-core slug/name/plan win
+	// once the webhook arrives.
 	_, created, err := rec.tenant.EnsureTenant(ctx, tenant.EnsureTenantInput{
 		ID:   d.TenantID,
-		Name: firstNonEmpty(d.Name, d.Slug, d.TenantID),
-		Slug: firstNonEmpty(d.Slug, d.TenantID),
-		Plan: firstNonEmpty(d.Plan, "core"),
+		Name: d.Name,
+		Slug: d.Slug,
+		Plan: d.Plan,
 	})
 	if err != nil {
 		return fmt.Errorf("tenant.create: %w", err)
@@ -433,15 +439,28 @@ func stalwartAccountID(iamUserID string) string {
 }
 
 // isDuplicate reports whether err is a Postgres unique-violation
-// surfaced through the tenant.Service (which wraps the pgconn error
-// with %w). Used to make create handlers idempotent against
-// iam-core's at-least-once webhook delivery.
+// (SQLSTATE 23505) surfaced through the tenant.Service, which wraps
+// the underlying pgconn error with %w. Used to make create handlers
+// idempotent against iam-core's at-least-once webhook delivery.
+//
+// The typed *pgconn.PgError check is authoritative and robust
+// against Postgres message-wording changes; the string match is a
+// defensive fallback for any path that loses the typed error in its
+// wrap chain.
 func isDuplicate(err error) bool {
 	if err == nil {
 		return false
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code == pgerrcodeUniqueViolation
 	}
 	msg := err.Error()
 	return strings.Contains(msg, "duplicate key") ||
 		strings.Contains(msg, "SQLSTATE 23505") ||
 		strings.Contains(msg, "unique constraint")
 }
+
+// pgerrcodeUniqueViolation is the Postgres SQLSTATE for a unique
+// constraint violation.
+const pgerrcodeUniqueViolation = "23505"

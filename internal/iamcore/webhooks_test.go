@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/kennguy3n/kmail/internal/tenant"
 )
 
@@ -30,6 +32,8 @@ type stubTenant struct {
 	updateCalls int
 	deleteCalls int
 
+	lastEnsureInput tenant.EnsureTenantInput
+
 	createErr error
 }
 
@@ -44,6 +48,7 @@ func (s *stubTenant) EnsureTenant(_ context.Context, in tenant.EnsureTenantInput
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.ensureCalls++
+	s.lastEnsureInput = in
 	if t, ok := s.tenants[in.ID]; ok {
 		return t, false, nil
 	}
@@ -278,6 +283,41 @@ func TestDispatch_TenantCreateRequiresID(t *testing.T) {
 	}
 }
 
+// TestDispatch_TenantCreatePassesAuthoritativeFields verifies the
+// handler forwards the iam-core name/slug/plan verbatim rather than
+// pre-defaulting them. Defaulting and placeholder reconciliation are
+// EnsureTenant's responsibility, so a sparse event must reach the
+// service with empty fields (it defaults on insert) and a rich event
+// must reach it with the real values (it reconciles a placeholder
+// row).
+func TestDispatch_TenantCreatePassesAuthoritativeFields(t *testing.T) {
+	id := "33333333-3333-3333-3333-333333333333"
+
+	st := newStubTenant()
+	rec := NewWebhookReceiver("shh", st, quietLogger())
+	if err := rec.Dispatch(context.Background(), mustEvent(t, EventTenantCreate, TenantEventData{TenantID: id})); err != nil {
+		t.Fatalf("sparse dispatch: %v", err)
+	}
+	if got := st.lastEnsureInput; got.Name != "" || got.Slug != "" || got.Plan != "" {
+		t.Fatalf("sparse event should pass empty name/slug/plan, got %+v", got)
+	}
+	if st.lastEnsureInput.ID != id {
+		t.Fatalf("id = %q, want %q", st.lastEnsureInput.ID, id)
+	}
+
+	st2 := newStubTenant()
+	rec2 := NewWebhookReceiver("shh", st2, quietLogger())
+	if err := rec2.Dispatch(context.Background(), mustEvent(t, EventTenantCreate, TenantEventData{
+		TenantID: id, Name: "Acme", Slug: "acme", Plan: "pro",
+	})); err != nil {
+		t.Fatalf("rich dispatch: %v", err)
+	}
+	want := tenant.EnsureTenantInput{ID: id, Name: "Acme", Slug: "acme", Plan: "pro"}
+	if st2.lastEnsureInput != want {
+		t.Fatalf("rich event input = %+v, want %+v", st2.lastEnsureInput, want)
+	}
+}
+
 func TestDispatch_UserCreateIdempotent(t *testing.T) {
 	st := newStubTenant()
 	rec := NewWebhookReceiver("shh", st, quietLogger())
@@ -400,5 +440,34 @@ func TestEnrichUser_EventFieldsWinOverAPI(t *testing.T) {
 	// Both fields already present → no API call, values unchanged.
 	if d.Email != "override@x.com" || d.DisplayName != "Override" {
 		t.Errorf("event fields should win: %+v", d)
+	}
+}
+
+// ------------------------------------------------------------------
+// isDuplicate
+// ------------------------------------------------------------------
+
+func TestIsDuplicate(t *testing.T) {
+	wrappedTyped := fmt.Errorf("insert user: %w", &pgconn.PgError{Code: pgerrcodeUniqueViolation, Message: "duplicate"})
+	otherTyped := fmt.Errorf("insert user: %w", &pgconn.PgError{Code: "23503", Message: "fk violation"})
+
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"typed unique violation through wrap", wrappedTyped, true},
+		{"typed non-unique violation", otherTyped, false},
+		{"string fallback duplicate key", errors.New("insert user: ERROR: duplicate key value violates unique constraint"), true},
+		{"string fallback sqlstate", errors.New("insert user: SQLSTATE 23505"), true},
+		{"unrelated error", errors.New("connection refused"), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isDuplicate(tc.err); got != tc.want {
+				t.Errorf("isDuplicate(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
 	}
 }

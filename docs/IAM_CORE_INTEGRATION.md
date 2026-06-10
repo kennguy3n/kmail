@@ -201,10 +201,18 @@ race). Two paths converge on it:
   for unknown users are no-ops.
 - **Lazy** (`KMAIL_IAM_CORE_LAZY_PROVISION=true`): on the first
   authenticated request for a tenant whose row does not yet exist
-  (e.g. a webhook was lost), KMail provisions it inline. Results are
+  (e.g. a webhook was lost), KMail provisions it inline with a
+  placeholder name/slug (derived from the tenant UUID). Results are
   cached in Valkey for 5 minutes so the check stays off the hot path,
   and the middleware **fails open** — a provisioning error logs and
   the request proceeds rather than 500-ing.
+
+When both paths run for the same tenant (a lazy provision followed by
+a later `tenant.create` webhook), `EnsureTenant` **reconciles** the
+authoritative iam-core `name`/`slug`/`plan` from the webhook onto the
+placeholder row rather than leaving the UUID-derived placeholders in
+place. Id-only callers (lazy provisioning) never overwrite metadata, so
+the webhook remains the source of truth for tenant metadata.
 
 Mailbox account ids are derived deterministically from the iam-core
 user id (`iam-<user_id>`) so redelivered `user.create` events resolve
