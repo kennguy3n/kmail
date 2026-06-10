@@ -3,13 +3,21 @@ package deliverability
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/kennguy3n/kmail/internal/middleware"
 )
+
+// abuseUserSeq guarantees per-call uniqueness for seedUser so a
+// future test that seeds more than one user per tenant cannot trip
+// the users-table UNIQUE constraints.
+var abuseUserSeq int64
 
 // TestAbuseDetectAndAlertsDB drives the full anomaly pipeline against
 // a live DB + Valkey: seed enough send volume and hard/complaint
@@ -121,7 +129,7 @@ func seedUser(t *testing.T, pool *pgxpool.Pool, tenantID string) string {
 		if err := middleware.SetTenantGUC(ctx, tx, tenantID); err != nil {
 			return err
 		}
-		suffix := tenantID[:8]
+		suffix := fmt.Sprintf("%s-%d-%d", tenantID[:8], time.Now().UnixNano(), atomic.AddInt64(&abuseUserSeq, 1))
 		return tx.QueryRow(ctx, `
 			INSERT INTO users (tenant_id, kchat_user_id, stalwart_account_id, email, display_name)
 			VALUES ($1::uuid, $2, $3, $4, 'Abuse Test User')
