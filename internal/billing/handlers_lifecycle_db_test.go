@@ -20,6 +20,15 @@ func TestHandlersWithLifecycleDB(t *testing.T) {
 	if err := lc.OnTenantCreated(ctx, tenant, PlanCore); err != nil {
 		t.Fatalf("OnTenantCreated: %v", err)
 	}
+	// seedTenant hardcodes tenants.plan='pro', but OnTenantCreated only
+	// provisions the subscription/quota for PlanCore — it does not touch
+	// tenants.plan. Align the tenants row with the seeded core plan so the
+	// changePlan("pro") below is a real core→pro transition rather than a
+	// degenerate same-plan no-op (ChangePlan early-returns when
+	// oldPlan == newPlan, see billing.go).
+	if _, err := svc.cfg.Pool.Exec(ctx, `UPDATE tenants SET plan = $2 WHERE id = $1::uuid`, tenant, PlanCore); err != nil {
+		t.Fatalf("align tenants.plan to core: %v", err)
+	}
 
 	// proration-preview with a real lifecycle returns the tenant/new_plan
 	// payload (cents computed from the subscription period).
@@ -56,7 +65,13 @@ func TestHandlersWithLifecycleDB(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &hist); err != nil {
 		t.Fatalf("decode history: %v", err)
 	}
-	if len(hist) == 0 {
-		t.Error("expected at least one billing history entry")
+	var sawPlanChanged bool
+	for _, e := range hist {
+		if e.EventType == "plan_changed" {
+			sawPlanChanged = true
+		}
+	}
+	if !sawPlanChanged {
+		t.Errorf("expected a plan_changed event from the core→pro transition; got %d entries: %+v", len(hist), hist)
 	}
 }
