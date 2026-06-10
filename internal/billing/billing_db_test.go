@@ -15,6 +15,15 @@ func dbService(t *testing.T) (*Service, *pgxpool.Pool, string) {
 	t.Helper()
 	pool := testPool(t)
 	tenant := seedTenant(t, pool, "active")
+	// billing_subscriptions.tenant_id is ON DELETE RESTRICT and
+	// stripe_subscription_id is globally UNIQUE; drop any row this
+	// tenant created so (a) the seedTenant tenant-delete cleanup is not
+	// blocked and (b) a fixed mock Stripe subscription ID does not
+	// collide across sequential tests. Registered after seedTenant so
+	// it runs first (LIFO), before the tenant row is deleted.
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM billing_subscriptions WHERE tenant_id = $1::uuid`, tenant)
+	})
 	return NewService(Config{Pool: pool}), pool, tenant
 }
 
