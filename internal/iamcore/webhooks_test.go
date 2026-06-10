@@ -289,7 +289,9 @@ func TestDispatch_TenantCreateRequiresID(t *testing.T) {
 // EnsureTenant's responsibility, so a sparse event must reach the
 // service with empty fields (it defaults on insert) and a rich event
 // must reach it with the real values (it reconciles a placeholder
-// row).
+// row). The webhook is the authoritative provisioning path, so it
+// always sets EnsureProvisioned to re-drive the idempotent hooks on
+// redelivery after a partial failure.
 func TestDispatch_TenantCreatePassesAuthoritativeFields(t *testing.T) {
 	id := "33333333-3333-3333-3333-333333333333"
 
@@ -312,7 +314,7 @@ func TestDispatch_TenantCreatePassesAuthoritativeFields(t *testing.T) {
 	})); err != nil {
 		t.Fatalf("rich dispatch: %v", err)
 	}
-	want := tenant.EnsureTenantInput{ID: id, Name: "Acme", Slug: "acme", Plan: "pro"}
+	want := tenant.EnsureTenantInput{ID: id, Name: "Acme", Slug: "acme", Plan: "pro", EnsureProvisioned: true}
 	if st2.lastEnsureInput != want {
 		t.Fatalf("rich event input = %+v, want %+v", st2.lastEnsureInput, want)
 	}

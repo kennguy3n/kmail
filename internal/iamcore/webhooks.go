@@ -215,11 +215,22 @@ func (rec *WebhookReceiver) handleTenantCreate(ctx context.Context, evt Event) e
 	// reconciles them onto a row that a prior lazy provision created
 	// with placeholder values, so the iam-core slug/name/plan win
 	// once the webhook arrives.
+	//
+	// EnsureProvisioned makes EnsureTenant re-run the idempotent
+	// post-insert hooks (zk-fabric bucket + billing) even when the
+	// row already exists. Without it, a tenant whose first insert
+	// succeeded but whose hook then failed would never get its
+	// storage/billing on webhook redelivery (the retry would hit the
+	// existing-row fast path and report success), leaving it
+	// permanently under-provisioned. The webhook is the authoritative,
+	// infrequent provisioning path so it pays the extra round-trip;
+	// the lazy hot path leaves the flag unset.
 	_, created, err := rec.tenant.EnsureTenant(ctx, tenant.EnsureTenantInput{
-		ID:   d.TenantID,
-		Name: d.Name,
-		Slug: d.Slug,
-		Plan: d.Plan,
+		ID:                d.TenantID,
+		Name:              d.Name,
+		Slug:              d.Slug,
+		Plan:              d.Plan,
+		EnsureProvisioned: true,
 	})
 	if err != nil {
 		return fmt.Errorf("tenant.create: %w", err)

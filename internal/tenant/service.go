@@ -199,6 +199,20 @@ type EnsureTenantInput struct {
 	Name string `json:"name"`
 	Slug string `json:"slug"`
 	Plan string `json:"plan"`
+	// EnsureProvisioned, when true, makes EnsureTenant guarantee the
+	// idempotent post-insert hooks (zk-fabric bucket + billing
+	// lifecycle) have run even when the row already exists — not just
+	// on the insert that creates it. This closes the
+	// partial-provisioning gap where a prior call inserted the row
+	// but then failed a hook: a plain idempotent retry would hit the
+	// existing-row fast path and return success without ever
+	// re-running the hooks, leaving the tenant permanently without
+	// storage / billing. The authoritative tenant.create webhook sets
+	// this so its at-least-once redelivery converges on a fully
+	// provisioned tenant; the lazy-provisioning hot path leaves it
+	// false to stay off the zk-fabric/billing network path on every
+	// authenticated request.
+	EnsureProvisioned bool `json:"-"`
 }
 
 // CreateUserInput carries the fields accepted by
@@ -338,6 +352,15 @@ func (s *Service) CreateTenant(ctx context.Context, in CreateTenantInput) (*Tena
 // provision is reconciled to the real slug/name/plan rather than
 // keeping its UUID-derived placeholders forever.
 //
+// Post-insert hooks (zk-fabric bucket + billing) always run on the
+// insert that creates the row. They are NOT re-run on the
+// existing-row fast path unless in.EnsureProvisioned is set — the
+// webhook sets it so a retry after a hook failed the first time
+// re-drives the (idempotent) hooks and converges on a fully
+// provisioned tenant, while the lazy hot path leaves it false to
+// avoid a zk-fabric/billing round-trip on every authenticated
+// request.
+//
 // Like CreateTenant this is a control-plane-admin operation and is
 // not subject to RLS (the `tenants` table has no RLS policy).
 func (s *Service) EnsureTenant(ctx context.Context, in EnsureTenantInput) (*Tenant, bool, error) {
@@ -349,8 +372,7 @@ func (s *Service) EnsureTenant(ctx context.Context, in EnsureTenantInput) (*Tena
 	// entirely (and avoids burning a sequence / WAL on a no-op
 	// insert under the lazy-provisioning hot path).
 	if existing, err := s.GetTenant(ctx, in.ID); err == nil {
-		reconciled, rerr := s.reconcileTenantMetadata(ctx, existing, in)
-		return reconciled, false, rerr
+		return s.reconcileExisting(ctx, existing, in)
 	} else if !errors.Is(err, ErrNotFound) {
 		return nil, false, err
 	}
@@ -381,29 +403,60 @@ func (s *Service) EnsureTenant(ctx context.Context, in EnsureTenantInput) (*Tena
 		if getErr != nil {
 			return nil, false, fmt.Errorf("ensure tenant: lost insert race and re-read failed: %w", getErr)
 		}
-		reconciled, rerr := s.reconcileTenantMetadata(ctx, existing, in)
-		return reconciled, false, rerr
+		return s.reconcileExisting(ctx, existing, in)
 	}
 	if err != nil {
 		return nil, false, fmt.Errorf("ensure tenant: %w", err)
 	}
 
-	// Post-insert hooks mirror CreateTenant exactly: both are
-	// idempotent (CreateBucket / placement PUT no-op on an existing
-	// resource), so a retried EnsureTenant after a hook failure
-	// converges. Errors are surfaced with the partially-provisioned
-	// tenant so callers can decide whether to retry.
+	// Post-insert hooks mirror CreateTenant exactly. They always run
+	// on the insert that creates the row; on failure the
+	// partially-provisioned tenant is returned so the caller can
+	// retry (the webhook sets EnsureProvisioned so that retry
+	// re-drives the idempotent hooks via reconcileExisting).
+	if err := s.runProvisioningHooks(ctx, t.ID, t.Plan); err != nil {
+		return &t, true, err
+	}
+	return &t, true, nil
+}
+
+// reconcileExisting handles the existing-row outcome shared by the
+// fast path and the lost-insert-race re-read: it reconciles any
+// authoritative metadata the caller supplied and, when
+// in.EnsureProvisioned is set, re-runs the idempotent post-insert
+// hooks so a tenant whose original insert failed a hook converges on
+// full provisioning. It always reports created=false.
+func (s *Service) reconcileExisting(ctx context.Context, existing *Tenant, in EnsureTenantInput) (*Tenant, bool, error) {
+	reconciled, err := s.reconcileTenantMetadata(ctx, existing, in)
+	if err != nil {
+		return reconciled, false, err
+	}
+	if in.EnsureProvisioned {
+		if err := s.runProvisioningHooks(ctx, reconciled.ID, reconciled.Plan); err != nil {
+			return reconciled, false, err
+		}
+	}
+	return reconciled, false, nil
+}
+
+// runProvisioningHooks executes the idempotent post-insert
+// provisioning hooks (zk-object-fabric bucket/placement and billing
+// lifecycle) for a tenant. It mirrors the hook sequence in
+// CreateTenant / EnsureProvisioned and is safe to call repeatedly:
+// CreateBucket / placement PUT and the billing OnTenantCreated upsert
+// all no-op when the resource already exists.
+func (s *Service) runProvisioningHooks(ctx context.Context, tenantID, plan string) error {
 	if s.provisioner != nil {
-		if _, err := s.provisioner.Provision(ctx, t.ID, t.Plan); err != nil {
-			return &t, true, fmt.Errorf("zk-fabric provision: %w", err)
+		if _, err := s.provisioner.Provision(ctx, tenantID, plan); err != nil {
+			return fmt.Errorf("zk-fabric provision: %w", err)
 		}
 	}
 	if s.billing != nil {
-		if err := s.billing.OnTenantCreated(ctx, t.ID, t.Plan); err != nil {
-			return &t, true, fmt.Errorf("billing.OnTenantCreated: %w", err)
+		if err := s.billing.OnTenantCreated(ctx, tenantID, plan); err != nil {
+			return fmt.Errorf("billing.OnTenantCreated: %w", err)
 		}
 	}
-	return &t, true, nil
+	return nil
 }
 
 // LazyProvisioner adapts the Service onto the narrow
