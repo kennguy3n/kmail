@@ -146,6 +146,65 @@ type Config struct {
 	// threshold, default link expiry, and the bucket name on
 	// zk-object-fabric.
 	Attachments AttachmentsConfig
+
+	// IAMCore holds the iam-core Management API wiring for
+	// user/tenant sync. See docs/IAM_CORE_INTEGRATION.md. When
+	// IAMCore.MgmtURL is set the BFF treats iam-core as the OIDC
+	// identity provider: the internal OAuth2 authorization server
+	// is not mounted, the auth middleware accepts iam-core token
+	// claims, and (optionally) tenants are lazily provisioned.
+	IAMCore IAMCoreConfig
+}
+
+// IAMCoreConfig wires the iam-core Management API integration. All
+// fields are read from `KMAIL_IAM_CORE_*` environment variables
+// (see Load). The integration is inert unless MgmtURL is set:
+// `Enabled()` gates whether main.go skips the internal OAuth2
+// server and constructs the iamcore.Client / webhook receiver.
+type IAMCoreConfig struct {
+	// MgmtURL is the iam-core Management API base URL (e.g.
+	// `https://auth.kmail.io`). The M2M token endpoint is
+	// `<MgmtURL>/oauth2/token` and the management resources live
+	// under `<MgmtURL>/api/v1/management/...`. Empty disables the
+	// entire integration.
+	MgmtURL string
+
+	// M2MClientID is the Client Credentials `client_id` iam-core
+	// issued for KMail's M2M application.
+	M2MClientID string
+
+	// M2MClientSecret is the matching Client Credentials
+	// `client_secret`. Sourced from a Kubernetes Secret in
+	// production (see deploy/helm/kmail).
+	M2MClientSecret string
+
+	// M2MAudience is the token `audience` requested for the
+	// management API (e.g.
+	// `https://<mgmt-tenant>/api/v1/management/`). iam-core scopes
+	// M2M clients per tenant; the audience host names the tenant
+	// KMail's M2M client is registered in, which the client also
+	// sends as the `X-Tenant-ID` header on the token request.
+	M2MAudience string
+
+	// WebhookSecret is the shared secret iam-core signs event
+	// webhooks with. The receiver at POST
+	// /api/v1/webhooks/iam-core validates `X-KMail-Signature`
+	// (HMAC-SHA256) against it. Empty disables the receiver.
+	WebhookSecret string
+
+	// LazyProvision gates the optional middleware that provisions
+	// a KMail tenant on first authenticated request when webhook
+	// delivery has not already created it. Default false.
+	LazyProvision bool
+}
+
+// Enabled reports whether the iam-core integration is active. It is
+// the single switch main.go consults to decide whether to skip the
+// internal OAuth2 server and wire the iam-core client / webhook
+// receiver. Keyed on MgmtURL because every other field is
+// meaningless without an endpoint to talk to.
+func (c IAMCoreConfig) Enabled() bool {
+	return strings.TrimSpace(c.MgmtURL) != ""
 }
 
 // BillingConfig wires the Billing / Quota Service.
@@ -551,6 +610,20 @@ func Load() (*Config, error) {
 			DefaultExpiry:  getenvDuration("KMAIL_ATTACHMENT_EXPIRY", 7*24*time.Hour),
 			BucketName:     getenv("KMAIL_ATTACHMENT_BUCKET", "kmail-attachments"),
 		},
+		IAMCore: IAMCoreConfig{
+			// All iam-core knobs are brand-new variables read with
+			// plain `getenv` — there is no legacy bare-name form to
+			// migrate from, so the two-step `getenvKMail` lookup
+			// would only add noise. The Helm chart sets the
+			// `KMAIL_IAM_CORE_*` names directly; local dev / compose
+			// leave them unset to keep the integration disabled.
+			MgmtURL:         getenv("KMAIL_IAM_CORE_MGMT_URL", ""),
+			M2MClientID:     getenv("KMAIL_IAM_CORE_M2M_CLIENT_ID", ""),
+			M2MClientSecret: getenv("KMAIL_IAM_CORE_M2M_CLIENT_SECRET", ""),
+			M2MAudience:     getenv("KMAIL_IAM_CORE_M2M_AUDIENCE", ""),
+			WebhookSecret:   getenv("KMAIL_IAM_CORE_WEBHOOK_SECRET", ""),
+			LazyProvision:   GetenvBool("KMAIL_IAM_CORE_LAZY_PROVISION", false),
+		},
 	}, nil
 }
 
@@ -655,7 +728,7 @@ func GetenvInt64(key string, fallback int64) int64 {
 // config for startup logging.
 func (c *Config) String() string {
 	return fmt.Sprintf(
-		"Config{HTTP.Addr=%s DatabaseURL=%s StalwartURL=%s ValkeyURL=%s KChatOIDCIssuer=%s DevBypass=%t ZKFabric.S3URL=%s ZKFabric.ConsoleURL=%s ZKFabric.Keys=%t}",
+		"Config{HTTP.Addr=%s DatabaseURL=%s StalwartURL=%s ValkeyURL=%s KChatOIDCIssuer=%s DevBypass=%t ZKFabric.S3URL=%s ZKFabric.ConsoleURL=%s ZKFabric.Keys=%t IAMCore.Enabled=%t IAMCore.MgmtURL=%s IAMCore.LazyProvision=%t}",
 		c.HTTP.Addr,
 		redactDSN(c.DatabaseURL),
 		c.StalwartURL,
@@ -673,6 +746,13 @@ func (c *Config) String() string {
 		c.ZKFabric.S3URL,
 		c.ZKFabric.ConsoleURL,
 		c.ZKFabric.AccessKey != "" && c.ZKFabric.SecretKey != "",
+		// iam-core: only the non-secret endpoint + toggles are
+		// logged. M2M client_id / client_secret and the webhook
+		// secret are intentionally omitted so the startup line
+		// stays safe to ship to log aggregation.
+		c.IAMCore.Enabled(),
+		c.IAMCore.MgmtURL,
+		c.IAMCore.LazyProvision,
 	)
 }
 

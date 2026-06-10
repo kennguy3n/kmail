@@ -482,8 +482,31 @@ func TestAuthenticate_UnverifiedFallbackAllowedInDev(t *testing.T) {
 	}
 }
 
+// TestAuthenticate_UnverifiedFallbackAppliesIAMCoreClaims verifies
+// the dev no-issuer fallback resolves iam-core-style tokens — a
+// namespaced tenant claim and the standard `sub` instead of the bare
+// tenant_id / kchat_user_id — just like the verified production path,
+// so an operator bootstrapping the iam-core integration locally is
+// not rejected with a 401.
+func TestAuthenticate_UnverifiedFallbackAppliesIAMCoreClaims(t *testing.T) {
+	o := &OIDC{cfg: OIDCConfig{Env: EnvDevelopment}}
+	tok := makeUnverifiedJWT(t, map[string]any{
+		"https://kmail.io/tenant_id": "t-iamcore",
+		"sub":                        "user-iamcore",
+	})
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	claims, err := o.authenticate(req)
+	if err != nil {
+		t.Fatalf("authenticate: %v", err)
+	}
+	if claims.TenantID != "t-iamcore" || claims.KChatUserID != "user-iamcore" {
+		t.Errorf("iam-core fallbacks not applied in dev: %+v", claims)
+	}
+}
+
 // makeUnverifiedJWT builds a compact JWT with a junk signature so
-// decodeJWTClaims succeeds in the dev fallback. The header is the
+// decodeUnverifiedClaims succeeds in the dev fallback. The header is the
 // canonical `{"alg":"none","typ":"JWT"}` so test consumers don't
 // need to provide signing material.
 func makeUnverifiedJWT(t *testing.T, claims map[string]any) string {
@@ -497,13 +520,14 @@ func makeUnverifiedJWT(t *testing.T, claims map[string]any) string {
 	return header + "." + payload + ".sig"
 }
 
-// Internal sanity check on decodeJWTClaims — the no-JWKS fallback
-// still rejects malformed payloads.
-func TestDecodeJWTClaims_Malformed(t *testing.T) {
-	if _, err := decodeJWTClaims("not.a.jwt"); err == nil {
+// Internal sanity check on decodeUnverifiedClaims — the no-JWKS
+// fallback still rejects malformed payloads.
+func TestDecodeUnverifiedClaims_Malformed(t *testing.T) {
+	o := &OIDC{cfg: OIDCConfig{Env: EnvDevelopment}}
+	if _, err := o.decodeUnverifiedClaims("not.a.jwt"); err == nil {
 		t.Error("expected malformed-payload error")
 	}
-	if _, err := decodeJWTClaims(strings.Repeat("a", 10)); err == nil {
+	if _, err := o.decodeUnverifiedClaims(strings.Repeat("a", 10)); err == nil {
 		t.Error("expected not-a-jwt error")
 	}
 }

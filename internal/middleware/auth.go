@@ -18,6 +18,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/jackc/pgx/v5"
@@ -65,6 +66,19 @@ type OIDCConfig struct {
 	// dev-bypass path is then usable. NewOIDC auto-populates this
 	// field from cfg.Issuer when Issuer is non-empty.
 	JWKS *JWKSFetcher
+
+	// PostAuthMiddleware, when non-nil, is applied immediately
+	// inside Wrap: it wraps the next handler so it runs AFTER a
+	// request has been authenticated and the tenant/user context
+	// values are populated, but BEFORE the route handler. This is
+	// the single chokepoint the iam-core integration uses to attach
+	// lazy tenant provisioning (LazyProvision.Wrap) to every
+	// authenticated route without threading a new wrapper through
+	// the ~50 per-feature Register call sites. It must be cheap and
+	// idempotent — it runs on every authenticated request (the
+	// lazy-provision middleware caches to keep that off the hot
+	// path). nil leaves the chain unchanged.
+	PostAuthMiddleware func(http.Handler) http.Handler
 }
 
 // EnvDevelopment is the only `OIDCConfig.Env` value that unlocks
@@ -154,6 +168,14 @@ func (c OIDCConfig) isKnownEnv() bool {
 // struct so one fetcher is shared across every request.
 type OIDC struct {
 	cfg OIDCConfig
+
+	// warnTenantFallback / warnUserFallback gate the iam-core
+	// claim-fallback warnings in resolveIdentity to one emission per
+	// process. Without this a deployment whose iam-core tokens always
+	// use the namespaced/sub claims would log on every authenticated
+	// request, flooding aggregation. See resolveIdentity.
+	warnTenantFallback sync.Once
+	warnUserFallback   sync.Once
 }
 
 // NewOIDC returns an OIDC middleware with the provided configuration.
@@ -224,6 +246,13 @@ func MustNewOIDC(cfg OIDCConfig) *OIDC {
 // callers can rely on the context values being populated when their
 // handler runs.
 func (o *OIDC) Wrap(next http.Handler) http.Handler {
+	// PostAuthMiddleware (when configured) wraps the route handler
+	// so it executes after authentication has populated the context
+	// values below but before the handler. Composed once here, at
+	// registration time, rather than per-request.
+	if o.cfg.PostAuthMiddleware != nil {
+		next = o.cfg.PostAuthMiddleware(next)
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		claims, err := o.authenticate(r)
 		if err != nil {
@@ -301,7 +330,7 @@ func (o *OIDC) authenticate(r *http.Request) (*Claims, error) {
 		// and the bare form both work — see `getenvKMail`).
 		return nil, errors.New("no JWKS issuer configured (set KMAIL_KCHAT_OIDC_ISSUER or KCHAT_OIDC_ISSUER)")
 	}
-	claims, err := decodeJWTClaims(token)
+	claims, err := o.decodeUnverifiedClaims(token)
 	if err != nil {
 		return nil, fmt.Errorf("invalid JWT: %w", err)
 	}
@@ -311,13 +340,26 @@ func (o *OIDC) authenticate(r *http.Request) (*Claims, error) {
 	return claims, nil
 }
 
+// namespacedTenantIDClaim is the namespaced (collision-proof) claim
+// KMail reads the tenant id from when a token does not carry the
+// bare `tenant_id` claim. iam-core projects metadata into JWTs via
+// Custom Token Claims (spec 018-custom-token-claims); operators who
+// cannot set the bare `tenant_id` claim configure a mapping whose
+// target claim name is this URI. The namespacing convention
+// (`https://<domain>/<claim>`) is the OIDC-standard way to avoid
+// collisions with registered/protected claim names.
+const namespacedTenantIDClaim = "https://kmail.io/tenant_id"
+
 // oidcTokenClaims mirrors the JWT payload shape KMail consumes.
 // It embeds jwt.RegisteredClaims so standard claim validation
-// (exp / iss / aud) runs through the jwt library.
+// (exp / iss / aud) runs through the jwt library. The namespaced
+// tenant claim and the standard `sub` (via RegisteredClaims.Subject)
+// back the iam-core fallback paths in resolveIdentity.
 type oidcTokenClaims struct {
-	TenantID          string `json:"tenant_id"`
-	KChatUserID       string `json:"kchat_user_id"`
-	StalwartAccountID string `json:"stalwart_account_id,omitempty"`
+	TenantID           string `json:"tenant_id"`
+	KChatUserID        string `json:"kchat_user_id"`
+	StalwartAccountID  string `json:"stalwart_account_id,omitempty"`
+	NamespacedTenantID string `json:"https://kmail.io/tenant_id,omitempty"`
 	jwt.RegisteredClaims
 }
 
@@ -359,14 +401,59 @@ func (o *OIDC) verifyAndExtract(ctx context.Context, tokenStr string) (*Claims, 
 		}
 	}
 
-	if claims.TenantID == "" || claims.KChatUserID == "" {
+	tenantID, kchatUserID := o.resolveIdentity(claims.TenantID, claims.KChatUserID, claims.NamespacedTenantID, claims.Subject)
+	if tenantID == "" || kchatUserID == "" {
 		return nil, errors.New("JWT is missing tenant_id or kchat_user_id claim")
 	}
 	return &Claims{
-		TenantID:          claims.TenantID,
-		KChatUserID:       claims.KChatUserID,
+		TenantID:          tenantID,
+		KChatUserID:       kchatUserID,
 		StalwartAccountID: claims.StalwartAccountID,
 	}, nil
+}
+
+// resolveIdentity applies the iam-core claim-fallback rules to the
+// raw token claims and returns the effective (tenantID,
+// kchatUserID). KChat OIDC tokens carry `tenant_id` and
+// `kchat_user_id` directly and hit neither fallback. iam-core
+// tokens may instead carry the namespaced tenant claim and the
+// standard `sub`, so:
+//
+//   - a missing `tenant_id` falls back to the
+//     `https://kmail.io/tenant_id` namespaced claim;
+//   - a missing `kchat_user_id` falls back to the standard `sub`.
+//
+// Each fallback logs a one-line warning so operators know to
+// configure Custom Token Claims in iam-core rather than relying on
+// the implicit mapping forever. Either fallback may still resolve
+// to "" (the caller treats that as a missing-claim rejection).
+func (o *OIDC) resolveIdentity(tenantID, kchatUserID, namespacedTenantID, sub string) (string, string) {
+	effTenant := tenantID
+	if effTenant == "" && namespacedTenantID != "" {
+		o.warnTenantFallback.Do(func() {
+			o.logf("auth: tenant_id claim missing; using namespaced %q claim — configure a Custom Token Claim in iam-core to emit tenant_id directly (warning logged once per process)", namespacedTenantIDClaim)
+		})
+		effTenant = namespacedTenantID
+	}
+	effUser := kchatUserID
+	if effUser == "" && sub != "" {
+		o.warnUserFallback.Do(func() {
+			o.logf("auth: kchat_user_id claim missing; falling back to standard sub claim — configure a Custom Token Claim in iam-core to emit kchat_user_id (warning logged once per process)")
+		})
+		effUser = sub
+	}
+	return effTenant, effUser
+}
+
+// logf writes a warning to the configured logger, falling back to
+// the standard logger so the fallback warnings surface even when no
+// logger was wired into OIDCConfig.
+func (o *OIDC) logf(format string, args ...any) {
+	logger := o.cfg.Logger
+	if logger == nil {
+		logger = log.Default()
+	}
+	logger.Printf(format, args...)
 }
 
 func audienceContains(aud jwt.ClaimStrings, want string) bool {
@@ -378,10 +465,16 @@ func audienceContains(aud jwt.ClaimStrings, want string) bool {
 	return false
 }
 
-// decodeJWTClaims parses the unverified payload of a compact JWT.
-// Retained for the no-issuer fallback path; production traffic
-// flows through verifyAndExtract instead.
-func decodeJWTClaims(token string) (*Claims, error) {
+// decodeUnverifiedClaims parses the unverified payload of a compact
+// JWT and applies the same iam-core claim fallbacks as the verified
+// path (resolveIdentity), so the development no-issuer fallback
+// accepts iam-core-style tokens (the namespaced tenant claim and the
+// standard `sub`) exactly like production rather than only tokens
+// carrying the bare `tenant_id` / `kchat_user_id` claims. Reachable
+// only in development (authenticate gates it behind isDevEnv);
+// production traffic flows through verifyAndExtract, which
+// cryptographically verifies the token before resolving identity.
+func (o *OIDC) decodeUnverifiedClaims(token string) (*Claims, error) {
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
 		return nil, errors.New("token is not a well-formed JWT")
@@ -390,11 +483,16 @@ func decodeJWTClaims(token string) (*Claims, error) {
 	if err != nil {
 		return nil, fmt.Errorf("decode payload: %w", err)
 	}
-	var c Claims
+	var c oidcTokenClaims
 	if err := json.Unmarshal(payload, &c); err != nil {
 		return nil, fmt.Errorf("decode claims: %w", err)
 	}
-	return &c, nil
+	tenantID, kchatUserID := o.resolveIdentity(c.TenantID, c.KChatUserID, c.NamespacedTenantID, c.Subject)
+	return &Claims{
+		TenantID:          tenantID,
+		KChatUserID:       kchatUserID,
+		StalwartAccountID: c.StalwartAccountID,
+	}, nil
 }
 
 // devClaimsFromHeaders synthesizes Claims for dev-bypass requests.

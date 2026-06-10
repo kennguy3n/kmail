@@ -143,6 +143,39 @@ spec:
               value: {{ . | quote }}
             {{- end }}
             {{- end }}
+            {{- if .Values.iamCore.enabled }}
+            # iam-core OIDC integration. Non-secret values inline;
+            # the M2M client secret and webhook secret are pulled
+            # from operator-managed Secrets via secretKeyRef. See
+            # docs/IAM_CORE_INTEGRATION.md. `env:` wins over the
+            # shared ConfigMap, so these are authoritative.
+            - name: KMAIL_IAM_CORE_MGMT_URL
+              value: {{ required "iamCore.mgmtURL is required when iamCore.enabled" .Values.iamCore.mgmtURL | quote }}
+            - name: KMAIL_IAM_CORE_LAZY_PROVISION
+              value: {{ .Values.iamCore.lazyProvision | quote }}
+            {{- with .Values.iamCore.m2mClientID }}
+            - name: KMAIL_IAM_CORE_M2M_CLIENT_ID
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.iamCore.m2mAudience }}
+            - name: KMAIL_IAM_CORE_M2M_AUDIENCE
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.iamCore.m2mClientSecretRef }}
+            - name: KMAIL_IAM_CORE_M2M_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . | quote }}
+                  key: KMAIL_IAM_CORE_M2M_CLIENT_SECRET
+            {{- end }}
+            {{- with .Values.iamCore.webhookSecretRef }}
+            - name: KMAIL_IAM_CORE_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . | quote }}
+                  key: KMAIL_IAM_CORE_WEBHOOK_SECRET
+            {{- end }}
+            {{- end }}
           {{- if .Values.mtls.enabled }}
           volumeMounts:
             - name: stalwart-client-tls
