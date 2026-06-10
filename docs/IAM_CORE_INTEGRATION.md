@@ -199,6 +199,18 @@ race). Two paths converge on it:
   provision-on-miss); `user.delete` → `DeleteUser`. Every handler is
   safe under redelivery — duplicate creates become no-ops, deletes
   for unknown users are no-ops.
+
+  > **Provision-on-miss needs the M2M client for sparse updates.** A
+  > `user.update` for a user KMail hasn't provisioned yet falls
+  > through to `CreateUser` so the update isn't dropped. A mailbox
+  > requires an email address, so if the update payload is sparse
+  > (no `email`) **and** the M2M client is not configured to backfill
+  > it, `CreateUser` rejects the input and the delivery `500`s —
+  > iam-core then retries until the authoritative `user.create`
+  > arrives (carrying the email) or the M2M client is configured.
+  > KMail deliberately never fabricates a placeholder address: a
+  > wrong mailbox address is worse than a retried webhook. Configure
+  > the M2M client for reliable provision-on-miss.
 - **Lazy** (`KMAIL_IAM_CORE_LAZY_PROVISION=true`): on the first
   authenticated request for a tenant whose row does not yet exist
   (e.g. a webhook was lost), KMail provisions it inline with a
