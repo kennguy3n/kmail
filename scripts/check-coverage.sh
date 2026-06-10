@@ -3,11 +3,10 @@
 #
 # Runs the Go test suite with a coverage profile and fails if total
 # statement coverage (over packages that have tests) is below
-# MIN_COVERAGE. The floor is intentionally set to JUST BELOW the
-# current measured baseline (~35%) so the gate ratchets UP over time
-# — never down — without blocking every PR on day one. Raise
-# MIN_COVERAGE toward the 60% → 80% target as the suite grows; the
-# WS4 plan's "60%" is the destination, not the starting line.
+# MIN_COVERAGE. The floor ratchets UP over time — never down. It has
+# now reached the WS4 destination of 80%: every tested package and the
+# global total sit above that line. The default below matches the gate
+# enforced in CI (.github/workflows/ci.yml).
 #
 # Usage:
 #     ./scripts/check-coverage.sh
@@ -21,7 +20,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 
-MIN_COVERAGE="${MIN_COVERAGE:-30}"
+MIN_COVERAGE="${MIN_COVERAGE:-80}"
 PROFILE="${COVERAGE_PROFILE:-coverage.out}"
 
 log() { printf '[coverage] %s\n' "$*" >&2; }
