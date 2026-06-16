@@ -278,18 +278,38 @@ setting_upsert() {
     log "setting ${key}=${value} created"
     return 0
   fi
+  # Stalwart exposes its settings registry via x:Setting/set on some
+  # builds but not all: the upstream stalwartlabs/stalwart image
+  # pinned in docker-compose.yml does not register the Setting object
+  # type, so the method resolves to `unknownMethod`. Report that to
+  # the caller (return 1) so the optional spam-filter configuration
+  # can be skipped cleanly instead of aborting the whole init. Any
+  # other failure is a genuine misconfiguration and stays fatal.
+  if printf '%s' "$response" | grep -q '"unknownMethod"'; then
+    return 1
+  fi
   log "failed to apply setting ${key}: ${response}"
   exit 1
 }
 
+# Spam / phishing filter configuration is layered on top of the core
+# stores and the dev domain configured above, all of which the stack
+# needs to boot. The filter itself is optional: it is driven through
+# x:Setting/set, which the upstream stalwartlabs/stalwart image pinned
+# in docker-compose.yml does not register (the method resolves to
+# `unknownMethod`). setting_upsert returns non-zero in that case, so
+# this function bails out early and the caller skips the filter
+# cleanly rather than aborting the whole init. A genuine
+# misconfiguration on a build that DOES expose the method stays fatal.
+configure_spam_filter() {
 log "configuring Stalwart built-in spam / phishing filter"
 
 # Master enable. Turns on the classifier, DNSBL lookups, Sieve
 # `spamtest` support, and the X-Spam-* header injection path.
-setting_upsert "spam-filter.enable" "true"
-setting_upsert "spam-filter.header.status.enable" "true"
-setting_upsert "spam-filter.header.result.enable" "true"
-setting_upsert "spam-filter.header.score.enable" "true"
+setting_upsert "spam-filter.enable" "true" || return 1
+setting_upsert "spam-filter.header.status.enable" "true" || return 1
+setting_upsert "spam-filter.header.result.enable" "true" || return 1
+setting_upsert "spam-filter.header.score.enable" "true" || return 1
 
 # Thresholds. SpamAssassin convention: 5.0 is the standard
 # "probably spam" line; 10.0 is high-confidence spam where the
@@ -297,26 +317,26 @@ setting_upsert "spam-filter.header.score.enable" "true"
 # deliver to Junk. Scores compound across rules (DNSBL hits,
 # URIBL hits, Bayesian probability, header heuristics), so a
 # legitimate message with one weak hit stays under 5.0.
-setting_upsert "spam-filter.score.spam" "5.0"
-setting_upsert "spam-filter.score.discard" "10.0"
-setting_upsert "spam-filter.score.reject" "15.0"
+setting_upsert "spam-filter.score.spam" "5.0" || return 1
+setting_upsert "spam-filter.score.discard" "10.0" || return 1
+setting_upsert "spam-filter.score.reject" "15.0" || return 1
 
 # Bayesian classifier — trained on the JMAP `$junk` / `$notjunk`
 # keyword feedback loop the web UI sends via `markAsSpam`.
-setting_upsert "spam-filter.bayes.enable" "true"
-setting_upsert "spam-filter.bayes.auto-learn.enable" "true"
-setting_upsert "spam-filter.bayes.auto-learn.threshold.spam" "7.0"
-setting_upsert "spam-filter.bayes.auto-learn.threshold.ham" "-1.0"
+setting_upsert "spam-filter.bayes.enable" "true" || return 1
+setting_upsert "spam-filter.bayes.auto-learn.enable" "true" || return 1
+setting_upsert "spam-filter.bayes.auto-learn.threshold.spam" "7.0" || return 1
+setting_upsert "spam-filter.bayes.auto-learn.threshold.ham" "-1.0" || return 1
 
 # DNSBL / URIBL lookups. The picks below are well-known public
 # lists that are free for low-volume dev use; tenants on shared
 # deliverability pools override these in production via the
 # Deliverability Control Plane (see docs/ARCHITECTURE.md §7).
-setting_upsert "spam-filter.dnsbl.enable" "true"
-setting_upsert "spam-filter.dnsbl.ip.zen.spamhaus.org" "2.0"
-setting_upsert "spam-filter.dnsbl.ip.bl.spamcop.net" "1.5"
-setting_upsert "spam-filter.dnsbl.domain.dbl.spamhaus.org" "2.5"
-setting_upsert "spam-filter.dnsbl.domain.multi.surbl.org" "1.5"
+setting_upsert "spam-filter.dnsbl.enable" "true" || return 1
+setting_upsert "spam-filter.dnsbl.ip.zen.spamhaus.org" "2.0" || return 1
+setting_upsert "spam-filter.dnsbl.ip.bl.spamcop.net" "1.5" || return 1
+setting_upsert "spam-filter.dnsbl.domain.dbl.spamhaus.org" "2.5" || return 1
+setting_upsert "spam-filter.dnsbl.domain.multi.surbl.org" "1.5" || return 1
 
 # Junk mailbox auto-filing. Stalwart creates a per-principal
 # mailbox with role=junk on first mailbox enumeration; this
@@ -357,6 +377,13 @@ elif printf '%s' "$sieve_response" | grep -q '"notCreated":{"s":{"type":"already
   log "junk-filing Sieve script already present, skipping"
 else
   log "sieve install returned: ${sieve_response}"
+fi
+
+return 0
+}
+
+if ! configure_spam_filter; then
+  log "spam / phishing filter not configured (this Stalwart build does not expose x:Setting/set); continuing without it"
 fi
 
 # ------------------------------------------------------------------
