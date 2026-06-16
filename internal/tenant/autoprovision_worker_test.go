@@ -10,16 +10,18 @@ import (
 	"time"
 )
 
-// countingProvisioner is a ShardProvisioner that records its calls in
-// a mutex-guarded counter (the worker invokes it from its own
-// goroutine).
-type countingProvisioner struct {
+// countingShardProvisioner is a ShardProvisioner that records its
+// calls in a mutex-guarded counter (the worker invokes it from its
+// own goroutine). Named distinctly from the StorageProvisioner stub
+// in ensure_tenant_hooks_test.go so both can coexist in the package
+// test binary.
+type countingShardProvisioner struct {
 	mu    sync.Mutex
 	calls int
 	err   error
 }
 
-func (c *countingProvisioner) Provision(context.Context, string) (Shard, error) {
+func (c *countingShardProvisioner) Provision(context.Context, string) (Shard, error) {
 	c.mu.Lock()
 	c.calls++
 	c.mu.Unlock()
@@ -29,7 +31,7 @@ func (c *countingProvisioner) Provision(context.Context, string) (Shard, error) 
 	return Shard{Name: "auto", StalwartURL: "http://auto:8080"}, nil
 }
 
-func (c *countingProvisioner) count() int {
+func (c *countingShardProvisioner) count() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.calls
@@ -60,7 +62,7 @@ func TestAutoProvisionWorkerRunProvisions(t *testing.T) {
 	// nil pool → ListShards returns nil → empty cluster needs
 	// provisioning → provisioner fires and RegisterShard returns a
 	// stub row, exercising Run's success branch.
-	prov := &countingProvisioner{}
+	prov := &countingShardProvisioner{}
 	svc := NewShardService(nil, log.New(io.Discard, "", 0)).SetProvisioner(prov)
 	w := &AutoProvisionWorker{Service: svc, Interval: 10 * time.Millisecond, Logger: log.New(io.Discard, "", 0)}
 	runWorkerBriefly(t, w)
@@ -79,7 +81,7 @@ func TestAutoProvisionWorkerRunNoProvisioner(t *testing.T) {
 
 func TestAutoProvisionWorkerRunProvisionError(t *testing.T) {
 	// Provisioner returns an error → Run logs the err != nil branch.
-	prov := &countingProvisioner{err: errors.New("terraform boom")}
+	prov := &countingShardProvisioner{err: errors.New("terraform boom")}
 	svc := NewShardService(nil, log.New(io.Discard, "", 0)).SetProvisioner(prov)
 	w := &AutoProvisionWorker{Service: svc, Interval: 10 * time.Millisecond, Logger: log.New(io.Discard, "", 0)}
 	runWorkerBriefly(t, w)
