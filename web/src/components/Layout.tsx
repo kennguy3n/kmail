@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Suspense, useEffect, useMemo, useRef, useState } from "react";
 import {
   NavLink,
   Outlet,
@@ -21,6 +21,7 @@ import { Dropdown } from "./ui/Dropdown";
 import type { DropdownItem } from "./ui/Dropdown";
 import { Tooltip } from "./ui/Tooltip";
 import { Breadcrumbs } from "./Breadcrumbs";
+import { RouteFallback } from "./RouteFallback";
 import { ShortcutHelpModal } from "./ShortcutHelpModal";
 import {
   NAV_TREE,
@@ -367,7 +368,12 @@ export default function Layout(): JSX.Element {
             </div>
           )}
           <div className="flex-1 p-6 max-sm:p-4">
-            <Outlet />
+            {/* Route pages are code-split (see App.tsx); this boundary
+                keeps the nav + chrome mounted and shows a skeleton in
+                the content area while the next page's chunk loads. */}
+            <Suspense fallback={<RouteFallback />}>
+              <Outlet />
+            </Suspense>
           </div>
         </main>
       </div>
