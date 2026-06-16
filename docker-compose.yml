@@ -93,15 +93,19 @@ services:
   #      The demo Dockerfile there produces a minimal gateway
   #      running the `local_fs_dev` provider with a pre-loaded
   #      `kmail-dev` tenant.
-  #   2. CI (`.github/workflows/ci.yml` integration job, plus the
-  #      nightly `chaos.yml`): the runner only checks out the
-  #      kmail repo, so the sibling path doesn't exist. The
-  #      `image:` fallback below resolves the published GHCR tag
-  #      so `docker compose up` succeeds without the sibling
-  #      checkout. Compose prefers `image:` over `build:` when
-  #      the image already exists locally, and `docker compose
-  #      pull` (which both workflows run before `up`) populates
-  #      the local cache from GHCR.
+  #   2. CI (`.github/workflows/ci.yml` integration job, plus
+  #      `sdk-nightly.yml` and the nightly `chaos.yml`): the runner
+  #      only checks out the kmail repo, so each workflow first
+  #      clones the sibling to `../zk-object-fabric`, then runs
+  #      `docker compose pull --ignore-buildable` (which skips this
+  #      service precisely because it is buildable) followed by
+  #      `docker compose build zk-fabric`, which tags the result as
+  #      the `image:` name below. `docker compose up` then uses that
+  #      locally-built image. CI does NOT pull from GHCR: the
+  #      `:dev` package is private and the workflow token cannot pull
+  #      it, and building from source means CI exercises the exact
+  #      image the sibling `main` produces rather than a separately
+  #      published tag that can drift.
   #
   # Pinned to `:dev` rather than a digest because the sibling
   # repo is iterated in lockstep with kmail during the Phase E

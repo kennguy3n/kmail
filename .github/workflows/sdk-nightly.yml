@@ -74,8 +74,14 @@ jobs:
             ../zk-object-fabric
           ls -la ../zk-object-fabric | head -10
 
+      # `--ignore-buildable` skips zk-fabric (private GHCR package the
+      # CI token can't pull); we build it from the sibling checkout in
+      # the next step instead. See ci.yml for the full rationale.
       - name: docker compose pull
-        run: docker compose pull --quiet
+        run: docker compose pull --quiet --ignore-buildable
+
+      - name: docker compose build zk-fabric
+        run: docker compose build zk-fabric
 
       - name: docker compose up -d
         run: |
