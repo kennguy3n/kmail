@@ -226,9 +226,16 @@ func base64URL(b []byte) string {
 }
 
 // encodeUncompressed returns the base64url SEC1 uncompressed
-// public-key encoding (0x04 || X || Y).
+// public-key encoding (0x04 || X || Y). Built by hand rather than
+// via the deprecated elliptic.Marshal: for an on-curve point the
+// two are byte-identical, and this mirrors the inverse split in
+// decodeVAPIDPublic (X = raw[1:1+len], Y = raw[1+len:]).
 func encodeUncompressed(pub *ecdsa.PublicKey) string {
-	buf := elliptic.Marshal(pub.Curve, pub.X, pub.Y)
+	byteLen := (pub.Curve.Params().BitSize + 7) / 8
+	buf := make([]byte, 1+2*byteLen)
+	buf[0] = 0x04
+	pub.X.FillBytes(buf[1 : 1+byteLen])
+	pub.Y.FillBytes(buf[1+byteLen:])
 	return base64URL(buf)
 }
 
