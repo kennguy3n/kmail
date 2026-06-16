@@ -628,6 +628,12 @@ jobs:
         env:
           DATABASE_URL: postgresql://kmail:kmail@localhost:5432/kmail
 
+      - name: Seed default dev tenant + user
+        run: |
+          psql "postgresql://kmail:kmail@localhost:5432/kmail" \
+            -v ON_ERROR_STOP=1 \
+            -f ./scripts/seed-dev-tenant.sql
+
       - name: Build kmail-api
         run: make build
 

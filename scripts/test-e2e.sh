@@ -123,7 +123,7 @@ else fail "search query failed"; fi
 # ---------------------------------------------------------------
 step '8. Billing summary'
 if [ -n "${TENANT_ID}" ]; then
-  if curl_json "${API}/api/v1/tenants/${TENANT_ID}/billing/summary" \
+  if curl_json "${API}/api/v1/tenants/${TENANT_ID}/billing" \
        -H "X-KMail-Dev-Tenant-Id: ${TENANT_ID}" >/dev/null; then ok
   else fail "billing summary failed"; fi
 fi
@@ -133,7 +133,7 @@ fi
 # ---------------------------------------------------------------
 step '9. Audit log query'
 if [ -n "${TENANT_ID}" ]; then
-  if curl_json "${API}/api/v1/tenants/${TENANT_ID}/audit?limit=5" \
+  if curl_json "${API}/api/v1/tenants/${TENANT_ID}/audit-log?limit=5" \
        -H "X-KMail-Dev-Tenant-Id: ${TENANT_ID}" >/dev/null; then ok
   else fail "audit log failed"; fi
 fi
@@ -290,7 +290,7 @@ fi
 # the billing summary back to confirm quota fields are present.
 step '15. Billing plan change (idempotent) → summary/quota'
 if [ -n "${TENANT_ID}" ]; then
-  SUMMARY_JSON=$(curl_json "${API}/api/v1/tenants/${TENANT_ID}/billing/summary" \
+  SUMMARY_JSON=$(curl_json "${API}/api/v1/tenants/${TENANT_ID}/billing" \
                    -H "X-KMail-Dev-Tenant-Id: ${TENANT_ID}" || echo '{}')
   CUR_PLAN=$(printf '%s' "${SUMMARY_JSON}" | jq -r '.plan // .subscription.plan // empty')
   if [ -n "${CUR_PLAN}" ]; then
