@@ -11,13 +11,14 @@ import (
 	"testing"
 )
 
-const accountGetBody = `{"methodResponses":[["x:Account/get",{"list":[{"id":"b","name":"kmail-dev"}]},"0"]]}`
+const accountGetBody = `{"methodResponses":[["x:Account/get",{"list":[{"id":"b","name":"kmail-dev","emailAddress":"kmail-dev@kmail.dev"}]},"0"]]}`
 
-// TestDavAccountResolvesNameAndCaches verifies the JMAP id -> account
-// name resolution actually drives the CardDAV path, and that a
-// resolved name is memoised (only one x:Account/get call across
+// TestDavAccountResolvesEmailAndCaches verifies the JMAP id -> account
+// email resolution actually drives the CardDAV path (Stalwart keys DAV
+// collections by the account email, not the login name), and that a
+// resolved email is memoised (only one x:Account/get call across
 // repeated use).
-func TestDavAccountResolvesNameAndCaches(t *testing.T) {
+func TestDavAccountResolvesEmailAndCaches(t *testing.T) {
 	var jmapCalls int32
 	var propfindPath string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -39,22 +40,22 @@ func TestDavAccountResolvesNameAndCaches(t *testing.T) {
 	svc := NewService(Config{StalwartURL: srv.URL, AdminUser: "admin", AdminPassword: "pw"})
 	ctx := context.Background()
 
-	if got := svc.davAccount(ctx, "b"); got != "kmail-dev" {
-		t.Fatalf("davAccount=%q want kmail-dev", got)
+	if got := svc.davAccount(ctx, "b"); got != "kmail-dev@kmail.dev" {
+		t.Fatalf("davAccount=%q want kmail-dev@kmail.dev", got)
 	}
-	if got := svc.davAccount(ctx, "b"); got != "kmail-dev" {
-		t.Fatalf("davAccount (cached)=%q want kmail-dev", got)
+	if got := svc.davAccount(ctx, "b"); got != "kmail-dev@kmail.dev" {
+		t.Fatalf("davAccount (cached)=%q want kmail-dev@kmail.dev", got)
 	}
 	if n := atomic.LoadInt32(&jmapCalls); n != 1 {
 		t.Fatalf("x:Account/get calls=%d want 1 (second served from cache)", n)
 	}
 
-	// The resolved *name* — not the raw JMAP id — must drive the path.
+	// The resolved *email* — not the raw JMAP id — must drive the path.
 	if _, err := svc.ListAddressBooks(ctx, "b"); err != nil {
 		t.Fatalf("ListAddressBooks: %v", err)
 	}
-	if propfindPath != "/dav/card/kmail-dev/" {
-		t.Fatalf("PROPFIND path=%q want /dav/card/kmail-dev/", propfindPath)
+	if propfindPath != "/dav/card/kmail-dev@kmail.dev/" {
+		t.Fatalf("PROPFIND path=%q want /dav/card/kmail-dev@kmail.dev/", propfindPath)
 	}
 }
 
@@ -86,21 +87,21 @@ func TestDavAccountDoesNotCacheFailures(t *testing.T) {
 		t.Fatalf("davAccount on transient failure=%q want raw id b", got)
 	}
 	fail.Store(false)
-	if got := svc.davAccount(ctx, "b"); got != "kmail-dev" {
-		t.Fatalf("davAccount after recovery=%q want kmail-dev (failure must not be cached)", got)
+	if got := svc.davAccount(ctx, "b"); got != "kmail-dev@kmail.dev" {
+		t.Fatalf("davAccount after recovery=%q want kmail-dev@kmail.dev (failure must not be cached)", got)
 	}
 }
 
 // TestDavAccountIgnoresMismatchedID guards the security hardening: if
 // x:Account/get returns an entry whose id does not match the one
 // requested (a server bug, or an id-format mismatch), the bridge must
-// NOT adopt — let alone cache — that unrelated principal's name. It
+// NOT adopt — let alone cache — that unrelated principal's email. It
 // falls back to the raw id so a stray response can never silently
 // route one account's CardDAV traffic to another's addressbook home.
 func TestDavAccountIgnoresMismatchedID(t *testing.T) {
 	// Response carries a different principal ("z"/"someone-else") than
 	// the requested id ("b").
-	const mismatchBody = `{"methodResponses":[["x:Account/get",{"list":[{"id":"z","name":"someone-else"}]},"0"]]}`
+	const mismatchBody = `{"methodResponses":[["x:Account/get",{"list":[{"id":"z","name":"someone-else","emailAddress":"someone-else@kmail.dev"}]},"0"]]}`
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost && r.URL.Path == "/jmap" {
 			w.Header().Set("Content-Type", "application/json")
@@ -115,9 +116,9 @@ func TestDavAccountIgnoresMismatchedID(t *testing.T) {
 	ctx := context.Background()
 
 	if got := svc.davAccount(ctx, "b"); got != "b" {
-		t.Fatalf("davAccount on id mismatch=%q want raw id b (never another principal's name)", got)
+		t.Fatalf("davAccount on id mismatch=%q want raw id b (never another principal's email)", got)
 	}
-	if _, ok := svc.nameCache.Get("b"); ok {
+	if _, ok := svc.emailCache.Get("b"); ok {
 		t.Fatalf("mismatched lookup must not be cached")
 	}
 }
@@ -212,7 +213,7 @@ func TestDavAccountLogsJMAPMethodError(t *testing.T) {
 	if !strings.Contains(buf.String(), "unknownMethod") {
 		t.Fatalf("JMAP method error must be logged with its type, got %q", buf.String())
 	}
-	if _, ok := svc.nameCache.Get("b"); ok {
+	if _, ok := svc.emailCache.Get("b"); ok {
 		t.Fatalf("JMAP method error must not be cached")
 	}
 }
