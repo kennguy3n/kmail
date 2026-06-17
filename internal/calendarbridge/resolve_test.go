@@ -87,6 +87,38 @@ func TestDavAccountDoesNotCacheFailures(t *testing.T) {
 	}
 }
 
+// TestDavAccountIgnoresMismatchedID guards the security hardening the
+// review flagged: if x:Account/get returns an entry whose id does not
+// match the one requested (a server bug, or an id-format mismatch),
+// the bridge must NOT adopt — let alone cache — that unrelated
+// principal's name. It falls back to the raw id so a stray response
+// can never silently route one account's CalDAV traffic to another's
+// calendar home.
+func TestDavAccountIgnoresMismatchedID(t *testing.T) {
+	// Response carries a different principal ("z"/"someone-else") than
+	// the requested id ("b").
+	const mismatchBody = `{"methodResponses":[["x:Account/get",{"list":[{"id":"z","name":"someone-else"}]},"0"]]}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/jmap" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(mismatchBody))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	svc := NewService(Config{StalwartURL: srv.URL, AdminUser: "admin", AdminPassword: "pw"})
+	ctx := context.Background()
+
+	if got := svc.davAccount(ctx, "b"); got != "b" {
+		t.Fatalf("davAccount on id mismatch=%q want raw id b (never another principal's name)", got)
+	}
+	if _, ok := svc.nameCache.Get("b"); ok {
+		t.Fatalf("mismatched lookup must not be cached")
+	}
+}
+
 // TestDavAccountNoAdminCreds confirms the bridge issues no management
 // call and returns the id unchanged when it holds no credentials
 // (the production mTLS path, where the resolver is a no-op).

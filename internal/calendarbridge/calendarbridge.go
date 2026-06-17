@@ -26,9 +26,9 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"sync"
 	"time"
 
+	lru "github.com/hashicorp/golang-lru/v2/expirable"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -59,22 +59,33 @@ type Service struct {
 	// nameCache memoises JMAP account id -> CalDAV account name
 	// lookups (see davAccount). Stalwart assigns a stable id and
 	// name per principal, so the mapping never changes for the
-	// process lifetime. Only *successful* resolutions are stored,
-	// so a transient lookup failure is retried rather than poisoned
-	// in the cache.
-	nameMu    sync.RWMutex
-	nameCache map[string]string
+	// process lifetime; the cache is bounded (LRU) only to cap
+	// memory on a BFF instance fronting very many principals. Only
+	// *successful* resolutions are stored, so a transient lookup
+	// failure is retried rather than poisoned in the cache. The
+	// expirable LRU is internally synchronised, so no extra mutex.
+	nameCache *lru.LRU[string, string]
 	// nameSF collapses concurrent lookups for the same account id
 	// into a single in-flight x:Account/get call.
 	nameSF singleflight.Group
 }
+
+// nameCacheMaxEntries bounds the id->name cache. The mapping is
+// stable for the process lifetime so entries never expire (ttl 0);
+// the LRU size cap is purely a memory guard for a BFF instance that
+// fronts a very large number of distinct principals. At ~64 B per
+// entry, 50,000 entries stays well under ~4 MiB.
+const nameCacheMaxEntries = 50_000
 
 // NewService builds a Service from the provided Config.
 func NewService(cfg Config) *Service {
 	if cfg.HTTPClient == nil {
 		cfg.HTTPClient = &http.Client{Timeout: 15 * time.Second}
 	}
-	return &Service{cfg: cfg, nameCache: make(map[string]string)}
+	return &Service{
+		cfg:       cfg,
+		nameCache: lru.NewLRU[string, string](nameCacheMaxEntries, nil, 0),
+	}
 }
 
 // Calendar describes a calendar collection as surfaced to the BFF.
@@ -330,10 +341,7 @@ func (s *Service) davAccount(ctx context.Context, accountID string) string {
 	if accountID == "" || s.cfg.AdminUser == "" {
 		return accountID
 	}
-	s.nameMu.RLock()
-	cached, ok := s.nameCache[accountID]
-	s.nameMu.RUnlock()
-	if ok {
+	if cached, ok := s.nameCache.Get(accountID); ok {
 		return cached
 	}
 	// Dedupe concurrent lookups and only memoise a *resolved* name.
@@ -345,9 +353,7 @@ func (s *Service) davAccount(ctx context.Context, accountID string) string {
 	v, _, _ := s.nameSF.Do(accountID, func() (interface{}, error) {
 		name := s.lookupAccountName(ctx, accountID)
 		if name != "" {
-			s.nameMu.Lock()
-			s.nameCache[accountID] = name
-			s.nameMu.Unlock()
+			s.nameCache.Add(accountID, name)
 		}
 		return name, nil
 	})
@@ -404,13 +410,16 @@ func (s *Service) lookupAccountName(ctx context.Context, accountID string) strin
 	if err := json.Unmarshal(envelope.MethodResponses[0][1], &result); err != nil {
 		return ""
 	}
+	// Match strictly on the requested id. The request passes
+	// `ids:[accountID]`, so Stalwart returns at most that one
+	// account; we never fall back to an arbitrary list entry,
+	// which could otherwise cache a *different* principal's name
+	// and route every subsequent CalDAV call for this account to
+	// the wrong calendar home.
 	for _, a := range result.List {
 		if a.ID == accountID && a.Name != "" {
 			return a.Name
 		}
-	}
-	if len(result.List) > 0 {
-		return result.List[0].Name
 	}
 	return ""
 }
