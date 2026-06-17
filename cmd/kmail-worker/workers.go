@@ -125,8 +125,9 @@ func buildWorkers(ctx context.Context, d workerDeps) ([]workerRegistration, erro
 			// Share the application pool so the alias
 			// read-modify-write is serialised per principal by a
 			// Postgres advisory lock across the worker and kmail-api
-			// (Stalwart's x:Account/set has no ifInState guard).
-			aliasSync = aliasSync.WithLockPool(pool)
+			// (Stalwart's x:Account/set has no ifInState guard), and a
+			// logger so a failed advisory-unlock is observable.
+			aliasSync = aliasSync.WithLockPool(pool).WithLogger(logger)
 			w := tenant.NewAliasStalwartSyncWorker(pool, aliasSync, logger)
 			regs = append(regs, workerRegistration{name: "alias-stalwart-sync", run: w.Run})
 		}

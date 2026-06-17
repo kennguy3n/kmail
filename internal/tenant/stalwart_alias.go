@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -77,6 +78,11 @@ type StalwartAliasHTTPSync struct {
 	// tests), production wires it via WithLockPool so concurrent
 	// add/remove for one principal can't clobber each other.
 	lockPool *pgxpool.Pool
+	// logger records best-effort failures that have no caller to
+	// surface them — currently the advisory-unlock on the pooled
+	// connection (see withPrincipalLock). Optional: nil disables
+	// that logging (unit tests); production wires it via WithLogger.
+	logger *log.Logger
 }
 
 // NewStalwartAliasHTTPSync constructs a sync wired to the given
@@ -123,6 +129,16 @@ func (s *StalwartAliasHTTPSync) WithHTTPClient(c *http.Client) *StalwartAliasHTT
 func (s *StalwartAliasHTTPSync) WithLockPool(pool *pgxpool.Pool) *StalwartAliasHTTPSync {
 	cp := *s
 	cp.lockPool = pool
+	return &cp
+}
+
+// WithLogger returns a copy of the sync wired to a logger used for
+// best-effort failures that are not returned to a caller — currently
+// the advisory-unlock in withPrincipalLock. A nil logger leaves that
+// logging disabled.
+func (s *StalwartAliasHTTPSync) WithLogger(l *log.Logger) *StalwartAliasHTTPSync {
+	cp := *s
+	cp.logger = l
 	return &cp
 }
 
@@ -243,11 +259,13 @@ func (s *StalwartAliasHTTPSync) syncAlias(ctx context.Context, tenantID, stalwar
 //
 // The lock is a blocking acquire on a dedicated pooled connection
 // (a waiter proceeds once the holder finishes), bounded by ctx, and
-// released before the connection returns to the pool. hashtext
-// keeps the key inside int4 like the audit-log lock; a hash
-// collision only causes two unrelated principals to occasionally
-// serialise, never an incorrect result. When no pool is wired fn
-// runs without locking (unit tests drive the sync single-threaded).
+// released before the connection returns to the pool. The key is
+// hashed with the 64-bit hashtextextended into pg_advisory_lock's
+// single bigint keyspace; over a 64-bit space a collision is
+// vanishingly unlikely and would only cause two unrelated principals
+// to serialise occasionally, never an incorrect result. When no pool
+// is wired fn runs without locking (unit tests drive the sync
+// single-threaded).
 func (s *StalwartAliasHTTPSync) withPrincipalLock(ctx context.Context, key string, fn func() error) error {
 	if s.lockPool == nil {
 		return fn()
@@ -258,16 +276,24 @@ func (s *StalwartAliasHTTPSync) withPrincipalLock(ctx context.Context, key strin
 	}
 	defer conn.Release()
 	if _, err := conn.Exec(ctx,
-		`SELECT pg_advisory_lock(hashtext('kmail.alias_sync:' || $1))`, key,
+		`SELECT pg_advisory_lock(hashtextextended('kmail.alias_sync:' || $1, 0))`, key,
 	); err != nil {
 		return fmt.Errorf("stalwart alias sync: acquire advisory lock: %w", err)
 	}
 	// Release on a background context: fn most often returns because
 	// its own ctx was cancelled, and the unlock must still run so the
-	// lock isn't left dangling on the pooled connection.
+	// lock isn't left dangling on the pooled connection. A failed
+	// unlock is logged (when a logger is wired) rather than swallowed,
+	// so a dangling lock — which would serialise every later sync for
+	// this principal until the connection is recycled — is at least
+	// observable; it can't be returned because fn's result is
+	// authoritative.
 	defer func() {
-		_, _ = conn.Exec(context.Background(),
-			`SELECT pg_advisory_unlock(hashtext('kmail.alias_sync:' || $1))`, key)
+		if _, uerr := conn.Exec(context.Background(),
+			`SELECT pg_advisory_unlock(hashtextextended('kmail.alias_sync:' || $1, 0))`, key,
+		); uerr != nil && s.logger != nil {
+			s.logger.Printf("stalwart alias sync: advisory unlock for %q: %v", key, uerr)
+		}
 	}()
 	return fn()
 }
@@ -309,7 +335,12 @@ func (s *StalwartAliasHTTPSync) resolvePrincipal(ctx context.Context, shardURL, 
 			return stalwartAccount{}, err
 		}
 		for _, a := range byName {
-			if a.ID == ids[0] {
+			// Confirm the resolved principal's name actually matches
+			// the identifier we queried for (case-insensitively),
+			// symmetric with the exact emailAddress confirmation in
+			// strategy 3, so a broadened name filter can never bind
+			// us to an unrelated principal.
+			if a.ID == ids[0] && strings.EqualFold(a.Name, identifier) {
 				return a, nil
 			}
 		}
