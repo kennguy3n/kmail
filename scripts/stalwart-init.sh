@@ -81,6 +81,12 @@ VALKEY_URL=${VALKEY_URL:-redis://valkey:6379}
 # default without surprising the validator.
 DEV_DOMAIN=${KMAIL_DEV_TENANT_DOMAIN:-kmail.dev}
 
+# Mailbox principal provisioned under DEV_DOMAIN so the e2e / smoke
+# harness has a real account (and its auto-created folder tree) to
+# read over JMAP. Matches the `stalwart_account_id` seeded by
+# scripts/seed-dev-tenant.sql.
+DEV_ACCOUNT_NAME=${KMAIL_DEV_ACCOUNT_NAME:-kmail-dev}
+
 log() { printf '[stalwart-init] %s\n' "$*"; }
 
 # ------------------------------------------------------------------
@@ -219,6 +225,46 @@ else
     log "domain ${DEV_DOMAIN} created"
   else
     log "failed to create domain ${DEV_DOMAIN}: ${response}"
+    exit 1
+  fi
+fi
+
+# ------------------------------------------------------------------
+# kmail-dev mailbox principal.
+#
+# The e2e / smoke harness reads a real mailbox over JMAP, which
+# requires an actual principal — Stalwart auto-creates the Inbox /
+# Drafts / Sent / Junk folder tree on create. Stalwart v0.16.0
+# dropped the REST `/api/principal` surface; principals are now
+# created via the custom `x:Account/set` JMAP method with a root
+# `@type` of "User" and the parent domain's server-assigned id.
+# Non-singleton, so we query first to keep re-runs idempotent.
+# ------------------------------------------------------------------
+log "creating kmail-dev mailbox principal ${DEV_ACCOUNT_NAME}"
+
+# Resolve the domain's server-assigned id (needed as `domainId` on
+# the principal). The domain was ensured above, so this query
+# returns exactly one id.
+DOMAIN_LOOKUP_ARGS=$(printf '{"accountId":"%s","filter":{"name":"%s"}}' "$ADMIN_ACCOUNT_ID" "$DEV_DOMAIN")
+domain_lookup=$(jmap_call "x:Domain/query" "$DOMAIN_LOOKUP_ARGS")
+DOMAIN_ID=$(printf '%s' "$domain_lookup" | sed -n 's/.*"ids":\["\([^"]*\)".*/\1/p')
+if [ -z "$DOMAIN_ID" ]; then
+  log "failed to resolve domain id for ${DEV_DOMAIN}: ${domain_lookup}"
+  exit 1
+fi
+
+ACCOUNT_QUERY_ARGS=$(printf '{"accountId":"%s","filter":{"name":"%s"}}' "$ADMIN_ACCOUNT_ID" "$DEV_ACCOUNT_NAME")
+existing_account=$(jmap_call "x:Account/query" "$ACCOUNT_QUERY_ARGS")
+if printf '%s' "$existing_account" | grep -q '"ids":\["[^"]'; then
+  log "principal ${DEV_ACCOUNT_NAME} already exists, skipping"
+else
+  ACCOUNT_SET_ARGS=$(printf '{"accountId":"%s","create":{"u":{"@type":"User","name":"%s","domainId":"%s"}}}' \
+    "$ADMIN_ACCOUNT_ID" "$DEV_ACCOUNT_NAME" "$DOMAIN_ID")
+  response=$(jmap_call "x:Account/set" "$ACCOUNT_SET_ARGS")
+  if printf '%s' "$response" | grep -q '"created":{"u":'; then
+    log "principal ${DEV_ACCOUNT_NAME} created (domainId=${DOMAIN_ID})"
+  else
+    log "failed to create principal ${DEV_ACCOUNT_NAME}: ${response}"
     exit 1
   fi
 fi

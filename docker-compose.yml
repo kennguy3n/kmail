@@ -485,11 +485,15 @@ services:
       #     cold start produces log lines, NOT worker returns — the
       #     supervisor only restarts on a return or panic, so there is
       #     no cold-start restart-loop to prevent.
-      #  2. It would be fragile. stalwart-init is a one-shot whose
-      #     terminal (non-essential) spam-filter tuning hard-exits 1
-      #     under `set -eu` if the pinned Stalwart image rejects
-      #     `x:Setting/set`; gating on its success would then leave the
-      #     worker permanently `Created` and never started.
+      #  2. Its exit code is a poor gate. stalwart-init is a one-shot
+      #     whose terminal spam-filter tuning is best-effort: if the
+      #     pinned Stalwart image rejects `x:Setting/set` it now
+      #     logs-and-skips rather than exiting 1 (see the
+      #     `configure_spam_filter` wrapper in scripts/stalwart-init.sh),
+      #     so a clean exit no longer implies that tuning actually ran.
+      #     Gating the worker on it would couple worker startup to an
+      #     init step whose success is decoupled from the worker's
+      #     real backend dependencies.
       #
       # The full mail stack still comes up: `docker compose
       # --profile workers up` (no service arg) starts every

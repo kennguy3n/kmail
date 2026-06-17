@@ -667,6 +667,14 @@ jobs:
           DATABASE_URL: postgresql://kmail:kmail@localhost:5432/kmail
           VALKEY_URL: redis://localhost:6379
           STALWART_URL: http://localhost:8080
+          # DEV/CI-only: the official stalwartlabs/stalwart image does
+          # not implement the X-KMail-* header-trust the production BFF
+          # relies on over mTLS, so in dev/CI the proxy authenticates to
+          # Stalwart as the recovery admin (Basic). Gated on
+          # KMAIL_ENV=development in cmd/kmail-api/main.go; the prod
+          # mTLS path is untouched.
+          KMAIL_STALWART_ADMIN_USER: admin
+          KMAIL_STALWART_ADMIN_PASS: kmail-dev
           KCHAT_OIDC_ISSUER: ""
           KCHAT_OIDC_AUDIENCE: ""
           ZK_FABRIC_S3_URL: http://localhost:9080

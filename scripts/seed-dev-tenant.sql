@@ -15,9 +15,23 @@
 -- moment they try to drive a JMAP method through the proxy.
 --
 -- The dev tenant lives at a fixed UUID so it is stable across
--- compose stack tear-downs and re-creations. The `kmail-dev`
--- Stalwart account ID matches the one the `scripts/stalwart-init.sh`
--- bootstrap creates on the upstream side.
+-- compose stack tear-downs and re-creations.
+--
+-- `stalwart_account_id` is the server-assigned JMAP id of the
+-- `kmail-dev` principal that `scripts/stalwart-init.sh` provisions
+-- (via `x:Account/set`). On a fresh registry that principal is the
+-- first one created after the recovery admin, so Stalwart assigns
+-- it the deterministic id `b` (the recovery admin is `d333333`).
+-- In production the BFF passes this id to Stalwart as the
+-- `X-KMail-Stalwart-Account-Id` header so the mail core acts as the
+-- right principal. NOTE: the official `stalwartlabs/stalwart` image
+-- used by the dev/CI stack does NOT implement that header-trust
+-- feature, so in dev/CI the proxy authenticates as the recovery
+-- admin (Basic) instead and the queried account is taken from the
+-- JMAP request body (the e2e harness derives it from
+-- `/jmap/session`). The value here therefore only needs to be a
+-- valid, non-empty id so `resolveAccount` finds a row rather than
+-- returning `accountNotFound`.
 --
 -- Idempotent: ON CONFLICT (id) and ON CONFLICT (tenant_id,
 -- kchat_user_id) ensure re-runs over an already-seeded database are
@@ -51,8 +65,8 @@ VALUES (
     '00000000-0000-0000-0000-000000000001'::uuid,
     '00000000-0000-0000-0000-000000000000'::uuid,
     'dev-user',
-    'kmail-dev',
-    'dev@kmail-dev',
+    'b',
+    'dev-user@kmail.dev',
     'KMail Dev User',
     'owner',
     'active'

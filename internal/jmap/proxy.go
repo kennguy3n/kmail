@@ -67,6 +67,20 @@ type ProxyConfig struct {
 	// in compose dev, HTTPS without a client cert in staging.
 	TLS *ClientTLSConfig
 
+	// DevStalwartAuthHeader, when non-empty, is the exact value the
+	// proxy sets on the outbound `Authorization` header instead of
+	// stripping it. It exists ONLY for the dev/CI stack: the
+	// official Stalwart image cannot authenticate the BFF over the
+	// production mTLS header-trust path (it does not implement the
+	// `X-KMail-*` trust feature), so to exercise the real mail data
+	// plane the dev BFF authenticates with the recovery-admin Basic
+	// credential instead. In production this stays empty and the
+	// proxy strips `Authorization`, deferring to the mTLS client
+	// certificate for caller authentication (see
+	// `docs/JMAP-CONTRACT.md` §3.2). Wired in `cmd/kmail-api/main.go`
+	// only when `middleware.IsDevEnv(cfg.Env)` is true.
+	DevStalwartAuthHeader string
+
 	// AccountCacheTTL controls how long the `(tenant_id, kchat_user_id)
 	// → stalwart_account_id` cache entries live. Defaults to 5
 	// minutes per `docs/JMAP-CONTRACT.md` §3.3.
@@ -737,7 +751,6 @@ type Proxy struct {
 	logger  *log.Logger
 	cache   *accountCache
 	target  *url.URL
-	stripPR string
 
 	// base is the underlying BFF→Stalwart transport (mTLS-aware
 	// when `cfg.TLS != nil`, the default transport otherwise).
@@ -980,7 +993,6 @@ func NewProxy(cfg ProxyConfig) (*Proxy, error) {
 		logger:  logger,
 		cache:   newAccountCache(ttl),
 		target:  target,
-		stripPR: "/jmap",
 		breaker: breaker,
 	}
 	// Migrate the static `ProxyConfig.SendInterceptor` (if any) into
@@ -1401,10 +1413,10 @@ func (p *Proxy) resolveShardURLsUncached(ctx context.Context, tenantID string) [
 }
 
 // rewrite adapts the incoming request to the upstream Stalwart URL.
-// It strips the `/jmap` prefix so clients can hit `/jmap/session`
-// and Stalwart sees `/session`, and injects the resolved Stalwart
-// account ID as a header the upstream can trust in internal-network
-// deployments.
+// It forwards the request path unchanged — Stalwart serves JMAP at
+// `/jmap` and `/jmap/session`, which are exactly the paths the BFF
+// exposes — and injects the resolved Stalwart account ID as a header
+// the upstream can trust in internal-network deployments.
 func (p *Proxy) rewrite(r *httputil.ProxyRequest) {
 	accountID := middleware.StalwartAccountIDFrom(r.In.Context())
 	tenantID := middleware.TenantIDFrom(r.In.Context())
@@ -1412,40 +1424,40 @@ func (p *Proxy) rewrite(r *httputil.ProxyRequest) {
 
 	r.SetURL(p.target)
 	r.Out.Host = p.target.Host
-
-	// Strip the `/jmap` prefix from the outgoing path so the
-	// upstream sees the JMAP path it actually implements. Leave
-	// trailing `/` and deeper paths intact. Clear RawPath so
-	// net/url regenerates it from the rewritten Path — otherwise a
-	// non-empty RawPath (set whenever the incoming URL contained
-	// percent-encoded bytes) would win inside RequestURI() and the
-	// upstream would still see `/jmap`.
-	outPath := r.Out.URL.Path
-	if strings.HasPrefix(outPath, p.stripPR) {
-		trimmed := strings.TrimPrefix(outPath, p.stripPR)
-		if trimmed == "" {
-			trimmed = "/"
-		}
-		r.Out.URL.Path = trimmed
-		r.Out.URL.RawPath = ""
-	}
+	// Path is forwarded as-is: `SetURL` joins the (empty) target
+	// path with the inbound path, so `/jmap/session` stays
+	// `/jmap/session` and POST `/jmap` stays `/jmap`. Stalwart
+	// serves JMAP under `/jmap` (root `/` is the admin UI), so the
+	// prefix must be preserved.
 
 	r.Out.Header.Set("X-KMail-Tenant-Id", tenantID)
 	r.Out.Header.Set("X-KMail-Kchat-User-Id", kchatUserID)
 	if accountID != "" {
 		r.Out.Header.Set("X-KMail-Stalwart-Account-Id", accountID)
 	}
-	// The BFF authenticates itself to Stalwart via the mutual-TLS
-	// client certificate presented by the transport (see
+	// Production: the BFF authenticates itself to Stalwart via the
+	// mutual-TLS client certificate presented by the transport (see
 	// `ClientTLSConfig`). Stalwart pins the issuing CA and refuses
-	// any connection that does not chain to it, so the
-	// X-KMail-* identity headers are only honoured for callers
-	// the transport already vouched for cryptographically. The
-	// inbound `Authorization` header (the user's OIDC bearer) is
-	// stripped because Stalwart neither needs it nor trusts it —
-	// the BFF is the authentication boundary, the mTLS handshake
-	// is the BFF→Stalwart trust boundary.
-	r.Out.Header.Del("Authorization")
+	// any connection that does not chain to it, so the X-KMail-*
+	// identity headers are only honoured for callers the transport
+	// already vouched for cryptographically. The inbound
+	// `Authorization` header (the user's OIDC bearer) is stripped
+	// because Stalwart neither needs it nor trusts it — the BFF is
+	// the authentication boundary, the mTLS handshake is the
+	// BFF→Stalwart trust boundary.
+	//
+	// Dev/CI only: `DevStalwartAuthHeader` is set (see ProxyConfig)
+	// because the official Stalwart image does not implement the
+	// X-KMail-* header-trust feature and would 401 the plain-HTTP
+	// BFF. We replace `Authorization` with the recovery-admin Basic
+	// credential so the smoke tests exercise a real mailbox. This
+	// branch is unreachable in production (the env gate in main.go
+	// leaves the field empty).
+	if p.cfg.DevStalwartAuthHeader != "" {
+		r.Out.Header.Set("Authorization", p.cfg.DevStalwartAuthHeader)
+	} else {
+		r.Out.Header.Del("Authorization")
+	}
 }
 
 // errorHandler maps upstream failures into BFF-visible errors per
