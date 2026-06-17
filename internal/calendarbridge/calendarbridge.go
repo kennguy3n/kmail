@@ -52,11 +52,11 @@ type Config struct {
 	// requests (timeouts, transport tuning). Defaults to an
 	// http.Client with a 15s timeout.
 	HTTPClient *http.Client
-	// Logger, when set, records CalDAV account-name resolution
+	// Logger, when set, records CalDAV account-email resolution
 	// failures (see davAccount). A hard lookup failure means the
-	// bridge falls back to the raw JMAP id, which Stalwart serves at
-	// a different DAV path — so every CalDAV call for that principal
-	// 404s. Logging makes a misconfigured admin credential or an
+	// bridge falls back to the raw JMAP id, which Stalwart cannot
+	// resolve to a DAV principal — so every CalDAV call for that
+	// principal 404s. Logging makes a misconfigured admin credential or an
 	// unreachable Stalwart visible instead of silently degrading.
 	// nil disables this logging (e.g. the JMAP-first prod path, where
 	// davAccount is a no-op because no admin credential is set).
@@ -67,34 +67,34 @@ type Config struct {
 // enough — the proxy is stateless across requests.
 type Service struct {
 	cfg Config
-	// nameCache memoises JMAP account id -> CalDAV account name
+	// emailCache memoises JMAP account id -> CalDAV account email
 	// lookups (see davAccount). The mapping is effectively stable,
 	// but the cache is both size- and time-bounded: the LRU size
 	// caps memory on a BFF instance fronting very many principals,
 	// and the TTL bounds how long a stale mapping survives if an
-	// admin renames a principal mid-process (after which the entry
-	// is re-resolved with one cheap x:Account/get). Only successful
-	// resolutions are stored, so a transient lookup failure is
-	// retried rather than poisoned. The expirable LRU is internally
-	// synchronised, so no extra mutex.
-	nameCache *lru.LRU[string, string]
-	// nameSF collapses concurrent lookups for the same account id
+	// admin changes a principal's email mid-process (after which the
+	// entry is re-resolved with one cheap x:Account/get). Only
+	// successful resolutions are stored, so a transient lookup
+	// failure is retried rather than poisoned. The expirable LRU is
+	// internally synchronised, so no extra mutex.
+	emailCache *lru.LRU[string, string]
+	// emailSF collapses concurrent lookups for the same account id
 	// into a single in-flight x:Account/get call.
-	nameSF singleflight.Group
+	emailSF singleflight.Group
 }
 
 const (
-	// nameCacheMaxEntries caps the id->name cache as a memory guard
+	// emailCacheMaxEntries caps the id->email cache as a memory guard
 	// for a BFF instance fronting a very large number of distinct
 	// principals. At ~64 B per entry, 50,000 entries stays well
 	// under ~4 MiB.
-	nameCacheMaxEntries = 50_000
-	// nameCacheTTL bounds staleness after a principal rename and
-	// mirrors the JMAP proxy's accountCache / shard resolver TTL so
-	// all three identity caches age out consistently. The id->name
-	// mapping rarely changes, so re-resolving every 5 min is a
-	// negligible extra x:Account/get per active principal.
-	nameCacheTTL = 5 * time.Minute
+	emailCacheMaxEntries = 50_000
+	// emailCacheTTL bounds staleness after a principal email change
+	// and mirrors the JMAP proxy's accountCache / shard resolver TTL
+	// so all three identity caches age out consistently. The
+	// id->email mapping rarely changes, so re-resolving every 5 min
+	// is a negligible extra x:Account/get per active principal.
+	emailCacheTTL = 5 * time.Minute
 )
 
 // DevAdminConfig builds the calendar-bridge Config shared by
@@ -105,7 +105,7 @@ const (
 // authenticates to Stalwart via mTLS upstream rather than Basic.
 // Centralising the gating here keeps the two entrypoints from
 // drifting — if they wired the credentials differently the bridge
-// would resolve CalDAV names in one process but 404 in the other.
+// would resolve CalDAV emails in one process but 404 in the other.
 func DevAdminConfig(stalwartURL string, devEnv bool, logger *log.Logger) Config {
 	cfg := Config{StalwartURL: stalwartURL}
 	if devEnv {
@@ -124,8 +124,8 @@ func NewService(cfg Config) *Service {
 		cfg.HTTPClient = &http.Client{Timeout: 15 * time.Second}
 	}
 	return &Service{
-		cfg:       cfg,
-		nameCache: lru.NewLRU[string, string](nameCacheMaxEntries, nil, nameCacheTTL),
+		cfg:        cfg,
+		emailCache: lru.NewLRU[string, string](emailCacheMaxEntries, nil, emailCacheTTL),
 	}
 }
 
@@ -369,24 +369,25 @@ func (s *Service) eventPath(ctx context.Context, accountID, calendarID, eventUID
 	return s.calendarPath(ctx, accountID, calendarID) + url.PathEscape(eventUID) + ".ics"
 }
 
-// davAccount maps a JMAP account id to the account *name* Stalwart
-// uses to key CalDAV collections (`/dav/cal/{name}/`). The BFF
-// resolves callers to their JMAP account id, but DAV paths require
-// the principal name, and the two are distinct identifiers in
-// Stalwart. When the bridge holds admin credentials it asks
-// Stalwart for the name via the `x:Account/get` management method
-// and memoises the result; without credentials — or on any lookup
-// failure — it returns the id unchanged so the path scheme is at
-// least correct.
+// davAccount maps a JMAP account id to the account *email* Stalwart
+// uses to key CalDAV collections (`/dav/cal/{email}/`). Stalwart
+// resolves a DAV path's principal segment via the account's email
+// address (crates/dav/src/common/uri.rs -> account_id_from_email),
+// so a bare login name 404s; the BFF resolves callers to their
+// JMAP account id, which is a third, distinct identifier. When the
+// bridge holds admin credentials it asks Stalwart for the email via
+// the `x:Account/get` management method and memoises the result;
+// without credentials — or on any lookup failure — it returns the
+// id unchanged (in production the id is already the email).
 func (s *Service) davAccount(ctx context.Context, accountID string) string {
 	if accountID == "" || s.cfg.AdminUser == "" {
 		return accountID
 	}
-	if cached, ok := s.nameCache.Get(accountID); ok {
+	if cached, ok := s.emailCache.Get(accountID); ok {
 		return cached
 	}
-	// Dedupe concurrent lookups and only memoise a *resolved* name.
-	// On any failure lookupAccountName returns ""; we then fall back
+	// Dedupe concurrent lookups and only memoise a *resolved* email.
+	// On any failure lookupAccountEmail returns ""; we then fall back
 	// to the raw id for this call without caching it, so the next
 	// request retries once Stalwart recovers. This also removes the
 	// race where a failing goroutine could overwrite another's
@@ -395,31 +396,32 @@ func (s *Service) davAccount(ctx context.Context, accountID string) string {
 	// as opposed to a clean not-found) is logged once per attempt
 	// inside the deduped closure so a persistent misconfiguration is
 	// observable rather than silently 404-ing every CalDAV call.
-	v, _, _ := s.nameSF.Do(accountID, func() (interface{}, error) {
-		name, lookupErr := s.lookupAccountName(ctx, accountID)
-		if name != "" {
-			s.nameCache.Add(accountID, name)
+	v, _, _ := s.emailSF.Do(accountID, func() (interface{}, error) {
+		email, lookupErr := s.lookupAccountEmail(ctx, accountID)
+		if email != "" {
+			s.emailCache.Add(accountID, email)
 		} else if lookupErr != nil && s.cfg.Logger != nil {
-			s.cfg.Logger.Printf("calendarbridge: resolve CalDAV name for account %q failed (falling back to id, CalDAV calls will 404): %v", accountID, lookupErr)
+			s.cfg.Logger.Printf("calendarbridge: resolve CalDAV email for account %q failed (falling back to id, CalDAV calls will 404): %v", accountID, lookupErr)
 		}
-		return name, nil
+		return email, nil
 	})
-	if name, _ := v.(string); name != "" {
-		return name
+	if email, _ := v.(string); email != "" {
+		return email
 	}
 	return accountID
 }
 
-// lookupAccountName issues a single `x:Account/get` JMAP call as the
-// admin principal and returns the resolved account name. It returns
-// a non-nil error for *hard* failures (transport, non-2xx, or a
+// lookupAccountEmail issues a single `x:Account/get` JMAP call as the
+// admin principal and returns the resolved account email address —
+// the identifier Stalwart keys DAV collections by. It returns a
+// non-nil error for *hard* failures (transport, non-2xx, or a
 // malformed response) so the caller can surface a misconfiguration;
 // a successful call that simply doesn't contain the requested id
 // (e.g. an unprovisioned principal) returns ("", nil) since that is
 // an expected, non-alarming outcome. Stalwart ignores the
 // `accountId` envelope field for this management method, so an
 // empty value is fine.
-func (s *Service) lookupAccountName(ctx context.Context, accountID string) (string, error) {
+func (s *Service) lookupAccountEmail(ctx context.Context, accountID string) (string, error) {
 	ids, err := json.Marshal([]string{accountID})
 	if err != nil {
 		return "", err
@@ -473,8 +475,8 @@ func (s *Service) lookupAccountName(ctx context.Context, accountID string) (stri
 	}
 	var result struct {
 		List []struct {
-			ID   string `json:"id"`
-			Name string `json:"name"`
+			ID    string `json:"id"`
+			Email string `json:"emailAddress"`
 		} `json:"list"`
 	}
 	if err := json.Unmarshal(envelope.MethodResponses[0][1], &result); err != nil {
@@ -483,12 +485,12 @@ func (s *Service) lookupAccountName(ctx context.Context, accountID string) (stri
 	// Match strictly on the requested id. The request passes
 	// `ids:[accountID]`, so Stalwart returns at most that one
 	// account; we never fall back to an arbitrary list entry,
-	// which could otherwise cache a *different* principal's name
+	// which could otherwise cache a *different* principal's email
 	// and route every subsequent CalDAV call for this account to
 	// the wrong calendar home.
 	for _, a := range result.List {
-		if a.ID == accountID && a.Name != "" {
-			return a.Name, nil
+		if a.ID == accountID && a.Email != "" {
+			return a.Email, nil
 		}
 	}
 	return "", nil
