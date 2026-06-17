@@ -12,10 +12,15 @@
 # only asserts the protocol surface those clients depend on.
 #
 # Inputs (all have sensible compose-stack defaults):
-#   CALDAV_URL       — base URL including /dav/calendars/ path
-#                      (default http://localhost:8080/dav/calendars/)
-#   CALDAV_USER      — full email address
+#   CALDAV_URL       — CalDAV root URL (default
+#                      http://localhost:8080/dav/cal/). The official
+#                      v0.16.0 image serves collections under
+#                      /dav/cal/{account-name}/.
+#   CALDAV_USER      — full email address (used for Basic auth)
 #   CALDAV_PASS      — password for CALDAV_USER
+#   CALDAV_ACCOUNT   — principal name that keys the CalDAV home
+#                      (default: local-part of CALDAV_USER). Stalwart
+#                      keys /dav/cal/ by principal name, not email.
 #   CALDAV_CALENDAR  — collection name within the user's home
 #                      (default "default")
 #
@@ -25,9 +30,10 @@
 
 set -eu
 
-CALDAV_URL=${CALDAV_URL:-http://localhost:8080/dav/calendars/}
+CALDAV_URL=${CALDAV_URL:-http://localhost:8080/dav/cal/}
 CALDAV_USER=${CALDAV_USER:-}
 CALDAV_PASS=${CALDAV_PASS:-}
+CALDAV_ACCOUNT=${CALDAV_ACCOUNT:-${CALDAV_USER%%@*}}
 CALDAV_CALENDAR=${CALDAV_CALENDAR:-default}
 
 log()  { printf '[test-caldav] %s\n' "$*"; }
@@ -40,7 +46,7 @@ command -v curl >/dev/null 2>&1 || fail "curl is required"
 
 # Strip any trailing slash + rebuild predictable paths.
 BASE=$(printf '%s' "$CALDAV_URL" | sed 's:/*$::')
-HOME_URL="${BASE}/${CALDAV_USER}/"
+HOME_URL="${BASE}/${CALDAV_ACCOUNT}/"
 CAL_URL="${HOME_URL}${CALDAV_CALENDAR}/"
 UID_STR="kmail-compat-$(date +%s)-$$"
 EVT_URL="${CAL_URL}${UID_STR}.ics"
