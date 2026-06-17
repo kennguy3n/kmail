@@ -40,10 +40,7 @@ pub mod notification;
 pub mod push;
 pub mod sync;
 
-pub use client::{
-    BackgroundSyncHandle, ClientConfig, KMailClient, PushIngestOutcome, SyncSummary,
-};
-pub use notification::LocalNotification;
+pub use client::{BackgroundSyncHandle, ClientConfig, KMailClient, PushIngestOutcome, SyncSummary};
 pub use crypto::{
     AeadEnvelope, ConfidentialEnvelope, KeyMaterial, MlsKeyProvider, StaticMlsKeyProvider,
 };
@@ -51,3 +48,4 @@ pub use error::{Error, Result};
 pub use models::{
     Email, EmailAddress, EmailDraft, EmailSummary, JmapAccount, JmapSession, Mailbox, MailboxRole,
 };
+pub use notification::LocalNotification;
