@@ -851,6 +851,14 @@ func (p *Proxy) BaseTransport() http.RoundTripper { return p.base }
 // is configured.
 func (p *Proxy) Target() *url.URL { return p.target }
 
+// DevStalwartAuthHeader returns the dev/CI `Authorization` header
+// value the proxy stamps on outbound requests (see
+// `ProxyConfig.DevStalwartAuthHeader`). It is non-empty only in the
+// dev/CI stack; production returns "". `InternalClient` reads it so
+// BFF-initiated JMAP calls authenticate to the official Stalwart
+// image the same way proxied traffic does instead of 401-ing.
+func (p *Proxy) DevStalwartAuthHeader() string { return p.cfg.DevStalwartAuthHeader }
+
 // Logger returns the proxy's logger so colocated helpers can emit
 // to the same destination.
 func (p *Proxy) Logger() *log.Logger { return p.logger }
@@ -982,6 +990,16 @@ func NewProxy(cfg ProxyConfig) (*Proxy, error) {
 	target, err := url.Parse(cfg.StalwartURL)
 	if err != nil {
 		return nil, fmt.Errorf("jmap.NewProxy: parse StalwartURL: %w", err)
+	}
+	// The proxy forwards inbound JMAP paths verbatim: `SetURL(target)`
+	// joins the request path onto the target, which only yields the
+	// correct upstream path (`/jmap/session`, `/jmap/api`) when the
+	// target has no path of its own. A configured path like
+	// `http://stalwart:8080/api/` would produce `/api/jmap/session`,
+	// and `InternalClient`'s own joinPath would be skewed the same
+	// way. Fail fast at startup rather than misroute every request.
+	if p := strings.TrimRight(target.Path, "/"); p != "" {
+		return nil, fmt.Errorf("jmap.NewProxy: StalwartURL %q must not include a path (got %q); use a bare scheme://host:port", cfg.StalwartURL, target.Path)
 	}
 	logger := cfg.Logger
 	if logger == nil {

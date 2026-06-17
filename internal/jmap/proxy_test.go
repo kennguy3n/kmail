@@ -93,6 +93,39 @@ func TestNewProxy_RequiresPool(t *testing.T) {
 	}
 }
 
+// TestNewProxy_RejectsStalwartURLWithPath pins the fail-fast guard:
+// the proxy forwards inbound JMAP paths verbatim onto the target, so
+// a StalwartURL carrying its own path would misroute every request
+// (e.g. `/api/` + `/jmap/session` → `/api/jmap/session`). A bare
+// host:port (with or without a trailing slash) must be accepted.
+func TestNewProxy_RejectsStalwartURLWithPath(t *testing.T) {
+	t.Parallel()
+	for _, ok := range []string{
+		"http://stalwart.test",
+		"http://stalwart.test/",
+		"http://stalwart.test:8080",
+		"https://stalwart.test:8443/",
+	} {
+		if _, err := NewProxy(ProxyConfig{StalwartURL: ok, Pool: newDummyPool(t), Logger: log.New(io.Discard, "", 0)}); err != nil {
+			t.Errorf("NewProxy(%q) unexpected error: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{
+		"http://stalwart.test/api",
+		"http://stalwart.test/api/",
+		"http://stalwart.test:8080/jmap",
+	} {
+		_, err := NewProxy(ProxyConfig{StalwartURL: bad, Pool: newDummyPool(t), Logger: log.New(io.Discard, "", 0)})
+		if err == nil {
+			t.Errorf("NewProxy(%q): expected error for non-empty path", bad)
+			continue
+		}
+		if !strings.Contains(err.Error(), "must not include a path") {
+			t.Errorf("NewProxy(%q): err = %v, want it to mention the path constraint", bad, err)
+		}
+	}
+}
+
 // stubInterceptor is a no-op SendInterceptor used to assert which
 // interceptor (if any) is wired and active at a given point.
 type stubInterceptor struct {
