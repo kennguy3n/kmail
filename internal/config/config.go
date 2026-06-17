@@ -791,7 +791,7 @@ func GetenvInt64(key string, fallback int64) int64 {
 // config for startup logging.
 func (c *Config) String() string {
 	return fmt.Sprintf(
-		"Config{HTTP.Addr=%s DatabaseURL=%s StalwartURL=%s ValkeyURL=%s KChatOIDCIssuer=%s DevBypass=%t ZKFabric.S3URL=%s ZKFabric.ConsoleURL=%s ZKFabric.Keys=%t IAMCore.Enabled=%t IAMCore.MgmtURL=%s IAMCore.LazyProvision=%t}",
+		"Config{HTTP.Addr=%s DatabaseURL=%s StalwartURL=%s ValkeyURL=%s KChatOIDCIssuer=%s DevBypass=%t ZKFabric.S3URL=%s ZKFabric.ConsoleURL=%s ZKFabric.Keys=%t IAMCore.Enabled=%t IAMCore.MgmtURL=%s IAMCore.LazyProvision=%t StalwartOIDC.Enabled=%t}",
 		c.HTTP.Addr,
 		redactDSN(c.DatabaseURL),
 		c.StalwartURL,
@@ -816,6 +816,10 @@ func (c *Config) String() string {
 		c.IAMCore.Enabled(),
 		c.IAMCore.MgmtURL,
 		c.IAMCore.LazyProvision,
+		// StalwartOIDC: only the on/off toggle is logged; the issuer,
+		// signing key, and kid are surfaced separately (and safely) by
+		// cmd/kmail-api at startup when minting is enabled.
+		c.StalwartOIDC.Enabled(),
 	)
 }
 

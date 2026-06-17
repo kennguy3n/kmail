@@ -219,6 +219,16 @@ through the admin JMAP API rather than a config file:
 the configured issuer) and is run after kmail-api is up. See
 `configs/stalwart.example.toml` for the annotated record shape.
 
+**Key rotation.** The BFF serves a single JWK and computes the
+discovery/JWKS documents once at startup, so rotating the signing key
+means rolling the BFF (e.g. a new pod with the new key). Because the
+JWKS endpoint advertises `Cache-Control: max-age=300` and minted
+tokens live ~5 minutes, plan for a worst-case ~10-minute overlap in
+which Stalwart may still hold the previous JWKS while old tokens drain.
+For zero-downtime rotation, publish the new key's JWK alongside the old
+one (so both verify) for at least that window before retiring the old
+key — the `kid` header lets Stalwart pick the right key per token.
+
 ### 3.3 KChat identity → Stalwart account resolution
 
 - The Tenant Service holds the mapping `(tenant_id, kchat_user_id)
