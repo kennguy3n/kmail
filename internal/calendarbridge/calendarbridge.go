@@ -57,25 +57,34 @@ type Config struct {
 type Service struct {
 	cfg Config
 	// nameCache memoises JMAP account id -> CalDAV account name
-	// lookups (see davAccount). Stalwart assigns a stable id and
-	// name per principal, so the mapping never changes for the
-	// process lifetime; the cache is bounded (LRU) only to cap
-	// memory on a BFF instance fronting very many principals. Only
-	// *successful* resolutions are stored, so a transient lookup
-	// failure is retried rather than poisoned in the cache. The
-	// expirable LRU is internally synchronised, so no extra mutex.
+	// lookups (see davAccount). The mapping is effectively stable,
+	// but the cache is both size- and time-bounded: the LRU size
+	// caps memory on a BFF instance fronting very many principals,
+	// and the TTL bounds how long a stale mapping survives if an
+	// admin renames a principal mid-process (after which the entry
+	// is re-resolved with one cheap x:Account/get). Only successful
+	// resolutions are stored, so a transient lookup failure is
+	// retried rather than poisoned. The expirable LRU is internally
+	// synchronised, so no extra mutex.
 	nameCache *lru.LRU[string, string]
 	// nameSF collapses concurrent lookups for the same account id
 	// into a single in-flight x:Account/get call.
 	nameSF singleflight.Group
 }
 
-// nameCacheMaxEntries bounds the id->name cache. The mapping is
-// stable for the process lifetime so entries never expire (ttl 0);
-// the LRU size cap is purely a memory guard for a BFF instance that
-// fronts a very large number of distinct principals. At ~64 B per
-// entry, 50,000 entries stays well under ~4 MiB.
-const nameCacheMaxEntries = 50_000
+const (
+	// nameCacheMaxEntries caps the id->name cache as a memory guard
+	// for a BFF instance fronting a very large number of distinct
+	// principals. At ~64 B per entry, 50,000 entries stays well
+	// under ~4 MiB.
+	nameCacheMaxEntries = 50_000
+	// nameCacheTTL bounds staleness after a principal rename and
+	// mirrors the JMAP proxy's accountCache / shard resolver TTL so
+	// all three identity caches age out consistently. The id->name
+	// mapping rarely changes, so re-resolving every 5 min is a
+	// negligible extra x:Account/get per active principal.
+	nameCacheTTL = 5 * time.Minute
+)
 
 // NewService builds a Service from the provided Config.
 func NewService(cfg Config) *Service {
@@ -84,7 +93,7 @@ func NewService(cfg Config) *Service {
 	}
 	return &Service{
 		cfg:       cfg,
-		nameCache: lru.NewLRU[string, string](nameCacheMaxEntries, nil, 0),
+		nameCache: lru.NewLRU[string, string](nameCacheMaxEntries, nil, nameCacheTTL),
 	}
 }
 
