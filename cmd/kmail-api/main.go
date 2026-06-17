@@ -715,6 +715,7 @@ func main() {
 		if adminUser := os.Getenv("KMAIL_STALWART_ADMIN_USER"); adminUser != "" {
 			calCfg.AdminUser = adminUser
 			calCfg.AdminPassword = os.Getenv("KMAIL_STALWART_ADMIN_PASS")
+			calCfg.Logger = logger
 		}
 	}
 	calendarSvc := calendarbridge.NewService(calCfg)

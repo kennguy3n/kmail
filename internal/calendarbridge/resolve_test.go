@@ -1,9 +1,12 @@
 package calendarbridge
 
 import (
+	"bytes"
 	"context"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 )
@@ -116,6 +119,67 @@ func TestDavAccountIgnoresMismatchedID(t *testing.T) {
 	}
 	if _, ok := svc.nameCache.Get("b"); ok {
 		t.Fatalf("mismatched lookup must not be cached")
+	}
+}
+
+// TestDavAccountLogsHardFailure asserts a *hard* resolution failure
+// (transport / non-2xx / malformed body) is logged once when a Logger
+// is configured, so a misconfigured admin credential or unreachable
+// Stalwart is observable instead of silently 404-ing every CalDAV
+// call. The call still falls back to the raw id.
+func TestDavAccountLogsHardFailure(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/jmap" {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	var buf bytes.Buffer
+	svc := NewService(Config{
+		StalwartURL:   srv.URL,
+		AdminUser:     "admin",
+		AdminPassword: "pw",
+		Logger:        log.New(&buf, "", 0),
+	})
+	if got := svc.davAccount(context.Background(), "b"); got != "b" {
+		t.Fatalf("davAccount on hard failure=%q want raw id b", got)
+	}
+	if !strings.Contains(buf.String(), `account "b"`) {
+		t.Fatalf("hard failure must be logged, got %q", buf.String())
+	}
+}
+
+// TestDavAccountSilentOnCleanNotFound asserts a clean not-found (a
+// successful x:Account/get that simply lacks the requested id, e.g.
+// an unprovisioned principal) is NOT logged — only hard failures are
+// — so an expected, non-alarming outcome doesn't generate log noise.
+func TestDavAccountSilentOnCleanNotFound(t *testing.T) {
+	const emptyList = `{"methodResponses":[["x:Account/get",{"list":[]},"0"]]}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/jmap" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(emptyList))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	var buf bytes.Buffer
+	svc := NewService(Config{
+		StalwartURL:   srv.URL,
+		AdminUser:     "admin",
+		AdminPassword: "pw",
+		Logger:        log.New(&buf, "", 0),
+	})
+	if got := svc.davAccount(context.Background(), "b"); got != "b" {
+		t.Fatalf("davAccount on clean not-found=%q want raw id b", got)
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("clean not-found must not be logged, got %q", buf.String())
 	}
 }
 

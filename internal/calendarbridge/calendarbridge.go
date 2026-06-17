@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -50,6 +51,15 @@ type Config struct {
 	// requests (timeouts, transport tuning). Defaults to an
 	// http.Client with a 15s timeout.
 	HTTPClient *http.Client
+	// Logger, when set, records CalDAV account-name resolution
+	// failures (see davAccount). A hard lookup failure means the
+	// bridge falls back to the raw JMAP id, which Stalwart serves at
+	// a different DAV path — so every CalDAV call for that principal
+	// 404s. Logging makes a misconfigured admin credential or an
+	// unreachable Stalwart visible instead of silently degrading.
+	// nil disables this logging (e.g. the JMAP-first prod path, where
+	// davAccount is a no-op because no admin credential is set).
+	Logger *log.Logger
 }
 
 // Service is the Calendar Bridge. One instance per process is
@@ -208,7 +218,7 @@ func (s *Service) CreateEvent(ctx context.Context, accountID, calendarID, icalDa
 	}
 	path := s.eventPath(ctx, accountID, calendarID, uid)
 	resp, err := s.do(ctx, http.MethodPut, path, strings.NewReader(icalData), map[string]string{
-		"Content-Type": "text/calendar; charset=utf-8",
+		"Content-Type":  "text/calendar; charset=utf-8",
 		"If-None-Match": "*",
 	})
 	if err != nil {
@@ -358,11 +368,17 @@ func (s *Service) davAccount(ctx context.Context, accountID string) string {
 	// to the raw id for this call without caching it, so the next
 	// request retries once Stalwart recovers. This also removes the
 	// race where a failing goroutine could overwrite another's
-	// successful result, since failures never touch the cache.
+	// successful result, since failures never touch the cache. A
+	// hard lookup error (transport / non-2xx / malformed response,
+	// as opposed to a clean not-found) is logged once per attempt
+	// inside the deduped closure so a persistent misconfiguration is
+	// observable rather than silently 404-ing every CalDAV call.
 	v, _, _ := s.nameSF.Do(accountID, func() (interface{}, error) {
-		name := s.lookupAccountName(ctx, accountID)
+		name, lookupErr := s.lookupAccountName(ctx, accountID)
 		if name != "" {
 			s.nameCache.Add(accountID, name)
+		} else if lookupErr != nil && s.cfg.Logger != nil {
+			s.cfg.Logger.Printf("calendarbridge: resolve CalDAV name for account %q failed (falling back to id, CalDAV calls will 404): %v", accountID, lookupErr)
 		}
 		return name, nil
 	})
@@ -373,42 +389,47 @@ func (s *Service) davAccount(ctx context.Context, accountID string) string {
 }
 
 // lookupAccountName issues a single `x:Account/get` JMAP call as the
-// admin principal and returns the resolved account name, or "" on
-// any error. Stalwart ignores the `accountId` envelope field for
-// this management method, so an empty value is fine.
-func (s *Service) lookupAccountName(ctx context.Context, accountID string) string {
+// admin principal and returns the resolved account name. It returns
+// a non-nil error for *hard* failures (transport, non-2xx, or a
+// malformed response) so the caller can surface a misconfiguration;
+// a successful call that simply doesn't contain the requested id
+// (e.g. an unprovisioned principal) returns ("", nil) since that is
+// an expected, non-alarming outcome. Stalwart ignores the
+// `accountId` envelope field for this management method, so an
+// empty value is fine.
+func (s *Service) lookupAccountName(ctx context.Context, accountID string) (string, error) {
 	ids, err := json.Marshal([]string{accountID})
 	if err != nil {
-		return ""
+		return "", err
 	}
 	body := `{"using":["urn:ietf:params:jmap:core"],"methodCalls":[["x:Account/get",{"accountId":"","ids":` + string(ids) + `},"0"]]}`
 	endpoint := strings.TrimRight(s.cfg.StalwartURL, "/") + "/jmap"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(body))
 	if err != nil {
-		return ""
+		return "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.SetBasicAuth(s.cfg.AdminUser, s.cfg.AdminPassword)
 	resp, err := s.cfg.HTTPClient.Do(req)
 	if err != nil {
-		return ""
+		return "", err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return ""
+		return "", fmt.Errorf("x:Account/get: HTTP %d", resp.StatusCode)
 	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return ""
+		return "", err
 	}
 	var envelope struct {
 		MethodResponses [][]json.RawMessage `json:"methodResponses"`
 	}
 	if err := json.Unmarshal(raw, &envelope); err != nil {
-		return ""
+		return "", err
 	}
 	if len(envelope.MethodResponses) == 0 || len(envelope.MethodResponses[0]) < 2 {
-		return ""
+		return "", fmt.Errorf("x:Account/get: malformed response envelope")
 	}
 	var result struct {
 		List []struct {
@@ -417,7 +438,7 @@ func (s *Service) lookupAccountName(ctx context.Context, accountID string) strin
 		} `json:"list"`
 	}
 	if err := json.Unmarshal(envelope.MethodResponses[0][1], &result); err != nil {
-		return ""
+		return "", err
 	}
 	// Match strictly on the requested id. The request passes
 	// `ids:[accountID]`, so Stalwart returns at most that one
@@ -427,10 +448,10 @@ func (s *Service) lookupAccountName(ctx context.Context, accountID string) strin
 	// the wrong calendar home.
 	for _, a := range result.List {
 		if a.ID == accountID && a.Name != "" {
-			return a.Name
+			return a.Name, nil
 		}
 	}
-	return ""
+	return "", nil
 }
 
 // ------------------------------------------------------------------
@@ -455,8 +476,8 @@ type multistatusResponse struct {
 		Href     string `xml:"DAV: href"`
 		Propstat []struct {
 			Prop struct {
-				DisplayName    string `xml:"DAV: displayname"`
-				ResourceType   struct {
+				DisplayName  string `xml:"DAV: displayname"`
+				ResourceType struct {
 					Calendar *struct{} `xml:"urn:ietf:params:xml:ns:caldav calendar"`
 				} `xml:"DAV: resourcetype"`
 				CalendarDescription string `xml:"urn:ietf:params:xml:ns:caldav calendar-description"`
