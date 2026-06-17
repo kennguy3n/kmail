@@ -185,6 +185,13 @@ services:
     # `http://<container-id>:8080` as the issuer and the admin SPA
     # redirects browsers to an unresolvable URL.
     hostname: localhost
+    # Lets the container resolve `host.docker.internal` to the host
+    # gateway so Stalwart can fetch the BFF's OIDC discovery + JWKS
+    # documents (the `kmail-api` BFF runs as a host process on :8088,
+    # not a compose service). Used by the production-faithful OIDC
+    # bearer path — see `scripts/provision-stalwart-oidc.sh`.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       postgres:
         condition: service_healthy

@@ -121,15 +121,41 @@ tls.implicit = true
 # ---------------------------------------------------------------
 # Authentication
 # ---------------------------------------------------------------
-# The Go BFF mints internal short-lived tokens that Stalwart
-# trusts via JWKS discovery. See docs/JMAP-CONTRACT.md §3.2 for
-# the auth injection model.
+# The Go BFF mints internal short-lived bearer tokens that Stalwart
+# validates via JWKS discovery. See docs/JMAP-CONTRACT.md §3.2 for
+# the auth model and §3.2.1 for the provisioning steps.
+#
+# IMPORTANT: there is no file-based `[auth.oidc]` block on
+# stalwartlabs/stalwart:v0.16.0 — OIDC is an internal *directory*
+# stored in the runtime registry, not TOML. The directory is
+# created through the admin JMAP API, not this file. The block
+# below is illustrative only; the canonical, runnable provisioning
+# lives in `scripts/provision-stalwart-oidc.sh`.
+#
+# Equivalent registry records (admin JMAP API; @type values and
+# camelCase keys match the v0.16.0 registry schema):
+#
+#   x:Directory/set  -> create the OIDC directory:
+#     {
+#       "@type":         "Oidc",
+#       "description":   "KMail BFF OIDC bearer",
+#       "issuerUrl":     "$KMAIL_BFF_OIDC_ISSUER",
+#       "requireAudience": "stalwart",
+#       "claimUsername": "email"
+#       // requireScopes defaults to ["openid","email"]; omit it
+#       // (an empty list is rejected as an invalid patch).
+#     }
+#   x:Authentication/set -> make it the default directory:
+#     { "singleton": { "directoryId": "<id returned above>" } }
+#
+# Stalwart fetches `$KMAIL_BFF_OIDC_ISSUER/.well-known/
+# openid-configuration` (it appends that suffix to issuerUrl, so a
+# path-namespaced issuer works) and the `jwks_uri` it advertises.
+# The discovery doc's `issuer` MUST equal issuerUrl exactly.
+#
+# The default-directory switch is latched at boot on v0.16.0, so
+# restart Stalwart once after provisioning (while the BFF JWKS is
+# reachable) for it to take effect.
 
 [auth]
 directory = "data"
-
-[auth.oidc]
-enable = true
-issuer = "$KMAIL_BFF_OIDC_ISSUER"
-jwks-url = "$KMAIL_BFF_OIDC_ISSUER/.well-known/jwks.json"
-audience = "stalwart"
