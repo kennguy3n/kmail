@@ -188,7 +188,8 @@ func (r *JmapResponse) FirstCallError() error {
 // the Stalwart account ID through the proxy's cache and stamps
 // the same `X-KMail-*` identity headers as the proxy (Stalwart
 // trusts them only because the mTLS handshake authenticated the
-// BFF).
+// BFF), plus — in dev/CI only — the recovery-admin `Authorization`
+// header the proxy uses (see setDevAuth).
 //
 // On primary-shard 5xx or transport failure, the client retries
 // against each secondary shard in order. The breaker / Postgres
@@ -238,6 +239,7 @@ func (c *InternalClient) Dispatch(
 		httpReq.Header.Set("X-KMail-Tenant-Id", tenantID)
 		httpReq.Header.Set("X-KMail-Kchat-User-Id", kchatUserID)
 		httpReq.Header.Set("X-KMail-Stalwart-Account-Id", accountID)
+		c.setDevAuth(httpReq)
 
 		resp, err := c.httpc.Do(httpReq)
 		if err != nil {
@@ -288,6 +290,24 @@ func (c *InternalClient) Dispatch(
 		lastErr = errors.New("jmap dispatch: no shard URL configured")
 	}
 	return nil, lastErr
+}
+
+// setDevAuth stamps the dev/CI `Authorization` header on a
+// BFF-initiated request when one is configured. It mirrors the
+// proxy: in dev/CI the official Stalwart image cannot authenticate
+// the BFF over the production mTLS header-trust path, so the proxy
+// authenticates with the recovery-admin Basic credential
+// (`ProxyConfig.DevStalwartAuthHeader`, gated by
+// `middleware.IsDevEnv` in `cmd/kmail-api/main.go`). Without this,
+// InternalClient-backed features (sync bootstrap, undo-send,
+// scheduled-send, snooze, retention, eDiscovery export) 401 in
+// single-binary dev mode (`KMAIL_DISABLE_WORKERS=false`) against
+// the stock image. In production the header is empty and the
+// request authenticates via the shared mTLS transport instead.
+func (c *InternalClient) setDevAuth(req *http.Request) {
+	if h := c.proxy.DevStalwartAuthHeader(); h != "" {
+		req.Header.Set("Authorization", h)
+	}
 }
 
 // DownloadBlob fetches a JMAP blob from Stalwart and returns its
@@ -356,6 +376,7 @@ func (c *InternalClient) DownloadBlob(
 		httpReq.Header.Set("X-KMail-Tenant-Id", tenantID)
 		httpReq.Header.Set("X-KMail-Kchat-User-Id", kchatUserID)
 		httpReq.Header.Set("X-KMail-Stalwart-Account-Id", accountID)
+		c.setDevAuth(httpReq)
 
 		resp, err := c.httpc.Do(httpReq)
 		if err != nil {

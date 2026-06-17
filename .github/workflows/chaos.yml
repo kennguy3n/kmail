@@ -87,8 +87,14 @@ jobs:
             ../zk-object-fabric
           ls -la ../zk-object-fabric | head -10
 
+      # `--ignore-buildable` skips zk-fabric (private GHCR package the
+      # CI token can't pull); we build it from the sibling checkout in
+      # the next step instead. See ci.yml for the full rationale.
       - name: docker compose pull
-        run: docker compose pull --quiet
+        run: docker compose pull --quiet --ignore-buildable
+
+      - name: docker compose build zk-fabric
+        run: docker compose build zk-fabric
 
       - name: docker compose up -d
         run: |
@@ -138,6 +144,28 @@ jobs:
         env:
           DATABASE_URL: postgresql://kmail:kmail@localhost:5432/kmail
 
+      # The dev-bypass bearer resolves to the
+      # `(tenant_id="00000000-...", kchat_user_id="dev-user")`
+      # identity. Without a matching row in Postgres the JMAP proxy
+      # returns `accountNotFound` on every call, so the chaos
+      # scenarios' pre-fault JMAP probe 404s and the shard scenario
+      # degrades to ENFORCE=0 (report-only). Seed both rows via the
+      # idempotent `scripts/seed-dev-tenant.sql` fixture so chaos
+      # actually enforces its SLO budget against real JMAP traffic.
+      # Applied AFTER `scripts/migrate.sh` because the seed references
+      # the `tenants` / `users` tables that migration 001 creates.
+      - name: Seed default dev tenant + user
+        # seed-dev-tenant.sh resolves the kmail-dev principal's
+        # server-assigned JMAP id from Stalwart by name (rather than
+        # hard-coding it) before applying the seed fixture, so the
+        # chaos JMAP probe drives the real provisioned mailbox.
+        env:
+          DATABASE_URL: postgresql://kmail:kmail@localhost:5432/kmail
+          STALWART_URL: http://localhost:8080
+          KMAIL_STALWART_ADMIN_USER: admin
+          KMAIL_STALWART_ADMIN_PASS: kmail-dev
+        run: ./scripts/seed-dev-tenant.sh
+
       - name: Build kmail-api
         run: make build
 
@@ -161,6 +189,15 @@ jobs:
           DATABASE_URL: postgresql://kmail:kmail@localhost:5432/kmail
           VALKEY_URL: redis://localhost:6379
           STALWART_URL: http://localhost:8080
+          # DEV/CI-only: the official stalwartlabs/stalwart image does
+          # not implement the X-KMail-* header-trust the production BFF
+          # relies on over mTLS, so in dev/CI the proxy authenticates to
+          # Stalwart as the recovery admin (Basic). Gated on
+          # KMAIL_ENV=development in cmd/kmail-api/main.go; the prod
+          # mTLS path is untouched. Without these, chaos-shard's pre-fault
+          # JMAP probe 401s and the scenario degrades to report-only.
+          KMAIL_STALWART_ADMIN_USER: admin
+          KMAIL_STALWART_ADMIN_PASS: kmail-dev
           KCHAT_OIDC_ISSUER: ""
           KCHAT_OIDC_AUDIENCE: ""
           ZK_FABRIC_S3_URL: http://localhost:9080
