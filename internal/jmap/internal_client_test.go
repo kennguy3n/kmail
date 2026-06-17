@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -309,6 +310,76 @@ func TestInternalClient_Dispatch_OversizeErrors(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "exceeds") {
 		t.Errorf("err = %v, want it to mention the byte limit", err)
+	}
+}
+
+// TestInternalClient_DevAuthHeader verifies the dev/CI-only branch:
+// when the backing proxy carries a DevStalwartAuthHeader,
+// BFF-initiated calls (Dispatch + DownloadBlob) stamp that
+// Authorization value so they authenticate to the stock Stalwart
+// image instead of 401-ing; with no dev header (the production
+// posture) no Authorization is sent and the request relies on the
+// shared mTLS transport.
+func TestInternalClient_DevAuthHeader(t *testing.T) {
+	t.Parallel()
+
+	const devHeader = "Basic Zm9vOmJhcg==" // foo:bar
+
+	for _, tc := range []struct {
+		name      string
+		devHeader string
+		wantAuth  string
+	}{
+		{name: "dev sets admin Basic", devHeader: devHeader, wantAuth: devHeader},
+		{name: "prod sends none", devHeader: "", wantAuth: ""},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var dispatchAuth, downloadAuth string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/jmap/api" {
+					dispatchAuth = r.Header.Get("Authorization")
+					_, _ = w.Write([]byte(`{"methodResponses":[]}`))
+					return
+				}
+				downloadAuth = r.Header.Get("Authorization")
+				_, _ = w.Write([]byte("BLOB"))
+			}))
+			defer srv.Close()
+
+			p, err := NewProxy(ProxyConfig{
+				StalwartURL:           srv.URL,
+				Pool:                  newDummyPool(t),
+				Logger:                log.New(io.Discard, "", 0),
+				DevStalwartAuthHeader: tc.devHeader,
+			})
+			if err != nil {
+				t.Fatalf("NewProxy: %v", err)
+			}
+			p.PrimeAccountCache("t1", "u1", "acc-1")
+			c, err := NewInternalClient(p)
+			if err != nil {
+				t.Fatalf("NewInternalClient: %v", err)
+			}
+
+			if _, err := c.Dispatch(context.Background(), "t1", "u1", JmapRequest{
+				MethodCalls: [][]any{{"Mailbox/get", map[string]any{}, "c0"}},
+			}); err != nil {
+				t.Fatalf("Dispatch: %v", err)
+			}
+			if dispatchAuth != tc.wantAuth {
+				t.Errorf("Dispatch Authorization = %q want %q", dispatchAuth, tc.wantAuth)
+			}
+
+			if _, err := c.DownloadBlob(context.Background(), "t1", "u1", "acc-1", "blob-1", "m.eml"); err != nil {
+				t.Fatalf("DownloadBlob: %v", err)
+			}
+			if downloadAuth != tc.wantAuth {
+				t.Errorf("DownloadBlob Authorization = %q want %q", downloadAuth, tc.wantAuth)
+			}
+		})
 	}
 }
 
