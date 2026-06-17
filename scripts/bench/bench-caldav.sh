@@ -23,15 +23,23 @@ trap 'rm -f "$tmp"' EXIT
 
 for i in $(seq 1 "$N"); do
     uid="bench-$(date +%s%N)-$i@kmail.local"
+    now=$(date -u +%Y%m%dT%H%M%SZ)
+    # DTEND = now + 30 min. `date -d` is GNU-only; `date -r <epoch>`
+    # is BSD / macOS. Compute the epoch, then format with a fallback
+    # (mirrors the portable pattern in scripts/test-caldav.sh).
+    end_epoch=$(( $(date +%s) + 1800 ))
+    if ! dtend=$(date -u -d "@${end_epoch}" +%Y%m%dT%H%M%SZ 2>/dev/null); then
+        dtend=$(date -u -r "${end_epoch}" +%Y%m%dT%H%M%SZ)
+    fi
     ical=$(cat <<ICS
 BEGIN:VCALENDAR
 VERSION:2.0
 PRODID:-//kmail//bench//EN
 BEGIN:VEVENT
 UID:$uid
-DTSTAMP:$(date -u +%Y%m%dT%H%M%SZ)
-DTSTART:$(date -u +%Y%m%dT%H%M%SZ)
-DTEND:$(date -u -d '+30 minutes' +%Y%m%dT%H%M%SZ)
+DTSTAMP:$now
+DTSTART:$now
+DTEND:$dtend
 SUMMARY:Bench event $i
 END:VEVENT
 END:VCALENDAR
