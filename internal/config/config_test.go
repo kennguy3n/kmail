@@ -305,6 +305,7 @@ func TestConfigString_RedactsValkeyDSNPassword(t *testing.T) {
 		t.Errorf("Config.String mangled bare host:port: %q", cfg.String())
 	}
 }
+
 // TestStalwartMTLSConfig_Validate pins the partial-config detector
 // added so the proxy doesn't silently fall through to plain HTTP
 // when an operator sets KMAIL_STALWART_TLS_CERT without KEY (or
@@ -417,4 +418,45 @@ func containsSubstring(s, sub string) bool {
 		}
 	}
 	return false
+}
+
+func TestLoadStalwartOIDC(t *testing.T) {
+	// Default: minting disabled.
+	t.Setenv("KMAIL_STALWART_OIDC_ISSUER", "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.StalwartOIDC.Enabled() {
+		t.Error("StalwartOIDC.Enabled() should be false when issuer unset")
+	}
+
+	t.Setenv("KMAIL_STALWART_OIDC_ISSUER", "https://kmail-api.internal/oidc/stalwart")
+	t.Setenv("KMAIL_STALWART_OIDC_AUDIENCE", "stalwart")
+	t.Setenv("KMAIL_STALWART_OIDC_KEY_FILE", "/etc/kmail/oidc/key.pem")
+	t.Setenv("KMAIL_STALWART_OIDC_KID", "kmail-bff-1")
+	t.Setenv("KMAIL_STALWART_OIDC_TOKEN_TTL", "3m")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	o := cfg.StalwartOIDC
+	if !o.Enabled() {
+		t.Fatal("StalwartOIDC.Enabled() should be true when issuer set")
+	}
+	if o.Issuer != "https://kmail-api.internal/oidc/stalwart" {
+		t.Errorf("Issuer = %q", o.Issuer)
+	}
+	if o.Audience != "stalwart" {
+		t.Errorf("Audience = %q", o.Audience)
+	}
+	if o.KeyFile != "/etc/kmail/oidc/key.pem" {
+		t.Errorf("KeyFile = %q", o.KeyFile)
+	}
+	if o.KeyID != "kmail-bff-1" {
+		t.Errorf("KeyID = %q", o.KeyID)
+	}
+	if o.TokenTTL != 3*time.Minute {
+		t.Errorf("TokenTTL = %v, want 3m", o.TokenTTL)
+	}
 }

@@ -335,6 +335,98 @@ func TestRewrite_DevStalwartAuth(t *testing.T) {
 	}
 }
 
+var errTest = fmt.Errorf("mint boom")
+
+// fakeMinter is a test BearerMinter. When err is set, Mint fails;
+// otherwise it returns "tok-for-<principal>" and records the call.
+type fakeMinter struct {
+	err  error
+	last string
+}
+
+func (m *fakeMinter) Mint(principal string) (string, error) {
+	m.last = principal
+	if m.err != nil {
+		return "", m.err
+	}
+	return "tok-for-" + principal, nil
+}
+
+func rewriteWith(t *testing.T, cfg ProxyConfig, accountID string) *httputil.ProxyRequest {
+	t.Helper()
+	cfg.StalwartURL = "http://stalwart.test"
+	cfg.Pool = newDummyPool(t)
+	cfg.Logger = log.New(io.Discard, "", 0)
+	p, err := NewProxy(cfg)
+	if err != nil {
+		t.Fatalf("NewProxy: %v", err)
+	}
+	in := httptest.NewRequest(http.MethodPost, "http://kmail-api/jmap", nil)
+	if accountID != "" {
+		in = in.WithContext(middleware.WithStalwartAccountID(in.Context(), accountID))
+	}
+	outURL, _ := url.Parse("http://stalwart.test/jmap")
+	out := in.Clone(in.Context())
+	out.URL = outURL
+	out.Header = http.Header{"Authorization": []string{"Bearer user-token"}}
+	pr := &httputil.ProxyRequest{In: in, Out: out}
+	p.rewrite(pr)
+	return pr
+}
+
+// TestRewrite_OIDCBearer_Mints verifies the production path: with a
+// Minter configured and an account resolved, the proxy forwards a
+// freshly minted bearer for that principal.
+func TestRewrite_OIDCBearer_Mints(t *testing.T) {
+	m := &fakeMinter{}
+	pr := rewriteWith(t, ProxyConfig{Minter: m}, "kmail-dev@kmail.dev")
+	if got := pr.Out.Header.Get("Authorization"); got != "Bearer tok-for-kmail-dev@kmail.dev" {
+		t.Errorf("Authorization = %q, want minted bearer", got)
+	}
+	if m.last != "kmail-dev@kmail.dev" {
+		t.Errorf("minted for principal %q, want kmail-dev@kmail.dev", m.last)
+	}
+}
+
+// TestRewrite_OIDCBearer_FailsClosedOnMintError: a mint failure must
+// strip Authorization (upstream 401) rather than leak the user token
+// or act as an unintended principal.
+func TestRewrite_OIDCBearer_FailsClosedOnMintError(t *testing.T) {
+	pr := rewriteWith(t, ProxyConfig{Minter: &fakeMinter{err: errTest}}, "kmail-dev@kmail.dev")
+	if got := pr.Out.Header.Get("Authorization"); got != "" {
+		t.Errorf("Authorization = %q, want stripped on mint error", got)
+	}
+}
+
+// TestRewrite_OIDCBearer_NoAccountStripsAuth: with a Minter but no
+// resolved account, the proxy must never mint an unscoped token.
+func TestRewrite_OIDCBearer_NoAccountStripsAuth(t *testing.T) {
+	m := &fakeMinter{}
+	pr := rewriteWith(t, ProxyConfig{Minter: m}, "")
+	if got := pr.Out.Header.Get("Authorization"); got != "" {
+		t.Errorf("Authorization = %q, want stripped when no account", got)
+	}
+	if m.last != "" {
+		t.Errorf("Mint should not be called without an account; got %q", m.last)
+	}
+}
+
+// TestRewrite_DevHeaderBeatsMinter: the dev/CI admin-Basic path takes
+// precedence so dev never accidentally exercises token minting.
+func TestRewrite_DevHeaderBeatsMinter(t *testing.T) {
+	m := &fakeMinter{}
+	pr := rewriteWith(t, ProxyConfig{
+		DevStalwartAuthHeader: "Basic Zm9vOmJhcg==",
+		Minter:                m,
+	}, "kmail-dev@kmail.dev")
+	if got := pr.Out.Header.Get("Authorization"); got != "Basic Zm9vOmJhcg==" {
+		t.Errorf("Authorization = %q, want dev admin Basic (precedence)", got)
+	}
+	if m.last != "" {
+		t.Errorf("Mint should not be called when dev header set; got %q", m.last)
+	}
+}
+
 // TestServeHTTP_MissingContext: when the OIDC middleware has not
 // run, ServeHTTP must return 500 (caller wired the mux wrong).
 func TestServeHTTP_MissingContext(t *testing.T) {

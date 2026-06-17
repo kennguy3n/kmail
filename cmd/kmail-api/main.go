@@ -9,6 +9,7 @@ package main
 
 import (
 	"context"
+	"crypto/rsa"
 	"encoding/base64"
 	"errors"
 	"log"
@@ -56,6 +57,7 @@ import (
 	"github.com/kennguy3n/kmail/internal/sieve"
 	"github.com/kennguy3n/kmail/internal/smartfeatures"
 	"github.com/kennguy3n/kmail/internal/snooze"
+	"github.com/kennguy3n/kmail/internal/stalwartauth"
 	syncsvc "github.com/kennguy3n/kmail/internal/sync"
 	"github.com/kennguy3n/kmail/internal/tenant"
 	"github.com/kennguy3n/kmail/internal/undosend"
@@ -436,6 +438,59 @@ func main() {
 			logger.Printf("jmap proxy: DEV-ONLY Stalwart Basic auth enabled (user=%s) — NON-PRODUCTION; prod uses mTLS", adminUser)
 		}
 	}
+	// Production BFF→Stalwart authentication (findings #1/#2). On the
+	// official Stalwart image the header-trust scheme is dead, so the
+	// BFF authenticates by minting a short-lived `stalwart`-audience
+	// OIDC bearer per request and serving the discovery + JWKS
+	// documents Stalwart fetches to validate it (see
+	// `internal/stalwartauth`). Enabled by setting
+	// KMAIL_STALWART_OIDC_ISSUER to a URL Stalwart can reach back to
+	// (e.g. https://kmail-api.internal/oidc/stalwart). The signing key
+	// is REQUIRED in production (fail closed); a dev stack with no key
+	// gets an ephemeral one so CI can still exercise the bearer path.
+	var stalwartMinter jmap.BearerMinter
+	if cfg.StalwartOIDC.Enabled() {
+		var oidcKey *rsa.PrivateKey
+		switch {
+		case strings.TrimSpace(cfg.StalwartOIDC.KeyFile) != "":
+			pemBytes, rerr := os.ReadFile(cfg.StalwartOIDC.KeyFile)
+			if rerr != nil {
+				logger.Fatalf("stalwart oidc: read KMAIL_STALWART_OIDC_KEY_FILE=%s: %v", cfg.StalwartOIDC.KeyFile, rerr)
+			}
+			oidcKey, err = stalwartauth.ParsePrivateKeyPEM(pemBytes)
+			if err != nil {
+				logger.Fatalf("stalwart oidc: parse signing key from %s: %v", cfg.StalwartOIDC.KeyFile, err)
+			}
+		case strings.TrimSpace(cfg.StalwartOIDC.Key) != "":
+			oidcKey, err = stalwartauth.ParsePrivateKeyPEM([]byte(cfg.StalwartOIDC.Key))
+			if err != nil {
+				logger.Fatalf("stalwart oidc: parse signing key from KMAIL_STALWART_OIDC_KEY: %v", err)
+			}
+		case middleware.IsDevEnv(cfg.Env):
+			oidcKey, err = stalwartauth.GenerateEphemeralKey()
+			if err != nil {
+				logger.Fatalf("stalwart oidc: generate ephemeral dev key: %v", err)
+			}
+			logger.Printf("stalwart oidc: DEV-ONLY ephemeral signing key generated (no KMAIL_STALWART_OIDC_KEY[_FILE] set) — NON-PRODUCTION")
+		default:
+			logger.Fatalf("stalwart oidc: KMAIL_STALWART_OIDC_ISSUER is set but no signing key provided " +
+				"(set KMAIL_STALWART_OIDC_KEY_FILE or KMAIL_STALWART_OIDC_KEY) — refusing to start without a way to mint Stalwart bearers")
+		}
+		signer, serr := stalwartauth.NewSigner(oidcKey, stalwartauth.Config{
+			Issuer:   cfg.StalwartOIDC.Issuer,
+			Audience: cfg.StalwartOIDC.Audience,
+			KeyID:    cfg.StalwartOIDC.KeyID,
+			TokenTTL: cfg.StalwartOIDC.TokenTTL,
+		})
+		if serr != nil {
+			logger.Fatalf("stalwart oidc: build signer: %v", serr)
+		}
+		// Stalwart fetches these unauthenticated, pre-auth — mounted
+		// directly on the mux like the autoconfig endpoints.
+		stalwartauth.NewHandlers(signer, logger).Register(mux)
+		stalwartMinter = signer
+		logger.Printf("stalwart oidc: BFF bearer minting enabled (issuer=%s kid=%s) — discovery+JWKS served for Stalwart validation", signer.Issuer(), signer.KeyID())
+	}
 	proxy, err := jmap.NewProxy(jmap.ProxyConfig{
 		StalwartURL:           cfg.StalwartURL,
 		Pool:                  pool,
@@ -444,6 +499,7 @@ func main() {
 		PreDeliverHook:        malwareHook,
 		TLS:                   stalwartTLS,
 		DevStalwartAuthHeader: devStalwartAuth,
+		Minter:                stalwartMinter,
 		Breaker:               jmapBreaker,
 		CircuitBreakThreshold: breakerThreshold,
 		CircuitBreakCooldown:  breakerCooldown,
