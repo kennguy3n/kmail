@@ -451,25 +451,29 @@ func main() {
 	var stalwartMinter jmap.BearerMinter
 	if cfg.StalwartOIDC.Enabled() {
 		var oidcKey *rsa.PrivateKey
+		// keyErr is scoped to the key-loading switch so it never aliases
+		// the outer main-scope err; each case checks it immediately.
+		var keyErr error
 		switch {
 		case strings.TrimSpace(cfg.StalwartOIDC.KeyFile) != "":
-			pemBytes, rerr := os.ReadFile(cfg.StalwartOIDC.KeyFile)
-			if rerr != nil {
-				logger.Fatalf("stalwart oidc: read KMAIL_STALWART_OIDC_KEY_FILE=%s: %v", cfg.StalwartOIDC.KeyFile, rerr)
+			var pemBytes []byte
+			pemBytes, keyErr = os.ReadFile(cfg.StalwartOIDC.KeyFile)
+			if keyErr != nil {
+				logger.Fatalf("stalwart oidc: read KMAIL_STALWART_OIDC_KEY_FILE=%s: %v", cfg.StalwartOIDC.KeyFile, keyErr)
 			}
-			oidcKey, err = stalwartauth.ParsePrivateKeyPEM(pemBytes)
-			if err != nil {
-				logger.Fatalf("stalwart oidc: parse signing key from %s: %v", cfg.StalwartOIDC.KeyFile, err)
+			oidcKey, keyErr = stalwartauth.ParsePrivateKeyPEM(pemBytes)
+			if keyErr != nil {
+				logger.Fatalf("stalwart oidc: parse signing key from %s: %v", cfg.StalwartOIDC.KeyFile, keyErr)
 			}
 		case strings.TrimSpace(cfg.StalwartOIDC.Key) != "":
-			oidcKey, err = stalwartauth.ParsePrivateKeyPEM([]byte(cfg.StalwartOIDC.Key))
-			if err != nil {
-				logger.Fatalf("stalwart oidc: parse signing key from KMAIL_STALWART_OIDC_KEY: %v", err)
+			oidcKey, keyErr = stalwartauth.ParsePrivateKeyPEM([]byte(cfg.StalwartOIDC.Key))
+			if keyErr != nil {
+				logger.Fatalf("stalwart oidc: parse signing key from KMAIL_STALWART_OIDC_KEY: %v", keyErr)
 			}
 		case middleware.IsDevEnv(cfg.Env):
-			oidcKey, err = stalwartauth.GenerateEphemeralKey()
-			if err != nil {
-				logger.Fatalf("stalwart oidc: generate ephemeral dev key: %v", err)
+			oidcKey, keyErr = stalwartauth.GenerateEphemeralKey()
+			if keyErr != nil {
+				logger.Fatalf("stalwart oidc: generate ephemeral dev key: %v", keyErr)
 			}
 			logger.Printf("stalwart oidc: DEV-ONLY ephemeral signing key generated (no KMAIL_STALWART_OIDC_KEY[_FILE] set) — NON-PRODUCTION")
 		default:
