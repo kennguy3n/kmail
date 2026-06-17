@@ -26,6 +26,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -95,6 +96,27 @@ const (
 	// negligible extra x:Account/get per active principal.
 	nameCacheTTL = 5 * time.Minute
 )
+
+// DevAdminConfig builds the calendar-bridge Config shared by
+// kmail-api and kmail-worker, layering in the dev/CI-only Stalwart
+// superuser credentials when devEnv is true and
+// KMAIL_STALWART_ADMIN_USER is set. In production (devEnv false) it
+// returns a bare config: davAccount stays a no-op and the bridge
+// authenticates to Stalwart via mTLS upstream rather than Basic.
+// Centralising the gating here keeps the two entrypoints from
+// drifting — if they wired the credentials differently the bridge
+// would resolve CalDAV names in one process but 404 in the other.
+func DevAdminConfig(stalwartURL string, devEnv bool, logger *log.Logger) Config {
+	cfg := Config{StalwartURL: stalwartURL}
+	if devEnv {
+		if adminUser := os.Getenv("KMAIL_STALWART_ADMIN_USER"); adminUser != "" {
+			cfg.AdminUser = adminUser
+			cfg.AdminPassword = os.Getenv("KMAIL_STALWART_ADMIN_PASS")
+			cfg.Logger = logger
+		}
+	}
+	return cfg
+}
 
 // NewService builds a Service from the provided Config.
 func NewService(cfg Config) *Service {
@@ -430,6 +452,24 @@ func (s *Service) lookupAccountName(ctx context.Context, accountID string) (stri
 	}
 	if len(envelope.MethodResponses) == 0 || len(envelope.MethodResponses[0]) < 2 {
 		return "", fmt.Errorf("x:Account/get: malformed response envelope")
+	}
+	// A JMAP method-level error arrives as an HTTP 200 whose first
+	// tuple element is the literal "error" (e.g.
+	// `["error",{"type":"unknownMethod"},"0"]`) rather than the
+	// echoed method name. Without this check the error object would
+	// unmarshal cleanly into result with an empty List and look like
+	// a benign not-found, hiding a real misconfiguration (wrong
+	// method capability, server bug) from the caller's logging.
+	var methodName string
+	if err := json.Unmarshal(envelope.MethodResponses[0][0], &methodName); err != nil {
+		return "", fmt.Errorf("x:Account/get: malformed method name: %w", err)
+	}
+	if methodName == "error" {
+		var jmapErr struct {
+			Type string `json:"type"`
+		}
+		_ = json.Unmarshal(envelope.MethodResponses[0][1], &jmapErr)
+		return "", fmt.Errorf("x:Account/get: JMAP error %q", jmapErr.Type)
 	}
 	var result struct {
 		List []struct {

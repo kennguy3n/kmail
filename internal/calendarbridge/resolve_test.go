@@ -183,6 +183,77 @@ func TestDavAccountSilentOnCleanNotFound(t *testing.T) {
 	}
 }
 
+// TestDavAccountLogsJMAPMethodError asserts a JMAP method-level error
+// returned as an HTTP 200 `["error",{...}]` tuple is treated as a hard
+// failure: it must be logged (not silently swallowed as a benign
+// not-found) and the call still falls back to the raw id.
+func TestDavAccountLogsJMAPMethodError(t *testing.T) {
+	const jmapErrBody = `{"methodResponses":[["error",{"type":"unknownMethod"},"0"]]}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/jmap" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(jmapErrBody))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	var buf bytes.Buffer
+	svc := NewService(Config{
+		StalwartURL:   srv.URL,
+		AdminUser:     "admin",
+		AdminPassword: "pw",
+		Logger:        log.New(&buf, "", 0),
+	})
+	if got := svc.davAccount(context.Background(), "b"); got != "b" {
+		t.Fatalf("davAccount on JMAP method error=%q want raw id b", got)
+	}
+	if !strings.Contains(buf.String(), "unknownMethod") {
+		t.Fatalf("JMAP method error must be logged with its type, got %q", buf.String())
+	}
+	if _, ok := svc.nameCache.Get("b"); ok {
+		t.Fatalf("JMAP method error must not be cached")
+	}
+}
+
+// TestDevAdminConfig verifies the shared dev/CI wiring helper: it only
+// layers in the Stalwart superuser credentials when both the dev gate
+// is open and KMAIL_STALWART_ADMIN_USER is set, and otherwise returns
+// a bare config (the production mTLS path).
+func TestDevAdminConfig(t *testing.T) {
+	logger := log.New(&bytes.Buffer{}, "", 0)
+
+	t.Run("prod env yields bare config", func(t *testing.T) {
+		t.Setenv("KMAIL_STALWART_ADMIN_USER", "admin")
+		t.Setenv("KMAIL_STALWART_ADMIN_PASS", "pw")
+		cfg := DevAdminConfig("http://stalwart:8080", false, logger)
+		if cfg.AdminUser != "" || cfg.AdminPassword != "" || cfg.Logger != nil {
+			t.Fatalf("prod config must not carry admin creds/logger, got %+v", cfg)
+		}
+		if cfg.StalwartURL != "http://stalwart:8080" {
+			t.Fatalf("StalwartURL=%q", cfg.StalwartURL)
+		}
+	})
+
+	t.Run("dev env without admin user yields bare config", func(t *testing.T) {
+		t.Setenv("KMAIL_STALWART_ADMIN_USER", "")
+		cfg := DevAdminConfig("http://stalwart:8080", true, logger)
+		if cfg.AdminUser != "" || cfg.Logger != nil {
+			t.Fatalf("dev config without admin user must stay bare, got %+v", cfg)
+		}
+	})
+
+	t.Run("dev env with admin user wires creds and logger", func(t *testing.T) {
+		t.Setenv("KMAIL_STALWART_ADMIN_USER", "admin")
+		t.Setenv("KMAIL_STALWART_ADMIN_PASS", "pw")
+		cfg := DevAdminConfig("http://stalwart:8080", true, logger)
+		if cfg.AdminUser != "admin" || cfg.AdminPassword != "pw" || cfg.Logger != logger {
+			t.Fatalf("dev config must wire creds + logger, got %+v", cfg)
+		}
+	})
+}
+
 // TestDavAccountNoAdminCreds confirms the bridge issues no management
 // call and returns the id unchanged when it holds no credentials
 // (the production mTLS path, where the resolver is a no-op).
