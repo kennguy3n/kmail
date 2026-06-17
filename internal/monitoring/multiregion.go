@@ -95,7 +95,7 @@ func (a *MultiRegionAggregator) Aggregate(ctx context.Context, window time.Durat
 	sort.Strings(regions)
 	for _, region := range regions {
 		key := "slo:region:" + region + ":requests"
-		members, err := a.valkey.ZRangeByScore(ctx, key, &redis.ZRangeBy{Min: low, Max: high}).Result()
+		members, err := a.valkey.ZRangeArgs(ctx, redis.ZRangeArgs{Key: key, Start: low, Stop: high, ByScore: true}).Result()
 		if err != nil {
 			return nil, err
 		}

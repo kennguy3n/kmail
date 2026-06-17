@@ -6,6 +6,10 @@ import {
   listResourceCalendars,
   type ResourceCalendar,
 } from "../../api/calendarSharing";
+import {
+  setCalendarChannelMapping,
+  setCalendarDefaultChannel,
+} from "../../api/admin";
 
 /**
  * ResourceCalendarAdmin manages the bookable-resource registry
@@ -180,7 +184,6 @@ function CalendarNotificationSettings({ rows }: { rows: ResourceCalendar[] }) {
       <button
         onClick={async () => {
           if (!tenantId || !defaultChannel) return;
-          const { setCalendarDefaultChannel } = await import("../../api/admin");
           try {
             await setCalendarDefaultChannel(tenantId, defaultChannel);
             setStatus("Saved tenant default.");
@@ -213,7 +216,6 @@ function CalendarNotificationSettings({ rows }: { rows: ResourceCalendar[] }) {
                     if (!tenantId) return;
                     const channelId = perCalendarChannel[r.id] ?? "";
                     if (!channelId) return;
-                    const { setCalendarChannelMapping } = await import("../../api/admin");
                     try {
                       await setCalendarChannelMapping(tenantId, r.id, channelId);
                       setStatus(`Saved override for ${r.name ?? r.id}.`);

@@ -3,9 +3,7 @@ package webhooks
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"crypto/subtle"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -205,10 +203,4 @@ func VerifySignature(secretHash, header string, payload []byte) bool {
 	// Compare the v1= half by re-signing.
 	provided := fmt.Sprintf("t=%d,v1=%s", ts, v1)
 	return subtle.ConstantTimeCompare([]byte(expected), []byte(provided)) == 1
-}
-
-// hashCheck guards against accidentally storing plaintext.
-func hashCheck(plain string) string {
-	sum := sha256.Sum256([]byte(plain))
-	return hex.EncodeToString(sum[:])
 }

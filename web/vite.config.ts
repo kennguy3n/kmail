@@ -30,5 +30,35 @@ export default defineConfig({
   build: {
     outDir: "dist",
     sourcemap: true,
+    rollupOptions: {
+      output: {
+        // Route pages are already code-split via React.lazy (see
+        // src/App.tsx), which is the bulk of the win. These manual
+        // groups keep the shared dependencies that every route pulls
+        // in out of the per-route chunks and in a stable, long-cached
+        // vendor file:
+        //   - react-vendor: the React runtime + router, imported by
+        //     every chunk, so a content hash only churns on a React
+        //     upgrade.
+        //   - editor: the TipTap/ProseMirror rich-text stack, which is
+        //     large and only reached from the compose/signature/
+        //     template routes, so it stays a lazily-loaded chunk.
+        manualChunks(id) {
+          if (!id.includes("node_modules")) return undefined;
+          if (
+            id.includes("/react/") ||
+            id.includes("/react-dom/") ||
+            id.includes("/react-router") ||
+            id.includes("/scheduler/")
+          ) {
+            return "react-vendor";
+          }
+          if (id.includes("@tiptap") || id.includes("prosemirror")) {
+            return "editor";
+          }
+          return undefined;
+        },
+      },
+    },
   },
 });

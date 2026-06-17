@@ -804,6 +804,7 @@ export class JMAPClient {
     // and double quotes so a filename like `a"b.txt` can't terminate
     // the quoted value early.
     const safeFilename = filename
+      // eslint-disable-next-line no-control-regex -- stripping C0/DEL control characters is the whole point: they would otherwise corrupt or inject the Content-Disposition header.
       ?.replace(/[\u0000-\u001f\u007f]/g, "")
       .replace(/\\/g, "\\\\")
       .replace(/"/g, '\\"');

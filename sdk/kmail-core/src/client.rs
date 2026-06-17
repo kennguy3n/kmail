@@ -1080,7 +1080,10 @@ impl KMailClient {
     /// `notification: None, email_cached: false, needs_delta_sync:
     /// true` — the shell silently falls back to a full sync rather
     /// than guessing.
-    pub fn ingest_push_delivery(&self, data: &BTreeMap<String, String>) -> Result<PushIngestOutcome> {
+    pub fn ingest_push_delivery(
+        &self,
+        data: &BTreeMap<String, String>,
+    ) -> Result<PushIngestOutcome> {
         let Some(hint) = EmailDeliveryHint::from_data(data) else {
             return Ok(PushIngestOutcome {
                 notification: None,
@@ -1141,7 +1144,12 @@ impl KMailClient {
             .received_at_unix
             .and_then(|ts| DateTime::<Utc>::from_timestamp(ts, 0))
             .unwrap_or_else(|| DateTime::<Utc>::from_timestamp(0, 0).expect("epoch in range"));
-        let from = match hint.from.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let from = match hint
+            .from
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             Some(display) => vec![parse_address_display(display)],
             None => Vec::new(),
         };
@@ -3980,7 +3988,11 @@ mod tests {
             .unwrap();
 
         // Precondition: cold email cache, no Email state cursor.
-        assert!(client.state_repo.get(SyncTypeName::Email).unwrap().is_none());
+        assert!(client
+            .state_repo
+            .get(SyncTypeName::Email)
+            .unwrap()
+            .is_none());
 
         let data = delivery_data(&[
             ("account_id", "acct-1"),
@@ -4021,7 +4033,11 @@ mod tests {
         // Cursor invariant: a push must not adopt the server state
         // token as the `Email/changes` cursor.
         assert!(
-            client.state_repo.get(SyncTypeName::Email).unwrap().is_none(),
+            client
+                .state_repo
+                .get(SyncTypeName::Email)
+                .unwrap()
+                .is_none(),
             "push delivery must not advance the Email sync cursor"
         );
     }
@@ -4098,7 +4114,10 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(120)).await;
         let ticks = counter.load(Ordering::SeqCst);
-        assert!(ticks >= 2, "worker should have ticked at least twice, got {ticks}");
+        assert!(
+            ticks >= 2,
+            "worker should have ticked at least twice, got {ticks}"
+        );
 
         handle.stop_and_join().await;
         let after_stop = counter.load(Ordering::SeqCst);

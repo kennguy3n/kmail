@@ -463,11 +463,13 @@ func (s *Service) dueIDs(ctx context.Context, now time.Time, limit int64) ([]str
 	if limit <= 0 {
 		limit = 50
 	}
-	return s.client.ZRangeByScore(ctx, sortedSetKey, &redis.ZRangeBy{
-		Min:    "-inf",
-		Max:    fmt.Sprintf("%d", now.Unix()),
-		Offset: 0,
-		Count:  limit,
+	return s.client.ZRangeArgs(ctx, redis.ZRangeArgs{
+		Key:     sortedSetKey,
+		Start:   "-inf",
+		Stop:    fmt.Sprintf("%d", now.Unix()),
+		Offset:  0,
+		Count:   limit,
+		ByScore: true,
 	}).Result()
 }
 

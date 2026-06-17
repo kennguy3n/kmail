@@ -4,7 +4,6 @@ import (
 	"context"
 	"net/http"
 	"strconv"
-	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -104,10 +103,6 @@ func (m *Metrics) Handler() http.Handler {
 // pathLabelLimit caps the cardinality of the `path` label on the
 // per-request metrics — arbitrary path values blow up Prometheus.
 const pathLabelLimit = 128
-
-var pathLabelPool = sync.Pool{
-	New: func() any { return make([]byte, 0, pathLabelLimit) },
-}
 
 // Middleware returns an http middleware that records
 // `kmail_http_requests_total` and `kmail_http_request_duration_seconds`
