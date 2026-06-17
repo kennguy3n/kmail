@@ -336,7 +336,8 @@ ports by `docker-compose.yml`:
    `localhost`, port `587`, STARTTLS. Username = full address.
 3. Calendar account → CalDAV → "Manual" → username + password,
    server address `localhost:8080`. Enter the CalDAV path when
-   prompted (`/dav/calendars/<principal>/`).
+   prompted (`/dav/cal/<email>/` — Stalwart keys collections by
+   the account email, so the email is the principal path segment).
 
 ### Known limitations (Stalwart v0.16.0)
 

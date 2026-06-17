@@ -12,9 +12,11 @@
 # only asserts the protocol surface those clients depend on.
 #
 # Inputs (all have sensible compose-stack defaults):
-#   CALDAV_URL       — base URL including /dav/calendars/ path
-#                      (default http://localhost:8080/dav/calendars/)
-#   CALDAV_USER      — full email address
+#   CALDAV_URL       — base URL including the /dav/cal/ path
+#                      (default http://localhost:8080/dav/cal/)
+#   CALDAV_USER      — full email address; Stalwart keys CalDAV
+#                      collections by the account email, so it also
+#                      forms the principal path segment
 #   CALDAV_PASS      — password for CALDAV_USER
 #   CALDAV_CALENDAR  — collection name within the user's home
 #                      (default "default")
@@ -25,7 +27,7 @@
 
 set -eu
 
-CALDAV_URL=${CALDAV_URL:-http://localhost:8080/dav/calendars/}
+CALDAV_URL=${CALDAV_URL:-http://localhost:8080/dav/cal/}
 CALDAV_USER=${CALDAV_USER:-}
 CALDAV_PASS=${CALDAV_PASS:-}
 CALDAV_CALENDAR=${CALDAV_CALENDAR:-default}

@@ -207,8 +207,8 @@ See `scripts/test-caldav.sh` for the automated smoke test.
 
 Apple Calendar and Thunderbird (with the Lightning /
 `TbSync+CalDAV` integration) both drive CalDAV over HTTP(S) to
-Stalwart's `/dav/calendars/` endpoint. In local development the
-endpoint is published on `http://localhost:8080/dav/calendars/`
+Stalwart's `/dav/cal/` endpoint. In local development the
+endpoint is published on `http://localhost:8080/dav/cal/`
 and served without TLS; stage the Go BFF in front of it in
 production so TLS terminates at the edge.
 
@@ -218,13 +218,14 @@ production so TLS terminates at the edge.
 - Username: full email address
 - Password: user password
 - Server address: `<your.kmail.host>`
-- Server path: `/dav/calendars/<account-id>/`
+- Server path: `/dav/cal/<email>/` (Stalwart keys collections by
+  the account email, which is the principal path segment)
 - Port: `443` in production (`8080` in local dev, no TLS)
 - Use SSL: yes in production
 
 **Thunderbird (Lightning or TbSync + CalDAV):**
 - New Calendar → On the Network → Location:
-  `http<s>://<your.kmail.host>/dav/calendars/<account-id>/<calendar-name>/`
+  `http<s>://<your.kmail.host>/dav/cal/<email>/<calendar-name>/`
 - Authentication: username / password when prompted.
 
 KMail also exposes the draft JMAP calendars capability
@@ -271,7 +272,7 @@ CALDAV_PASS=<password> \
 ```
 
 What it checks:
-1. `OPTIONS` against `/dav/calendars/` announces the CalDAV
+1. `OPTIONS` against `/dav/cal/` announces the CalDAV
    compliance class (`DAV: 1, 2, 3, calendar-access`).
 2. `PROPFIND` with `Depth: 0` returns a multistatus response
    describing the user's calendar home.
