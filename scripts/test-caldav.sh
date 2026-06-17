@@ -15,12 +15,14 @@
 #   CALDAV_URL       — CalDAV root URL (default
 #                      http://localhost:8080/dav/cal/). The official
 #                      v0.16.0 image serves collections under
-#                      /dav/cal/{account-name}/.
+#                      /dav/cal/{email}/.
 #   CALDAV_USER      — full email address (used for Basic auth)
 #   CALDAV_PASS      — password for CALDAV_USER
-#   CALDAV_ACCOUNT   — principal name that keys the CalDAV home
-#                      (default: local-part of CALDAV_USER). Stalwart
-#                      keys /dav/cal/ by principal name, not email.
+#   CALDAV_ACCOUNT   — account email that keys the CalDAV home
+#                      (default: CALDAV_USER). Stalwart keys /dav/cal/
+#                      by the account's email, not its bare login
+#                      name — /dav/cal/kmail-dev/ 404s, while
+#                      /dav/cal/kmail-dev@kmail.dev/ resolves.
 #   CALDAV_CALENDAR  — collection name within the user's home
 #                      (default "default")
 #
@@ -33,7 +35,7 @@ set -eu
 CALDAV_URL=${CALDAV_URL:-http://localhost:8080/dav/cal/}
 CALDAV_USER=${CALDAV_USER:-}
 CALDAV_PASS=${CALDAV_PASS:-}
-CALDAV_ACCOUNT=${CALDAV_ACCOUNT:-${CALDAV_USER%%@*}}
+CALDAV_ACCOUNT=${CALDAV_ACCOUNT:-$CALDAV_USER}
 CALDAV_CALENDAR=${CALDAV_CALENDAR:-default}
 
 log()  { printf '[test-caldav] %s\n' "$*"; }
