@@ -93,6 +93,39 @@ func TestNewProxy_RequiresPool(t *testing.T) {
 	}
 }
 
+// TestNewProxy_RejectsStalwartURLWithPath pins the fail-fast guard:
+// the proxy forwards inbound JMAP paths verbatim onto the target, so
+// a StalwartURL carrying its own path would misroute every request
+// (e.g. `/api/` + `/jmap/session` → `/api/jmap/session`). A bare
+// host:port (with or without a trailing slash) must be accepted.
+func TestNewProxy_RejectsStalwartURLWithPath(t *testing.T) {
+	t.Parallel()
+	for _, ok := range []string{
+		"http://stalwart.test",
+		"http://stalwart.test/",
+		"http://stalwart.test:8080",
+		"https://stalwart.test:8443/",
+	} {
+		if _, err := NewProxy(ProxyConfig{StalwartURL: ok, Pool: newDummyPool(t), Logger: log.New(io.Discard, "", 0)}); err != nil {
+			t.Errorf("NewProxy(%q) unexpected error: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{
+		"http://stalwart.test/api",
+		"http://stalwart.test/api/",
+		"http://stalwart.test:8080/jmap",
+	} {
+		_, err := NewProxy(ProxyConfig{StalwartURL: bad, Pool: newDummyPool(t), Logger: log.New(io.Discard, "", 0)})
+		if err == nil {
+			t.Errorf("NewProxy(%q): expected error for non-empty path", bad)
+			continue
+		}
+		if !strings.Contains(err.Error(), "must not include a path") {
+			t.Errorf("NewProxy(%q): err = %v, want it to mention the path constraint", bad, err)
+		}
+	}
+}
+
 // stubInterceptor is a no-op SendInterceptor used to assert which
 // interceptor (if any) is wired and active at a given point.
 type stubInterceptor struct {
@@ -237,42 +270,37 @@ func TestAccountCache_BoundedSize_EvictsLRU(t *testing.T) {
 	}
 }
 
-// TestRewrite_StripsJmapPrefix verifies the proxy rewrite strips the
-// `/jmap` prefix so Stalwart sees the path it actually implements,
-// and clears RawPath so net/url regenerates it from Path.
-func TestRewrite_StripsJmapPrefix(t *testing.T) {
+// TestRewrite_PreservesJmapPrefix verifies the proxy forwards the
+// request path unchanged. Stalwart serves JMAP under `/jmap` and
+// `/jmap/session` (root `/` is the admin UI), so the prefix must
+// reach the upstream intact — stripping it (the previous behaviour)
+// sent `/jmap/session` to `/session` (a 302) and POST `/jmap` to `/`
+// (a 404), so every proxied JMAP call hit the wrong path.
+func TestRewrite_PreservesJmapPrefix(t *testing.T) {
 	p := newTestProxy(t)
 
-	tests := []struct {
-		name    string
-		inPath  string
-		outPath string
+	paths := []struct {
+		name string
+		path string
 	}{
-		{"bare jmap", "/jmap", "/"},
-		{"session", "/jmap/session", "/session"},
-		{"upload", "/jmap/upload/deadbeef", "/upload/deadbeef"},
-		{"root", "/jmap/", "/"},
+		{"bare jmap", "/jmap"},
+		{"session", "/jmap/session"},
+		{"upload", "/jmap/upload/deadbeef"},
+		{"root", "/jmap/"},
 	}
-	for _, tc := range tests {
+	for _, tc := range paths {
 		t.Run(tc.name, func(t *testing.T) {
-			in := httptest.NewRequest(http.MethodPost, "http://kmail-api"+tc.inPath, nil)
-			// Force RawPath to a non-empty value to ensure the rewrite
-			// clears it — otherwise RequestURI would still emit the
-			// original prefixed path.
-			in.URL.RawPath = tc.inPath
+			in := httptest.NewRequest(http.MethodPost, "http://kmail-api"+tc.path, nil)
 
-			outURL, _ := url.Parse("http://stalwart.test" + tc.inPath)
+			outURL, _ := url.Parse("http://stalwart.test" + tc.path)
 			out := in.Clone(in.Context())
 			out.URL = outURL
 
 			pr := &httputil.ProxyRequest{In: in, Out: out}
 			p.rewrite(pr)
 
-			if pr.Out.URL.Path != tc.outPath {
-				t.Errorf("Path = %q, want %q", pr.Out.URL.Path, tc.outPath)
-			}
-			if pr.Out.URL.RawPath != "" {
-				t.Errorf("RawPath = %q, want empty", pr.Out.URL.RawPath)
+			if pr.Out.URL.Path != tc.path {
+				t.Errorf("Path = %q, want %q (forwarded unchanged)", pr.Out.URL.Path, tc.path)
 			}
 		})
 	}
@@ -307,6 +335,36 @@ func TestRewrite_InjectsHeaders(t *testing.T) {
 	}
 	if pr.Out.Host != "stalwart.test" {
 		t.Errorf("Out.Host = %q, want stalwart.test", pr.Out.Host)
+	}
+}
+
+// TestRewrite_DevStalwartAuth verifies the dev/CI-only branch: when
+// DevStalwartAuthHeader is set the proxy replaces the inbound
+// Authorization with the configured (admin Basic) credential instead
+// of stripping it, so the plain-HTTP dev BFF can authenticate to the
+// stock Stalwart image that does not honour the X-KMail-* headers.
+func TestRewrite_DevStalwartAuth(t *testing.T) {
+	p, err := NewProxy(ProxyConfig{
+		StalwartURL:           "http://stalwart.test",
+		Pool:                  newDummyPool(t),
+		Logger:                log.New(io.Discard, "", 0),
+		DevStalwartAuthHeader: "Basic Zm9vOmJhcg==",
+	})
+	if err != nil {
+		t.Fatalf("NewProxy: %v", err)
+	}
+
+	in := httptest.NewRequest(http.MethodPost, "http://kmail-api/jmap/session", nil)
+	outURL, _ := url.Parse("http://stalwart.test/jmap/session")
+	out := in.Clone(in.Context())
+	out.URL = outURL
+	out.Header = http.Header{"Authorization": []string{"Bearer user-token"}}
+
+	pr := &httputil.ProxyRequest{In: in, Out: out}
+	p.rewrite(pr)
+
+	if got := pr.Out.Header.Get("Authorization"); got != "Basic Zm9vOmJhcg==" {
+		t.Errorf("Authorization = %q, want the dev admin Basic credential", got)
 	}
 }
 

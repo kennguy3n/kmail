@@ -74,8 +74,14 @@ jobs:
             ../zk-object-fabric
           ls -la ../zk-object-fabric | head -10
 
+      # `--ignore-buildable` skips zk-fabric (private GHCR package the
+      # CI token can't pull); we build it from the sibling checkout in
+      # the next step instead. See ci.yml for the full rationale.
       - name: docker compose pull
-        run: docker compose pull --quiet
+        run: docker compose pull --quiet --ignore-buildable
+
+      - name: docker compose build zk-fabric
+        run: docker compose build zk-fabric
 
       - name: docker compose up -d
         run: |
@@ -136,10 +142,16 @@ jobs:
       # references the `tenants` / `users` tables that migration
       # 001 creates.
       - name: Seed default dev tenant + user
-        run: |
-          psql "postgresql://kmail:kmail@localhost:5432/kmail" \
-            -v ON_ERROR_STOP=1 \
-            -f ./scripts/seed-dev-tenant.sql
+        # seed-dev-tenant.sh resolves the kmail-dev principal's
+        # server-assigned JMAP id from Stalwart by name (rather than
+        # hard-coding it) before applying the seed fixture, so the SDK
+        # probes below drive the real provisioned mailbox.
+        env:
+          DATABASE_URL: postgresql://kmail:kmail@localhost:5432/kmail
+          STALWART_URL: http://localhost:8080
+          KMAIL_STALWART_ADMIN_USER: admin
+          KMAIL_STALWART_ADMIN_PASS: kmail-dev
+        run: ./scripts/seed-dev-tenant.sh
 
       - name: Build kmail-api
         run: make build
@@ -158,6 +170,15 @@ jobs:
           DATABASE_URL: postgresql://kmail:kmail@localhost:5432/kmail
           VALKEY_URL: redis://localhost:6379
           STALWART_URL: http://localhost:8080
+          # DEV/CI-only: the official stalwartlabs/stalwart image does
+          # not implement the X-KMail-* header-trust the production BFF
+          # relies on over mTLS, so in dev/CI the proxy authenticates to
+          # Stalwart as the recovery admin (Basic). Gated on
+          # KMAIL_ENV=development in cmd/kmail-api/main.go; the prod
+          # mTLS path is untouched. Must stay in sync with ci.yml and
+          # chaos.yml or the SDK nightly's JMAP calls 401.
+          KMAIL_STALWART_ADMIN_USER: admin
+          KMAIL_STALWART_ADMIN_PASS: kmail-dev
           KCHAT_OIDC_ISSUER: ""
           KCHAT_OIDC_AUDIENCE: ""
           ZK_FABRIC_S3_URL: http://localhost:9080
