@@ -129,7 +129,7 @@ func (s *SLOTracker) GetAvailability(ctx context.Context, tenantID string, windo
 		return &AvailabilityResult{TenantID: tenantID, Target: t}, nil
 	}
 	low, high := s.windowBounds(window)
-	members, err := s.valkey.ZRangeByScore(ctx, requestsKey(tenantID), &redis.ZRangeBy{Min: low, Max: high}).Result()
+	members, err := s.valkey.ZRangeArgs(ctx, redis.ZRangeArgs{Key: requestsKey(tenantID), Start: low, Stop: high, ByScore: true}).Result()
 	if err != nil {
 		return nil, err
 	}
@@ -173,7 +173,7 @@ func (s *SLOTracker) GetLatencyPercentiles(ctx context.Context, tenantID string,
 		return &LatencyPercentiles{TenantID: tenantID}, nil
 	}
 	low, high := s.windowBounds(window)
-	members, err := s.valkey.ZRangeByScore(ctx, latencyKey(tenantID), &redis.ZRangeBy{Min: low, Max: high}).Result()
+	members, err := s.valkey.ZRangeArgs(ctx, redis.ZRangeArgs{Key: latencyKey(tenantID), Start: low, Stop: high, ByScore: true}).Result()
 	if err != nil {
 		return nil, err
 	}
@@ -223,7 +223,7 @@ func (s *SLOTracker) ListSLOBreaches(ctx context.Context, tenantID string) ([]SL
 		start := end.Add(-time.Hour)
 		low := strconv.FormatInt(start.UnixNano(), 10)
 		high := strconv.FormatInt(end.UnixNano(), 10)
-		members, err := s.valkey.ZRangeByScore(ctx, requestsKey(tenantID), &redis.ZRangeBy{Min: low, Max: high}).Result()
+		members, err := s.valkey.ZRangeArgs(ctx, redis.ZRangeArgs{Key: requestsKey(tenantID), Start: low, Stop: high, ByScore: true}).Result()
 		if err != nil {
 			return nil, err
 		}

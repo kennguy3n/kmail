@@ -327,12 +327,6 @@ func (s *AttachmentService) resolveTenantBucket(ctx context.Context, tenantID st
 	return bucket
 }
 
-// s3Put uploads `body` to the configured S3 endpoint using SigV4
-// query-style signing. Content-Length is inferred from `size`.
-func (s *AttachmentService) s3Put(ctx context.Context, objectKey, contentType string, body io.Reader, size int64) error {
-	return s.s3PutToBucket(ctx, s.cfg.Bucket, objectKey, contentType, body, size)
-}
-
 // s3PutToBucket is the bucket-parameterized PUT helper used by the
 // per-tenant upload path. Falls back to `cfg.Bucket` when `bucket`
 // is empty so the global single-bucket deployment still works.

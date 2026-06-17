@@ -3,7 +3,6 @@ package adminproxy
 import (
 	"encoding/json"
 	"errors"
-	"io"
 	"log"
 	"net/http"
 	"net/http/httputil"
@@ -174,17 +173,6 @@ func (s *statusRecorder) Write(b []byte) (int, error) {
 		s.wrote = true
 	}
 	return s.ResponseWriter.Write(b)
-}
-
-// drainBody is a small helper for tests that intercept the body
-// without forwarding.
-func drainBody(r io.Reader) string {
-	if r == nil {
-		return ""
-	}
-	var sb strings.Builder
-	_, _ = io.Copy(&sb, r)
-	return sb.String()
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
