@@ -12,7 +12,7 @@ import (
 const twoBusyEventsReport = `<?xml version="1.0" encoding="utf-8"?>
 <D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
   <D:response>
-    <D:href>/dav/alice/calendars/default/ev1.ics</D:href>
+    <D:href>/dav/cal/alice/default/ev1.ics</D:href>
     <D:propstat><D:prop><C:calendar-data>BEGIN:VCALENDAR
 VERSION:2.0
 BEGIN:VEVENT
@@ -23,7 +23,7 @@ END:VEVENT
 END:VCALENDAR</C:calendar-data></D:prop></D:propstat>
   </D:response>
   <D:response>
-    <D:href>/dav/alice/calendars/default/ev2.ics</D:href>
+    <D:href>/dav/cal/alice/default/ev2.ics</D:href>
     <D:propstat><D:prop><C:calendar-data>BEGIN:VCALENDAR
 VERSION:2.0
 BEGIN:VEVENT

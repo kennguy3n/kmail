@@ -525,7 +525,7 @@ Entries are reverse-chronological (most recent batch first).
     a `curl`-submitted RFC 5322 message round-trips through the
     recipient's INBOX within 10 s.
   * `scripts/test-caldav.sh` asserts that `OPTIONS
-    /dav/calendars/` announces the `calendar-access` compliance
+    /dav/cal/` announces the `calendar-access` compliance
     class, `PROPFIND Depth:0/1` returns multistatus + at least
     one calendar collection, and a minimal VEVENT survives a
     PUT → GET → DELETE round-trip (the script re-reads the

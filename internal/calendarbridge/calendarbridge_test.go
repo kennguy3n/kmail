@@ -12,7 +12,7 @@ import (
 const samplePropfindResponse = `<?xml version="1.0" encoding="utf-8"?>
 <D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
   <D:response>
-    <D:href>/dav/alice/calendars/default/</D:href>
+    <D:href>/dav/cal/alice/default/</D:href>
     <D:propstat>
       <D:prop>
         <D:displayname>Default</D:displayname>
@@ -30,7 +30,7 @@ const samplePropfindResponse = `<?xml version="1.0" encoding="utf-8"?>
 const sampleEventsReportResponse = `<?xml version="1.0" encoding="utf-8"?>
 <D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
   <D:response>
-    <D:href>/dav/alice/calendars/default/ev1.ics</D:href>
+    <D:href>/dav/cal/alice/default/ev1.ics</D:href>
     <D:propstat>
       <D:prop>
         <C:calendar-data>BEGIN:VCALENDAR
@@ -58,7 +58,7 @@ func TestListCalendars_ParsesMultistatus(t *testing.T) {
 		if r.Method != "PROPFIND" {
 			t.Errorf("expected PROPFIND, got %s", r.Method)
 		}
-		if !strings.Contains(r.URL.Path, "/dav/alice/calendars/") {
+		if !strings.Contains(r.URL.Path, "/dav/cal/alice/") {
 			t.Errorf("unexpected path: %s", r.URL.Path)
 		}
 		w.Header().Set("Content-Type", "application/xml")
@@ -218,9 +218,9 @@ func TestRewritePartstat_UnknownResponse(t *testing.T) {
 
 func TestCalendarIDFromHref(t *testing.T) {
 	cases := map[string]string{
-		"/dav/alice/calendars/default/":          "default",
-		"/dav/alice/calendars/work-cal":          "work-cal",
-		"http://host/dav/bob/calendars/personal": "personal",
+		"/dav/cal/alice/default/":          "default",
+		"/dav/cal/alice/work-cal":          "work-cal",
+		"http://host/dav/cal/bob/personal": "personal",
 	}
 	for in, want := range cases {
 		if got := calendarIDFromHref(in); got != want {
