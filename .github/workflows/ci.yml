@@ -546,8 +546,28 @@ jobs:
       # zk-fabric + Meilisearch + ClamAV in parallel; pulling them
       # up-front saves ~90s on the critical path versus letting
       # `docker compose up` lazy-pull during startup.
+      #
+      # `--ignore-buildable` skips the zk-fabric service. It carries
+      # both an `image:` (ghcr.io/kennguy3n/zk-object-fabric:dev) and
+      # a `build:` context, and the GHCR package is private — the CI
+      # token's packages:read scope only covers THIS repo, so a plain
+      # `docker compose pull` dies with `denied` before any code runs.
+      # We build zk-fabric from the sibling checkout in the next step
+      # instead, which tags the same `image:` name locally so
+      # `docker compose up` finds it without ever touching GHCR.
       - name: docker compose pull
-        run: docker compose pull --quiet
+        run: docker compose pull --quiet --ignore-buildable
+
+      # Build zk-fabric from the sibling checkout cloned above. The
+      # service declares both `image:` and `build:`, so `compose
+      # build` tags the result as ghcr.io/kennguy3n/zk-object-fabric:dev
+      # locally; the subsequent `up` then uses that local image rather
+      # than pulling the private GHCR package. This also means CI now
+      # exercises the exact image the source produces (the canonical
+      # `make dev` path in docs/DEVELOPMENT.md) instead of a separately
+      # published tag that can silently drift from `main`.
+      - name: docker compose build zk-fabric
+        run: docker compose build zk-fabric
 
       - name: docker compose up -d
         run: |
@@ -608,6 +628,20 @@ jobs:
         env:
           DATABASE_URL: postgresql://kmail:kmail@localhost:5432/kmail
 
+      - name: Seed default dev tenant + user
+        # seed-dev-tenant.sh resolves the kmail-dev principal's
+        # server-assigned JMAP id from Stalwart by name (rather than
+        # hard-coding it) and applies the seed fixture. The admin Basic
+        # creds match the dev/CI recovery admin used by the kmail-api
+        # step below; the official Stalwart image has no header-trust,
+        # so these creds are dev/CI-only.
+        env:
+          DATABASE_URL: postgresql://kmail:kmail@localhost:5432/kmail
+          STALWART_URL: http://localhost:8080
+          KMAIL_STALWART_ADMIN_USER: admin
+          KMAIL_STALWART_ADMIN_PASS: kmail-dev
+        run: ./scripts/seed-dev-tenant.sh
+
       - name: Build kmail-api
         run: make build
 
@@ -641,6 +675,14 @@ jobs:
           DATABASE_URL: postgresql://kmail:kmail@localhost:5432/kmail
           VALKEY_URL: redis://localhost:6379
           STALWART_URL: http://localhost:8080
+          # DEV/CI-only: the official stalwartlabs/stalwart image does
+          # not implement the X-KMail-* header-trust the production BFF
+          # relies on over mTLS, so in dev/CI the proxy authenticates to
+          # Stalwart as the recovery admin (Basic). Gated on
+          # KMAIL_ENV=development in cmd/kmail-api/main.go; the prod
+          # mTLS path is untouched.
+          KMAIL_STALWART_ADMIN_USER: admin
+          KMAIL_STALWART_ADMIN_PASS: kmail-dev
           KCHAT_OIDC_ISSUER: ""
           KCHAT_OIDC_AUDIENCE: ""
           ZK_FABRIC_S3_URL: http://localhost:9080
