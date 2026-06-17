@@ -5,8 +5,12 @@
 # Usage:
 #   ./scripts/bench/bench-caldav.sh [N] [BASE_URL] [USER] [PASS] [CAL_PATH]
 #
+# Stalwart v0.16.0 keys /dav/cal/ by the account's *email*, not its
+# bare login name (/dav/cal/kmail-dev/ 404s, /dav/cal/kmail-dev@kmail.dev/
+# resolves), so CAL_PATH must use the full email segment.
+#
 # Example:
-#   ./scripts/bench/bench-caldav.sh 50 http://localhost:8080 kmail-dev@kmail.dev kmail-dev /dav/cal/kmail-dev@kmail.dev/default/
+#   ./scripts/bench/bench-caldav.sh 50 http://localhost:8080 kmail-dev@kmail.dev <password> /dav/cal/kmail-dev@kmail.dev/default/
 
 set -euo pipefail
 
@@ -14,8 +18,6 @@ N="${1:-50}"
 BASE="${2:-http://localhost:8080}"
 USER="${3:-kmail-dev@kmail.dev}"
 PASS="${4:-kmail-dev}"
-# Stalwart keys CalDAV collections by the account email, so the
-# principal path segment is the email address, not the login name.
 PATHP="${5:-/dav/cal/kmail-dev@kmail.dev/default/}"
 
 tmp="$(mktemp)"

@@ -321,7 +321,7 @@ ports by `docker-compose.yml`:
    - **Outgoing**: SMTP, server `localhost`, port `587`, STARTTLS,
      normal password auth.
 3. Thunderbird's Lightning / TB Calendar add-on — "New calendar" →
-   "On the network" → CalDAV → `http://localhost:8080/dav/` →
+   "On the network" → CalDAV → `http://localhost:8080/dav/cal/` →
    pick the default calendar.
 4. Autoconfig / autodiscover is not wired in dev; production
    deployments can point `autoconfig.<domain>` and

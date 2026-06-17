@@ -117,8 +117,8 @@ func (s *AutoconfigService) SettingsForEmail(ctx context.Context, email string) 
 		IMAPPort:       s.cfg.IMAPPort,
 		SMTPHost:       s.cfg.SMTPHost,
 		SMTPPort:       s.cfg.SMTPPort,
-		CalDAVURL:      fmt.Sprintf("https://%s/dav/calendars/", s.cfg.CalDAVHost),
-		CardDAVURL:     fmt.Sprintf("https://%s/dav/contacts/", s.cfg.CalDAVHost),
+		CalDAVURL:      fmt.Sprintf("https://%s/dav/cal/", s.cfg.CalDAVHost),
+		CardDAVURL:     fmt.Sprintf("https://%s/dav/card/", s.cfg.CalDAVHost),
 		SocketType:     "SSL",
 		Authentication: "password-cleartext",
 	}
