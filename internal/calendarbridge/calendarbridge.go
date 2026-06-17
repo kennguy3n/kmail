@@ -28,6 +28,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/sync/singleflight"
 )
 
 // Config wires the CalDAV proxy.
@@ -57,9 +59,14 @@ type Service struct {
 	// nameCache memoises JMAP account id -> CalDAV account name
 	// lookups (see davAccount). Stalwart assigns a stable id and
 	// name per principal, so the mapping never changes for the
-	// process lifetime.
+	// process lifetime. Only *successful* resolutions are stored,
+	// so a transient lookup failure is retried rather than poisoned
+	// in the cache.
 	nameMu    sync.RWMutex
 	nameCache map[string]string
+	// nameSF collapses concurrent lookups for the same account id
+	// into a single in-flight x:Account/get call.
+	nameSF singleflight.Group
 }
 
 // NewService builds a Service from the provided Config.
@@ -329,14 +336,25 @@ func (s *Service) davAccount(ctx context.Context, accountID string) string {
 	if ok {
 		return cached
 	}
-	name := s.lookupAccountName(ctx, accountID)
-	if name == "" {
-		name = accountID
+	// Dedupe concurrent lookups and only memoise a *resolved* name.
+	// On any failure lookupAccountName returns ""; we then fall back
+	// to the raw id for this call without caching it, so the next
+	// request retries once Stalwart recovers. This also removes the
+	// race where a failing goroutine could overwrite another's
+	// successful result, since failures never touch the cache.
+	v, _, _ := s.nameSF.Do(accountID, func() (interface{}, error) {
+		name := s.lookupAccountName(ctx, accountID)
+		if name != "" {
+			s.nameMu.Lock()
+			s.nameCache[accountID] = name
+			s.nameMu.Unlock()
+		}
+		return name, nil
+	})
+	if name, _ := v.(string); name != "" {
+		return name
 	}
-	s.nameMu.Lock()
-	s.nameCache[accountID] = name
-	s.nameMu.Unlock()
-	return name
+	return accountID
 }
 
 // lookupAccountName issues a single `x:Account/get` JMAP call as the
