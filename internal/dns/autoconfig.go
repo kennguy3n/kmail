@@ -11,12 +11,18 @@
 //     plus the legacy `.well-known/autoconfig/mail/config-v1.1.xml`
 //     path).
 //   - Microsoft Outlook autodiscover (`/autodiscover/autodiscover.xml`).
+//   - Apple configuration profile (`/email.mobileconfig`) — the
+//     only one of the three formats that can carry CalDAV / CardDAV
+//     alongside mail, so it's how iOS / macOS users set up mail,
+//     calendar, and contacts in a single tap (see mobileconfig.go).
 //
-// Both responses are tenant-aware: the email address in the
+// All three responses are tenant-aware: the email address in the
 // inbound request is parsed, the bare domain looked up against
 // the `domains` table (without RLS — these are unauthenticated
 // public discovery endpoints), and the reply describes the
-// tenant's IMAP / SMTP / CalDAV / CardDAV endpoints.
+// tenant's IMAP / SMTP / CalDAV / CardDAV endpoints. (The Mozilla
+// and Outlook schemas have no CalDAV / CardDAV slot, so the
+// CalDAV / CardDAV settings surface only via the Apple profile.)
 package dns
 
 import (
@@ -62,6 +68,18 @@ type AutoconfigConfig struct {
 	BrandName  string // shown in Thunderbird's UI; defaults to "KMail"
 }
 
+// davAuthority returns the `host[:port]` used to build the
+// CalDAV / CardDAV URLs. The standard HTTPS port is elided so the
+// common case stays `https://host/dav/...`; a non-443 port is
+// rendered explicitly so the URL stays a faithful single source
+// of truth (the Apple profile parses it back out for host/port).
+func (c AutoconfigConfig) davAuthority() string {
+	if c.CalDAVPort != 0 && c.CalDAVPort != 443 {
+		return fmt.Sprintf("%s:%d", c.CalDAVHost, c.CalDAVPort)
+	}
+	return c.CalDAVHost
+}
+
 // AutoconfigService resolves an inbound email to its tenant's
 // server settings. A nil pool short-circuits to the configured
 // defaults (handy for dev / single-tenant deployments).
@@ -96,6 +114,10 @@ func NewAutoconfigService(cfg AutoconfigConfig) *AutoconfigService {
 	return &AutoconfigService{cfg: cfg}
 }
 
+// BrandName returns the configured brand (defaulted in
+// NewAutoconfigService), used as the Apple profile organization.
+func (s *AutoconfigService) BrandName() string { return s.cfg.BrandName }
+
 // ErrUnknownDomain is returned when the requested email's domain
 // is not registered to any tenant. The handler maps this to 404.
 var ErrUnknownDomain = errors.New("autoconfig: domain not registered")
@@ -117,8 +139,8 @@ func (s *AutoconfigService) SettingsForEmail(ctx context.Context, email string) 
 		IMAPPort:       s.cfg.IMAPPort,
 		SMTPHost:       s.cfg.SMTPHost,
 		SMTPPort:       s.cfg.SMTPPort,
-		CalDAVURL:      fmt.Sprintf("https://%s/dav/calendars/", s.cfg.CalDAVHost),
-		CardDAVURL:     fmt.Sprintf("https://%s/dav/contacts/", s.cfg.CalDAVHost),
+		CalDAVURL:      fmt.Sprintf("https://%s/dav/cal/", s.cfg.davAuthority()),
+		CardDAVURL:     fmt.Sprintf("https://%s/dav/card/", s.cfg.davAuthority()),
 		SocketType:     "SSL",
 		Authentication: "password-cleartext",
 	}
