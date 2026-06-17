@@ -9,6 +9,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"log"
 	"net/http"
@@ -419,6 +420,22 @@ func main() {
 	} else {
 		logger.Printf("jmap: shared circuit breaker disabled (KMAIL_VALKEY_URL unset); falling back to per-pod breaker")
 	}
+	// Dev/CI only: the official Stalwart image does not implement
+	// the production mTLS header-trust path, so a plain-HTTP dev BFF
+	// would be 401'd. When running in a development environment we
+	// instead authenticate to Stalwart with the recovery-admin Basic
+	// credential (KMAIL_STALWART_ADMIN_USER / _PASS, the same pair
+	// the alias sync reads) so the e2e smoke tests exercise a real
+	// mailbox. This stays empty in staging/production, where the
+	// proxy strips Authorization and relies on the mTLS client cert.
+	var devStalwartAuth string
+	if middleware.IsDevEnv(cfg.Env) {
+		if adminUser := os.Getenv("KMAIL_STALWART_ADMIN_USER"); adminUser != "" {
+			adminPass := os.Getenv("KMAIL_STALWART_ADMIN_PASS")
+			devStalwartAuth = "Basic " + base64.StdEncoding.EncodeToString([]byte(adminUser+":"+adminPass))
+			logger.Printf("jmap proxy: DEV-ONLY Stalwart Basic auth enabled (user=%s) — NON-PRODUCTION; prod uses mTLS", adminUser)
+		}
+	}
 	proxy, err := jmap.NewProxy(jmap.ProxyConfig{
 		StalwartURL:           cfg.StalwartURL,
 		Pool:                  pool,
@@ -426,6 +443,7 @@ func main() {
 		Shards:                shardSvc,
 		PreDeliverHook:        malwareHook,
 		TLS:                   stalwartTLS,
+		DevStalwartAuthHeader: devStalwartAuth,
 		Breaker:               jmapBreaker,
 		CircuitBreakThreshold: breakerThreshold,
 		CircuitBreakCooldown:  breakerCooldown,
