@@ -1476,7 +1476,7 @@ func main() {
 	}
 
 	// Phase 5 closeout — CardDAV contact bridge.
-	contactSvc := contactbridge.NewService(contactbridge.Config{StalwartURL: cfg.StalwartURL})
+	contactSvc := contactbridge.NewService(contactbridge.DevAdminConfig(cfg.StalwartURL, middleware.IsDevEnv(cfg.Env), logger))
 	galSvc := contactbridge.NewGALService(pool, contactSvc)
 	contactbridge.NewHandlers(contactSvc, logger).WithGAL(galSvc).Register(mux, authMW)
 
