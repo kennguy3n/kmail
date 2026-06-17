@@ -144,6 +144,22 @@ jobs:
         env:
           DATABASE_URL: postgresql://kmail:kmail@localhost:5432/kmail
 
+      # The dev-bypass bearer resolves to the
+      # `(tenant_id="00000000-...", kchat_user_id="dev-user")`
+      # identity. Without a matching row in Postgres the JMAP proxy
+      # returns `accountNotFound` on every call, so the chaos
+      # scenarios' pre-fault JMAP probe 404s and the shard scenario
+      # degrades to ENFORCE=0 (report-only). Seed both rows via the
+      # idempotent `scripts/seed-dev-tenant.sql` fixture so chaos
+      # actually enforces its SLO budget against real JMAP traffic.
+      # Applied AFTER `scripts/migrate.sh` because the seed references
+      # the `tenants` / `users` tables that migration 001 creates.
+      - name: Seed default dev tenant + user
+        run: |
+          psql "postgresql://kmail:kmail@localhost:5432/kmail" \
+            -v ON_ERROR_STOP=1 \
+            -f ./scripts/seed-dev-tenant.sql
+
       - name: Build kmail-api
         run: make build
 
