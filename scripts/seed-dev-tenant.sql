@@ -19,9 +19,16 @@
 --
 -- `stalwart_account_id` is the server-assigned JMAP id of the
 -- `kmail-dev` principal that `scripts/stalwart-init.sh` provisions
--- (via `x:Account/set`). On a fresh registry that principal is the
--- first one created after the recovery admin, so Stalwart assigns
--- it the deterministic id `b` (the recovery admin is `d333333`).
+-- (via `x:Account/set`). That id is NOT hard-coded here: it is passed
+-- in through the `dev_stalwart_account_id` psql variable by
+-- `scripts/seed-dev-tenant.sh`, which resolves it from Stalwart by the
+-- principal's stable *name* (`x:Account/query`). This deliberately
+-- decouples the fixture from Stalwart's id-assignment order — a
+-- version bump or a change in `stalwart-init.sh` provisioning order
+-- could assign the principal a different id, and a hard-coded value
+-- would silently desync from the real principal (every proxied JMAP
+-- call would then 404). Resolving by name removes that coupling.
+--
 -- In production the BFF passes this id to Stalwart as the
 -- `X-KMail-Stalwart-Account-Id` header so the mail core acts as the
 -- right principal. NOTE: the official `stalwartlabs/stalwart` image
@@ -29,14 +36,21 @@
 -- feature, so in dev/CI the proxy authenticates as the recovery
 -- admin (Basic) instead and the queried account is taken from the
 -- JMAP request body (the e2e harness derives it from
--- `/jmap/session`). The value here therefore only needs to be a
--- valid, non-empty id so `resolveAccount` finds a row rather than
--- returning `accountNotFound`.
+-- `/jmap/session`).
 --
--- Idempotent: ON CONFLICT (id) and ON CONFLICT (tenant_id,
--- kchat_user_id) ensure re-runs over an already-seeded database are
--- no-ops. Safe to apply both on first-boot and on a re-up of the
--- compose stack.
+-- Idempotent: re-runnable over an already-seeded database. The tenant
+-- insert is a no-op on conflict; the user upsert refreshes
+-- `stalwart_account_id` so a re-seed after a Stalwart re-provision
+-- self-corrects the row to the principal's current id rather than
+-- leaving a stale value behind.
+
+\if :{?dev_stalwart_account_id}
+\else
+\echo '>>> seed-dev-tenant.sql requires the dev_stalwart_account_id psql variable.'
+\echo '>>> Run it via scripts/seed-dev-tenant.sh (which resolves the kmail-dev'
+\echo '>>> principal id from Stalwart by name), or pass -v dev_stalwart_account_id=<id>.'
+DO $$ BEGIN RAISE EXCEPTION 'dev_stalwart_account_id psql variable is not set'; END $$;
+\endif
 
 BEGIN;
 
@@ -65,12 +79,13 @@ VALUES (
     '00000000-0000-0000-0000-000000000001'::uuid,
     '00000000-0000-0000-0000-000000000000'::uuid,
     'dev-user',
-    'b',
+    :'dev_stalwart_account_id',
     'dev-user@kmail.dev',
     'KMail Dev User',
     'owner',
     'active'
 )
-ON CONFLICT (tenant_id, kchat_user_id) DO NOTHING;
+ON CONFLICT (tenant_id, kchat_user_id)
+    DO UPDATE SET stalwart_account_id = EXCLUDED.stalwart_account_id;
 
 COMMIT;

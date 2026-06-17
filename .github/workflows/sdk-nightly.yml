@@ -142,10 +142,16 @@ jobs:
       # references the `tenants` / `users` tables that migration
       # 001 creates.
       - name: Seed default dev tenant + user
-        run: |
-          psql "postgresql://kmail:kmail@localhost:5432/kmail" \
-            -v ON_ERROR_STOP=1 \
-            -f ./scripts/seed-dev-tenant.sql
+        # seed-dev-tenant.sh resolves the kmail-dev principal's
+        # server-assigned JMAP id from Stalwart by name (rather than
+        # hard-coding it) before applying the seed fixture, so the SDK
+        # probes below drive the real provisioned mailbox.
+        env:
+          DATABASE_URL: postgresql://kmail:kmail@localhost:5432/kmail
+          STALWART_URL: http://localhost:8080
+          KMAIL_STALWART_ADMIN_USER: admin
+          KMAIL_STALWART_ADMIN_PASS: kmail-dev
+        run: ./scripts/seed-dev-tenant.sh
 
       - name: Build kmail-api
         run: make build
