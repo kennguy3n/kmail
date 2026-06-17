@@ -321,7 +321,7 @@ ports by `docker-compose.yml`:
    - **Outgoing**: SMTP, server `localhost`, port `587`, STARTTLS,
      normal password auth.
 3. Thunderbird's Lightning / TB Calendar add-on — "New calendar" →
-   "On the network" → CalDAV → `http://localhost:8080/dav/` →
+   "On the network" → CalDAV → `http://localhost:8080/dav/cal/` →
    pick the default calendar.
 4. Autoconfig / autodiscover is not wired in dev; production
    deployments can point `autoconfig.<domain>` and
@@ -336,7 +336,7 @@ ports by `docker-compose.yml`:
    `localhost`, port `587`, STARTTLS. Username = full address.
 3. Calendar account → CalDAV → "Manual" → username + password,
    server address `localhost:8080`. Enter the CalDAV path when
-   prompted (`/dav/calendars/<principal>/`).
+   prompted (`/dav/cal/<principal>/`).
 
 ### Known limitations (Stalwart v0.16.0)
 

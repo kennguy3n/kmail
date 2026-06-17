@@ -174,7 +174,7 @@ Delivered so far:
   manual test checklist.
 - **CalDAV compatibility** — `scripts/test-caldav.sh`
   (OPTIONS + PROPFIND Depth:0/1 + PUT / GET / DELETE
-  round-trip against `/dav/calendars/`) with matching Apple
+  round-trip against `/dav/cal/`) with matching Apple
   Calendar + Thunderbird sections in `docs/COMPATIBILITY.md`.
 - **Admin UI** — Domain and User admin pages in
   `web/src/pages/Admin/` go from placeholders to functional
