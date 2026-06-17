@@ -14,7 +14,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -26,19 +26,23 @@ type StalwartShardResolver interface {
 	GetTenantShard(ctx context.Context, tenantID string) (string, error)
 }
 
-// StalwartAliasHTTPSync talks to Stalwart's management API at
-// `PATCH /api/principal/{name}` to add or remove an alias on a
-// principal's `emails` field.
+// StalwartAliasHTTPSync mirrors alias CRUD into Stalwart over the
+// custom `x:`-namespaced JMAP management methods served at
+// `POST {shard}/jmap`. Stalwart 0.16 dropped the REST
+// `/api/principal/{name}` surface this used to call; aliases now
+// live in a structured `aliases` list on the principal and are
+// edited with the JMAP `x:Account/set` patch grammar:
 //
-// Stalwart's principal-update wire format is a JSON array of
-// operation objects:
+//	x:Account/set {"update": {"<accountId>": {"aliases/<n>": {...}}}}
 //
-//	[{"action":"addItem","field":"emails","value":"alias@example.com"}]
-//
-// The "emails" field on a principal holds the principal's primary
-// address and every alias (Stalwart treats them all as deliverable
-// recipients). `addItem` / `removeItem` are the documented atomic
-// operations and are idempotent on the server side.
+// where each list entry is an EmailAlias object
+// `{enabled, name (local-part), domainId, description}` and the
+// `aliases/<n>` patch path either sets (object value) or removes
+// (null value) the entry at integer index `n`. Because the patch
+// is index-addressed rather than value-addressed, every mutation
+// is a read-modify-write: the principal is fetched, the existing
+// aliases are inspected for idempotency, and a free index is
+// chosen (add) or the matching index located (remove).
 //
 // Authentication is HTTP Basic against the Stalwart admin
 // credentials configured at deploy time. The recovery admin in
@@ -92,80 +96,328 @@ func (s *StalwartAliasHTTPSync) WithHTTPClient(c *http.Client) *StalwartAliasHTT
 	return &cp
 }
 
-// AddAlias appends the alias address to the principal's `emails`
-// field. Idempotent: Stalwart returns 200 on a duplicate addItem.
+// AddAlias adds an EmailAlias entry for aliasEmail to the
+// principal. Idempotent: a no-op when the principal already has a
+// matching (local-part + domain) alias.
 func (s *StalwartAliasHTTPSync) AddAlias(ctx context.Context, tenantID, stalwartAccountID, aliasEmail string) error {
-	return s.patchPrincipal(ctx, tenantID, stalwartAccountID, "addItem", aliasEmail)
+	return s.syncAlias(ctx, tenantID, stalwartAccountID, aliasEmail, true)
 }
 
-// RemoveAlias drops the alias address from the principal's `emails`
-// field. Idempotent: Stalwart returns 200 on a missing removeItem.
+// RemoveAlias removes the EmailAlias entry for aliasEmail from the
+// principal. Idempotent: a no-op when no matching alias exists.
 func (s *StalwartAliasHTTPSync) RemoveAlias(ctx context.Context, tenantID, stalwartAccountID, aliasEmail string) error {
-	return s.patchPrincipal(ctx, tenantID, stalwartAccountID, "removeItem", aliasEmail)
+	return s.syncAlias(ctx, tenantID, stalwartAccountID, aliasEmail, false)
 }
 
-// stalwartPrincipalOp is one entry in the principal-update array
-// (Stalwart 0.16 management API).
-type stalwartPrincipalOp struct {
-	Action string `json:"action"`
-	Field  string `json:"field"`
-	Value  string `json:"value"`
+// stalwartEmailAlias mirrors Stalwart's EmailAlias struct. `name`
+// is the address local-part; `domainId` references a Domain
+// principal. `enabled` defaults to true and `description` is
+// optional, so both are omitted from add patches when zero.
+type stalwartEmailAlias struct {
+	Enabled     bool    `json:"enabled"`
+	Name        string  `json:"name"`
+	DomainID    string  `json:"domainId"`
+	Description *string `json:"description,omitempty"`
 }
 
-func (s *StalwartAliasHTTPSync) patchPrincipal(ctx context.Context, tenantID, stalwartAccountID, action, value string) error {
+// stalwartAccount is the slice of a Stalwart principal the alias
+// sync reads back. `aliases` is a sparse map keyed by the integer
+// list index (as a string), matching Stalwart's wire encoding of
+// its internal `VecMap<u32, EmailAlias>`.
+type stalwartAccount struct {
+	ID           string                        `json:"id"`
+	Name         string                        `json:"name"`
+	EmailAddress string                        `json:"emailAddress"`
+	Aliases      map[string]stalwartEmailAlias `json:"aliases"`
+}
+
+func (s *StalwartAliasHTTPSync) syncAlias(ctx context.Context, tenantID, stalwartAccountID, aliasEmail string, add bool) error {
 	if strings.TrimSpace(stalwartAccountID) == "" {
 		return errors.New("stalwart alias sync: stalwart account id is required")
 	}
-	if strings.TrimSpace(value) == "" {
-		return errors.New("stalwart alias sync: alias email is required")
+	localPart, domain, err := splitAliasEmail(aliasEmail)
+	if err != nil {
+		return err
 	}
 	shardURL, err := s.resolver.GetTenantShard(ctx, tenantID)
 	if err != nil {
 		return fmt.Errorf("resolve tenant shard: %w", err)
 	}
-	body, err := json.Marshal([]stalwartPrincipalOp{{
-		Action: action,
-		Field:  "emails",
-		Value:  value,
-	}})
+	account, err := s.resolvePrincipal(ctx, shardURL, stalwartAccountID)
 	if err != nil {
-		return fmt.Errorf("marshal principal op: %w", err)
+		return err
 	}
-	endpoint := strings.TrimRight(shardURL, "/") + "/api/principal/" + url.PathEscape(stalwartAccountID)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, endpoint, bytes.NewReader(body))
+	domainID, err := s.resolveDomainID(ctx, shardURL, domain)
 	if err != nil {
-		return fmt.Errorf("build principal request: %w", err)
+		return err
+	}
+	// Locate an existing alias matching local-part + domain so add
+	// and remove are both idempotent. Local-parts are matched
+	// case-insensitively to avoid creating case-variant duplicates.
+	existingIdx, found := "", false
+	for idx, a := range account.Aliases {
+		if strings.EqualFold(a.Name, localPart) && a.DomainID == domainID {
+			existingIdx, found = idx, true
+			break
+		}
+	}
+	if add {
+		if found {
+			return nil
+		}
+		patch := map[string]any{
+			"aliases/" + nextAliasIndex(account.Aliases): stalwartEmailAlias{
+				Enabled:  true,
+				Name:     localPart,
+				DomainID: domainID,
+			},
+		}
+		return s.setAccount(ctx, shardURL, account.ID, patch)
+	}
+	if !found {
+		return nil
+	}
+	return s.setAccount(ctx, shardURL, account.ID, map[string]any{
+		"aliases/" + existingIdx: nil,
+	})
+}
+
+// resolvePrincipal maps the stored stalwart_account_id to a live
+// Stalwart principal. The stored value is not uniform across
+// deployments — dev/CI seeds a JMAP id, while prod's signup wiring
+// stores the user's email as a placeholder — so three strategies
+// are tried in order of precision:
+//
+//  1. Treat it as a JMAP id directly. x:Account/get returns the
+//     principal for a real id and an empty list (not an error) for
+//     a non-id string, so this is a clean probe.
+//  2. Resolve by principal name (the login local-part Stalwart
+//     stores as `name`) via x:Account/query filter:{name}.
+//  3. Resolve by email address. Stalwart's account filter rejects
+//     an `email` key (unsupportedFilter) but its `text` filter
+//     matches the full address; we text-search then confirm with an
+//     exact, case-insensitive emailAddress match so a substring
+//     collision can never bind us to the wrong principal.
+func (s *StalwartAliasHTTPSync) resolvePrincipal(ctx context.Context, shardURL, identifier string) (stalwartAccount, error) {
+	byID, err := s.getAccounts(ctx, shardURL, []string{identifier})
+	if err != nil {
+		return stalwartAccount{}, err
+	}
+	for _, a := range byID {
+		if a.ID == identifier {
+			return a, nil
+		}
+	}
+
+	ids, err := s.queryAccountIDs(ctx, shardURL, map[string]any{"name": identifier})
+	if err != nil {
+		return stalwartAccount{}, err
+	}
+	if len(ids) > 0 {
+		byName, err := s.getAccounts(ctx, shardURL, ids[:1])
+		if err != nil {
+			return stalwartAccount{}, err
+		}
+		for _, a := range byName {
+			if a.ID == ids[0] {
+				return a, nil
+			}
+		}
+	}
+
+	if strings.Contains(identifier, "@") {
+		ids, err := s.queryAccountIDs(ctx, shardURL, map[string]any{"text": identifier})
+		if err != nil {
+			return stalwartAccount{}, err
+		}
+		if len(ids) > 0 {
+			byEmail, err := s.getAccounts(ctx, shardURL, ids)
+			if err != nil {
+				return stalwartAccount{}, err
+			}
+			for _, a := range byEmail {
+				if strings.EqualFold(a.EmailAddress, identifier) {
+					return a, nil
+				}
+			}
+		}
+	}
+
+	return stalwartAccount{}, fmt.Errorf("stalwart alias sync: principal %q not found", identifier)
+}
+
+// resolveDomainID maps a domain name to its Stalwart Domain
+// principal id, which EmailAlias.domainId must reference.
+func (s *StalwartAliasHTTPSync) resolveDomainID(ctx context.Context, shardURL, domain string) (string, error) {
+	raw, err := s.jmapCall(ctx, shardURL, "x:Domain/query", map[string]any{
+		"filter": map[string]any{"name": domain},
+	})
+	if err != nil {
+		return "", err
+	}
+	var res struct {
+		IDs []string `json:"ids"`
+	}
+	if err := json.Unmarshal(raw, &res); err != nil {
+		return "", fmt.Errorf("decode x:Domain/query: %w", err)
+	}
+	if len(res.IDs) == 0 {
+		return "", fmt.Errorf("stalwart alias sync: domain %q not found", domain)
+	}
+	return res.IDs[0], nil
+}
+
+// getAccounts fetches principals by id. Unknown ids are silently
+// omitted from `list` by Stalwart rather than erroring.
+func (s *StalwartAliasHTTPSync) getAccounts(ctx context.Context, shardURL string, ids []string) ([]stalwartAccount, error) {
+	raw, err := s.jmapCall(ctx, shardURL, "x:Account/get", map[string]any{"ids": ids})
+	if err != nil {
+		return nil, err
+	}
+	var res struct {
+		List []stalwartAccount `json:"list"`
+	}
+	if err := json.Unmarshal(raw, &res); err != nil {
+		return nil, fmt.Errorf("decode x:Account/get: %w", err)
+	}
+	return res.List, nil
+}
+
+func (s *StalwartAliasHTTPSync) queryAccountIDs(ctx context.Context, shardURL string, filter map[string]any) ([]string, error) {
+	raw, err := s.jmapCall(ctx, shardURL, "x:Account/query", map[string]any{"filter": filter})
+	if err != nil {
+		return nil, err
+	}
+	var res struct {
+		IDs []string `json:"ids"`
+	}
+	if err := json.Unmarshal(raw, &res); err != nil {
+		return nil, fmt.Errorf("decode x:Account/query: %w", err)
+	}
+	return res.IDs, nil
+}
+
+// setAccount applies an x:Account/set update patch to one
+// principal and reports the per-object result. The envelope
+// `accountId` is intentionally omitted: Stalwart ignores it for
+// this management method, and omitting it keeps the call
+// independent of whichever account the admin principal maps to
+// (which differs between deployments).
+func (s *StalwartAliasHTTPSync) setAccount(ctx context.Context, shardURL, jmapID string, patch map[string]any) error {
+	raw, err := s.jmapCall(ctx, shardURL, "x:Account/set", map[string]any{
+		"update": map[string]any{jmapID: patch},
+	})
+	if err != nil {
+		return err
+	}
+	var res struct {
+		Updated    map[string]json.RawMessage `json:"updated"`
+		NotUpdated map[string]struct {
+			Type        string `json:"type"`
+			Description string `json:"description"`
+		} `json:"notUpdated"`
+	}
+	if err := json.Unmarshal(raw, &res); err != nil {
+		return fmt.Errorf("decode x:Account/set: %w", err)
+	}
+	if _, ok := res.Updated[jmapID]; ok {
+		return nil
+	}
+	if e, ok := res.NotUpdated[jmapID]; ok {
+		return fmt.Errorf("stalwart alias sync: account %s not updated: %s: %s", jmapID, e.Type, strings.TrimSpace(e.Description))
+	}
+	return fmt.Errorf("stalwart alias sync: account %s missing from x:Account/set response", jmapID)
+}
+
+// jmapCall issues a single-method JMAP request against the shard's
+// `/jmap` endpoint with admin Basic auth and returns the raw
+// arguments object of the (sole) method response. A method-level
+// JMAP error (response name "error") and a non-2xx HTTP status are
+// both surfaced as Go errors.
+func (s *StalwartAliasHTTPSync) jmapCall(ctx context.Context, shardURL, method string, args any) (json.RawMessage, error) {
+	reqBody, err := json.Marshal(map[string]any{
+		"using":       []string{"urn:ietf:params:jmap:core"},
+		"methodCalls": []any{[]any{method, args, "0"}},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal jmap request: %w", err)
+	}
+	endpoint := strings.TrimRight(shardURL, "/") + "/jmap"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(reqBody))
+	if err != nil {
+		return nil, fmt.Errorf("build jmap request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.SetBasicAuth(s.adminUser, s.adminPass)
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("call stalwart admin api: %w", err)
+		return nil, fmt.Errorf("call stalwart jmap: %w", err)
 	}
-	// Drain the body before Close so the underlying HTTP/1.1
-	// connection is returned to the keep-alive pool. Without
-	// the explicit Copy-then-Close, a non-empty 200 response
-	// (Stalwart 0.16 returns a small JSON status envelope on
-	// principal updates) leaves bytes unread and forces the
-	// transport to close the connection, defeating connection
-	// reuse across the worker's batched retries. A bounded
-	// LimitReader caps the worst case so an admin endpoint that
-	// regresses into returning a multi-MB body cannot pin the
-	// goroutine.
-	defer func() {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
-		_ = resp.Body.Close()
-	}()
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		return nil
+	// Bound the body read, then drain any residual bytes before
+	// Close so the keep-alive connection is returned to the pool
+	// across the worker's batched retries.
+	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+	_ = resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("stalwart jmap returned %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
 	}
-	// Drain a bounded slice of the error body so the audit log
-	// captures the Stalwart error code without spamming on a
-	// large HTML 500 page from a misrouted call. The deferred
-	// LimitReader above still runs after we read here, so any
-	// residual bytes past the 1KB prefix are still discarded
-	// and the connection is returned to the pool.
-	body, _ = io.ReadAll(io.LimitReader(resp.Body, 1024))
-	return fmt.Errorf("stalwart admin api returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	if readErr != nil {
+		return nil, fmt.Errorf("read jmap response: %w", readErr)
+	}
+	var envelope struct {
+		MethodResponses [][]json.RawMessage `json:"methodResponses"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return nil, fmt.Errorf("decode jmap response: %w", err)
+	}
+	if len(envelope.MethodResponses) == 0 || len(envelope.MethodResponses[0]) < 2 {
+		return nil, errors.New("stalwart jmap: empty method response")
+	}
+	var name string
+	if err := json.Unmarshal(envelope.MethodResponses[0][0], &name); err != nil {
+		return nil, fmt.Errorf("decode jmap method name: %w", err)
+	}
+	respArgs := envelope.MethodResponses[0][1]
+	if name == "error" {
+		var je struct {
+			Type        string `json:"type"`
+			Description string `json:"description"`
+		}
+		_ = json.Unmarshal(respArgs, &je)
+		return nil, fmt.Errorf("stalwart jmap method error: %s: %s", je.Type, strings.TrimSpace(je.Description))
+	}
+	return respArgs, nil
 }
 
+// splitAliasEmail splits an address into local-part and domain,
+// rejecting empty input and malformed addresses (no `@`, empty
+// local-part, or empty domain).
+func splitAliasEmail(aliasEmail string) (localPart, domain string, err error) {
+	aliasEmail = strings.TrimSpace(aliasEmail)
+	if aliasEmail == "" {
+		return "", "", errors.New("stalwart alias sync: alias email is required")
+	}
+	at := strings.LastIndex(aliasEmail, "@")
+	if at <= 0 || at == len(aliasEmail)-1 {
+		return "", "", fmt.Errorf("stalwart alias sync: invalid alias email %q", aliasEmail)
+	}
+	return aliasEmail[:at], aliasEmail[at+1:], nil
+}
+
+// nextAliasIndex returns the smallest non-negative integer index
+// not already used as an aliases-map key, so adds reuse gaps left
+// by prior removes rather than growing the index space unbounded.
+func nextAliasIndex(aliases map[string]stalwartEmailAlias) string {
+	used := make(map[uint64]bool, len(aliases))
+	for k := range aliases {
+		if n, err := strconv.ParseUint(k, 10, 32); err == nil {
+			used[n] = true
+		}
+	}
+	var n uint64
+	for used[n] {
+		n++
+	}
+	return strconv.FormatUint(n, 10)
+}
