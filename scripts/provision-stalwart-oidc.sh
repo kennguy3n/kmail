@@ -20,8 +20,12 @@
 # v0.16.0 has NO file-based `[auth.oidc]` TOML — directories live in
 # the admin registry and are written via the custom `x:Directory/set`
 # + `x:Authentication/set` JMAP methods, exactly like the storage
-# backends in `stalwart-init.sh`. A registry write hot-reloads the
-# directory with no restart.
+# backends in `stalwart-init.sh`. The default-directory switch is
+# latched at boot on v0.16.0, so the registry write is necessary but
+# NOT sufficient — Stalwart must be restarted (with the BFF reachable
+# so it can fetch the JWKS at boot) before it validates bearer tokens.
+# This script performs that restart via STALWART_RESTART_CMD (see the
+# activation block below); when it is unset it prints the manual step.
 #
 # Idempotent: if Stalwart's default directory is already the OIDC
 # directory for this issuer, the script is a no-op.
