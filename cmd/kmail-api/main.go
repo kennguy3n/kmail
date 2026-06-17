@@ -705,9 +705,19 @@ func main() {
 	})
 	chatbridge.NewHandlers(chatbridgeSvc, logger).Register(mux, authMW)
 
-	calendarSvc := calendarbridge.NewService(calendarbridge.Config{
-		StalwartURL: cfg.StalwartURL,
-	})
+	calCfg := calendarbridge.Config{StalwartURL: cfg.StalwartURL}
+	// Dev/CI only: the bridge resolves CalDAV account names and
+	// reads collections as the Stalwart superuser over plain HTTP
+	// Basic. Production authenticates via mTLS (StalwartMTLS) and
+	// never sets these — gated through the same IsDevEnv alias
+	// table the proxy and OIDC middleware use.
+	if middleware.IsDevEnv(cfg.Env) {
+		if adminUser := os.Getenv("KMAIL_STALWART_ADMIN_USER"); adminUser != "" {
+			calCfg.AdminUser = adminUser
+			calCfg.AdminPassword = os.Getenv("KMAIL_STALWART_ADMIN_PASS")
+		}
+	}
+	calendarSvc := calendarbridge.NewService(calCfg)
 	// Per-tenant scheduling notifications. Phase 4 routes every
 	// tenant to a single configured channel
 	// (`KMAIL_CALENDAR_NOTIFY_CHANNEL`); Phase 5 will route per

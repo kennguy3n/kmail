@@ -23,7 +23,7 @@ func mockCalDAV(t *testing.T) *httptest.Server {
 			_, _ = w.Write([]byte(`<?xml version="1.0"?>
 <multistatus xmlns="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
   <response>
-    <href>/dav/acct/calendars/work/</href>
+    <href>/dav/cal/acct/work/</href>
     <propstat>
       <prop>
         <displayname>Work</displayname>
@@ -39,7 +39,7 @@ func mockCalDAV(t *testing.T) *httptest.Server {
 			_, _ = w.Write([]byte(`<?xml version="1.0"?>
 <multistatus xmlns="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
   <response>
-    <href>/dav/acct/calendars/work/evt-1.ics</href>
+    <href>/dav/cal/acct/work/evt-1.ics</href>
     <propstat>
       <prop>
         <c:calendar-data>` + sampleICS + `</c:calendar-data>

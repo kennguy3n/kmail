@@ -18,6 +18,7 @@ package calendarbridge
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -25,6 +26,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -52,6 +54,12 @@ type Config struct {
 // enough — the proxy is stateless across requests.
 type Service struct {
 	cfg Config
+	// nameCache memoises JMAP account id -> CalDAV account name
+	// lookups (see davAccount). Stalwart assigns a stable id and
+	// name per principal, so the mapping never changes for the
+	// process lifetime.
+	nameMu    sync.RWMutex
+	nameCache map[string]string
 }
 
 // NewService builds a Service from the provided Config.
@@ -59,7 +67,7 @@ func NewService(cfg Config) *Service {
 	if cfg.HTTPClient == nil {
 		cfg.HTTPClient = &http.Client{Timeout: 15 * time.Second}
 	}
-	return &Service{cfg: cfg}
+	return &Service{cfg: cfg, nameCache: make(map[string]string)}
 }
 
 // Calendar describes a calendar collection as surfaced to the BFF.
@@ -114,12 +122,12 @@ var ErrNotFound = errors.New("not found")
 
 // ListCalendars enumerates the authenticated principal's calendar
 // home by issuing a CalDAV PROPFIND with Depth:1 at
-// `/dav/{accountID}/calendars/`.
+// `/dav/cal/{account}/`.
 func (s *Service) ListCalendars(ctx context.Context, accountID string) ([]Calendar, error) {
 	if accountID == "" {
 		return nil, fmt.Errorf("%w: accountID required", ErrInvalidInput)
 	}
-	home := s.calendarHome(accountID)
+	home := s.calendarHome(ctx, accountID)
 	body := strings.NewReader(calendarHomePropfindBody)
 	resp, err := s.do(ctx, "PROPFIND", home, body, map[string]string{
 		"Depth":        "1",
@@ -144,7 +152,7 @@ func (s *Service) GetEvents(ctx context.Context, accountID, calendarID string, r
 	if accountID == "" || calendarID == "" {
 		return nil, fmt.Errorf("%w: accountID and calendarID required", ErrInvalidInput)
 	}
-	path := s.calendarPath(accountID, calendarID)
+	path := s.calendarPath(ctx, accountID, calendarID)
 	body := buildCalendarQueryReport(r)
 	resp, err := s.do(ctx, "REPORT", path, strings.NewReader(body), map[string]string{
 		"Depth":        "1",
@@ -171,7 +179,7 @@ func (s *Service) CreateEvent(ctx context.Context, accountID, calendarID, icalDa
 	if err != nil {
 		return "", err
 	}
-	path := s.eventPath(accountID, calendarID, uid)
+	path := s.eventPath(ctx, accountID, calendarID, uid)
 	resp, err := s.do(ctx, http.MethodPut, path, strings.NewReader(icalData), map[string]string{
 		"Content-Type": "text/calendar; charset=utf-8",
 		"If-None-Match": "*",
@@ -198,7 +206,7 @@ func (s *Service) UpdateEvent(ctx context.Context, accountID, calendarID, eventU
 			return err
 		}
 	}
-	path := s.eventPath(accountID, calendarID, eventUID)
+	path := s.eventPath(ctx, accountID, calendarID, eventUID)
 	resp, err := s.do(ctx, http.MethodPut, path, strings.NewReader(icalData), map[string]string{
 		"Content-Type": "text/calendar; charset=utf-8",
 	})
@@ -220,7 +228,7 @@ func (s *Service) DeleteEvent(ctx context.Context, accountID, calendarID, eventU
 	if eventUID == "" {
 		return fmt.Errorf("%w: eventUID required", ErrInvalidInput)
 	}
-	path := s.eventPath(accountID, calendarID, eventUID)
+	path := s.eventPath(ctx, accountID, calendarID, eventUID)
 	resp, err := s.do(ctx, http.MethodDelete, path, nil, nil)
 	if err != nil {
 		return err
@@ -257,7 +265,7 @@ func (s *Service) RespondToEvent(ctx context.Context, accountID, calendarID, eve
 }
 
 func (s *Service) fetchEvent(ctx context.Context, accountID, calendarID, eventUID string) (string, error) {
-	path := s.eventPath(accountID, calendarID, eventUID)
+	path := s.eventPath(ctx, accountID, calendarID, eventUID)
 	resp, err := s.do(ctx, http.MethodGet, path, nil, nil)
 	if err != nil {
 		return "", err
@@ -290,16 +298,103 @@ func (s *Service) do(ctx context.Context, method, urlStr string, body io.Reader,
 	return s.cfg.HTTPClient.Do(req)
 }
 
-func (s *Service) calendarHome(accountID string) string {
-	return strings.TrimRight(s.cfg.StalwartURL, "/") + "/dav/" + url.PathEscape(accountID) + "/calendars/"
+func (s *Service) calendarHome(ctx context.Context, accountID string) string {
+	return strings.TrimRight(s.cfg.StalwartURL, "/") + "/dav/cal/" + url.PathEscape(s.davAccount(ctx, accountID)) + "/"
 }
 
-func (s *Service) calendarPath(accountID, calendarID string) string {
-	return strings.TrimRight(s.cfg.StalwartURL, "/") + "/dav/" + url.PathEscape(accountID) + "/calendars/" + url.PathEscape(calendarID) + "/"
+func (s *Service) calendarPath(ctx context.Context, accountID, calendarID string) string {
+	return strings.TrimRight(s.cfg.StalwartURL, "/") + "/dav/cal/" + url.PathEscape(s.davAccount(ctx, accountID)) + "/" + url.PathEscape(calendarID) + "/"
 }
 
-func (s *Service) eventPath(accountID, calendarID, eventUID string) string {
-	return s.calendarPath(accountID, calendarID) + url.PathEscape(eventUID) + ".ics"
+func (s *Service) eventPath(ctx context.Context, accountID, calendarID, eventUID string) string {
+	return s.calendarPath(ctx, accountID, calendarID) + url.PathEscape(eventUID) + ".ics"
+}
+
+// davAccount maps a JMAP account id to the account *name* Stalwart
+// uses to key CalDAV collections (`/dav/cal/{name}/`). The BFF
+// resolves callers to their JMAP account id, but DAV paths require
+// the principal name, and the two are distinct identifiers in
+// Stalwart. When the bridge holds admin credentials it asks
+// Stalwart for the name via the `x:Account/get` management method
+// and memoises the result; without credentials — or on any lookup
+// failure — it returns the id unchanged so the path scheme is at
+// least correct.
+func (s *Service) davAccount(ctx context.Context, accountID string) string {
+	if accountID == "" || s.cfg.AdminUser == "" {
+		return accountID
+	}
+	s.nameMu.RLock()
+	cached, ok := s.nameCache[accountID]
+	s.nameMu.RUnlock()
+	if ok {
+		return cached
+	}
+	name := s.lookupAccountName(ctx, accountID)
+	if name == "" {
+		name = accountID
+	}
+	s.nameMu.Lock()
+	s.nameCache[accountID] = name
+	s.nameMu.Unlock()
+	return name
+}
+
+// lookupAccountName issues a single `x:Account/get` JMAP call as the
+// admin principal and returns the resolved account name, or "" on
+// any error. Stalwart ignores the `accountId` envelope field for
+// this management method, so an empty value is fine.
+func (s *Service) lookupAccountName(ctx context.Context, accountID string) string {
+	ids, err := json.Marshal([]string{accountID})
+	if err != nil {
+		return ""
+	}
+	body := `{"using":["urn:ietf:params:jmap:core"],"methodCalls":[["x:Account/get",{"accountId":"","ids":` + string(ids) + `},"0"]]}`
+	endpoint := strings.TrimRight(s.cfg.StalwartURL, "/") + "/jmap"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(body))
+	if err != nil {
+		return ""
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.SetBasicAuth(s.cfg.AdminUser, s.cfg.AdminPassword)
+	resp, err := s.cfg.HTTPClient.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return ""
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return ""
+	}
+	var envelope struct {
+		MethodResponses [][]json.RawMessage `json:"methodResponses"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return ""
+	}
+	if len(envelope.MethodResponses) == 0 || len(envelope.MethodResponses[0]) < 2 {
+		return ""
+	}
+	var result struct {
+		List []struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+		} `json:"list"`
+	}
+	if err := json.Unmarshal(envelope.MethodResponses[0][1], &result); err != nil {
+		return ""
+	}
+	for _, a := range result.List {
+		if a.ID == accountID && a.Name != "" {
+			return a.Name
+		}
+	}
+	if len(result.List) > 0 {
+		return result.List[0].Name
+	}
+	return ""
 }
 
 // ------------------------------------------------------------------
@@ -375,7 +470,7 @@ func parseCalendarsMultistatus(r io.Reader, homeHref string) ([]Calendar, error)
 }
 
 func calendarIDFromHref(href string) string {
-	// href looks like /dav/<account>/calendars/<id>/ — pluck the
+	// href looks like /dav/cal/<account>/<id>/ — pluck the
 	// trailing collection segment.
 	trimmed := strings.TrimRight(href, "/")
 	idx := strings.LastIndex(trimmed, "/")
