@@ -17,6 +17,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // StalwartShardResolver returns the Stalwart base URL for a tenant.
@@ -44,6 +46,17 @@ type StalwartShardResolver interface {
 // aliases are inspected for idempotency, and a free index is
 // chosen (add) or the matching index located (remove).
 //
+// Stalwart's custom x:Account/set rejects the JMAP `ifInState`
+// optimistic-concurrency argument (verified against v0.16.0), so
+// there is no server-side guard against two callers interleaving
+// that read-modify-write and the second clobbering the first
+// (e.g. both choosing the same free index). The sync serialises
+// per principal with a Postgres advisory lock instead — see
+// `withPrincipalLock` — and re-reads the aliases under the lock so
+// the index choice always reflects the authoritative current
+// state. When no lock pool is wired the sync still works but is
+// only safe single-threaded (the unit tests drive it that way).
+//
 // Authentication is HTTP Basic against the Stalwart admin
 // credentials configured at deploy time. The recovery admin in
 // dev-compose (`admin:kmail-dev`) is fine for local testing;
@@ -59,6 +72,11 @@ type StalwartAliasHTTPSync struct {
 	adminUser  string
 	adminPass  string
 	httpClient *http.Client
+	// lockPool serialises the per-principal read-modify-write via a
+	// Postgres advisory lock. Optional: nil disables locking (unit
+	// tests), production wires it via WithLockPool so concurrent
+	// add/remove for one principal can't clobber each other.
+	lockPool *pgxpool.Pool
 }
 
 // NewStalwartAliasHTTPSync constructs a sync wired to the given
@@ -93,6 +111,18 @@ func (s *StalwartAliasHTTPSync) WithHTTPClient(c *http.Client) *StalwartAliasHTT
 	}
 	cp := *s
 	cp.httpClient = c
+	return &cp
+}
+
+// WithLockPool returns a copy of the sync wired to a Postgres pool
+// used to take the per-principal advisory lock that serialises the
+// alias read-modify-write (see withPrincipalLock). Production wires
+// the application pool here at both call sites (kmail-api and the
+// sync worker) so the lock is shared cluster-wide. A nil pool
+// leaves locking disabled.
+func (s *StalwartAliasHTTPSync) WithLockPool(pool *pgxpool.Pool) *StalwartAliasHTTPSync {
+	cp := *s
+	cp.lockPool = pool
 	return &cp
 }
 
@@ -143,6 +173,12 @@ func (s *StalwartAliasHTTPSync) syncAlias(ctx context.Context, tenantID, stalwar
 	if err != nil {
 		return fmt.Errorf("resolve tenant shard: %w", err)
 	}
+	// Resolve the principal id and the alias's domain id up front.
+	// Both are read-only, idempotent lookups (and resolveDomainID is
+	// needed by the remove path too, to match the alias by
+	// local-part + domain), so they run outside the per-principal
+	// lock to keep the locked critical section — the actual
+	// read-modify-write — as short as possible.
 	account, err := s.resolvePrincipal(ctx, shardURL, stalwartAccountID)
 	if err != nil {
 		return err
@@ -151,35 +187,89 @@ func (s *StalwartAliasHTTPSync) syncAlias(ctx context.Context, tenantID, stalwar
 	if err != nil {
 		return err
 	}
-	// Locate an existing alias matching local-part + domain so add
-	// and remove are both idempotent. Local-parts are matched
-	// case-insensitively to avoid creating case-variant duplicates.
-	existingIdx, found := "", false
-	for idx, a := range account.Aliases {
-		if strings.EqualFold(a.Name, localPart) && a.DomainID == domainID {
-			existingIdx, found = idx, true
-			break
+	jmapID := account.ID
+
+	// Serialise the read-modify-write per principal. Inside the lock
+	// the aliases are re-read so the idempotency check and free-index
+	// choice reflect the authoritative current state rather than the
+	// snapshot resolvePrincipal fetched before the lock was held — a
+	// concurrent add/remove may have landed in between.
+	return s.withPrincipalLock(ctx, tenantID+":"+jmapID, func() error {
+		current, err := s.getAccount(ctx, shardURL, jmapID)
+		if err != nil {
+			return err
 		}
-	}
-	if add {
-		if found {
+		// Locate an existing alias matching local-part + domain so
+		// add and remove are both idempotent. Local-parts are matched
+		// case-insensitively to avoid creating case-variant
+		// duplicates.
+		existingIdx, found := "", false
+		for idx, a := range current.Aliases {
+			if strings.EqualFold(a.Name, localPart) && a.DomainID == domainID {
+				existingIdx, found = idx, true
+				break
+			}
+		}
+		if add {
+			if found {
+				return nil
+			}
+			return s.setAccount(ctx, shardURL, jmapID, map[string]any{
+				"aliases/" + nextAliasIndex(current.Aliases): stalwartEmailAlias{
+					Enabled:  true,
+					Name:     localPart,
+					DomainID: domainID,
+				},
+			})
+		}
+		if !found {
 			return nil
 		}
-		patch := map[string]any{
-			"aliases/" + nextAliasIndex(account.Aliases): stalwartEmailAlias{
-				Enabled:  true,
-				Name:     localPart,
-				DomainID: domainID,
-			},
-		}
-		return s.setAccount(ctx, shardURL, account.ID, patch)
-	}
-	if !found {
-		return nil
-	}
-	return s.setAccount(ctx, shardURL, account.ID, map[string]any{
-		"aliases/" + existingIdx: nil,
+		return s.setAccount(ctx, shardURL, jmapID, map[string]any{
+			"aliases/" + existingIdx: nil,
+		})
 	})
+}
+
+// withPrincipalLock runs fn while holding a cluster-wide Postgres
+// advisory lock keyed on (tenant, principal). It is the
+// application-level substitute for the optimistic concurrency
+// Stalwart's x:Account/set does not offer: concurrent add/remove
+// for the same principal — from the inline create path, multiple
+// kmail-api replicas, or multiple sync-worker replicas — run
+// serially, so the index-addressed aliases read-modify-write can't
+// interleave and clobber. Different principals hash to different
+// keys and never block each other.
+//
+// The lock is a blocking acquire on a dedicated pooled connection
+// (a waiter proceeds once the holder finishes), bounded by ctx, and
+// released before the connection returns to the pool. hashtext
+// keeps the key inside int4 like the audit-log lock; a hash
+// collision only causes two unrelated principals to occasionally
+// serialise, never an incorrect result. When no pool is wired fn
+// runs without locking (unit tests drive the sync single-threaded).
+func (s *StalwartAliasHTTPSync) withPrincipalLock(ctx context.Context, key string, fn func() error) error {
+	if s.lockPool == nil {
+		return fn()
+	}
+	conn, err := s.lockPool.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("stalwart alias sync: acquire conn: %w", err)
+	}
+	defer conn.Release()
+	if _, err := conn.Exec(ctx,
+		`SELECT pg_advisory_lock(hashtext('kmail.alias_sync:' || $1))`, key,
+	); err != nil {
+		return fmt.Errorf("stalwart alias sync: acquire advisory lock: %w", err)
+	}
+	// Release on a background context: fn most often returns because
+	// its own ctx was cancelled, and the unlock must still run so the
+	// lock isn't left dangling on the pooled connection.
+	defer func() {
+		_, _ = conn.Exec(context.Background(),
+			`SELECT pg_advisory_unlock(hashtext('kmail.alias_sync:' || $1))`, key)
+	}()
+	return fn()
 }
 
 // resolvePrincipal maps the stored stalwart_account_id to a live
@@ -265,6 +355,24 @@ func (s *StalwartAliasHTTPSync) resolveDomainID(ctx context.Context, shardURL, d
 		return "", fmt.Errorf("stalwart alias sync: domain %q not found", domain)
 	}
 	return res.IDs[0], nil
+}
+
+// getAccount fetches a single principal by its JMAP id, confirming
+// the returned object's id matches so a stale or garbage id can't
+// bind us to the wrong principal. Returns an error when the
+// principal is absent — e.g. deleted between resolvePrincipal and
+// the locked re-read.
+func (s *StalwartAliasHTTPSync) getAccount(ctx context.Context, shardURL, jmapID string) (stalwartAccount, error) {
+	accounts, err := s.getAccounts(ctx, shardURL, []string{jmapID})
+	if err != nil {
+		return stalwartAccount{}, err
+	}
+	for _, a := range accounts {
+		if a.ID == jmapID {
+			return a, nil
+		}
+	}
+	return stalwartAccount{}, fmt.Errorf("stalwart alias sync: principal %q not found", jmapID)
 }
 
 // getAccounts fetches principals by id. Unknown ids are silently

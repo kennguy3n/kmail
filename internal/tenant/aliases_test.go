@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -326,6 +327,50 @@ func TestStalwartAliasHTTPSync_AddAlias_Idempotent(t *testing.T) {
 	}
 	if sets := fake.methodCalls("x:Account/set"); len(sets) != 0 {
 		t.Errorf("expected no x:Account/set on duplicate add, got %d", len(sets))
+	}
+}
+
+// TestStalwartAliasHTTPSync_AddAlias_ReReadsUnderLock proves the
+// race fix: the free-index choice is computed from the alias state
+// read *after* the per-principal lock is held, not the snapshot
+// resolvePrincipal fetched before it. Without the under-lock
+// re-read, two concurrent adds could both observe an empty list,
+// both pick index 0, and the second x:Account/set would clobber the
+// first. The fake returns an empty aliases map on the first
+// x:Account/get (resolvePrincipal) and a populated one — index 0
+// already taken by another alias — on the second (the under-lock
+// re-read), simulating a concurrent add landing in between. The
+// resulting patch must therefore target aliases/1.
+func TestStalwartAliasHTTPSync_AddAlias_ReReadsUnderLock(t *testing.T) {
+	var getCalls atomic.Int64
+	fake := &fakeStalwart{respond: func(method string, _ json.RawMessage) (string, int) {
+		switch method {
+		case "x:Account/get":
+			if getCalls.Add(1) == 1 {
+				return `{"list":[{"id":"acc-1","name":"user","emailAddress":"user@example.com","aliases":{}}]}`, 0
+			}
+			return `{"list":[{"id":"acc-1","name":"user","emailAddress":"user@example.com","aliases":{"0":{"enabled":true,"name":"other","domainId":"dom-1"}}}]}`, 0
+		case "x:Domain/query":
+			return `{"ids":["dom-1"]}`, 0
+		case "x:Account/set":
+			return `{"updated":{"acc-1":null}}`, 0
+		default:
+			return `{}`, 0
+		}
+	}}
+	srv := httptest.NewServer(fake)
+	t.Cleanup(srv.Close)
+
+	syncer, _ := NewStalwartAliasHTTPSync(&stubResolver{url: srv.URL}, "admin", "secret")
+	if err := syncer.AddAlias(context.Background(), "tid", "acc-1", "alias@example.com"); err != nil {
+		t.Fatalf("AddAlias: %v", err)
+	}
+	sets := fake.methodCalls("x:Account/set")
+	if len(sets) != 1 {
+		t.Fatalf("x:Account/set calls = %d want 1", len(sets))
+	}
+	if key, _ := aliasPatch(t, sets[0], "acc-1"); key != "aliases/1" {
+		t.Errorf("patch key = %q want aliases/1 (index computed from the under-lock re-read, not the stale resolve snapshot)", key)
 	}
 }
 

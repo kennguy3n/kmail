@@ -583,6 +583,10 @@ func main() {
 		if err != nil {
 			logger.Printf("stalwart alias sync disabled: %v", err)
 		} else {
+			// Wire the application pool so the alias read-modify-write
+			// is serialised per principal by a Postgres advisory lock
+			// (Stalwart's x:Account/set has no ifInState guard).
+			aliasSync = aliasSync.WithLockPool(pool)
 			tenantSvc = tenantSvc.WithStalwartAliasSync(aliasSync).WithLogger(logger)
 			// Drain `alias_stalwart_sync_queue` (see `migrations/001_baseline.sql`)
 			// in the background. The Tenant Service enqueues

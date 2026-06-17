@@ -122,6 +122,11 @@ func buildWorkers(ctx context.Context, d workerDeps) ([]workerRegistration, erro
 		if syncErr != nil {
 			logger.Printf("alias-stalwart-sync worker disabled: %v", syncErr)
 		} else {
+			// Share the application pool so the alias
+			// read-modify-write is serialised per principal by a
+			// Postgres advisory lock across the worker and kmail-api
+			// (Stalwart's x:Account/set has no ifInState guard).
+			aliasSync = aliasSync.WithLockPool(pool)
 			w := tenant.NewAliasStalwartSyncWorker(pool, aliasSync, logger)
 			regs = append(regs, workerRegistration{name: "alias-stalwart-sync", run: w.Run})
 		}
