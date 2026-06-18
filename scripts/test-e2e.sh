@@ -120,14 +120,14 @@ if [ -n "${TENANT_ID}" ]; then
   case "${CAL_CODE}" in
     2??) ok ;;
     404)
-      # Known divergence: the bridge speaks CalDAV at
-      # `/dav/{accountID}/calendars/`, but the stock stalwartlabs/stalwart
-      # image serves CalDAV under `/dav/cal/{accountName}/` (account *name*,
-      # not the JMAP id) and auto-provisions no calendar home for a freshly
-      # created principal — so list-calendars 404s even though the route and
-      # admin auth are correct. Treated as a skip (cf. stages 12/14); the
-      # mail data plane (stages 5/7) is the load-bearing assertion here.
-      printf '  skip: calendar home not provisioned on stock Stalwart (CalDAV path/identifier divergence)\n' ;;
+      # Known divergence: the stock stalwartlabs/stalwart image
+      # auto-provisions no calendar home for a freshly created
+      # principal, so list-calendars 404s even though the bridge now
+      # speaks the official `/dav/cal/{email}/` scheme (Stalwart keys
+      # collections by the account email) and admin auth is correct.
+      # Treated as a skip (cf. stages 12/14); the mail data plane
+      # (stages 5/7) is the load-bearing assertion here.
+      printf '  skip: calendar home not provisioned on stock Stalwart\n' ;;
     *) fail "calendar list returned HTTP ${CAL_CODE}" ;;
   esac
 fi

@@ -122,6 +122,12 @@ func buildWorkers(ctx context.Context, d workerDeps) ([]workerRegistration, erro
 		if syncErr != nil {
 			logger.Printf("alias-stalwart-sync worker disabled: %v", syncErr)
 		} else {
+			// Share the application pool so the alias
+			// read-modify-write is serialised per principal by a
+			// Postgres advisory lock across the worker and kmail-api
+			// (Stalwart's x:Account/set has no ifInState guard), and a
+			// logger so a failed advisory-unlock is observable.
+			aliasSync = aliasSync.WithLockPool(pool).WithLogger(logger)
 			w := tenant.NewAliasStalwartSyncWorker(pool, aliasSync, logger)
 			regs = append(regs, workerRegistration{name: "alias-stalwart-sync", run: w.Run})
 		}
@@ -137,9 +143,19 @@ func buildWorkers(ctx context.Context, d workerDeps) ([]workerRegistration, erro
 		Pool:          pool,
 		Logger:        logger,
 	})
-	calendarSvc := calendarbridge.NewService(calendarbridge.Config{
-		StalwartURL: cfg.StalwartURL,
-	})
+	// Dev/CI only: the reminder worker resolves CalDAV account
+	// names and reads collections as the Stalwart superuser over
+	// plain HTTP Basic, mirroring the kmail-api wiring. Production
+	// authenticates via mTLS and never sets these — gated through
+	// the same IsDevEnv alias table the proxy and OIDC middleware
+	// use. Without the credential davAccount is a no-op, so every
+	// CalDAV call targets /dav/cal/{id}/ while Stalwart serves
+	// /dav/cal/{name}/ — i.e. the reminder sweep would 404 for
+	// every tenant in dev/CI. DevAdminConfig is the single source of
+	// this wiring, shared with kmail-api so the two can't drift.
+	calendarSvc := calendarbridge.NewService(
+		calendarbridge.DevAdminConfig(cfg.StalwartURL, middleware.IsDevEnv(cfg.Env), logger),
+	)
 	calendarChannelResolver := calendarbridge.NewDBChannelResolver(pool, os.Getenv("KMAIL_CALENDAR_NOTIFY_CHANNEL"))
 	calendarNotifier := calendarbridge.NewNotifier(chatbridgeSvc.KChat(), calendarChannelResolver)
 	reminderWorker := calendarbridge.NewReminderWorker(pool, calendarSvc, calendarNotifier, valkeyClient, logger)

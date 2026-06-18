@@ -25,19 +25,36 @@ if ! command -v swaks >/dev/null; then
     exit 2
 fi
 
+# Portable millisecond clock. GNU `date +%s%N` exposes nanoseconds;
+# BSD/macOS `date` lacks %N (emits a literal "N", which breaks the
+# arithmetic), so fall back to Perl's Time::HiRes (a core module,
+# present on macOS by default) or python3. Selected once so the
+# per-iteration hot path stays a single fast call.
+case "$(date +%N 2>/dev/null)" in
+    ''|*[!0-9]*) HAVE_NS=0 ;;
+    *)           HAVE_NS=1 ;;
+esac
+if [ "$HAVE_NS" = 1 ]; then
+    now_ms() { echo $(( $(date +%s%N) / 1000000 )); }
+elif command -v perl >/dev/null 2>&1; then
+    now_ms() { perl -MTime::HiRes=time -e 'printf "%d\n", time()*1000'; }
+else
+    now_ms() { python3 -c 'import time; print(int(time.time()*1000))'; }
+fi
+
 tmp="$(mktemp)"
 trap 'rm -f "$tmp"' EXIT
 
 for i in $(seq 1 "$N"); do
-    start=$(date +%s%N)
+    start=$(now_ms)
     swaks --quit-after DATA-OK \
         --server "$HOSTPORT" --from "$FROM" --to "$TO" \
         --header "Subject: bench $i" \
         --body "bench $i $(date -u +%FT%TZ)" \
         --auth-user dev --auth-password kmail-dev \
         >/dev/null 2>&1 || true
-    end=$(date +%s%N)
-    echo "$(( (end - start) / 1000000 ))" >>"$tmp"
+    end=$(now_ms)
+    echo "$(( end - start ))" >>"$tmp"
 done
 
 python3 - "$tmp" <<'PY'
