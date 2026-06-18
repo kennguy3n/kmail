@@ -51,6 +51,16 @@ type Config struct {
 	// compose dev where the upstream listens on plain HTTP.
 	StalwartMTLS StalwartMTLSConfig
 
+	// StalwartOIDC configures the OIDC bearer the BFF mints to
+	// authenticate to Stalwart's data plane. The official Stalwart
+	// image validates inbound `Authorization: Bearer` JWTs against
+	// an OIDC directory whose `issuerUrl` points back at the BFF;
+	// see `docs/JMAP-CONTRACT.md` §3.2 and the `internal/stalwartauth`
+	// package. Empty `Issuer` disables minting (the proxy then uses
+	// the dev-only admin-Basic path, or — in legacy deployments —
+	// strips Authorization and relies on the upstream's own auth).
+	StalwartOIDC StalwartOIDCConfig
+
 	// ValkeyURL is the Redis-compatible Valkey connection string
 	// used for session caches, rate-limit buckets, and the
 	// `(tenant_id, kchat_user_id) → stalwart_account_id` lookup
@@ -418,6 +428,47 @@ func (c StalwartMTLSConfig) Validate() error {
 	}
 }
 
+// StalwartOIDCConfig wires the OIDC bearer the BFF mints to
+// authenticate to Stalwart on the production data plane. See
+// `internal/stalwartauth` for the trust model.
+//
+// Production: set Issuer to the externally-resolvable BFF URL that
+// Stalwart can reach (path-namespaced, e.g.
+// `https://kmail-api.internal/oidc/stalwart`) and provide a signing
+// key via KeyFile or Key. A misconfigured production deployment
+// (Issuer set, no key) fails closed — main.go refuses to boot.
+//
+// Dev/CI: set Issuer (typically `http://host.docker.internal:8088/oidc/stalwart`)
+// and leave the key empty; the BFF generates an ephemeral key at boot
+// so CI can exercise the bearer path end-to-end without provisioning
+// secrets. The dev-only admin-Basic path (KMAIL_STALWART_ADMIN_USER)
+// remains available in parallel.
+type StalwartOIDCConfig struct {
+	// Issuer is the exact OIDC issuer URL. It MUST match the
+	// `issuerUrl` configured on Stalwart's OIDC directory and be
+	// reachable by the Stalwart process. Empty disables minting.
+	Issuer string
+	// Audience is the `aud` claim Stalwart's directory pins via
+	// `requireAudience`. Defaults to "stalwart".
+	Audience string
+	// KeyFile is a path to a PEM-encoded RSA private key (PKCS#1 or
+	// PKCS#8). Takes precedence over Key.
+	KeyFile string
+	// Key is an inline PEM-encoded RSA private key, for deployments
+	// that inject the key via a Secret env var rather than a file.
+	Key string
+	// KeyID overrides the JWK `kid`. Empty derives the RFC 7638
+	// thumbprint of the public key.
+	KeyID string
+	// TokenTTL is the minted-token lifetime. Defaults to 5m.
+	TokenTTL time.Duration
+}
+
+// Enabled reports whether OIDC bearer minting is configured.
+func (c StalwartOIDCConfig) Enabled() bool {
+	return strings.TrimSpace(c.Issuer) != ""
+}
+
 // DNSConfig wires the DNS Onboarding Service. The defaults target
 // KMail's dev infrastructure (`kmail.local`) so `go run
 // ./cmd/kmail-api` and `go run ./cmd/kmail-dns` work out of the
@@ -523,6 +574,18 @@ func Load() (*Config, error) {
 			KeyFile:    getenv("KMAIL_STALWART_TLS_KEY", ""),
 			CAFile:     getenv("KMAIL_STALWART_TLS_CA", ""),
 			ServerName: getenv("KMAIL_STALWART_TLS_SERVER_NAME", ""),
+		},
+		// OIDC bearer the BFF mints for Stalwart's data plane. Read
+		// with plain `getenv` (brand-new Phase-B variables; no legacy
+		// bare-name form to migrate). Issuer empty => minting
+		// disabled. TokenTTL defaults to 5m (handled in stalwartauth).
+		StalwartOIDC: StalwartOIDCConfig{
+			Issuer:   getenv("KMAIL_STALWART_OIDC_ISSUER", ""),
+			Audience: getenv("KMAIL_STALWART_OIDC_AUDIENCE", ""),
+			KeyFile:  getenv("KMAIL_STALWART_OIDC_KEY_FILE", ""),
+			Key:      getenv("KMAIL_STALWART_OIDC_KEY", ""),
+			KeyID:    getenv("KMAIL_STALWART_OIDC_KID", ""),
+			TokenTTL: getenvDuration("KMAIL_STALWART_OIDC_TOKEN_TTL", 0),
 		},
 		// `redis://localhost:6379` (full DSN with scheme) so a
 		// host-run BFF reaches the compose-published valkey on
@@ -728,7 +791,7 @@ func GetenvInt64(key string, fallback int64) int64 {
 // config for startup logging.
 func (c *Config) String() string {
 	return fmt.Sprintf(
-		"Config{HTTP.Addr=%s DatabaseURL=%s StalwartURL=%s ValkeyURL=%s KChatOIDCIssuer=%s DevBypass=%t ZKFabric.S3URL=%s ZKFabric.ConsoleURL=%s ZKFabric.Keys=%t IAMCore.Enabled=%t IAMCore.MgmtURL=%s IAMCore.LazyProvision=%t}",
+		"Config{HTTP.Addr=%s DatabaseURL=%s StalwartURL=%s ValkeyURL=%s KChatOIDCIssuer=%s DevBypass=%t ZKFabric.S3URL=%s ZKFabric.ConsoleURL=%s ZKFabric.Keys=%t IAMCore.Enabled=%t IAMCore.MgmtURL=%s IAMCore.LazyProvision=%t StalwartOIDC.Enabled=%t}",
 		c.HTTP.Addr,
 		redactDSN(c.DatabaseURL),
 		c.StalwartURL,
@@ -753,6 +816,10 @@ func (c *Config) String() string {
 		c.IAMCore.Enabled(),
 		c.IAMCore.MgmtURL,
 		c.IAMCore.LazyProvision,
+		// StalwartOIDC: only the on/off toggle is logged; the issuer,
+		// signing key, and kid are surfaced separately (and safely) by
+		// cmd/kmail-api at startup when minting is enabled.
+		c.StalwartOIDC.Enabled(),
 	)
 }
 

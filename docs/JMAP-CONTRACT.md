@@ -149,31 +149,121 @@ vectors and are locked behind the development gate by design.
 
 ### 3.2 BFF → Stalwart authentication
 
-- The BFF authenticates itself to Stalwart with a **mutual-TLS
-  client certificate** issued by the internal KMail PKI. Stalwart
-  is configured with `verify_client = required` and pins the
-  issuing CA, so any connection from a caller that cannot present
-  a valid client cert is dropped at the TLS handshake before any
-  HTTP layer runs.
-- The client certificate is provisioned by cert-manager on every
-  kmail-api pod (see `deploy/helm/kmail/templates/stalwart-mtls.yaml`).
-  Certificates have a 24-hour lifetime and are renewed automatically
-  8 hours before expiry; the Reloader controller restarts the pod
-  so it picks up the new keypair without manual intervention.
-- The acting tenant and user identity travel as headers
-  (`X-KMail-Tenant-Id`, `X-KMail-Kchat-User-Id`,
-  `X-KMail-Stalwart-Account-Id`) that Stalwart trusts **only**
-  because the TLS layer has already authenticated the caller as
-  the BFF. Stalwart applies no header trust to non-mTLS callers.
-- Per-user OIDC bearer tokens issued by KChat are stripped at the
-  proxy (`Authorization` header is deleted). The BFF is the
-  authentication boundary for end users; the mTLS handshake is
-  the BFF→Stalwart trust boundary. No password or long-lived
-  credential is ever forwarded to Stalwart.
-- The legacy trusted-network posture (Stalwart accepting the
-  identity headers from any source on the cluster network) is
-  removed for production; it is only acceptable in local compose
-  development where the upstream listens on plain HTTP.
+The BFF authenticates to Stalwart with a **short-lived OIDC bearer
+token it mints itself**, validated by Stalwart against the BFF's
+JWKS. This is the model the upstream `stalwartlabs/stalwart` image
+actually implements (an OpenID Connect directory backend); the
+end-user's KChat token is never forwarded to Stalwart.
+
+- **Minting.** For each request to Stalwart — both the client
+  requests the proxy forwards **and** the BFF-initiated calls from
+  `InternalClient` (sync bootstrap, undo-send, scheduled-send,
+  snooze, retention, eDiscovery export) — the BFF mints an RS256
+  JWT (`internal/stalwartauth`): `aud=stalwart`, `sub`/`email`/
+  `preferred_username` = the **resolved** `stalwart_account_id`
+  principal email (§3.3), `scope="openid email"`, ~5-minute TTL with
+  a small clock-skew `nbf`. Tokens are cached per principal in an
+  in-process LRU (cache TTL = token TTL / 2) so steady-state request
+  latency is unaffected. The signing key never leaves the BFF.
+- **Forwarding.** The proxy deletes the inbound end-user
+  `Authorization` header and sets `Authorization: Bearer <minted
+  jwt>` (`internal/jmap/proxy.go`); `InternalClient` mints the same
+  bearer for its already-resolved account and sets the header itself
+  (`internal/jmap/internal_client.go` `setAuth`). On either path, if
+  the principal cannot be resolved or minting fails the BFF **fails
+  closed** — the proxy forwards no credential, and `InternalClient`
+  aborts the call with an error — rather than leaking an
+  unauthenticated request or acting as an unintended principal.
+- **Verification.** Stalwart is configured with an OIDC directory
+  (`issuerUrl` = the BFF issuer, `requireAudience=stalwart`,
+  `claimUsername=email`) set as the default authentication
+  directory. It fetches the BFF's discovery document and JWKS at the
+  issuer and validates each bearer locally — signature against the
+  JWKS `kid`, `aud`, issuer, `exp`/`nbf`, and the `openid email`
+  scopes. The BFF therefore exposes **unauthenticated** endpoints
+  under the issuer path: `…/.well-known/openid-configuration` and
+  `…/jwks.json` (only the public key is served).
+- **Channel security.** The bearer is the *authentication* of the
+  acting principal; the BFF→Stalwart *channel* is still expected to
+  be TLS (and may be mTLS) in production. On both production paths
+  (the proxy and `InternalClient`, whenever a `Minter` is
+  configured), authentication is the minted bearer and no longer
+  depends on any `X-KMail-*` header trust — the official image does
+  not honor those headers. The `X-KMail-*` identity headers are
+  still stamped, but only as routing/diagnostic metadata, never as
+  an authentication signal. (The legacy header-trust posture
+  survives only in the mTLS-only deployment where neither a dev
+  header nor a `Minter` is set; both paths then send no
+  `Authorization` and defer to the mTLS client certificate.)
+- **Issuer must be `https` in production.** Stalwart fetches the
+  discovery/JWKS documents over the issuer URL, so a cleartext
+  `http` issuer would let a network attacker tamper with the served
+  JWKS and forge bearers for any principal (CWE-319). The signer
+  therefore **refuses to start** on a non-`https` issuer; `http` is
+  permitted only when `AllowInsecureIssuer` is set, which both
+  binaries gate on `KMAIL_ENV=development` for the dev/CI stack
+  (where the BFF serves plain HTTP on the local docker network).
+- **JIT-provisioning safety.** An OIDC directory auto-provisions an
+  account for an unknown `email` claim on first use, so the `email`
+  claim is **security-critical**: the BFF only ever mints it from an
+  already-resolved `stalwart_account_id` (§3.3), never from
+  user-supplied input, so an arbitrary mailbox can never be willed
+  into existence by a client.
+- **Dev/CI.** The proxy — and `InternalClient` for BFF-initiated
+  calls — authenticates to Stalwart with the recovery admin (Basic)
+  gated on `KMAIL_ENV=development` (the official image honors the
+  recovery admin *before* the directory, so admin Basic and
+  `x:`-API provisioning keep working with an OIDC default
+  directory). This dev/CI admin-Basic header takes precedence over
+  the `Minter` on both paths, so dev never accidentally mints
+  tokens. The minted-bearer path is exercised directly by
+  `scripts/test-e2e.sh` stage 18 against the dev stack; the OIDC
+  directory is registered out-of-band via
+  `scripts/provision-stalwart-oidc.sh` (see §3.2.1).
+- **Worker process.** In production the background jobs that go
+  through `InternalClient` (sync bootstrap, undo-send, scheduled-send,
+  snooze, retention, eDiscovery export) run in the standalone
+  `cmd/kmail-worker` binary (`KMAIL_DISABLE_WORKERS=true` on the API),
+  not in-process. That binary mints its own bearers, so it MUST be
+  provisioned the **same** signing key as `kmail-api`
+  (`KMAIL_STALWART_OIDC_KEY` / `KMAIL_STALWART_OIDC_KEY_FILE`) — only
+  the API serves the discovery/JWKS documents Stalwart fetches, so a
+  worker token signed with a different key would fail validation. The
+  worker fails closed (refuses to start) if the issuer is configured
+  without a key, mirroring the API.
+
+#### 3.2.1 Registering the Stalwart OIDC directory
+
+The upstream `stalwartlabs/stalwart:v0.16.0` image stores its
+configuration in an internal registry, **not** a file-based
+`[auth.oidc]` TOML block. The OIDC directory is therefore created
+through the admin JMAP API rather than a config file:
+
+1. `x:Directory/set` creates an `{"@type":"Oidc"}` record with
+   `issuerUrl` (the BFF issuer), `requireAudience="stalwart"`, and
+   `claimUsername="email"`.
+2. `x:Authentication/set` points the singleton `directoryId` at that
+   record, making it the default authentication directory.
+3. **Restart Stalwart.** On v0.16.0 the default-directory switch is
+   latched at boot, not hot-reloaded, so the change only takes effect
+   after a restart while the BFF's JWKS/discovery is reachable
+   (`docker compose restart stalwart` in dev/CI; a one-time rollout
+   step in production).
+
+`scripts/provision-stalwart-oidc.sh` performs all three idempotently
+(it no-ops if the default directory is already the OIDC directory for
+the configured issuer) and is run after kmail-api is up. See
+`configs/stalwart.example.toml` for the annotated record shape.
+
+**Key rotation.** The BFF serves a single JWK and computes the
+discovery/JWKS documents once at startup, so rotating the signing key
+means rolling the BFF (e.g. a new pod with the new key). Because the
+JWKS endpoint advertises `Cache-Control: max-age=300` and minted
+tokens live ~5 minutes, plan for a worst-case ~10-minute overlap in
+which Stalwart may still hold the previous JWKS while old tokens drain.
+For zero-downtime rotation, publish the new key's JWK alongside the old
+one (so both verify) for at least that window before retiring the old
+key — the `kid` header lets Stalwart pick the right key per token.
 
 ### 3.3 KChat identity → Stalwart account resolution
 

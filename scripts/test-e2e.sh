@@ -363,11 +363,82 @@ if curl_json "${API}/api/v1/admin/feature-flags" >/dev/null; then ok
 else fail "feature-flag admin list failed"; fi
 
 # ---------------------------------------------------------------
+# 18. OIDC bearer: BFF-minted JWT validated by Stalwart via JWKS
+# ---------------------------------------------------------------
+# The production BFF->Stalwart auth path (findings #1/#2): the BFF
+# mints a short-lived `stalwart`-audience RS256 JWT and Stalwart
+# validates it against the BFF's JWKS endpoint. In dev/CI the proxy
+# itself authenticates with admin Basic (#87), so this stage proves
+# the genuinely-new cross-process trust directly — it reads the
+# BFF's discovery+JWKS, mints a token with the same key Stalwart
+# fetched, and POSTs straight to Stalwart.
+#
+# Skipped unless the OIDC signing material is wired (the directory
+# must already be provisioned + Stalwart restarted to activate it,
+# see scripts/provision-stalwart-oidc.sh).
+step '18. OIDC bearer (BFF JWKS -> Stalwart validation)'
+OIDC_ISS="${KMAIL_STALWART_OIDC_ISSUER:-}"
+OIDC_KEY="${KMAIL_STALWART_OIDC_KEY_FILE:-}"
+STW="${STALWART_URL:-http://localhost:8080}"
+if [ -z "${OIDC_ISS}" ] || [ -z "${OIDC_KEY}" ] || [ ! -f "${OIDC_KEY}" ]; then
+  printf '  skip: OIDC bearer not wired (set KMAIL_STALWART_OIDC_ISSUER + KMAIL_STALWART_OIDC_KEY_FILE)\n'
+else
+  require openssl
+  OIDC_KID="${KMAIL_STALWART_OIDC_KID:-kmail-bff-1}"
+  OIDC_AUD="${KMAIL_STALWART_OIDC_AUDIENCE:-stalwart}"
+  OIDC_EMAIL="${KMAIL_STALWART_OIDC_PRINCIPAL:-kmail-dev@kmail.dev}"
+  # issuerPath = path component of the configured issuer (e.g. /oidc/stalwart);
+  # the BFF serves discovery/JWKS under it.
+  ISS_PATH=$(printf '%s' "${OIDC_ISS}" | sed -E 's#^[a-z][a-z0-9+.-]*://[^/]+##')
+
+  # (a) the BFF serves a self-consistent discovery doc + a JWKS
+  if curl --fail --silent "${API}${ISS_PATH}/.well-known/openid-configuration" |
+       jq -e '.issuer and .jwks_uri' >/dev/null; then ok
+  else fail "BFF OIDC discovery missing/invalid"; fi
+  if curl --fail --silent "${API}${ISS_PATH}/jwks.json" |
+       jq -e '.keys[0].kty == "RSA"' >/dev/null; then ok
+  else fail "BFF JWKS missing RSA key"; fi
+
+  # (b) mint a short-lived RS256 JWT with the same key the BFF signs with
+  b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+  mint() { # $1 = audience claim
+    _now=$(date +%s); _exp=$((_now + 300)); _nbf=$((_now - 5))
+    _h=$(printf '{"alg":"RS256","typ":"JWT","kid":"%s"}' "${OIDC_KID}" | b64url)
+    _p=$(printf '{"iss":"%s","aud":"%s","sub":"%s","email":"%s","preferred_username":"%s","scope":"openid email","iat":%s,"nbf":%s,"exp":%s}' \
+         "${OIDC_ISS}" "$1" "${OIDC_EMAIL}" "${OIDC_EMAIL}" "${OIDC_EMAIL}" "${_now}" "${_nbf}" "${_exp}" | b64url)
+    _si="${_h}.${_p}"
+    _sig=$(printf '%s' "${_si}" | openssl dgst -sha256 -sign "${OIDC_KEY}" -binary | b64url)
+    printf '%s.%s' "${_si}" "${_sig}"
+  }
+  GOOD=$(mint "${OIDC_AUD}")
+
+  # (c) Stalwart validates the token and resolves it to the principal
+  SESS=$(curl --fail --silent -H "Authorization: Bearer ${GOOD}" "${STW}/jmap/session" || echo '{}')
+  OIDC_ACCT=$(printf '%s' "${SESS}" | jq -r '.primaryAccounts["urn:ietf:params:jmap:mail"] // empty')
+  if [ -n "${OIDC_ACCT}" ]; then ok
+  else fail "OIDC token did not authenticate to Stalwart (no session account)"; fi
+
+  # (d) a real JMAP method call succeeds with the minted token
+  if [ -n "${OIDC_ACCT}" ]; then
+    OIDC_REQ=$(printf '{"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail"],"methodCalls":[["Email/query",{"accountId":"%s","limit":1},"0"]]}' "${OIDC_ACCT}")
+    if curl --fail --silent -H "Authorization: Bearer ${GOOD}" \
+         -H 'Content-Type: application/json' -d "${OIDC_REQ}" "${STW}/jmap" >/dev/null; then ok
+    else fail "OIDC Email/query failed"; fi
+  fi
+
+  # (e) negative: a wrong-audience token must be rejected (401)
+  BAD_CODE=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+    -H "Authorization: Bearer $(mint "not-stalwart")" "${STW}/jmap/session")
+  if [ "${BAD_CODE}" = "401" ]; then ok
+  else fail "wrong-audience token was not rejected (got HTTP ${BAD_CODE})"; fi
+fi
+
+# ---------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------
 printf '\n'
 if [ "${FAIL}" -eq 0 ]; then
-  printf 'kmail-e2e: all 17 stages passed\n'
+  printf 'kmail-e2e: all 18 stages passed\n'
   exit 0
 fi
 printf 'kmail-e2e: %d stage(s) failed\n' "${FAIL}" 1>&2

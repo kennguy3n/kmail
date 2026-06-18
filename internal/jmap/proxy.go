@@ -45,6 +45,15 @@ type ShardResolver interface {
 	GetSecondaryShards(ctx context.Context, tenantID string) ([]string, error)
 }
 
+// BearerMinter mints a short-lived OIDC bearer token authenticating
+// the BFF to Stalwart as the given principal (the resolved Stalwart
+// account email). Implemented by `*stalwartauth.Signer`. The proxy
+// depends on this narrow interface rather than the concrete signer so
+// the `jmap` package need not import `stalwartauth`.
+type BearerMinter interface {
+	Mint(principal string) (string, error)
+}
+
 // ProxyConfig wires the JMAP reverse proxy. `StalwartURL` is the
 // internal Stalwart JMAP endpoint (e.g., `http://stalwart:8080` in
 // the local compose stack, `https://kmail-stalwart-0.kmail-stalwart.svc:8443`
@@ -80,6 +89,20 @@ type ProxyConfig struct {
 	// `docs/JMAP-CONTRACT.md` §3.2). Wired in `cmd/kmail-api/main.go`
 	// only when `middleware.IsDevEnv(cfg.Env)` is true.
 	DevStalwartAuthHeader string
+
+	// Minter, when non-nil, mints a short-lived OIDC bearer per
+	// request (subject = the resolved Stalwart account) which the
+	// proxy forwards as `Authorization: Bearer …`. This is the
+	// production BFF→Stalwart authentication path on the official
+	// Stalwart image, which validates the JWT against an OIDC
+	// directory whose `issuerUrl` points back at the BFF (see
+	// `internal/stalwartauth` and `docs/JMAP-CONTRACT.md` §3.2).
+	// Mutually exclusive with `DevStalwartAuthHeader` (the dev/CI
+	// admin-Basic path takes precedence when both are set). When nil
+	// and no dev header is set, the proxy strips `Authorization`
+	// (legacy mTLS-header-trust posture). Wired in
+	// `cmd/kmail-api/main.go` when `KMAIL_STALWART_OIDC_ISSUER` is set.
+	Minter BearerMinter
 
 	// AccountCacheTTL controls how long the `(tenant_id, kchat_user_id)
 	// → stalwart_account_id` cache entries live. Defaults to 5
@@ -836,6 +859,15 @@ func (p *Proxy) Target() *url.URL { return p.target }
 // image the same way proxied traffic does instead of 401-ing.
 func (p *Proxy) DevStalwartAuthHeader() string { return p.cfg.DevStalwartAuthHeader }
 
+// Minter returns the proxy's OIDC bearer minter (see
+// `ProxyConfig.Minter`), or nil if none is configured. It is
+// non-nil only on the production path (`KMAIL_STALWART_OIDC_ISSUER`
+// set). `InternalClient` reads it so BFF-initiated JMAP calls mint
+// the same `stalwart`-audience bearer the proxy forwards, instead
+// of relying on the `X-KMail-*` header trust the official Stalwart
+// image does not honor.
+func (p *Proxy) Minter() BearerMinter { return p.cfg.Minter }
+
 // Logger returns the proxy's logger so colocated helpers can emit
 // to the same destination.
 func (p *Proxy) Logger() *log.Logger { return p.logger }
@@ -1453,27 +1485,50 @@ func (p *Proxy) rewrite(r *httputil.ProxyRequest) {
 	if accountID != "" {
 		r.Out.Header.Set("X-KMail-Stalwart-Account-Id", accountID)
 	}
-	// Production: the BFF authenticates itself to Stalwart via the
-	// mutual-TLS client certificate presented by the transport (see
-	// `ClientTLSConfig`). Stalwart pins the issuing CA and refuses
-	// any connection that does not chain to it, so the X-KMail-*
-	// identity headers are only honoured for callers the transport
-	// already vouched for cryptographically. The inbound
-	// `Authorization` header (the user's OIDC bearer) is stripped
-	// because Stalwart neither needs it nor trusts it — the BFF is
-	// the authentication boundary, the mTLS handshake is the
-	// BFF→Stalwart trust boundary.
+	// The inbound `Authorization` header carries the *end user's*
+	// KChat OIDC bearer, which Stalwart neither needs nor trusts —
+	// the BFF is the authentication boundary. How the BFF then
+	// authenticates *itself* to Stalwart depends on the deployment:
 	//
-	// Dev/CI only: `DevStalwartAuthHeader` is set (see ProxyConfig)
-	// because the official Stalwart image does not implement the
-	// X-KMail-* header-trust feature and would 401 the plain-HTTP
-	// BFF. We replace `Authorization` with the recovery-admin Basic
-	// credential so the smoke tests exercise a real mailbox. This
-	// branch is unreachable in production (the env gate in main.go
-	// leaves the field empty).
-	if p.cfg.DevStalwartAuthHeader != "" {
+	//   1. Dev/CI (`DevStalwartAuthHeader` set): the official
+	//      Stalwart image does not implement the X-KMail-* header
+	//      trust feature and would 401 the plain-HTTP BFF, so we
+	//      authenticate with the recovery-admin Basic credential to
+	//      exercise a real mailbox. Gated to dev in main.go; takes
+	//      precedence so dev never accidentally mints tokens.
+	//
+	//   2. Production (`Minter` set): mint a short-lived,
+	//      `stalwart`-audience OIDC bearer for the resolved account
+	//      and forward it. Stalwart validates it against the OIDC
+	//      directory whose `issuerUrl` points back at the BFF's JWKS
+	//      (see `internal/stalwartauth`, `docs/JMAP-CONTRACT.md`
+	//      §3.2). The `email` claim selects the principal, so it MUST
+	//      be the server-resolved account ID and never user input. A
+	//      mint failure FAILS CLOSED — we strip `Authorization` so
+	//      the upstream 401s rather than acting as the wrong (or an
+	//      admin) principal.
+	//
+	//   3. Legacy mTLS-only (neither set): strip `Authorization` and
+	//      defer to the mTLS client certificate / trusted-network
+	//      posture for caller authentication.
+	switch {
+	case p.cfg.DevStalwartAuthHeader != "":
 		r.Out.Header.Set("Authorization", p.cfg.DevStalwartAuthHeader)
-	} else {
+	case p.cfg.Minter != nil:
+		if accountID == "" {
+			// No principal resolved — never mint an unscoped token.
+			r.Out.Header.Del("Authorization")
+			p.logger.Printf("jmap proxy: no stalwart account resolved for tenant=%s; stripping Authorization (request will 401)", tenantID)
+			break
+		}
+		token, err := p.cfg.Minter.Mint(accountID)
+		if err != nil {
+			r.Out.Header.Del("Authorization")
+			p.logger.Printf("jmap proxy: bearer mint failed for account=%s: %v; stripping Authorization (request will 401)", accountID, err)
+			break
+		}
+		r.Out.Header.Set("Authorization", "Bearer "+token)
+	default:
 		r.Out.Header.Del("Authorization")
 	}
 }

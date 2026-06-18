@@ -645,6 +645,18 @@ jobs:
       - name: Build kmail-api
         run: make build
 
+      - name: Generate OIDC signing key (BFF -> Stalwart bearer)
+        # The production BFF->Stalwart auth path (findings #1/#2): the
+        # BFF mints short-lived `stalwart`-audience RS256 JWTs and
+        # Stalwart validates them against the BFF's JWKS endpoint. CI
+        # generates a throwaway 2048-bit RSA key the BFF signs with;
+        # the public half is served at the BFF's JWKS endpoint and
+        # fetched by Stalwart when the OIDC directory is provisioned.
+        run: |
+          mkdir -p /tmp/kmail-oidc
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
+            -out /tmp/kmail-oidc/key.pem
+
       - name: Start kmail-api (background, port 8088)
         # Env vars split by which code path reads them:
         #
@@ -690,6 +702,18 @@ jobs:
           ZK_FABRIC_SECRET_KEY: kmail-secret-key
           KMAIL_MEILISEARCH_URL: http://localhost:7700
           KMAIL_MEILISEARCH_API_KEY: kmail-dev
+          # OIDC bearer (findings #1/#2): when these are set the BFF
+          # mints stalwart-audience JWTs for proxied calls and serves
+          # discovery + JWKS under the issuer path. The issuer must be
+          # reachable from the Stalwart container (host.docker.internal
+          # -> host-gateway, see docker-compose.yml extra_hosts) since
+          # Stalwart fetches the JWKS itself. In dev/CI the proxy still
+          # authenticates with admin Basic (#87); this material drives
+          # the direct BFF-JWKS -> Stalwart validation exercised by
+          # test-e2e.sh stage 18.
+          KMAIL_STALWART_OIDC_ISSUER: http://host.docker.internal:8088/oidc/stalwart
+          KMAIL_STALWART_OIDC_KEY_FILE: /tmp/kmail-oidc/key.pem
+          KMAIL_STALWART_OIDC_KID: kmail-bff-1
         run: |
           mkdir -p /tmp/kmail-logs
           nohup ./bin/kmail-api > /tmp/kmail-logs/kmail-api.log 2>&1 &
@@ -708,7 +732,33 @@ jobs:
           tail -200 /tmp/kmail-logs/kmail-api.log >&2 || true
           exit 1
 
+      - name: Provision + activate OIDC bearer directory
+        # Register the OIDC directory in Stalwart's registry pointing at
+        # the BFF's (now-running) JWKS, then restart Stalwart to latch it
+        # as the default auth directory (the default-directory switch is
+        # boot-latched on v0.16.0, not hot-reloaded). The recovery admin
+        # (admin:kmail-dev) is still honoured afterwards, so #87's
+        # admin-Basic proxy path and stalwart-init provisioning keep
+        # working. OIDC_PROBE_URL points the script at the BFF via
+        # localhost (the issuer host only resolves inside the container).
+        env:
+          STALWART_ADMIN_URL: http://localhost:8080
+          STALWART_ADMIN_PASSWORD: kmail-dev
+          KMAIL_STALWART_OIDC_ISSUER: http://host.docker.internal:8088/oidc/stalwart
+          KMAIL_STALWART_OIDC_AUDIENCE: stalwart
+          OIDC_PROBE_URL: http://localhost:8088/oidc/stalwart/.well-known/openid-configuration
+          STALWART_RESTART_CMD: docker compose restart stalwart
+        run: ./scripts/provision-stalwart-oidc.sh
+
       - name: Run e2e smoke (scripts/test-e2e.sh)
+        # OIDC env enables stage 18 (BFF-minted JWT -> Stalwart via
+        # JWKS); without it the stage skips. STALWART_URL lets the stage
+        # POST the minted token straight to Stalwart.
+        env:
+          STALWART_URL: http://localhost:8080
+          KMAIL_STALWART_OIDC_ISSUER: http://host.docker.internal:8088/oidc/stalwart
+          KMAIL_STALWART_OIDC_KEY_FILE: /tmp/kmail-oidc/key.pem
+          KMAIL_STALWART_OIDC_KID: kmail-bff-1
         run: ./scripts/test-e2e.sh
 
       - name: Dump kmail-api log on failure

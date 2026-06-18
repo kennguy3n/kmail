@@ -185,11 +185,12 @@ func (r *JmapResponse) FirstCallError() error {
 
 // Dispatch sends `req` to Stalwart as the given user. The user is
 // identified by `(tenantID, kchatUserID)`; the client resolves
-// the Stalwart account ID through the proxy's cache and stamps
-// the same `X-KMail-*` identity headers as the proxy (Stalwart
-// trusts them only because the mTLS handshake authenticated the
-// BFF), plus — in dev/CI only — the recovery-admin `Authorization`
-// header the proxy uses (see setDevAuth).
+// the Stalwart account ID through the proxy's cache, stamps the
+// same `X-KMail-*` identity headers as the proxy, and authenticates
+// itself to Stalwart exactly as the proxy does (see setAuth): the
+// recovery-admin Basic credential in dev/CI, or — in production —
+// a freshly minted `stalwart`-audience OIDC bearer for the
+// resolved account.
 //
 // On primary-shard 5xx or transport failure, the client retries
 // against each secondary shard in order. The breaker / Postgres
@@ -239,7 +240,12 @@ func (c *InternalClient) Dispatch(
 		httpReq.Header.Set("X-KMail-Tenant-Id", tenantID)
 		httpReq.Header.Set("X-KMail-Kchat-User-Id", kchatUserID)
 		httpReq.Header.Set("X-KMail-Stalwart-Account-Id", accountID)
-		c.setDevAuth(httpReq)
+		// A mint failure is not shard-specific — surface it
+		// immediately rather than retrying every shard with the
+		// same un-mintable principal.
+		if err := c.setAuth(httpReq, accountID); err != nil {
+			return nil, err
+		}
 
 		resp, err := c.httpc.Do(httpReq)
 		if err != nil {
@@ -292,22 +298,44 @@ func (c *InternalClient) Dispatch(
 	return nil, lastErr
 }
 
-// setDevAuth stamps the dev/CI `Authorization` header on a
-// BFF-initiated request when one is configured. It mirrors the
-// proxy: in dev/CI the official Stalwart image cannot authenticate
-// the BFF over the production mTLS header-trust path, so the proxy
-// authenticates with the recovery-admin Basic credential
-// (`ProxyConfig.DevStalwartAuthHeader`, gated by
-// `middleware.IsDevEnv` in `cmd/kmail-api/main.go`). Without this,
-// InternalClient-backed features (sync bootstrap, undo-send,
-// scheduled-send, snooze, retention, eDiscovery export) 401 in
-// single-binary dev mode (`KMAIL_DISABLE_WORKERS=false`) against
-// the stock image. In production the header is empty and the
-// request authenticates via the shared mTLS transport instead.
-func (c *InternalClient) setDevAuth(req *http.Request) {
-	if h := c.proxy.DevStalwartAuthHeader(); h != "" {
-		req.Header.Set("Authorization", h)
+// setAuth stamps the BFF→Stalwart `Authorization` header on a
+// BFF-initiated request, mirroring the proxy's three-armed switch
+// (`Proxy.rewrite`, `docs/JMAP-CONTRACT.md` §3.2) so InternalClient
+// authenticates to Stalwart exactly as proxied traffic does:
+//
+//  1. Dev/CI (`DevStalwartAuthHeader` set): the official Stalwart
+//     image cannot authenticate the BFF over the X-KMail-* header
+//     trust path, so we authenticate with the recovery-admin Basic
+//     credential (gated by `middleware.IsDevEnv` in
+//     `cmd/kmail-api/main.go`). Takes precedence so dev never mints.
+//  2. Production (`Minter` set): mint a short-lived,
+//     `stalwart`-audience OIDC bearer for the resolved `accountID`
+//     and forward it as `Authorization: Bearer …`. Without this,
+//     InternalClient-backed features (sync bootstrap, undo-send,
+//     scheduled-send, snooze, retention, eDiscovery export) would
+//     401 against the official image, which does not honor the
+//     X-KMail-* headers. A mint failure FAILS CLOSED — we return an
+//     error rather than dispatch an unauthenticated request that
+//     would act as the wrong (or an admin) principal.
+//  3. Legacy mTLS-only (neither set): leave `Authorization` unset
+//     and defer to the mTLS client certificate / trusted-network
+//     posture.
+func (c *InternalClient) setAuth(req *http.Request, accountID string) error {
+	switch {
+	case c.proxy.DevStalwartAuthHeader() != "":
+		req.Header.Set("Authorization", c.proxy.DevStalwartAuthHeader())
+	case c.proxy.Minter() != nil:
+		if strings.TrimSpace(accountID) == "" {
+			// Never mint an unscoped token — fail closed.
+			return errors.New("jmap.InternalClient: cannot mint stalwart bearer with empty account id")
+		}
+		token, err := c.proxy.Minter().Mint(accountID)
+		if err != nil {
+			return fmt.Errorf("jmap.InternalClient: mint stalwart bearer for account=%s: %w", accountID, err)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
+	return nil
 }
 
 // DownloadBlob fetches a JMAP blob from Stalwart and returns its
@@ -376,7 +404,11 @@ func (c *InternalClient) DownloadBlob(
 		httpReq.Header.Set("X-KMail-Tenant-Id", tenantID)
 		httpReq.Header.Set("X-KMail-Kchat-User-Id", kchatUserID)
 		httpReq.Header.Set("X-KMail-Stalwart-Account-Id", accountID)
-		c.setDevAuth(httpReq)
+		// A mint failure is not shard-specific — surface it
+		// immediately rather than retrying every shard.
+		if err := c.setAuth(httpReq, accountID); err != nil {
+			return nil, err
+		}
 
 		resp, err := c.httpc.Do(httpReq)
 		if err != nil {
