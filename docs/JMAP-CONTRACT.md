@@ -155,7 +155,10 @@ JWKS. This is the model the upstream `stalwartlabs/stalwart` image
 actually implements (an OpenID Connect directory backend); the
 end-user's KChat token is never forwarded to Stalwart.
 
-- **Minting.** For each proxied JMAP request the BFF mints an RS256
+- **Minting.** For each request to Stalwart — both the client
+  requests the proxy forwards **and** the BFF-initiated calls from
+  `InternalClient` (sync bootstrap, undo-send, scheduled-send,
+  snooze, retention, eDiscovery export) — the BFF mints an RS256
   JWT (`internal/stalwartauth`): `aud=stalwart`, `sub`/`email`/
   `preferred_username` = the **resolved** `stalwart_account_id`
   principal email (§3.3), `scope="openid email"`, ~5-minute TTL with
@@ -164,9 +167,13 @@ end-user's KChat token is never forwarded to Stalwart.
   latency is unaffected. The signing key never leaves the BFF.
 - **Forwarding.** The proxy deletes the inbound end-user
   `Authorization` header and sets `Authorization: Bearer <minted
-  jwt>` (`internal/jmap/proxy.go`). If the principal cannot be
-  resolved or minting fails, the proxy **fails closed** (forwards no
-  credential) rather than leaking an unauthenticated call.
+  jwt>` (`internal/jmap/proxy.go`); `InternalClient` mints the same
+  bearer for its already-resolved account and sets the header itself
+  (`internal/jmap/internal_client.go` `setAuth`). On either path, if
+  the principal cannot be resolved or minting fails the BFF **fails
+  closed** — the proxy forwards no credential, and `InternalClient`
+  aborts the call with an error — rather than leaking an
+  unauthenticated request or acting as an unintended principal.
 - **Verification.** Stalwart is configured with an OIDC directory
   (`issuerUrl` = the BFF issuer, `requireAudience=stalwart`,
   `claimUsername=email`) set as the default authentication
@@ -178,23 +185,44 @@ end-user's KChat token is never forwarded to Stalwart.
   `…/jwks.json` (only the public key is served).
 - **Channel security.** The bearer is the *authentication* of the
   acting principal; the BFF→Stalwart *channel* is still expected to
-  be TLS (and may be mTLS) in production. Authentication no longer
+  be TLS (and may be mTLS) in production. On both production paths
+  (the proxy and `InternalClient`, whenever a `Minter` is
+  configured), authentication is the minted bearer and no longer
   depends on any `X-KMail-*` header trust — the official image does
-  not honor those headers, so that posture has been removed.
+  not honor those headers. The `X-KMail-*` identity headers are
+  still stamped, but only as routing/diagnostic metadata, never as
+  an authentication signal. (The legacy header-trust posture
+  survives only in the mTLS-only deployment where neither a dev
+  header nor a `Minter` is set; both paths then send no
+  `Authorization` and defer to the mTLS client certificate.)
 - **JIT-provisioning safety.** An OIDC directory auto-provisions an
   account for an unknown `email` claim on first use, so the `email`
   claim is **security-critical**: the BFF only ever mints it from an
   already-resolved `stalwart_account_id` (§3.3), never from
   user-supplied input, so an arbitrary mailbox can never be willed
   into existence by a client.
-- **Dev/CI.** The proxy authenticates to Stalwart with the recovery
-  admin (Basic) gated on `KMAIL_ENV=development` (the official image
-  honors the recovery admin *before* the directory, so admin Basic
-  and `x:`-API provisioning keep working with an OIDC default
-  directory). The minted-bearer path is exercised directly by
+- **Dev/CI.** The proxy — and `InternalClient` for BFF-initiated
+  calls — authenticates to Stalwart with the recovery admin (Basic)
+  gated on `KMAIL_ENV=development` (the official image honors the
+  recovery admin *before* the directory, so admin Basic and
+  `x:`-API provisioning keep working with an OIDC default
+  directory). This dev/CI admin-Basic header takes precedence over
+  the `Minter` on both paths, so dev never accidentally mints
+  tokens. The minted-bearer path is exercised directly by
   `scripts/test-e2e.sh` stage 18 against the dev stack; the OIDC
   directory is registered out-of-band via
   `scripts/provision-stalwart-oidc.sh` (see §3.2.1).
+- **Worker process.** In production the background jobs that go
+  through `InternalClient` (sync bootstrap, undo-send, scheduled-send,
+  snooze, retention, eDiscovery export) run in the standalone
+  `cmd/kmail-worker` binary (`KMAIL_DISABLE_WORKERS=true` on the API),
+  not in-process. That binary mints its own bearers, so it MUST be
+  provisioned the **same** signing key as `kmail-api`
+  (`KMAIL_STALWART_OIDC_KEY` / `KMAIL_STALWART_OIDC_KEY_FILE`) — only
+  the API serves the discovery/JWKS documents Stalwart fetches, so a
+  worker token signed with a different key would fail validation. The
+  worker fails closed (refuses to start) if the issuer is configured
+  without a key, mirroring the API.
 
 #### 3.2.1 Registering the Stalwart OIDC directory
 

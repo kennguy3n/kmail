@@ -39,6 +39,7 @@ import (
 	"fmt"
 	"math/big"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -332,4 +333,61 @@ func ParsePrivateKeyPEM(pemBytes []byte) (*rsa.PrivateKey, error) {
 // on restart, so every boot rotates the JWKS automatically.
 func GenerateEphemeralKey() (*rsa.PrivateKey, error) {
 	return rsa.GenerateKey(rand.Reader, 2048)
+}
+
+// KeySource describes where a Signer's RSA private key comes from, in
+// precedence order: an explicit PEM file, an inline PEM string, or —
+// only when AllowEphemeral is set (dev/CI) — a freshly generated
+// ephemeral key.
+type KeySource struct {
+	// KeyFile is a path to a PEM-encoded RSA private key. Takes
+	// precedence over Key.
+	KeyFile string
+	// Key is an inline PEM-encoded RSA private key (for deployments
+	// that inject the key via a Secret env var rather than a file).
+	Key string
+	// AllowEphemeral permits generating a throwaway key when neither
+	// KeyFile nor Key is set. Enable ONLY in dev/CI — a production
+	// deployment must fail closed rather than mint with a key that is
+	// not the one whose JWKS Stalwart fetched.
+	AllowEphemeral bool
+}
+
+// LoadSigningKey resolves the RSA private key per KeySource's
+// precedence (KeyFile → Key → ephemeral-if-allowed) and reports
+// whether an ephemeral key was generated so the caller can log the
+// non-production warning. When no key is configured and
+// AllowEphemeral is false it returns an error (never a key), so a
+// misconfigured production deployment fails closed rather than
+// booting keyless. It is the shared key-loading path for every
+// binary that mints Stalwart bearers (kmail-api and the standalone
+// kmail-worker), which MUST use the same key material so a token
+// minted by one validates against the JWKS the other publishes.
+func LoadSigningKey(src KeySource) (key *rsa.PrivateKey, ephemeral bool, err error) {
+	switch {
+	case strings.TrimSpace(src.KeyFile) != "":
+		pemBytes, rerr := os.ReadFile(src.KeyFile)
+		if rerr != nil {
+			return nil, false, fmt.Errorf("stalwartauth: read key file %s: %w", src.KeyFile, rerr)
+		}
+		k, perr := ParsePrivateKeyPEM(pemBytes)
+		if perr != nil {
+			return nil, false, fmt.Errorf("stalwartauth: parse key file %s: %w", src.KeyFile, perr)
+		}
+		return k, false, nil
+	case strings.TrimSpace(src.Key) != "":
+		k, perr := ParsePrivateKeyPEM([]byte(src.Key))
+		if perr != nil {
+			return nil, false, fmt.Errorf("stalwartauth: parse inline signing key: %w", perr)
+		}
+		return k, false, nil
+	case src.AllowEphemeral:
+		k, gerr := GenerateEphemeralKey()
+		if gerr != nil {
+			return nil, false, fmt.Errorf("stalwartauth: generate ephemeral key: %w", gerr)
+		}
+		return k, true, nil
+	default:
+		return nil, false, errors.New("stalwartauth: no signing key configured — refusing to mint without a key")
+	}
 }

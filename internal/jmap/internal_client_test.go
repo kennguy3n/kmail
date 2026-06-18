@@ -383,6 +383,150 @@ func TestInternalClient_DevAuthHeader(t *testing.T) {
 	}
 }
 
+// TestInternalClient_OIDCBearer_Mints verifies the production path:
+// with a Minter configured and no dev header, BFF-initiated calls
+// (Dispatch + DownloadBlob) mint a `stalwart`-audience bearer for
+// the resolved account and forward it, exactly as the proxy does —
+// so they authenticate to the official OIDC image instead of 401-ing
+// on the X-KMail-* headers it does not honor.
+func TestInternalClient_OIDCBearer_Mints(t *testing.T) {
+	t.Parallel()
+
+	var dispatchAuth, downloadAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/jmap/api" {
+			dispatchAuth = r.Header.Get("Authorization")
+			_, _ = w.Write([]byte(`{"methodResponses":[]}`))
+			return
+		}
+		downloadAuth = r.Header.Get("Authorization")
+		_, _ = w.Write([]byte("BLOB"))
+	}))
+	defer srv.Close()
+
+	m := &fakeMinter{}
+	p, err := NewProxy(ProxyConfig{
+		StalwartURL: srv.URL,
+		Pool:        newDummyPool(t),
+		Logger:      log.New(io.Discard, "", 0),
+		Minter:      m,
+	})
+	if err != nil {
+		t.Fatalf("NewProxy: %v", err)
+	}
+	p.PrimeAccountCache("t1", "u1", "acc-1")
+	c, err := NewInternalClient(p)
+	if err != nil {
+		t.Fatalf("NewInternalClient: %v", err)
+	}
+
+	if _, err := c.Dispatch(context.Background(), "t1", "u1", JmapRequest{
+		MethodCalls: [][]any{{"Mailbox/get", map[string]any{}, "c0"}},
+	}); err != nil {
+		t.Fatalf("Dispatch: %v", err)
+	}
+	if want := "Bearer tok-for-acc-1"; dispatchAuth != want {
+		t.Errorf("Dispatch Authorization = %q want %q", dispatchAuth, want)
+	}
+	if m.last != "acc-1" {
+		t.Errorf("minted for principal %q, want acc-1", m.last)
+	}
+
+	if _, err := c.DownloadBlob(context.Background(), "t1", "u1", "acc-1", "blob-1", "m.eml"); err != nil {
+		t.Fatalf("DownloadBlob: %v", err)
+	}
+	if want := "Bearer tok-for-acc-1"; downloadAuth != want {
+		t.Errorf("DownloadBlob Authorization = %q want %q", downloadAuth, want)
+	}
+}
+
+// TestInternalClient_DevHeaderBeatsMinter verifies the dev/CI
+// admin-Basic path takes precedence when both a dev header and a
+// Minter are set, so dev never accidentally mints tokens — mirroring
+// the proxy's TestRewrite_DevHeaderBeatsMinter.
+func TestInternalClient_DevHeaderBeatsMinter(t *testing.T) {
+	t.Parallel()
+
+	const devHeader = "Basic Zm9vOmJhcg==" // foo:bar
+	var dispatchAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		dispatchAuth = r.Header.Get("Authorization")
+		_, _ = w.Write([]byte(`{"methodResponses":[]}`))
+	}))
+	defer srv.Close()
+
+	m := &fakeMinter{}
+	p, err := NewProxy(ProxyConfig{
+		StalwartURL:           srv.URL,
+		Pool:                  newDummyPool(t),
+		Logger:                log.New(io.Discard, "", 0),
+		DevStalwartAuthHeader: devHeader,
+		Minter:                m,
+	})
+	if err != nil {
+		t.Fatalf("NewProxy: %v", err)
+	}
+	p.PrimeAccountCache("t1", "u1", "acc-1")
+	c, err := NewInternalClient(p)
+	if err != nil {
+		t.Fatalf("NewInternalClient: %v", err)
+	}
+
+	if _, err := c.Dispatch(context.Background(), "t1", "u1", JmapRequest{
+		MethodCalls: [][]any{{"Mailbox/get", map[string]any{}, "c0"}},
+	}); err != nil {
+		t.Fatalf("Dispatch: %v", err)
+	}
+	if dispatchAuth != devHeader {
+		t.Errorf("Dispatch Authorization = %q want dev header %q", dispatchAuth, devHeader)
+	}
+	if m.last != "" {
+		t.Errorf("minter was called (principal=%q) but dev header should take precedence", m.last)
+	}
+}
+
+// TestInternalClient_OIDCBearer_FailsClosedOnMintError verifies a
+// mint failure fails closed: Dispatch and DownloadBlob return an
+// error rather than dispatching an unauthenticated request that
+// would act as the wrong (or an admin) principal.
+func TestInternalClient_OIDCBearer_FailsClosedOnMintError(t *testing.T) {
+	t.Parallel()
+
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		_, _ = w.Write([]byte(`{"methodResponses":[]}`))
+	}))
+	defer srv.Close()
+
+	p, err := NewProxy(ProxyConfig{
+		StalwartURL: srv.URL,
+		Pool:        newDummyPool(t),
+		Logger:      log.New(io.Discard, "", 0),
+		Minter:      &fakeMinter{err: errTest},
+	})
+	if err != nil {
+		t.Fatalf("NewProxy: %v", err)
+	}
+	p.PrimeAccountCache("t1", "u1", "acc-1")
+	c, err := NewInternalClient(p)
+	if err != nil {
+		t.Fatalf("NewInternalClient: %v", err)
+	}
+
+	if _, err := c.Dispatch(context.Background(), "t1", "u1", JmapRequest{
+		MethodCalls: [][]any{{"Mailbox/get", map[string]any{}, "c0"}},
+	}); err == nil {
+		t.Error("Dispatch: expected error on mint failure, got nil")
+	}
+	if _, err := c.DownloadBlob(context.Background(), "t1", "u1", "acc-1", "blob-1", "m.eml"); err == nil {
+		t.Error("DownloadBlob: expected error on mint failure, got nil")
+	}
+	if n := hits.Load(); n != 0 {
+		t.Errorf("upstream received %d requests, want 0 (must fail closed before dispatch)", n)
+	}
+}
+
 func TestInternalClient_RequiresProxy(t *testing.T) {
 	t.Parallel()
 	if _, err := NewInternalClient(nil); err == nil {

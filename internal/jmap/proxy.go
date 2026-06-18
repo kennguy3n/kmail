@@ -859,6 +859,15 @@ func (p *Proxy) Target() *url.URL { return p.target }
 // image the same way proxied traffic does instead of 401-ing.
 func (p *Proxy) DevStalwartAuthHeader() string { return p.cfg.DevStalwartAuthHeader }
 
+// Minter returns the proxy's OIDC bearer minter (see
+// `ProxyConfig.Minter`), or nil if none is configured. It is
+// non-nil only on the production path (`KMAIL_STALWART_OIDC_ISSUER`
+// set). `InternalClient` reads it so BFF-initiated JMAP calls mint
+// the same `stalwart`-audience bearer the proxy forwards, instead
+// of relying on the `X-KMail-*` header trust the official Stalwart
+// image does not honor.
+func (p *Proxy) Minter() BearerMinter { return p.cfg.Minter }
+
 // Logger returns the proxy's logger so colocated helpers can emit
 // to the same destination.
 func (p *Proxy) Logger() *log.Logger { return p.logger }

@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"math/big"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -269,4 +271,71 @@ func TestParsePrivateKeyPEM(t *testing.T) {
 	if _, err := ParsePrivateKeyPEM([]byte("not a pem")); err == nil {
 		t.Error("expected error for non-PEM input")
 	}
+}
+
+func TestLoadSigningKey(t *testing.T) {
+	key, err := GenerateEphemeralKey()
+	if err != nil {
+		t.Fatalf("gen: %v", err)
+	}
+	pkcs8, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatalf("marshal pkcs8: %v", err)
+	}
+	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: pkcs8})
+
+	t.Run("key file takes precedence over inline and loads exact key", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "oidc.pem")
+		if werr := os.WriteFile(path, pemBytes, 0o600); werr != nil {
+			t.Fatalf("write key: %v", werr)
+		}
+		got, ephemeral, lerr := LoadSigningKey(KeySource{KeyFile: path, Key: "garbage", AllowEphemeral: true})
+		if lerr != nil {
+			t.Fatalf("LoadSigningKey: %v", lerr)
+		}
+		if ephemeral {
+			t.Error("file-backed key must not be reported ephemeral")
+		}
+		if got.N.Cmp(key.N) != 0 {
+			t.Error("loaded key does not match the file key")
+		}
+	})
+
+	t.Run("inline key loads exact key", func(t *testing.T) {
+		got, ephemeral, lerr := LoadSigningKey(KeySource{Key: string(pemBytes)})
+		if lerr != nil {
+			t.Fatalf("LoadSigningKey: %v", lerr)
+		}
+		if ephemeral {
+			t.Error("inline key must not be reported ephemeral")
+		}
+		if got.N.Cmp(key.N) != 0 {
+			t.Error("loaded key does not match the inline key")
+		}
+	})
+
+	t.Run("ephemeral allowed when no key configured", func(t *testing.T) {
+		got, ephemeral, lerr := LoadSigningKey(KeySource{AllowEphemeral: true})
+		if lerr != nil {
+			t.Fatalf("LoadSigningKey: %v", lerr)
+		}
+		if !ephemeral {
+			t.Error("want ephemeral=true when generating a key")
+		}
+		if got == nil {
+			t.Error("want a generated key")
+		}
+	})
+
+	t.Run("fails closed when no key and ephemeral disallowed", func(t *testing.T) {
+		if _, _, lerr := LoadSigningKey(KeySource{}); lerr == nil {
+			t.Fatal("want error when no key is configured and ephemeral is disallowed")
+		}
+	})
+
+	t.Run("bad inline pem errors", func(t *testing.T) {
+		if _, _, lerr := LoadSigningKey(KeySource{Key: "not a pem"}); lerr == nil {
+			t.Fatal("want error for malformed inline key")
+		}
+	})
 }

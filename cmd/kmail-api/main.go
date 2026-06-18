@@ -9,7 +9,6 @@ package main
 
 import (
 	"context"
-	"crypto/rsa"
 	"encoding/base64"
 	"errors"
 	"log"
@@ -450,35 +449,19 @@ func main() {
 	// gets an ephemeral one so CI can still exercise the bearer path.
 	var stalwartMinter jmap.BearerMinter
 	if cfg.StalwartOIDC.Enabled() {
-		var oidcKey *rsa.PrivateKey
-		// keyErr is scoped to the key-loading switch so it never aliases
-		// the outer main-scope err; each case checks it immediately.
-		var keyErr error
-		switch {
-		case strings.TrimSpace(cfg.StalwartOIDC.KeyFile) != "":
-			var pemBytes []byte
-			pemBytes, keyErr = os.ReadFile(cfg.StalwartOIDC.KeyFile)
-			if keyErr != nil {
-				logger.Fatalf("stalwart oidc: read KMAIL_STALWART_OIDC_KEY_FILE=%s: %v", cfg.StalwartOIDC.KeyFile, keyErr)
-			}
-			oidcKey, keyErr = stalwartauth.ParsePrivateKeyPEM(pemBytes)
-			if keyErr != nil {
-				logger.Fatalf("stalwart oidc: parse signing key from %s: %v", cfg.StalwartOIDC.KeyFile, keyErr)
-			}
-		case strings.TrimSpace(cfg.StalwartOIDC.Key) != "":
-			oidcKey, keyErr = stalwartauth.ParsePrivateKeyPEM([]byte(cfg.StalwartOIDC.Key))
-			if keyErr != nil {
-				logger.Fatalf("stalwart oidc: parse signing key from KMAIL_STALWART_OIDC_KEY: %v", keyErr)
-			}
-		case middleware.IsDevEnv(cfg.Env):
-			oidcKey, keyErr = stalwartauth.GenerateEphemeralKey()
-			if keyErr != nil {
-				logger.Fatalf("stalwart oidc: generate ephemeral dev key: %v", keyErr)
-			}
+		// Shared loader (also used by cmd/kmail-worker) — KeyFile →
+		// inline Key → dev-only ephemeral, fail-closed in production.
+		oidcKey, ephemeral, keyErr := stalwartauth.LoadSigningKey(stalwartauth.KeySource{
+			KeyFile:        cfg.StalwartOIDC.KeyFile,
+			Key:            cfg.StalwartOIDC.Key,
+			AllowEphemeral: middleware.IsDevEnv(cfg.Env),
+		})
+		if keyErr != nil {
+			logger.Fatalf("stalwart oidc: %v "+
+				"(set KMAIL_STALWART_OIDC_KEY_FILE or KMAIL_STALWART_OIDC_KEY) — refusing to start without a way to mint Stalwart bearers", keyErr)
+		}
+		if ephemeral {
 			logger.Printf("stalwart oidc: DEV-ONLY ephemeral signing key generated (no KMAIL_STALWART_OIDC_KEY[_FILE] set) — NON-PRODUCTION")
-		default:
-			logger.Fatalf("stalwart oidc: KMAIL_STALWART_OIDC_ISSUER is set but no signing key provided " +
-				"(set KMAIL_STALWART_OIDC_KEY_FILE or KMAIL_STALWART_OIDC_KEY) — refusing to start without a way to mint Stalwart bearers")
 		}
 		signer, serr := stalwartauth.NewSigner(oidcKey, stalwartauth.Config{
 			Issuer:   cfg.StalwartOIDC.Issuer,

@@ -29,6 +29,7 @@ import (
 	"github.com/kennguy3n/kmail/internal/scheduledsend"
 	"github.com/kennguy3n/kmail/internal/search"
 	"github.com/kennguy3n/kmail/internal/snooze"
+	"github.com/kennguy3n/kmail/internal/stalwartauth"
 	"github.com/kennguy3n/kmail/internal/tenant"
 	"github.com/kennguy3n/kmail/internal/undosend"
 	"github.com/kennguy3n/kmail/internal/webhooks"
@@ -472,6 +473,43 @@ func buildInternalJMAP(
 		logger.Printf("jmap: shared circuit breaker disabled (KMAIL_VALKEY_URL unset); falling back to per-pod breaker")
 	}
 
+	// OIDC bearer minting, mirroring cmd/kmail-api. The standalone
+	// worker talks to Stalwart directly (sync bootstrap, undo-send,
+	// scheduled-send, snooze, retention, eDiscovery export), so in
+	// production — where the official image ignores the X-KMail-*
+	// headers — it must mint the same `stalwart`-audience bearer the
+	// API does. It does NOT serve the discovery/JWKS documents (the
+	// API does); it only mints, so it MUST be provisioned the SAME
+	// signing key as the API (KMAIL_STALWART_OIDC_KEY[_FILE]) for its
+	// tokens to validate against the JWKS Stalwart fetched from the
+	// API issuer. With no Minter (and no dev header) InternalClient
+	// would fall back to the legacy header-trust posture and 401.
+	var stalwartMinter jmap.BearerMinter
+	if cfg.StalwartOIDC.Enabled() {
+		oidcKey, ephemeral, keyErr := stalwartauth.LoadSigningKey(stalwartauth.KeySource{
+			KeyFile:        cfg.StalwartOIDC.KeyFile,
+			Key:            cfg.StalwartOIDC.Key,
+			AllowEphemeral: middleware.IsDevEnv(cfg.Env),
+		})
+		if keyErr != nil {
+			return nil, fmt.Errorf("stalwart oidc: %w (set KMAIL_STALWART_OIDC_KEY_FILE or KMAIL_STALWART_OIDC_KEY)", keyErr)
+		}
+		if ephemeral {
+			logger.Printf("stalwart oidc: DEV-ONLY ephemeral signing key generated in kmail-worker — NON-PRODUCTION; a standalone worker must share the kmail-api signing key for its bearers to validate")
+		}
+		signer, serr := stalwartauth.NewSigner(oidcKey, stalwartauth.Config{
+			Issuer:   cfg.StalwartOIDC.Issuer,
+			Audience: cfg.StalwartOIDC.Audience,
+			KeyID:    cfg.StalwartOIDC.KeyID,
+			TokenTTL: cfg.StalwartOIDC.TokenTTL,
+		})
+		if serr != nil {
+			return nil, fmt.Errorf("stalwart oidc: build worker signer: %w", serr)
+		}
+		stalwartMinter = signer
+		logger.Printf("stalwart oidc: kmail-worker bearer minting enabled (issuer=%s kid=%s)", signer.Issuer(), signer.KeyID())
+	}
+
 	proxy, err := jmap.NewProxy(jmap.ProxyConfig{
 		StalwartURL:           cfg.StalwartURL,
 		Pool:                  pool,
@@ -479,6 +517,7 @@ func buildInternalJMAP(
 		Shards:                shardSvc,
 		PreDeliverHook:        malwareHook,
 		TLS:                   stalwartTLS,
+		Minter:                stalwartMinter,
 		Breaker:               jmapBreaker,
 		CircuitBreakThreshold: breakerThreshold,
 		CircuitBreakCooldown:  breakerCooldown,
