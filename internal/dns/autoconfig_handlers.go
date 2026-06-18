@@ -43,6 +43,41 @@ func (h *AutoconfigHandlers) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /autodiscover/autodiscover.xml", h.outlookAutodiscover)
 	// Outlook also probes the lowercase path on some clients.
 	mux.HandleFunc("POST /Autodiscover/Autodiscover.xml", h.outlookAutodiscover)
+	// Apple configuration profile — the only format that also
+	// carries CalDAV / CardDAV. Linked from docs / the DNS wizard;
+	// not auto-probed by clients, so a single stable path suffices.
+	mux.HandleFunc("GET /email.mobileconfig", h.appleProfile)
+}
+
+// appleProfile serves an Apple `.mobileconfig` configuration
+// profile (mail + calendar + contacts) for the `emailaddress`
+// query parameter, mirroring the Mozilla handler's lookup path.
+func (h *AutoconfigHandlers) appleProfile(w http.ResponseWriter, r *http.Request) {
+	email := strings.TrimSpace(r.URL.Query().Get("emailaddress"))
+	if email == "" {
+		http.Error(w, "emailaddress query parameter required", http.StatusBadRequest)
+		return
+	}
+	settings, err := h.svc.SettingsForEmail(r.Context(), email)
+	if err != nil {
+		if errors.Is(err, ErrUnknownDomain) {
+			http.Error(w, "domain not registered", http.StatusNotFound)
+			return
+		}
+		h.logger.Printf("autoconfig.apple: %v", err)
+		http.Error(w, "lookup failed", http.StatusInternalServerError)
+		return
+	}
+	body, err := AppleMobileConfig(email, *settings, h.svc.BrandName())
+	if err != nil {
+		h.logger.Printf("autoconfig.apple: render: %v", err)
+		http.Error(w, "render failed", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", AppleConfigContentType)
+	w.Header().Set("Content-Disposition", `attachment; filename="kmail.mobileconfig"`)
+	w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=%d", int(CacheControlMaxAge.Seconds())))
+	_, _ = w.Write(body)
 }
 
 // mozillaAutoconfig answers Thunderbird's GET. The `emailaddress`
