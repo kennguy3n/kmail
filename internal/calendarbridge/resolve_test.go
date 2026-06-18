@@ -229,7 +229,7 @@ func TestDevAdminConfig(t *testing.T) {
 	t.Run("prod env yields bare config", func(t *testing.T) {
 		t.Setenv("KMAIL_STALWART_ADMIN_USER", "admin")
 		t.Setenv("KMAIL_STALWART_ADMIN_PASS", "pw")
-		cfg := DevAdminConfig("http://stalwart:8080", false, logger)
+		cfg := DevAdminConfig("http://stalwart:8080", false, logger, nil)
 		if cfg.AdminUser != "" || cfg.AdminPassword != "" || cfg.Logger != nil {
 			t.Fatalf("prod config must not carry admin creds/logger, got %+v", cfg)
 		}
@@ -240,7 +240,7 @@ func TestDevAdminConfig(t *testing.T) {
 
 	t.Run("dev env without admin user yields bare config", func(t *testing.T) {
 		t.Setenv("KMAIL_STALWART_ADMIN_USER", "")
-		cfg := DevAdminConfig("http://stalwart:8080", true, logger)
+		cfg := DevAdminConfig("http://stalwart:8080", true, logger, nil)
 		if cfg.AdminUser != "" || cfg.Logger != nil {
 			t.Fatalf("dev config without admin user must stay bare, got %+v", cfg)
 		}
@@ -249,7 +249,7 @@ func TestDevAdminConfig(t *testing.T) {
 	t.Run("dev env with admin user wires creds and logger", func(t *testing.T) {
 		t.Setenv("KMAIL_STALWART_ADMIN_USER", "admin")
 		t.Setenv("KMAIL_STALWART_ADMIN_PASS", "pw")
-		cfg := DevAdminConfig("http://stalwart:8080", true, logger)
+		cfg := DevAdminConfig("http://stalwart:8080", true, logger, nil)
 		if cfg.AdminUser != "admin" || cfg.AdminPassword != "pw" || cfg.Logger != logger {
 			t.Fatalf("dev config must wire creds + logger, got %+v", cfg)
 		}

@@ -55,6 +55,14 @@ ADMIN_PASS=${STALWART_ADMIN_PASSWORD:?STALWART_ADMIN_PASSWORD is required}
 ADMIN_ACCOUNT_ID=${STALWART_ADMIN_ACCOUNT_ID:-d333333}
 
 ISSUER=${KMAIL_STALWART_OIDC_ISSUER:?KMAIL_STALWART_OIDC_ISSUER is required}
+# Normalise the issuer to match internal/stalwartauth/signer.go
+# (NewSigner trims all trailing slashes from cfg.Issuer): a minted
+# token's `iss` claim is the trimmed issuer, and Stalwart rejects a
+# bearer whose `iss` does not byte-equal the directory's issuerUrl we
+# provision below. Trimming here keeps the provisioned issuerUrl and
+# the signer's `iss` from diverging over a stray trailing slash (it
+# also keeps the discovery `issuer` equality check below exact).
+while [ "${ISSUER%/}" != "$ISSUER" ]; do ISSUER=${ISSUER%/}; done
 AUDIENCE=${KMAIL_STALWART_OIDC_AUDIENCE:-stalwart}
 CLAIM_USERNAME=${OIDC_CLAIM_USERNAME:-email}
 DESCRIPTION=${OIDC_DIRECTORY_DESCRIPTION:-KMail BFF OIDC bearer}
