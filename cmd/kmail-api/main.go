@@ -601,6 +601,11 @@ func main() {
 		if err != nil {
 			logger.Printf("stalwart alias sync disabled: %v", err)
 		} else {
+			// Wire the application pool so the alias read-modify-write
+			// is serialised per principal by a Postgres advisory lock
+			// (Stalwart's x:Account/set has no ifInState guard), and a
+			// logger so a failed advisory-unlock is observable.
+			aliasSync = aliasSync.WithLockPool(pool).WithLogger(logger)
 			tenantSvc = tenantSvc.WithStalwartAliasSync(aliasSync).WithLogger(logger)
 			// Drain `alias_stalwart_sync_queue` (see `migrations/001_baseline.sql`)
 			// in the background. The Tenant Service enqueues
@@ -1500,7 +1505,7 @@ func main() {
 	}
 
 	// Phase 5 closeout — CardDAV contact bridge.
-	contactSvc := contactbridge.NewService(contactbridge.Config{StalwartURL: cfg.StalwartURL})
+	contactSvc := contactbridge.NewService(contactbridge.DevAdminConfig(cfg.StalwartURL, middleware.IsDevEnv(cfg.Env), logger))
 	galSvc := contactbridge.NewGALService(pool, contactSvc)
 	contactbridge.NewHandlers(contactSvc, logger).WithGAL(galSvc).Register(mux, authMW)
 

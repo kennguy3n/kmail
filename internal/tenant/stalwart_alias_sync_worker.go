@@ -28,9 +28,10 @@ import (
 // worker drains in a single tick. Without this cap, a backlog
 // spike (e.g. hundreds of rows becoming due simultaneously after a
 // Stalwart outage clears) would cause `tick()` to fire that many
-// admin-API requests back-to-back. Stalwart's /api/principal
-// endpoint is single-threaded per shard and an unbounded burst can
-// starve interactive operator traffic.
+// admin-API requests back-to-back. Each sync is a read-modify-write
+// against the Stalwart principal store (an `x:Account/get` followed
+// by an `x:Account/set`), and an unbounded burst can starve
+// interactive operator traffic.
 //
 // 50 rows × the default 30s tick interval = 100 syncs/min sustained.
 // That comfortably exceeds any realistic alias-edit rate while

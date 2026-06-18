@@ -1851,8 +1851,8 @@ CREATE POLICY search_cutover_jobs_tenant_isolation ON search_cutover_jobs
 -- Alias → Stalwart sync queue
 -- ----------------------------------------------------------------
 -- The Tenant Service mirrors alias CRUD into Stalwart's principal
--- database (PATCH /api/principal/{name}). The BFF row is the
--- source of truth for the admin console; Stalwart sync is
+-- database (via the x:Account/set JMAP management method). The BFF
+-- row is the source of truth for the admin console; Stalwart sync is
 -- best-effort. The service enqueues a row inside the same
 -- transaction that writes / deletes the alias, then attempts
 -- Stalwart sync inline. On inline success the row is marked
