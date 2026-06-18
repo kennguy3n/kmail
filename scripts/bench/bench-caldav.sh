@@ -24,28 +24,39 @@ tmp="$(mktemp)"
 trap 'rm -f "$tmp"' EXIT
 
 for i in $(seq 1 "$N"); do
-    uid="bench-$(date +%s%N)-$i@kmail.local"
+    uid="bench-$(date +%s)-$$-$i@kmail.local"
+    now=$(date -u +%Y%m%dT%H%M%SZ)
+    # DTEND = now + 30 min. `date -d` is GNU-only; `date -r <epoch>`
+    # is BSD / macOS. Compute the epoch, then format with a fallback
+    # (mirrors the portable pattern in scripts/test-caldav.sh).
+    end_epoch=$(( $(date +%s) + 1800 ))
+    if ! dtend=$(date -u -d "@${end_epoch}" +%Y%m%dT%H%M%SZ 2>/dev/null); then
+        dtend=$(date -u -r "${end_epoch}" +%Y%m%dT%H%M%SZ)
+    fi
     ical=$(cat <<ICS
 BEGIN:VCALENDAR
 VERSION:2.0
 PRODID:-//kmail//bench//EN
 BEGIN:VEVENT
 UID:$uid
-DTSTAMP:$(date -u +%Y%m%dT%H%M%SZ)
-DTSTART:$(date -u +%Y%m%dT%H%M%SZ)
-DTEND:$(date -u -d '+30 minutes' +%Y%m%dT%H%M%SZ)
+DTSTAMP:$now
+DTSTART:$now
+DTEND:$dtend
 SUMMARY:Bench event $i
 END:VEVENT
 END:VCALENDAR
 ICS
 )
-    start=$(date +%s%N)
-    curl -u "$USER:$PASS" -sS -o /dev/null \
+    # Measure latency with curl's own timer (`%{time_total}`,
+    # seconds) rather than wrapping the call in `date +%s%N`: `%N`
+    # is GNU-only (BSD/macOS `date` emits a literal "N", breaking
+    # the arithmetic), and curl's timer is both portable and more
+    # accurate since it excludes shell/spawn overhead.
+    secs=$(curl -u "$USER:$PASS" -sS -o /dev/null -w '%{time_total}' \
         -X PUT "$BASE$PATHP$uid.ics" \
         -H "Content-Type: text/calendar" \
-        --data-binary "$ical" || true
-    end=$(date +%s%N)
-    echo "$(( (end - start) / 1000000 ))" >>"$tmp"
+        --data-binary "$ical" || echo 0)
+    awk -v s="$secs" 'BEGIN { printf "%d\n", (s * 1000) + 0.5 }' >>"$tmp"
 done
 
 python3 - "$tmp" <<'PY'

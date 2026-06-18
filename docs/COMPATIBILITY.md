@@ -218,13 +218,14 @@ production so TLS terminates at the edge.
 - Username: full email address
 - Password: user password
 - Server address: `<your.kmail.host>`
-- Server path: `/dav/cal/<account-name>/`
+- Server path: `/dav/cal/<email>/` (Stalwart keys collections by
+  the account email, which is the principal path segment)
 - Port: `443` in production (`8080` in local dev, no TLS)
 - Use SSL: yes in production
 
 **Thunderbird (Lightning or TbSync + CalDAV):**
 - New Calendar → On the Network → Location:
-  `http<s>://<your.kmail.host>/dav/cal/<account-name>/<calendar-name>/`
+  `http<s>://<your.kmail.host>/dav/cal/<email>/<calendar-name>/`
 - Authentication: username / password when prompted.
 
 KMail also exposes the draft JMAP calendars capability
