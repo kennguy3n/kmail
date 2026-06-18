@@ -195,6 +195,14 @@ end-user's KChat token is never forwarded to Stalwart.
   survives only in the mTLS-only deployment where neither a dev
   header nor a `Minter` is set; both paths then send no
   `Authorization` and defer to the mTLS client certificate.)
+- **Issuer must be `https` in production.** Stalwart fetches the
+  discovery/JWKS documents over the issuer URL, so a cleartext
+  `http` issuer would let a network attacker tamper with the served
+  JWKS and forge bearers for any principal (CWE-319). The signer
+  therefore **refuses to start** on a non-`https` issuer; `http` is
+  permitted only when `AllowInsecureIssuer` is set, which both
+  binaries gate on `KMAIL_ENV=development` for the dev/CI stack
+  (where the BFF serves plain HTTP on the local docker network).
 - **JIT-provisioning safety.** An OIDC directory auto-provisions an
   account for an unknown `email` claim on first use, so the `email`
   claim is **security-critical**: the BFF only ever mints it from an

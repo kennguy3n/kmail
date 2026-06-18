@@ -219,9 +219,11 @@ func TestRootIssuerHasEmptyPath(t *testing.T) {
 func TestNewSignerRejectsBadConfig(t *testing.T) {
 	key, _ := GenerateEphemeralKey()
 	cases := map[string]Config{
-		"empty issuer":    {Issuer: ""},
-		"relative issuer": {Issuer: "/oidc/stalwart"},
-		"no host":         {Issuer: "https://"},
+		"empty issuer":       {Issuer: ""},
+		"relative issuer":    {Issuer: "/oidc/stalwart"},
+		"no host":            {Issuer: "https://"},
+		"cleartext http":     {Issuer: "http://bff.example.com/oidc/stalwart"},
+		"non-http(s) scheme": {Issuer: "ftp://bff.example.com"},
 	}
 	for name, cfg := range cases {
 		if _, err := NewSigner(key, cfg); err == nil {
@@ -230,6 +232,22 @@ func TestNewSignerRejectsBadConfig(t *testing.T) {
 	}
 	if _, err := NewSigner(nil, Config{Issuer: "https://bff.example.com"}); err == nil {
 		t.Error("nil key: expected error")
+	}
+}
+
+func TestInsecureIssuerOnlyAllowedWhenOptedIn(t *testing.T) {
+	key, _ := GenerateEphemeralKey()
+	// http issuer is rejected by default (production posture).
+	if _, err := NewSigner(key, Config{Issuer: "http://bff.example.com/oidc/stalwart"}); err == nil {
+		t.Error("cleartext http issuer: expected error without AllowInsecureIssuer")
+	}
+	// ...but permitted when explicitly opted in (dev/CI).
+	if _, err := NewSigner(key, Config{Issuer: "http://host.docker.internal:8088/oidc/stalwart", AllowInsecureIssuer: true}); err != nil {
+		t.Errorf("cleartext http issuer with AllowInsecureIssuer: unexpected error: %v", err)
+	}
+	// AllowInsecureIssuer must not loosen the scheme check beyond http.
+	if _, err := NewSigner(key, Config{Issuer: "ftp://bff.example.com", AllowInsecureIssuer: true}); err == nil {
+		t.Error("ftp issuer: expected error even with AllowInsecureIssuer")
 	}
 }
 

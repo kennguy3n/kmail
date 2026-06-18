@@ -486,22 +486,26 @@ func buildInternalJMAP(
 	// would fall back to the legacy header-trust posture and 401.
 	var stalwartMinter jmap.BearerMinter
 	if cfg.StalwartOIDC.Enabled() {
-		oidcKey, ephemeral, keyErr := stalwartauth.LoadSigningKey(stalwartauth.KeySource{
+		// AllowEphemeral is intentionally false here (unlike kmail-api):
+		// the standalone worker does NOT serve JWKS, so an ephemeral key
+		// it generates locally could never validate against the JWKS
+		// Stalwart fetched from the API. Refuse to start instead of
+		// minting tokens that will always 401 — the worker MUST be given
+		// the same KMAIL_STALWART_OIDC_KEY[_FILE] as the API.
+		oidcKey, _, keyErr := stalwartauth.LoadSigningKey(stalwartauth.KeySource{
 			KeyFile:        cfg.StalwartOIDC.KeyFile,
 			Key:            cfg.StalwartOIDC.Key,
-			AllowEphemeral: middleware.IsDevEnv(cfg.Env),
+			AllowEphemeral: false,
 		})
 		if keyErr != nil {
-			return nil, fmt.Errorf("stalwart oidc: %w (set KMAIL_STALWART_OIDC_KEY_FILE or KMAIL_STALWART_OIDC_KEY)", keyErr)
-		}
-		if ephemeral {
-			logger.Printf("stalwart oidc: DEV-ONLY ephemeral signing key generated in kmail-worker — NON-PRODUCTION; a standalone worker must share the kmail-api signing key for its bearers to validate")
+			return nil, fmt.Errorf("stalwart oidc: %w (the standalone worker must be provisioned the SAME KMAIL_STALWART_OIDC_KEY_FILE/KMAIL_STALWART_OIDC_KEY as kmail-api)", keyErr)
 		}
 		signer, serr := stalwartauth.NewSigner(oidcKey, stalwartauth.Config{
-			Issuer:   cfg.StalwartOIDC.Issuer,
-			Audience: cfg.StalwartOIDC.Audience,
-			KeyID:    cfg.StalwartOIDC.KeyID,
-			TokenTTL: cfg.StalwartOIDC.TokenTTL,
+			Issuer:              cfg.StalwartOIDC.Issuer,
+			Audience:            cfg.StalwartOIDC.Audience,
+			KeyID:               cfg.StalwartOIDC.KeyID,
+			TokenTTL:            cfg.StalwartOIDC.TokenTTL,
+			AllowInsecureIssuer: middleware.IsDevEnv(cfg.Env),
 		})
 		if serr != nil {
 			return nil, fmt.Errorf("stalwart oidc: build worker signer: %w", serr)

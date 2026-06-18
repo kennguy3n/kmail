@@ -464,10 +464,11 @@ func main() {
 			logger.Printf("stalwart oidc: DEV-ONLY ephemeral signing key generated (no KMAIL_STALWART_OIDC_KEY[_FILE] set) — NON-PRODUCTION")
 		}
 		signer, serr := stalwartauth.NewSigner(oidcKey, stalwartauth.Config{
-			Issuer:   cfg.StalwartOIDC.Issuer,
-			Audience: cfg.StalwartOIDC.Audience,
-			KeyID:    cfg.StalwartOIDC.KeyID,
-			TokenTTL: cfg.StalwartOIDC.TokenTTL,
+			Issuer:              cfg.StalwartOIDC.Issuer,
+			Audience:            cfg.StalwartOIDC.Audience,
+			KeyID:               cfg.StalwartOIDC.KeyID,
+			TokenTTL:            cfg.StalwartOIDC.TokenTTL,
+			AllowInsecureIssuer: middleware.IsDevEnv(cfg.Env),
 		})
 		if serr != nil {
 			logger.Fatalf("stalwart oidc: build signer: %v", serr)

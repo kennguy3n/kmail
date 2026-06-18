@@ -77,6 +77,15 @@ type Config struct {
 	// TokenTTL is the minted-token lifetime. Defaults to 5m.
 	TokenTTL time.Duration
 
+	// AllowInsecureIssuer permits a cleartext `http://` issuer. It
+	// defaults to false: in production the issuer MUST be `https`, so
+	// the JWKS/discovery documents Stalwart fetches to validate
+	// bearers cannot be tampered with by a network attacker (forging
+	// JWKS material would let an attacker mint tokens for any
+	// principal — CWE-319). Only dev/CI, where the BFF serves plain
+	// HTTP on a local docker network, should set this true.
+	AllowInsecureIssuer bool
+
 	// now is a test seam for the clock. nil uses time.Now.
 	now func() time.Time
 }
@@ -116,6 +125,14 @@ func NewSigner(key *rsa.PrivateKey, cfg Config) (*Signer, error) {
 	}
 	if u.Scheme == "" || u.Host == "" {
 		return nil, fmt.Errorf("stalwartauth: issuer %q must be an absolute URL", issuer)
+	}
+	switch {
+	case u.Scheme == "https":
+	case u.Scheme == "http" && cfg.AllowInsecureIssuer:
+	case u.Scheme == "http":
+		return nil, fmt.Errorf("stalwartauth: issuer %q uses cleartext http; Stalwart would fetch JWKS over an unauthenticated channel — set a https issuer (cleartext is only allowed in dev/CI)", issuer)
+	default:
+		return nil, fmt.Errorf("stalwartauth: issuer %q must use https", issuer)
 	}
 	aud := strings.TrimSpace(cfg.Audience)
 	if aud == "" {
