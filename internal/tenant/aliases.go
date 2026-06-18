@@ -64,8 +64,9 @@ var ErrAliasInUse = errors.New("alias email already in use")
 //   - the in-process write commits without depending on Stalwart's
 //     reachability,
 //   - tests can substitute a recorder without spinning up Stalwart,
-//   - production wires `StalwartAliasHTTPSync` which talks to
-//     Stalwart's `/api/principal/{name}` admin endpoint.
+//   - production wires `StalwartAliasHTTPSync` which edits the
+//     principal's `aliases` list via the `x:Account/set` JMAP
+//     management method.
 //
 // Implementations MUST be idempotent: AddAlias on an existing row
 // and RemoveAlias on a missing row both return nil. The service

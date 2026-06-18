@@ -601,6 +601,11 @@ func main() {
 		if err != nil {
 			logger.Printf("stalwart alias sync disabled: %v", err)
 		} else {
+			// Wire the application pool so the alias read-modify-write
+			// is serialised per principal by a Postgres advisory lock
+			// (Stalwart's x:Account/set has no ifInState guard), and a
+			// logger so a failed advisory-unlock is observable.
+			aliasSync = aliasSync.WithLockPool(pool).WithLogger(logger)
 			tenantSvc = tenantSvc.WithStalwartAliasSync(aliasSync).WithLogger(logger)
 			// Drain `alias_stalwart_sync_queue` (see `migrations/001_baseline.sql`)
 			// in the background. The Tenant Service enqueues
@@ -723,9 +728,15 @@ func main() {
 	})
 	chatbridge.NewHandlers(chatbridgeSvc, logger).Register(mux, authMW)
 
-	calendarSvc := calendarbridge.NewService(calendarbridge.Config{
-		StalwartURL: cfg.StalwartURL,
-	})
+	// Dev/CI only: the bridge resolves CalDAV account names and
+	// reads collections as the Stalwart superuser over plain HTTP
+	// Basic. Production authenticates via mTLS (StalwartMTLS) and
+	// never sets these — gated through the same IsDevEnv alias
+	// table the proxy and OIDC middleware use. DevAdminConfig is the
+	// single source of this wiring, shared with kmail-worker.
+	calendarSvc := calendarbridge.NewService(
+		calendarbridge.DevAdminConfig(cfg.StalwartURL, middleware.IsDevEnv(cfg.Env), logger),
+	)
 	// Per-tenant scheduling notifications. Phase 4 routes every
 	// tenant to a single configured channel
 	// (`KMAIL_CALENDAR_NOTIFY_CHANNEL`); Phase 5 will route per
