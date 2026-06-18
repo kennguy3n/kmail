@@ -13,25 +13,96 @@ package contactbridge
 
 import (
 	"context"
+	"encoding/json"
 	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
+
+	lru "github.com/hashicorp/golang-lru/v2/expirable"
+	"golang.org/x/sync/singleflight"
 )
 
 // Config wires NewService.
 type Config struct {
+	// StalwartURL is the base URL for Stalwart's CardDAV endpoint
+	// (e.g. `http://stalwart:8080`). The bridge appends the
+	// per-principal addressbook-home path on each request.
 	StalwartURL string
-	HTTPClient  *http.Client
+	// AdminUser is the Basic-auth username the bridge presents to
+	// Stalwart on behalf of the authenticated principal. Empty in
+	// JMAP-first deployments that re-use the caller's bearer token;
+	// populated (dev/CI) when the bridge is hoisted onto a dedicated
+	// service account so it can resolve names and read mailboxes.
+	AdminUser string
+	// AdminPassword pairs with AdminUser. Never logged.
+	AdminPassword string
+	// HTTPClient overrides the HTTP client used for CardDAV requests.
+	// Defaults to an http.Client with a 30s timeout.
+	HTTPClient *http.Client
+	// Logger, when set, records CardDAV account-email resolution
+	// failures (see davAccount). A hard lookup failure means the
+	// bridge falls back to the raw JMAP id, which Stalwart cannot
+	// resolve to a DAV principal — so every CardDAV call for that
+	// principal 404s. Logging makes a misconfigured admin credential or an
+	// unreachable Stalwart visible instead of silently degrading.
+	// nil disables this logging (e.g. the JMAP-first prod path, where
+	// davAccount is a no-op because no admin credential is set).
+	Logger *log.Logger
 }
 
 // Service speaks CardDAV to Stalwart.
 type Service struct {
 	cfg Config
+	// emailCache memoises JMAP account id -> CardDAV account email
+	// lookups (see davAccount). Size- and time-bounded: the LRU size
+	// caps memory on a BFF instance fronting very many principals,
+	// and the TTL bounds how long a stale mapping survives after an
+	// admin changes a principal's email mid-process. The expirable
+	// LRU is internally synchronised, so no extra mutex.
+	emailCache *lru.LRU[string, string]
+	// emailSF collapses concurrent lookups for the same account id
+	// into a single in-flight x:Account/get call.
+	emailSF singleflight.Group
+}
+
+const (
+	// emailCacheMaxEntries caps the id->email cache as a memory guard
+	// for a BFF instance fronting a very large number of distinct
+	// principals. At ~64 B per entry, 50,000 entries stays well under
+	// ~4 MiB.
+	emailCacheMaxEntries = 50_000
+	// emailCacheTTL bounds staleness after a principal email change
+	// and mirrors the JMAP proxy / calendar-bridge identity caches so
+	// all identity caches age out consistently. The id->email mapping
+	// rarely changes, so re-resolving every 5 min is a negligible
+	// extra x:Account/get per active principal.
+	emailCacheTTL = 5 * time.Minute
+)
+
+// DevAdminConfig builds the contact-bridge Config, layering in the
+// dev/CI-only Stalwart superuser credentials when devEnv is true and
+// KMAIL_STALWART_ADMIN_USER is set. In production (devEnv false) it
+// returns a bare config: davAccount stays a no-op and the bridge
+// authenticates to Stalwart via mTLS upstream rather than Basic.
+// Mirrors calendarbridge.DevAdminConfig so the two bridges gate the
+// dev credentials identically.
+func DevAdminConfig(stalwartURL string, devEnv bool, logger *log.Logger) Config {
+	cfg := Config{StalwartURL: stalwartURL}
+	if devEnv {
+		if adminUser := os.Getenv("KMAIL_STALWART_ADMIN_USER"); adminUser != "" {
+			cfg.AdminUser = adminUser
+			cfg.AdminPassword = os.Getenv("KMAIL_STALWART_ADMIN_PASS")
+			cfg.Logger = logger
+		}
+	}
+	return cfg
 }
 
 // NewService returns a Service.
@@ -39,7 +110,10 @@ func NewService(cfg Config) *Service {
 	if cfg.HTTPClient == nil {
 		cfg.HTTPClient = &http.Client{Timeout: 30 * time.Second}
 	}
-	return &Service{cfg: cfg}
+	return &Service{
+		cfg:        cfg,
+		emailCache: lru.NewLRU[string, string](emailCacheMaxEntries, nil, emailCacheTTL),
+	}
 }
 
 // AddressBook represents one CardDAV addressbook collection.
@@ -66,7 +140,7 @@ type Contact struct {
 // ContactDraft is the input shape for create / update. The
 // service builds a vCard 4.0 payload from these fields.
 type ContactDraft struct {
-	UID    string   `json:"uid,omitempty"`
+	UID      string   `json:"uid,omitempty"`
 	FN       string   `json:"fn"`
 	Emails   []string `json:"emails,omitempty"`
 	Phones   []string `json:"phones,omitempty"`
@@ -85,7 +159,7 @@ func (s *Service) ListAddressBooks(ctx context.Context, accountID string) ([]Add
 	if accountID == "" {
 		return nil, fmt.Errorf("%w: accountID required", ErrInvalidInput)
 	}
-	home := s.addressBookHome(accountID)
+	home := s.addressBookHome(ctx, accountID)
 	body := strings.NewReader(addressBookHomePropfindBody)
 	resp, err := s.do(ctx, "PROPFIND", home, body, map[string]string{
 		"Depth":        "1",
@@ -109,7 +183,7 @@ func (s *Service) GetContacts(ctx context.Context, accountID, addressBookID stri
 	if accountID == "" || addressBookID == "" {
 		return nil, fmt.Errorf("%w: accountID and addressBookID required", ErrInvalidInput)
 	}
-	path := s.addressBookPath(accountID, addressBookID)
+	path := s.addressBookPath(ctx, accountID, addressBookID)
 	resp, err := s.do(ctx, "REPORT", path, strings.NewReader(addressbookQueryBody), map[string]string{
 		"Depth":        "1",
 		"Content-Type": "application/xml; charset=utf-8",
@@ -132,7 +206,7 @@ func (s *Service) GetContact(ctx context.Context, accountID, addressBookID, uid 
 	if uid == "" {
 		return nil, fmt.Errorf("%w: uid required", ErrInvalidInput)
 	}
-	path := s.contactPath(accountID, addressBookID, uid)
+	path := s.contactPath(ctx, accountID, addressBookID, uid)
 	resp, err := s.do(ctx, "GET", path, nil, map[string]string{
 		"Accept": "text/vcard",
 	})
@@ -168,9 +242,9 @@ func (s *Service) CreateContact(ctx context.Context, accountID, addressBookID st
 	}
 	d.UID = uid
 	body := BuildVCard(d)
-	path := s.contactPath(accountID, addressBookID, uid)
+	path := s.contactPath(ctx, accountID, addressBookID, uid)
 	resp, err := s.do(ctx, "PUT", path, strings.NewReader(body), map[string]string{
-		"Content-Type": "text/vcard; charset=utf-8",
+		"Content-Type":  "text/vcard; charset=utf-8",
 		"If-None-Match": "*",
 	})
 	if err != nil {
@@ -190,7 +264,7 @@ func (s *Service) UpdateContact(ctx context.Context, accountID, addressBookID, u
 	}
 	d.UID = uid
 	body := BuildVCard(d)
-	path := s.contactPath(accountID, addressBookID, uid)
+	path := s.contactPath(ctx, accountID, addressBookID, uid)
 	resp, err := s.do(ctx, "PUT", path, strings.NewReader(body), map[string]string{
 		"Content-Type": "text/vcard; charset=utf-8",
 	})
@@ -212,7 +286,7 @@ func (s *Service) DeleteContact(ctx context.Context, accountID, addressBookID, u
 	if uid == "" {
 		return fmt.Errorf("%w: uid required", ErrInvalidInput)
 	}
-	path := s.contactPath(accountID, addressBookID, uid)
+	path := s.contactPath(ctx, accountID, addressBookID, uid)
 	resp, err := s.do(ctx, "DELETE", path, nil, nil)
 	if err != nil {
 		return err
@@ -227,16 +301,16 @@ func (s *Service) DeleteContact(ctx context.Context, accountID, addressBookID, u
 	return nil
 }
 
-func (s *Service) addressBookHome(accountID string) string {
-	return strings.TrimRight(s.cfg.StalwartURL, "/") + "/dav/" + url.PathEscape(accountID) + "/addressbooks/"
+func (s *Service) addressBookHome(ctx context.Context, accountID string) string {
+	return strings.TrimRight(s.cfg.StalwartURL, "/") + "/dav/card/" + url.PathEscape(s.davAccount(ctx, accountID)) + "/"
 }
 
-func (s *Service) addressBookPath(accountID, abID string) string {
-	return s.addressBookHome(accountID) + url.PathEscape(abID) + "/"
+func (s *Service) addressBookPath(ctx context.Context, accountID, abID string) string {
+	return s.addressBookHome(ctx, accountID) + url.PathEscape(abID) + "/"
 }
 
-func (s *Service) contactPath(accountID, abID, uid string) string {
-	return s.addressBookPath(accountID, abID) + url.PathEscape(uid) + ".vcf"
+func (s *Service) contactPath(ctx context.Context, accountID, abID, uid string) string {
+	return s.addressBookPath(ctx, accountID, abID) + url.PathEscape(uid) + ".vcf"
 }
 
 func (s *Service) do(ctx context.Context, method, urlStr string, body io.Reader, headers map[string]string) (*http.Response, error) {
@@ -247,7 +321,136 @@ func (s *Service) do(ctx context.Context, method, urlStr string, body io.Reader,
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
+	if s.cfg.AdminUser != "" {
+		req.SetBasicAuth(s.cfg.AdminUser, s.cfg.AdminPassword)
+	}
 	return s.cfg.HTTPClient.Do(req)
+}
+
+// davAccount maps a JMAP account id to the account *email* Stalwart
+// uses to key CardDAV collections (`/dav/card/{email}/`). Stalwart
+// resolves a DAV path's principal segment via the account's email
+// address (crates/dav/src/common/uri.rs -> account_id_from_email),
+// so a bare login name 404s; the BFF resolves callers to their JMAP
+// account id, which is a third, distinct identifier. When the bridge
+// holds admin credentials it asks Stalwart for the email via the
+// `x:Account/get` management method and memoises the result; without
+// credentials — or on any lookup failure — it returns the id
+// unchanged (in production the id is already the email).
+func (s *Service) davAccount(ctx context.Context, accountID string) string {
+	if accountID == "" || s.cfg.AdminUser == "" {
+		return accountID
+	}
+	if cached, ok := s.emailCache.Get(accountID); ok {
+		return cached
+	}
+	// Dedupe concurrent lookups and only memoise a *resolved* email.
+	// On any failure lookupAccountEmail returns ""; we then fall back to
+	// the raw id for this call without caching it, so the next request
+	// retries once Stalwart recovers. Failures never touch the cache,
+	// so a failing goroutine cannot overwrite another's success. A hard
+	// lookup error (transport / non-2xx / malformed or JMAP-level
+	// error response, as opposed to a clean not-found) is logged once
+	// per attempt so a persistent misconfiguration is observable
+	// rather than silently 404-ing every CardDAV call.
+	v, _, _ := s.emailSF.Do(accountID, func() (interface{}, error) {
+		email, lookupErr := s.lookupAccountEmail(ctx, accountID)
+		if email != "" {
+			s.emailCache.Add(accountID, email)
+		} else if lookupErr != nil && s.cfg.Logger != nil {
+			s.cfg.Logger.Printf("contactbridge: resolve CardDAV email for account %q failed: %v", accountID, lookupErr)
+		}
+		return email, nil
+	})
+	if email, _ := v.(string); email != "" {
+		return email
+	}
+	return accountID
+}
+
+// lookupAccountEmail issues a single `x:Account/get` JMAP call as the
+// admin principal and returns the resolved account email address —
+// the identifier Stalwart keys DAV collections by. It returns a
+// non-nil error for *hard* failures (transport, non-2xx, malformed or
+// JMAP-level error response) so the caller can surface a
+// misconfiguration; a successful call that simply doesn't contain the
+// requested id (e.g. an unprovisioned principal) returns ("", nil)
+// since that is an expected, non-alarming outcome. Stalwart ignores
+// the `accountId` envelope field for this management method, so an
+// empty value is fine.
+func (s *Service) lookupAccountEmail(ctx context.Context, accountID string) (string, error) {
+	ids, err := json.Marshal([]string{accountID})
+	if err != nil {
+		return "", err
+	}
+	body := `{"using":["urn:ietf:params:jmap:core"],"methodCalls":[["x:Account/get",{"accountId":"","ids":` + string(ids) + `},"0"]]}`
+	endpoint := strings.TrimRight(s.cfg.StalwartURL, "/") + "/jmap"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.SetBasicAuth(s.cfg.AdminUser, s.cfg.AdminPassword)
+	resp, err := s.cfg.HTTPClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("x:Account/get: HTTP %d", resp.StatusCode)
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return "", err
+	}
+	var envelope struct {
+		MethodResponses [][]json.RawMessage `json:"methodResponses"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return "", err
+	}
+	if len(envelope.MethodResponses) == 0 || len(envelope.MethodResponses[0]) < 2 {
+		return "", fmt.Errorf("x:Account/get: malformed response envelope")
+	}
+	// A JMAP method-level error arrives as an HTTP 200 whose first
+	// tuple element is the literal "error" (e.g.
+	// `["error",{"type":"unknownMethod"},"0"]`) rather than the echoed
+	// method name. Without this check the error object would unmarshal
+	// cleanly into result with an empty List and look like a benign
+	// not-found, hiding a real misconfiguration from the caller's
+	// logging.
+	var methodName string
+	if err := json.Unmarshal(envelope.MethodResponses[0][0], &methodName); err != nil {
+		return "", fmt.Errorf("x:Account/get: malformed method name: %w", err)
+	}
+	if methodName == "error" {
+		var jmapErr struct {
+			Type string `json:"type"`
+		}
+		_ = json.Unmarshal(envelope.MethodResponses[0][1], &jmapErr)
+		return "", fmt.Errorf("x:Account/get: JMAP error %q", jmapErr.Type)
+	}
+	var result struct {
+		List []struct {
+			ID    string `json:"id"`
+			Email string `json:"emailAddress"`
+		} `json:"list"`
+	}
+	if err := json.Unmarshal(envelope.MethodResponses[0][1], &result); err != nil {
+		return "", err
+	}
+	// Match strictly on the requested id. The request passes
+	// `ids:[accountID]`, so Stalwart returns at most that one account;
+	// we never fall back to an arbitrary list entry, which could
+	// otherwise cache a *different* principal's email and route every
+	// subsequent CardDAV call for this account to the wrong
+	// addressbook home.
+	for _, a := range result.List {
+		if a.ID == accountID && a.Email != "" {
+			return a.Email, nil
+		}
+	}
+	return "", nil
 }
 
 // ---------------------------------------------------------------
@@ -427,7 +630,7 @@ type davMultistatus struct {
 }
 
 type davResponse struct {
-	Href     string       `xml:"href"`
+	Href     string        `xml:"href"`
 	Propstat []davPropstat `xml:"propstat"`
 }
 
