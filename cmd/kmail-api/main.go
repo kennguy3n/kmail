@@ -779,7 +779,7 @@ func main() {
 	// table the proxy and OIDC middleware use. DevAdminConfig is the
 	// single source of this wiring, shared with kmail-worker.
 	calendarSvc := calendarbridge.NewService(
-		calendarbridge.DevAdminConfig(cfg.StalwartURL, middleware.IsDevEnv(cfg.Env), logger),
+		calendarbridge.DevAdminConfig(cfg.StalwartURL, middleware.IsDevEnv(cfg.Env), logger, stalwartMinter),
 	)
 	// Per-tenant scheduling notifications. Phase 4 routes every
 	// tenant to a single configured channel
@@ -1549,7 +1549,7 @@ func main() {
 	}
 
 	// Phase 5 closeout — CardDAV contact bridge.
-	contactSvc := contactbridge.NewService(contactbridge.DevAdminConfig(cfg.StalwartURL, middleware.IsDevEnv(cfg.Env), logger))
+	contactSvc := contactbridge.NewService(contactbridge.DevAdminConfig(cfg.StalwartURL, middleware.IsDevEnv(cfg.Env), logger, stalwartMinter))
 	galSvc := contactbridge.NewGALService(pool, contactSvc)
 	contactbridge.NewHandlers(contactSvc, logger).WithGAL(galSvc).Register(mux, authMW)
 

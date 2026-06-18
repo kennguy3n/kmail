@@ -29,6 +29,17 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
+// BearerMinter mints a short-lived OIDC bearer token authenticating
+// the BFF to Stalwart as the given principal (the resolved CardDAV
+// account email). Implemented by `*stalwartauth.Signer`; the bridge
+// depends on this narrow interface rather than the concrete signer
+// so the `contactbridge` package need not import `stalwartauth`.
+// It is the same contract the JMAP proxy and `InternalClient` mint
+// through (`docs/JMAP-CONTRACT.md` §3.2).
+type BearerMinter interface {
+	Mint(principal string) (string, error)
+}
+
 // Config wires NewService.
 type Config struct {
 	// StalwartURL is the base URL for Stalwart's CardDAV endpoint
@@ -43,6 +54,18 @@ type Config struct {
 	AdminUser string
 	// AdminPassword pairs with AdminUser. Never logged.
 	AdminPassword string
+	// Minter, when non-nil, mints a short-lived `stalwart`-audience
+	// OIDC bearer for the resolved CardDAV principal on each request,
+	// which the bridge forwards as `Authorization: Bearer …`. This
+	// is the production BFF→Stalwart authentication path on the
+	// official Stalwart image (which validates the JWT against the
+	// OIDC directory whose `issuerUrl` points back at the BFF), the
+	// same posture the JMAP proxy and `InternalClient` use. Mutually
+	// exclusive with `AdminUser` (the dev/CI admin-Basic path takes
+	// precedence when both are set, so dev never mints). When both
+	// are empty the bridge sends no `Authorization` and defers to
+	// the legacy mTLS client-certificate posture.
+	Minter BearerMinter
 	// HTTPClient overrides the HTTP client used for CardDAV requests.
 	// Defaults to an http.Client with a 30s timeout.
 	HTTPClient *http.Client
@@ -86,15 +109,19 @@ const (
 	emailCacheTTL = 5 * time.Minute
 )
 
-// DevAdminConfig builds the contact-bridge Config, layering in the
+// DevAdminConfig builds the contact-bridge Config. It layers in the
 // dev/CI-only Stalwart superuser credentials when devEnv is true and
-// KMAIL_STALWART_ADMIN_USER is set. In production (devEnv false) it
-// returns a bare config: davAccount stays a no-op and the bridge
-// authenticates to Stalwart via mTLS upstream rather than Basic.
-// Mirrors calendarbridge.DevAdminConfig so the two bridges gate the
-// dev credentials identically.
-func DevAdminConfig(stalwartURL string, devEnv bool, logger *log.Logger) Config {
-	cfg := Config{StalwartURL: stalwartURL}
+// KMAIL_STALWART_ADMIN_USER is set, and wires the production OIDC
+// `minter` (which may be nil) for the BFF→Stalwart bearer path. The
+// two are mutually exclusive at request time: when admin Basic is
+// present (dev/CI) it takes precedence, so dev never mints; in
+// production (devEnv false → no admin creds) the bridge mints a
+// `stalwart`-audience bearer per CardDAV request, exactly as the
+// JMAP proxy and `InternalClient` do. Mirrors
+// calendarbridge.DevAdminConfig so the two bridges gate auth
+// identically.
+func DevAdminConfig(stalwartURL string, devEnv bool, logger *log.Logger, minter BearerMinter) Config {
+	cfg := Config{StalwartURL: stalwartURL, Minter: minter}
 	if devEnv {
 		if adminUser := os.Getenv("KMAIL_STALWART_ADMIN_USER"); adminUser != "" {
 			cfg.AdminUser = adminUser
@@ -164,7 +191,7 @@ func (s *Service) ListAddressBooks(ctx context.Context, accountID string) ([]Add
 	resp, err := s.do(ctx, "PROPFIND", home, body, map[string]string{
 		"Depth":        "1",
 		"Content-Type": "application/xml; charset=utf-8",
-	})
+	}, accountID)
 	if err != nil {
 		return nil, err
 	}
@@ -187,7 +214,7 @@ func (s *Service) GetContacts(ctx context.Context, accountID, addressBookID stri
 	resp, err := s.do(ctx, "REPORT", path, strings.NewReader(addressbookQueryBody), map[string]string{
 		"Depth":        "1",
 		"Content-Type": "application/xml; charset=utf-8",
-	})
+	}, accountID)
 	if err != nil {
 		return nil, err
 	}
@@ -209,7 +236,7 @@ func (s *Service) GetContact(ctx context.Context, accountID, addressBookID, uid 
 	path := s.contactPath(ctx, accountID, addressBookID, uid)
 	resp, err := s.do(ctx, "GET", path, nil, map[string]string{
 		"Accept": "text/vcard",
-	})
+	}, accountID)
 	if err != nil {
 		return nil, err
 	}
@@ -246,7 +273,7 @@ func (s *Service) CreateContact(ctx context.Context, accountID, addressBookID st
 	resp, err := s.do(ctx, "PUT", path, strings.NewReader(body), map[string]string{
 		"Content-Type":  "text/vcard; charset=utf-8",
 		"If-None-Match": "*",
-	})
+	}, accountID)
 	if err != nil {
 		return "", err
 	}
@@ -267,7 +294,7 @@ func (s *Service) UpdateContact(ctx context.Context, accountID, addressBookID, u
 	path := s.contactPath(ctx, accountID, addressBookID, uid)
 	resp, err := s.do(ctx, "PUT", path, strings.NewReader(body), map[string]string{
 		"Content-Type": "text/vcard; charset=utf-8",
-	})
+	}, accountID)
 	if err != nil {
 		return err
 	}
@@ -287,7 +314,7 @@ func (s *Service) DeleteContact(ctx context.Context, accountID, addressBookID, u
 		return fmt.Errorf("%w: uid required", ErrInvalidInput)
 	}
 	path := s.contactPath(ctx, accountID, addressBookID, uid)
-	resp, err := s.do(ctx, "DELETE", path, nil, nil)
+	resp, err := s.do(ctx, "DELETE", path, nil, nil, accountID)
 	if err != nil {
 		return err
 	}
@@ -313,7 +340,7 @@ func (s *Service) contactPath(ctx context.Context, accountID, abID, uid string) 
 	return s.addressBookPath(ctx, accountID, abID) + url.PathEscape(uid) + ".vcf"
 }
 
-func (s *Service) do(ctx context.Context, method, urlStr string, body io.Reader, headers map[string]string) (*http.Response, error) {
+func (s *Service) do(ctx context.Context, method, urlStr string, body io.Reader, headers map[string]string, accountID string) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, method, urlStr, body)
 	if err != nil {
 		return nil, err
@@ -321,10 +348,47 @@ func (s *Service) do(ctx context.Context, method, urlStr string, body io.Reader,
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	if s.cfg.AdminUser != "" {
-		req.SetBasicAuth(s.cfg.AdminUser, s.cfg.AdminPassword)
+	if err := s.setAuth(ctx, req, accountID); err != nil {
+		return nil, err
 	}
 	return s.cfg.HTTPClient.Do(req)
+}
+
+// setAuth stamps the BFF→Stalwart `Authorization` header on a
+// CardDAV request, mirroring the JMAP proxy / InternalClient
+// three-armed switch (`docs/JMAP-CONTRACT.md` §3.2):
+//
+//  1. Dev/CI (`AdminUser` set): authenticate with the recovery-admin
+//     Basic credential (gated by `middleware.IsDevEnv` in the
+//     entrypoints). Takes precedence so dev never mints.
+//  2. Production (`Minter` set): mint a short-lived,
+//     `stalwart`-audience OIDC bearer for the resolved CardDAV
+//     principal and forward it as `Authorization: Bearer …`. The
+//     principal is the same `/dav/card/{principal}/` value the path
+//     is keyed by (`davAccount`); without admin creds that resolves
+//     to the account id unchanged, which in production is already
+//     the principal email. A mint failure FAILS CLOSED — return an
+//     error rather than issue an unauthenticated CardDAV call.
+//  3. Legacy mTLS-only (neither set): leave `Authorization` unset
+//     and defer to the mTLS client certificate / trusted-network
+//     posture.
+func (s *Service) setAuth(ctx context.Context, req *http.Request, accountID string) error {
+	switch {
+	case s.cfg.AdminUser != "":
+		req.SetBasicAuth(s.cfg.AdminUser, s.cfg.AdminPassword)
+	case s.cfg.Minter != nil:
+		principal := s.davAccount(ctx, accountID)
+		if strings.TrimSpace(principal) == "" {
+			// Never mint an unscoped token — fail closed.
+			return fmt.Errorf("contactbridge: cannot mint stalwart bearer with empty account id")
+		}
+		token, err := s.cfg.Minter.Mint(principal)
+		if err != nil {
+			return fmt.Errorf("contactbridge: mint stalwart bearer for account=%s: %w", principal, err)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	return nil
 }
 
 // davAccount maps a JMAP account id to the account *email* Stalwart

@@ -109,7 +109,7 @@ func buildWorkers(ctx context.Context, d workerDeps) ([]workerRegistration, erro
 	// path the undo / scheduled / snooze dispatch workers submit
 	// through, so it must carry the same mTLS + circuit-breaker
 	// posture cmd/kmail-api wires.
-	internalJmap, err := buildInternalJMAP(ctx, cfg, pool, valkeyClient, shardSvc, logger)
+	internalJmap, stalwartMinter, err := buildInternalJMAP(ctx, cfg, pool, valkeyClient, shardSvc, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -152,10 +152,14 @@ func buildWorkers(ctx context.Context, d workerDeps) ([]workerRegistration, erro
 	// use. Without the credential davAccount is a no-op, so every
 	// CalDAV call targets /dav/cal/{id}/ while Stalwart serves
 	// /dav/cal/{name}/ — i.e. the reminder sweep would 404 for
-	// every tenant in dev/CI. DevAdminConfig is the single source of
-	// this wiring, shared with kmail-api so the two can't drift.
+	// every tenant in dev/CI. In production the reminder sweep mints
+	// the same stalwart-audience bearer the proxy/InternalClient do
+	// (stalwartMinter, shared from buildInternalJMAP); admin-Basic
+	// takes precedence in dev/CI so dev never mints. DevAdminConfig
+	// is the single source of this wiring, shared with kmail-api so
+	// the two can't drift.
 	calendarSvc := calendarbridge.NewService(
-		calendarbridge.DevAdminConfig(cfg.StalwartURL, middleware.IsDevEnv(cfg.Env), logger),
+		calendarbridge.DevAdminConfig(cfg.StalwartURL, middleware.IsDevEnv(cfg.Env), logger, stalwartMinter),
 	)
 	calendarChannelResolver := calendarbridge.NewDBChannelResolver(pool, os.Getenv("KMAIL_CALENDAR_NOTIFY_CHANNEL"))
 	calendarNotifier := calendarbridge.NewNotifier(chatbridgeSvc.KChat(), calendarChannelResolver)
@@ -388,7 +392,7 @@ func buildInternalJMAP(
 	valkeyClient *redis.Client,
 	shardSvc *tenant.ShardService,
 	logger *log.Logger,
-) (*jmap.InternalClient, error) {
+) (*jmap.InternalClient, jmap.BearerMinter, error) {
 	// Pre-deliver malware hook (parity with the API submit path).
 	var malwareHook func(ctx context.Context, body []byte) error
 	if addr := os.Getenv("KMAIL_CLAMAV_ADDR"); addr != "" {
@@ -410,7 +414,7 @@ func buildInternalJMAP(
 		if middleware.IsDevEnv(cfg.Env) {
 			logger.Printf("jmap proxy: WARNING partial mTLS config (dev): %v", err)
 		} else {
-			return nil, fmt.Errorf("jmap proxy: partial mTLS config in env=%q (fail-closed): %w", cfg.Env, err)
+			return nil, nil, fmt.Errorf("jmap proxy: partial mTLS config in env=%q (fail-closed): %w", cfg.Env, err)
 		}
 	}
 	var stalwartTLS *jmap.ClientTLSConfig
@@ -449,7 +453,7 @@ func buildInternalJMAP(
 				Window:    breakerWindow,
 			})
 			if breakerErr != nil {
-				return nil, fmt.Errorf("jmap.NewRedisCircuitBreaker: %w", breakerErr)
+				return nil, nil, fmt.Errorf("jmap.NewRedisCircuitBreaker: %w", breakerErr)
 			}
 			jmapBreaker = shared
 			logger.Printf("jmap: shared circuit breaker enabled against %s", cfg.ValkeyURL)
@@ -462,7 +466,7 @@ func buildInternalJMAP(
 				Window:    breakerWindow,
 			})
 			if breakerErr != nil {
-				return nil, fmt.Errorf("jmap.NewRedisCircuitBreaker: %w", breakerErr)
+				return nil, nil, fmt.Errorf("jmap.NewRedisCircuitBreaker: %w", breakerErr)
 			}
 			jmapBreaker = shared
 			logger.Printf("jmap: shared circuit breaker forced (KMAIL_BREAKER_SHARED_FORCE=1) against unreachable %s: ping=%v", cfg.ValkeyURL, pingErr)
@@ -498,7 +502,7 @@ func buildInternalJMAP(
 			AllowEphemeral: false,
 		})
 		if keyErr != nil {
-			return nil, fmt.Errorf("stalwart oidc: %w (the standalone worker must be provisioned the SAME KMAIL_STALWART_OIDC_KEY_FILE/KMAIL_STALWART_OIDC_KEY as kmail-api)", keyErr)
+			return nil, nil, fmt.Errorf("stalwart oidc: %w (the standalone worker must be provisioned the SAME KMAIL_STALWART_OIDC_KEY_FILE/KMAIL_STALWART_OIDC_KEY as kmail-api)", keyErr)
 		}
 		signer, serr := stalwartauth.NewSigner(oidcKey, stalwartauth.Config{
 			Issuer:              cfg.StalwartOIDC.Issuer,
@@ -508,7 +512,7 @@ func buildInternalJMAP(
 			AllowInsecureIssuer: middleware.IsDevEnv(cfg.Env),
 		})
 		if serr != nil {
-			return nil, fmt.Errorf("stalwart oidc: build worker signer: %w", serr)
+			return nil, nil, fmt.Errorf("stalwart oidc: build worker signer: %w", serr)
 		}
 		stalwartMinter = signer
 		logger.Printf("stalwart oidc: kmail-worker bearer minting enabled (issuer=%s kid=%s)", signer.Issuer(), signer.KeyID())
@@ -528,13 +532,13 @@ func buildInternalJMAP(
 		CircuitBreakWindow:    breakerWindow,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("jmap.NewProxy: %w", err)
+		return nil, nil, fmt.Errorf("jmap.NewProxy: %w", err)
 	}
 	internalJmap, err := jmap.NewInternalClient(proxy)
 	if err != nil {
-		return nil, fmt.Errorf("jmap.NewInternalClient: %w", err)
+		return nil, nil, fmt.Errorf("jmap.NewInternalClient: %w", err)
 	}
-	return internalJmap, nil
+	return internalJmap, stalwartMinter, nil
 }
 
 // buildCutoverWorker wires the Meilisearch→OpenSearch auto-cutover

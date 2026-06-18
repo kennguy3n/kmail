@@ -56,7 +56,7 @@ func TestBuildInternalJMAPMalwareAndHTTPSWarn(t *testing.T) {
 		StalwartURL: "https://stalwart.internal:8080", // triggers HTTPS warning
 		Env:         "development",
 	}
-	jc, err := buildInternalJMAP(context.Background(), cfg, pool, nil, shardSvc, logger)
+	jc, _, err := buildInternalJMAP(context.Background(), cfg, pool, nil, shardSvc, logger)
 	if err != nil {
 		t.Fatalf("buildInternalJMAP (dev): %v", err)
 	}
@@ -84,7 +84,7 @@ func TestBuildInternalJMAPPartialMTLSFailClosed(t *testing.T) {
 	// Partial mTLS: cert without key → Validate() returns an error.
 	cfg.StalwartMTLS.CertFile = "/tmp/cert.pem"
 
-	if _, err := buildInternalJMAP(context.Background(), cfg, pool, nil, shardSvc, logger); err == nil {
+	if _, _, err := buildInternalJMAP(context.Background(), cfg, pool, nil, shardSvc, logger); err == nil {
 		t.Fatal("expected fail-closed error for partial mTLS in production")
 	}
 }
@@ -109,7 +109,7 @@ func TestBuildInternalJMAPSharedBreaker(t *testing.T) {
 		ValkeyURL:   "redis://" + mr.Addr(),
 		Env:         "development",
 	}
-	jc, err := buildInternalJMAP(context.Background(), cfg, pool, client, shardSvc, logger)
+	jc, _, err := buildInternalJMAP(context.Background(), cfg, pool, client, shardSvc, logger)
 	if err != nil {
 		t.Fatalf("buildInternalJMAP (shared breaker): %v", err)
 	}
@@ -141,7 +141,7 @@ func TestBuildInternalJMAPForceShared(t *testing.T) {
 		ValkeyURL:   "redis://" + addr,
 		Env:         "development",
 	}
-	jc, err := buildInternalJMAP(context.Background(), cfg, pool, client, shardSvc, logger)
+	jc, _, err := buildInternalJMAP(context.Background(), cfg, pool, client, shardSvc, logger)
 	if err != nil {
 		t.Fatalf("buildInternalJMAP (force shared): %v", err)
 	}

@@ -34,6 +34,17 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
+// BearerMinter mints a short-lived OIDC bearer token authenticating
+// the BFF to Stalwart as the given principal (the resolved CalDAV
+// account email). Implemented by `*stalwartauth.Signer`; the bridge
+// depends on this narrow interface rather than the concrete signer
+// so the `calendarbridge` package need not import `stalwartauth`.
+// It is the same contract the JMAP proxy and `InternalClient` mint
+// through (`docs/JMAP-CONTRACT.md` §3.2).
+type BearerMinter interface {
+	Mint(principal string) (string, error)
+}
+
 // Config wires the CalDAV proxy.
 type Config struct {
 	// StalwartURL is the base URL for Stalwart's CalDAV endpoint
@@ -48,6 +59,18 @@ type Config struct {
 	AdminUser string
 	// AdminPassword pairs with AdminUser. Never logged.
 	AdminPassword string
+	// Minter, when non-nil, mints a short-lived `stalwart`-audience
+	// OIDC bearer for the resolved CalDAV principal on each request,
+	// which the bridge forwards as `Authorization: Bearer …`. This
+	// is the production BFF→Stalwart authentication path on the
+	// official Stalwart image (which validates the JWT against the
+	// OIDC directory whose `issuerUrl` points back at the BFF), the
+	// same posture the JMAP proxy and `InternalClient` use. Mutually
+	// exclusive with `AdminUser` (the dev/CI admin-Basic path takes
+	// precedence when both are set, so dev never mints). When both
+	// are empty the bridge sends no `Authorization` and defers to
+	// the legacy mTLS client-certificate posture.
+	Minter BearerMinter
 	// HTTPClient overrides the HTTP client used for CalDAV
 	// requests (timeouts, transport tuning). Defaults to an
 	// http.Client with a 15s timeout.
@@ -98,16 +121,20 @@ const (
 )
 
 // DevAdminConfig builds the calendar-bridge Config shared by
-// kmail-api and kmail-worker, layering in the dev/CI-only Stalwart
+// kmail-api and kmail-worker. It layers in the dev/CI-only Stalwart
 // superuser credentials when devEnv is true and
-// KMAIL_STALWART_ADMIN_USER is set. In production (devEnv false) it
-// returns a bare config: davAccount stays a no-op and the bridge
-// authenticates to Stalwart via mTLS upstream rather than Basic.
-// Centralising the gating here keeps the two entrypoints from
-// drifting — if they wired the credentials differently the bridge
-// would resolve CalDAV emails in one process but 404 in the other.
-func DevAdminConfig(stalwartURL string, devEnv bool, logger *log.Logger) Config {
-	cfg := Config{StalwartURL: stalwartURL}
+// KMAIL_STALWART_ADMIN_USER is set, and wires the production OIDC
+// `minter` (which may be nil) for the BFF→Stalwart bearer path. The
+// two are mutually exclusive at request time: when admin Basic is
+// present (dev/CI) it takes precedence, so dev never mints; in
+// production (devEnv false → no admin creds) the bridge mints a
+// `stalwart`-audience bearer per CalDAV request, exactly as the
+// JMAP proxy and `InternalClient` do. Centralising the gating here
+// keeps the two entrypoints from drifting — if they wired auth
+// differently the bridge would authenticate in one process but 401
+// (or 404) in the other.
+func DevAdminConfig(stalwartURL string, devEnv bool, logger *log.Logger, minter BearerMinter) Config {
+	cfg := Config{StalwartURL: stalwartURL, Minter: minter}
 	if devEnv {
 		if adminUser := os.Getenv("KMAIL_STALWART_ADMIN_USER"); adminUser != "" {
 			cfg.AdminUser = adminUser
@@ -191,7 +218,7 @@ func (s *Service) ListCalendars(ctx context.Context, accountID string) ([]Calend
 	resp, err := s.do(ctx, "PROPFIND", home, body, map[string]string{
 		"Depth":        "1",
 		"Content-Type": "application/xml; charset=utf-8",
-	})
+	}, accountID)
 	if err != nil {
 		return nil, err
 	}
@@ -216,7 +243,7 @@ func (s *Service) GetEvents(ctx context.Context, accountID, calendarID string, r
 	resp, err := s.do(ctx, "REPORT", path, strings.NewReader(body), map[string]string{
 		"Depth":        "1",
 		"Content-Type": "application/xml; charset=utf-8",
-	})
+	}, accountID)
 	if err != nil {
 		return nil, err
 	}
@@ -242,7 +269,7 @@ func (s *Service) CreateEvent(ctx context.Context, accountID, calendarID, icalDa
 	resp, err := s.do(ctx, http.MethodPut, path, strings.NewReader(icalData), map[string]string{
 		"Content-Type":  "text/calendar; charset=utf-8",
 		"If-None-Match": "*",
-	})
+	}, accountID)
 	if err != nil {
 		return "", err
 	}
@@ -268,7 +295,7 @@ func (s *Service) UpdateEvent(ctx context.Context, accountID, calendarID, eventU
 	path := s.eventPath(ctx, accountID, calendarID, eventUID)
 	resp, err := s.do(ctx, http.MethodPut, path, strings.NewReader(icalData), map[string]string{
 		"Content-Type": "text/calendar; charset=utf-8",
-	})
+	}, accountID)
 	if err != nil {
 		return err
 	}
@@ -288,7 +315,7 @@ func (s *Service) DeleteEvent(ctx context.Context, accountID, calendarID, eventU
 		return fmt.Errorf("%w: eventUID required", ErrInvalidInput)
 	}
 	path := s.eventPath(ctx, accountID, calendarID, eventUID)
-	resp, err := s.do(ctx, http.MethodDelete, path, nil, nil)
+	resp, err := s.do(ctx, http.MethodDelete, path, nil, nil, accountID)
 	if err != nil {
 		return err
 	}
@@ -325,7 +352,7 @@ func (s *Service) RespondToEvent(ctx context.Context, accountID, calendarID, eve
 
 func (s *Service) fetchEvent(ctx context.Context, accountID, calendarID, eventUID string) (string, error) {
 	path := s.eventPath(ctx, accountID, calendarID, eventUID)
-	resp, err := s.do(ctx, http.MethodGet, path, nil, nil)
+	resp, err := s.do(ctx, http.MethodGet, path, nil, nil, accountID)
 	if err != nil {
 		return "", err
 	}
@@ -343,7 +370,7 @@ func (s *Service) fetchEvent(ctx context.Context, accountID, calendarID, eventUI
 	return string(body), nil
 }
 
-func (s *Service) do(ctx context.Context, method, urlStr string, body io.Reader, headers map[string]string) (*http.Response, error) {
+func (s *Service) do(ctx context.Context, method, urlStr string, body io.Reader, headers map[string]string, accountID string) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, method, urlStr, body)
 	if err != nil {
 		return nil, err
@@ -351,10 +378,47 @@ func (s *Service) do(ctx context.Context, method, urlStr string, body io.Reader,
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	if s.cfg.AdminUser != "" {
-		req.SetBasicAuth(s.cfg.AdminUser, s.cfg.AdminPassword)
+	if err := s.setAuth(ctx, req, accountID); err != nil {
+		return nil, err
 	}
 	return s.cfg.HTTPClient.Do(req)
+}
+
+// setAuth stamps the BFF→Stalwart `Authorization` header on a
+// CalDAV request, mirroring the JMAP proxy / InternalClient
+// three-armed switch (`docs/JMAP-CONTRACT.md` §3.2):
+//
+//  1. Dev/CI (`AdminUser` set): authenticate with the recovery-admin
+//     Basic credential (gated by `middleware.IsDevEnv` in the
+//     entrypoints). Takes precedence so dev never mints.
+//  2. Production (`Minter` set): mint a short-lived,
+//     `stalwart`-audience OIDC bearer for the resolved CalDAV
+//     principal and forward it as `Authorization: Bearer …`. The
+//     principal is the same `/dav/cal/{principal}/` value the path
+//     is keyed by (`davAccount`); without admin creds that resolves
+//     to the account id unchanged, which in production is already
+//     the principal email. A mint failure FAILS CLOSED — return an
+//     error rather than issue an unauthenticated CalDAV call.
+//  3. Legacy mTLS-only (neither set): leave `Authorization` unset
+//     and defer to the mTLS client certificate / trusted-network
+//     posture.
+func (s *Service) setAuth(ctx context.Context, req *http.Request, accountID string) error {
+	switch {
+	case s.cfg.AdminUser != "":
+		req.SetBasicAuth(s.cfg.AdminUser, s.cfg.AdminPassword)
+	case s.cfg.Minter != nil:
+		principal := s.davAccount(ctx, accountID)
+		if strings.TrimSpace(principal) == "" {
+			// Never mint an unscoped token — fail closed.
+			return fmt.Errorf("calendarbridge: cannot mint stalwart bearer with empty account id")
+		}
+		token, err := s.cfg.Minter.Mint(principal)
+		if err != nil {
+			return fmt.Errorf("calendarbridge: mint stalwart bearer for account=%s: %w", principal, err)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	return nil
 }
 
 func (s *Service) calendarHome(ctx context.Context, accountID string) string {

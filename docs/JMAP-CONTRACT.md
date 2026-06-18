@@ -155,10 +155,11 @@ JWKS. This is the model the upstream `stalwartlabs/stalwart` image
 actually implements (an OpenID Connect directory backend); the
 end-user's KChat token is never forwarded to Stalwart.
 
-- **Minting.** For each request to Stalwart — both the client
-  requests the proxy forwards **and** the BFF-initiated calls from
-  `InternalClient` (sync bootstrap, undo-send, scheduled-send,
-  snooze, retention, eDiscovery export) — the BFF mints an RS256
+- **Minting.** For each request to Stalwart — the client requests
+  the proxy forwards, the BFF-initiated calls from `InternalClient`
+  (sync bootstrap, undo-send, scheduled-send, snooze, retention,
+  eDiscovery export), **and** the CalDAV/CardDAV bridge requests
+  (§3.2 *Bridges*) — the BFF mints an RS256
   JWT (`internal/stalwartauth`): `aud=stalwart`, `sub`/`email`/
   `preferred_username` = the **resolved** `stalwart_account_id`
   principal email (§3.3), `scope="openid email"`, ~5-minute TTL with
@@ -169,11 +170,14 @@ end-user's KChat token is never forwarded to Stalwart.
   `Authorization` header and sets `Authorization: Bearer <minted
   jwt>` (`internal/jmap/proxy.go`); `InternalClient` mints the same
   bearer for its already-resolved account and sets the header itself
-  (`internal/jmap/internal_client.go` `setAuth`). On either path, if
-  the principal cannot be resolved or minting fails the BFF **fails
-  closed** — the proxy forwards no credential, and `InternalClient`
-  aborts the call with an error — rather than leaking an
-  unauthenticated request or acting as an unintended principal.
+  (`internal/jmap/internal_client.go` `setAuth`); the CalDAV/CardDAV
+  bridges do the same per request via their own `setAuth`
+  (`internal/calendarbridge`, `internal/contactbridge`). On every
+  path, if the principal cannot be resolved or minting fails the BFF
+  **fails closed** — the proxy forwards no credential, and
+  `InternalClient` / the bridges abort the call with an error —
+  rather than leaking an unauthenticated request or acting as an
+  unintended principal.
 - **Verification.** Stalwart is configured with an OIDC directory
   (`issuerUrl` = the BFF issuer, `requireAudience=stalwart`,
   `claimUsername=email`) set as the default authentication
@@ -185,16 +189,17 @@ end-user's KChat token is never forwarded to Stalwart.
   `…/jwks.json` (only the public key is served).
 - **Channel security.** The bearer is the *authentication* of the
   acting principal; the BFF→Stalwart *channel* is still expected to
-  be TLS (and may be mTLS) in production. On both production paths
-  (the proxy and `InternalClient`, whenever a `Minter` is
-  configured), authentication is the minted bearer and no longer
-  depends on any `X-KMail-*` header trust — the official image does
-  not honor those headers. The `X-KMail-*` identity headers are
-  still stamped, but only as routing/diagnostic metadata, never as
-  an authentication signal. (The legacy header-trust posture
-  survives only in the mTLS-only deployment where neither a dev
-  header nor a `Minter` is set; both paths then send no
-  `Authorization` and defer to the mTLS client certificate.)
+  be TLS (and may be mTLS) in production. On all production paths
+  (the proxy, `InternalClient`, and the CalDAV/CardDAV bridges,
+  whenever a `Minter` is configured), authentication is the minted
+  bearer and no longer depends on any `X-KMail-*` header trust — the
+  official image does not honor those headers. The `X-KMail-*`
+  identity headers are still stamped, but only as routing/diagnostic
+  metadata, never as an authentication signal. (The legacy
+  header-trust posture survives only in the mTLS-only deployment
+  where neither a dev header nor a `Minter` is set; every path then
+  sends no `Authorization` and defers to the mTLS client
+  certificate.)
 - **Issuer must be `https` in production.** Stalwart fetches the
   discovery/JWKS documents over the issuer URL, so a cleartext
   `http` issuer would let a network attacker tamper with the served
@@ -231,6 +236,20 @@ end-user's KChat token is never forwarded to Stalwart.
   worker token signed with a different key would fail validation. The
   worker fails closed (refuses to start) if the issuer is configured
   without a key, mirroring the API.
+- **Bridges (CalDAV/CardDAV).** The calendar and contact bridges
+  (`internal/calendarbridge`, `internal/contactbridge`) are HTTP
+  reverse proxies that issue raw CalDAV/CardDAV requests to Stalwart
+  on behalf of the React client. They apply the **same three-armed
+  switch** on each request (`setAuth`): dev/CI admin-Basic takes
+  precedence, otherwise mint a `stalwart`-audience bearer for the
+  resolved DAV principal, otherwise (neither set) send no
+  `Authorization` and defer to mTLS. The principal is the bridge's
+  already-resolved `davAccount` email — the same `/dav/cal/{email}/`
+  or `/dav/card/{email}/` value the collection path is keyed by
+  (§3.3) — so the minted `email` claim matches the path. A mint
+  failure fails closed. The bridges are wired in both `kmail-api`
+  (interactive client requests) and `kmail-worker` (the calendar
+  reminder sweep), each reusing the same `Minter` as the JMAP path.
 
 #### 3.2.1 Registering the Stalwart OIDC directory
 
@@ -254,6 +273,13 @@ through the admin JMAP API rather than a config file:
 (it no-ops if the default directory is already the OIDC directory for
 the configured issuer) and is run after kmail-api is up. See
 `configs/stalwart.example.toml` for the annotated record shape.
+
+The script normalises `KMAIL_STALWART_OIDC_ISSUER` by trimming
+trailing slashes before provisioning `issuerUrl`, matching
+`NewSigner` (which trims them from the `iss` claim it mints). Stalwart
+rejects a bearer whose `iss` does not byte-equal the directory's
+`issuerUrl`, so the trim keeps the provisioned value and the minted
+`iss` from diverging over a stray trailing slash.
 
 **Key rotation.** The BFF serves a single JWK and computes the
 discovery/JWKS documents once at startup, so rotating the signing key
