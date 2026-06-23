@@ -12,7 +12,10 @@ export interface EmptyStateProps {
   className?: string;
 }
 
-/** EmptyState — friendly placeholder for empty lists / zero results. */
+/** EmptyState — friendly placeholder for empty lists / zero results.
+ *  Aligned to the KChat umbrella: soft surface, generous spacing, indigo
+ *  accent icon when no custom icon is provided.
+ */
 export function EmptyState({
   icon,
   title,
@@ -23,13 +26,13 @@ export function EmptyState({
   return (
     <div
       className={cn(
-        "flex flex-col items-center justify-center gap-3 px-6 py-12 text-center",
+        "flex flex-col items-center justify-center gap-3 rounded-2xl border border-border bg-surface px-6 py-14 text-center shadow-sm",
         className,
       )}
     >
       {icon && (
         <div
-          className="flex size-12 items-center justify-center rounded-full bg-surface-muted text-fg-subtle [&>svg]:size-6"
+          className="mb-1 flex size-14 items-center justify-center rounded-full bg-primary-subtle text-primary [&>svg]:size-7"
           aria-hidden="true"
         >
           {icon}
@@ -37,9 +40,11 @@ export function EmptyState({
       )}
       <p className="text-base font-semibold text-fg">{title}</p>
       {description && (
-        <p className="max-w-prose text-sm text-fg-muted">{description}</p>
+        <p className="max-w-prose text-sm leading-relaxed text-fg-muted">
+          {description}
+        </p>
       )}
-      {action && <div className="mt-1">{action}</div>}
+      {action && <div className="mt-2">{action}</div>}
     </div>
   );
 }

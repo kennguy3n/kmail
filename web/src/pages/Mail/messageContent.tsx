@@ -172,9 +172,9 @@ export function HtmlMessageBody({
   const srcDoc = `<!doctype html><html><head><meta charset="utf-8">
 <base target="_blank">
 <style>
-  body{margin:0;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;font-size:14px;color:#111827;line-height:1.5;word-wrap:break-word;}
+  body{margin:0;font-family:Inter,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;font-size:14px;color:#111827;line-height:1.5;word-wrap:break-word;}
   img{max-width:100%;height:auto;}
-  a{color:#2563eb;}
+  a{color:#4f46e5;}
   blockquote{margin:0 0 0 0.8rem;padding-left:0.8rem;border-left:2px solid #e5e7eb;color:#6b7280;}
 </style></head><body>${resolved}</body></html>`;
 

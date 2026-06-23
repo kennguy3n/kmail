@@ -1,4 +1,5 @@
 import { Fragment, useCallback, useEffect, useRef, useState } from "react";
+import { Users } from "lucide-react";
 
 import {
   AdminApiError,
@@ -12,6 +13,7 @@ import {
   type TenantUser,
   type UpdateUserInput,
 } from "../../api/admin";
+import { EmptyState } from "../../components/ui/EmptyState";
 
 import { useTenantSelection } from "./useTenantSelection";
 
@@ -243,7 +245,11 @@ export default function UserAdmin() {
           )}
 
           {users && users.length === 0 && !usersLoading && (
-            <p>No users in this tenant.</p>
+            <EmptyState
+              icon={<Users />}
+              title="No users in this tenant"
+              description="Add a user to get started with email and calendar provisioning."
+            />
           )}
 
           {users && users.length > 0 && (

@@ -5,7 +5,10 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Contact2, User } from "lucide-react";
 
+import { Button } from "../../components/ui/Button";
+import { EmptyState } from "../../components/ui/EmptyState";
 import {
   createContact,
   deleteContact,
@@ -315,7 +318,16 @@ export default function ContactsView() {
                   </button>
                 </li>
               ))}
-              {filtered.length === 0 && <li>No contacts.</li>}
+              {filtered.length === 0 && (
+                <EmptyState
+                  icon={<Contact2 />}
+                  title="No contacts yet"
+                  description="Add your first contact or import a vCard."
+                  action={
+                    <Button onClick={() => startEdit(null)}>Add contact</Button>
+                  }
+                />
+              )}
             </ul>
           </div>
 
@@ -415,7 +427,13 @@ export default function ContactsView() {
                 {g.phone && <small> · {g.phone}</small>}
               </li>
             ))}
-            {galEntries.length === 0 && <li>No directory entries.</li>}
+            {galEntries.length === 0 && (
+              <EmptyState
+                icon={<User />}
+                title="No directory entries"
+                description="Global Address List entries will appear once users are provisioned."
+              />
+            )}
           </ul>
         </div>
       )}

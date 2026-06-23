@@ -1,7 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
+import { PenLine } from "lucide-react";
 
 import { cn } from "../../lib/cn";
+import { Button } from "../../components/ui/Button";
+import { EmptyState } from "../../components/ui/EmptyState";
 
 import { jmapClient } from "../../api/jmap";
 import {
@@ -112,7 +115,14 @@ export default function SignatureEditor() {
             + New signature
           </button>
           {signatures.length === 0 && (
-            <p className={styles.muted}>No signatures yet.</p>
+            <EmptyState
+              icon={<PenLine />}
+              title="No signatures yet"
+              description="Create a signature to automatically append it to your emails."
+              action={
+                <Button onClick={startNew}>Create signature</Button>
+              }
+            />
           )}
           <ul className={styles.ul}>
             {signatures.map((s) => (

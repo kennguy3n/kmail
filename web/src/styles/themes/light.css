@@ -29,16 +29,16 @@
   --color-text-subtle: var(--gray-400);
   --color-text-inverse: var(--gray-0);
 
-  /* Brand / accent */
-  --color-primary: var(--blue-600);
-  --color-primary-hover: var(--blue-700);
-  --color-primary-active: var(--blue-800);
+  /* Brand / accent (indigo — KChat umbrella) */
+  --color-primary: var(--indigo-600);
+  --color-primary-hover: var(--indigo-700);
+  --color-primary-active: var(--indigo-800);
   --color-primary-text: var(--gray-0);
-  --color-primary-subtle: var(--blue-50);
-  --color-on-accent: var(--blue-800);
+  --color-primary-subtle: var(--indigo-50);
+  --color-on-accent: var(--indigo-800);
 
   /* Focus ring */
-  --color-focus-ring: var(--blue-500);
+  --color-focus-ring: var(--indigo-500);
 
   /* Status: success */
   --color-success: var(--green-600);
@@ -57,15 +57,15 @@
   --color-danger-text: var(--red-700);
 
   /* Status: info */
-  --color-info: var(--blue-600);
-  --color-info-bg: var(--blue-100);
-  --color-info-text: var(--blue-800);
+  --color-info: var(--sky-600);
+  --color-info-bg: var(--sky-100);
+  --color-info-text: var(--sky-700);
 
   /* Overlay / scrim */
-  --color-overlay: rgba(17, 24, 39, 0.5);
+  --color-overlay: rgba(15, 23, 42, 0.48);
 
-  /* Shadows (tuned for light surfaces) */
-  --shadow-sm: 0 1px 2px rgba(17, 24, 39, 0.06);
-  --shadow-md: 0 4px 12px rgba(17, 24, 39, 0.1);
-  --shadow-lg: 0 12px 32px rgba(17, 24, 39, 0.16);
+  /* Shadows (soft, KChat-style) */
+  --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.05);
+  --shadow-md: 0 8px 24px rgba(15, 23, 42, 0.08);
+  --shadow-lg: 0 16px 40px rgba(15, 23, 42, 0.12);
 }

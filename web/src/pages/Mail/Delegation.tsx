@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
+import { Users } from "lucide-react";
 
+import { EmptyState } from "../../components/ui/EmptyState";
 import {
   createGrant,
   deleteGrant,
@@ -196,7 +198,11 @@ export default function Delegation() {
 
       <h3 className={styles.subhead}>Existing grants</h3>
       {grants.length === 0 ? (
-        <p className={styles.muted}>No delegation grants yet.</p>
+        <EmptyState
+          icon={<Users />}
+          title="No delegation grants yet"
+          description="Grant delegates access to your mailbox or let them send on your behalf."
+        />
       ) : (
         <table className={styles.table}>
           <thead>

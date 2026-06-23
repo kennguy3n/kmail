@@ -6,7 +6,9 @@
  */
 
 import { useCallback, useEffect, useState } from "react";
+import { FolderLock, Shield, Users } from "lucide-react";
 
+import { EmptyState } from "../../components/ui/EmptyState";
 import {
   type FolderAccess,
   type FolderAccessLogEntry,
@@ -159,7 +161,11 @@ export default function ProtectedFolderView() {
 
           <h3>Folders</h3>
           {folders.length === 0 ? (
-            <p>No protected folders yet.</p>
+            <EmptyState
+              icon={<FolderLock />}
+              title="No protected folders yet"
+              description="Create a protected folder and control exactly who can read it."
+            />
           ) : (
             <ul className="kmail-protected-list">
               {folders.map((f) => (
@@ -191,7 +197,11 @@ export default function ProtectedFolderView() {
 
               <h4>Current grants</h4>
               {access.length === 0 ? (
-                <p>No grants. Only the owner can read.</p>
+                <EmptyState
+                  icon={<Shield />}
+                  title="No grants yet"
+                  description="Only the owner can read this folder. Share access to add collaborators."
+                />
               ) : (
                 <table>
                   <thead>
@@ -221,7 +231,11 @@ export default function ProtectedFolderView() {
 
               <h4>Access log</h4>
               {logEntries.length === 0 ? (
-                <p>No log entries yet.</p>
+                <EmptyState
+                  icon={<Users />}
+                  title="No log entries yet"
+                  description="Access attempts will be recorded here once the folder is shared."
+                />
               ) : (
                 <table className="kmail-protected-log">
                   <thead>

@@ -19,7 +19,7 @@ export type ButtonSize = "sm" | "md" | "lg";
  * semantic colour tokens (so light/dark theming is automatic).
  */
 const button = cva(
-  "relative inline-flex select-none items-center justify-center gap-2 whitespace-nowrap rounded-md font-medium leading-none outline-none transition-[background-color,border-color,color,box-shadow] duration-150 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-canvas disabled:cursor-not-allowed disabled:opacity-60",
+  "relative inline-flex select-none items-center justify-center gap-2 whitespace-nowrap rounded-lg font-medium leading-none outline-none transition-[background-color,border-color,color,box-shadow] duration-150 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-canvas disabled:cursor-not-allowed disabled:opacity-60",
   {
     variants: {
       variant: {

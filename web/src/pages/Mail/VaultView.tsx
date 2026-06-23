@@ -11,7 +11,9 @@
  */
 
 import { useCallback, useEffect, useState } from "react";
+import { FolderLock } from "lucide-react";
 
+import { EmptyState } from "../../components/ui/EmptyState";
 import {
   createVaultFolder,
   deleteVaultFolder,
@@ -131,7 +133,11 @@ export default function VaultView() {
 
           <h3>Folders</h3>
           {folders.length === 0 ? (
-            <p>No vault folders yet for this tenant.</p>
+            <EmptyState
+              icon={<FolderLock />}
+              title="No vault folders yet"
+              description="Create a zero-access vault folder. Server-side search and push previews are disabled by design."
+            />
           ) : (
             <ul className="kmail-vault-list">
               {folders.map((f) => (

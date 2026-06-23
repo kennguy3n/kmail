@@ -621,44 +621,47 @@ function SignupCancelled() {
 
 // --- styles --------------------------------------------------------
 
-/** Theme-aware Tailwind class recipes for the signup wizard. */
+/** Theme-aware Tailwind class recipes for the signup wizard.
+ *  Aligned to the KChat umbrella: indigo accent, Inter typeface, soft
+ *  radius, and semantic surfaces so the funnel works in light and dark.
+ */
 const styles: Record<string, string> = {
-  page: "flex min-h-screen items-center justify-center bg-[#0f172a] p-8",
-  card: "w-full max-w-[720px] rounded-xl bg-white p-10 shadow-[0_10px_40px_rgba(0,0,0,0.25)]",
-  h1: "mb-2 mt-0 text-2xl font-semibold text-[#0f172a]",
-  subtitle: "mb-6 mt-0 leading-relaxed text-[#475569]",
-  label: "mb-1.5 mt-4 block font-semibold text-[#1e293b]",
+  page: "flex min-h-screen items-center justify-center bg-canvas p-6 sm:p-8",
+  card: "w-full max-w-[720px] rounded-2xl border border-border bg-elevated p-8 shadow-lg sm:p-10",
+  h1: "mb-2 mt-0 text-2xl font-semibold text-fg",
+  subtitle: "mb-6 mt-0 leading-relaxed text-fg-muted",
+  label: "mb-1.5 mt-4 block font-semibold text-fg",
   input:
-    "box-border w-full rounded-lg border border-[#cbd5e1] px-3 py-2.5 text-base outline-none focus-visible:border-[#2563eb] focus-visible:ring-2 focus-visible:ring-[#bfdbfe]",
+    "box-border w-full rounded-lg border border-border-strong bg-surface px-3 py-2.5 text-base text-fg outline-none transition-colors placeholder:text-fg-subtle focus-visible:border-primary focus-visible:ring-2 focus-visible:ring-primary-subtle",
   fieldset: "m-0 mt-5 border-none p-0",
-  planGrid: "grid grid-cols-3 gap-3",
+  planGrid: "grid grid-cols-1 gap-3 sm:grid-cols-3",
   planCard:
-    "flex cursor-pointer flex-col gap-1.5 rounded-[10px] border-2 border-[#e2e8f0] bg-[#f8fafc] p-4 text-left transition-colors hover:border-[#cbd5e1]",
-  planCardSelected: "border-[#2563eb] bg-[#eff6ff]",
-  planName: "text-lg font-bold text-[#0f172a]",
-  planDesc: "text-sm text-[#475569]",
-  featureList: "ml-4 mt-1 list-disc text-xs text-[#334155]",
+    "flex cursor-pointer flex-col gap-1.5 rounded-xl border-2 border-border bg-surface-muted p-4 text-left transition-colors hover:border-border-strong",
+  planCardSelected: "border-primary bg-primary-subtle",
+  planName: "text-lg font-bold text-fg",
+  planDesc: "text-sm text-fg-muted",
+  featureList: "ml-4 mt-1 list-disc text-xs text-fg-muted",
   submit:
-    "cursor-pointer rounded-lg border-none bg-[#2563eb] px-5 py-3 text-base font-semibold text-white transition-colors hover:bg-[#1d4ed8]",
-  back: "cursor-pointer rounded-lg border border-[#cbd5e1] bg-white px-5 py-3 text-base font-semibold text-[#1e293b] transition-colors hover:bg-[#f1f5f9]",
+    "cursor-pointer rounded-lg border-none bg-primary px-5 py-3 text-base font-semibold text-primary-fg transition-colors hover:bg-primary-hover",
+  back: "cursor-pointer rounded-lg border border-border-strong bg-surface px-5 py-3 text-base font-semibold text-fg transition-colors hover:bg-surface-hover",
   navRow: "mt-6 flex items-center justify-between gap-3",
-  help: "mt-2 text-sm leading-relaxed text-[#64748b]",
-  optional: "font-normal text-[#94a3b8]",
+  help: "mt-2 text-sm leading-relaxed text-fg-muted",
+  optional: "font-normal text-fg-subtle",
   stepper: "mb-7 flex list-none gap-2 p-0",
-  step: "flex min-w-0 flex-1 items-center gap-1.5 text-sm text-[#64748b]",
+  step: "flex min-w-0 flex-1 items-center gap-1.5 text-sm text-fg-muted",
   stepDot:
-    "inline-flex size-[26px] shrink-0 items-center justify-center rounded-full bg-[#e2e8f0] text-sm font-bold text-[#475569]",
-  stepDotCurrent: "bg-[#2563eb] text-white",
-  stepDotDone: "bg-[#16a34a] text-white",
+    "inline-flex size-[26px] shrink-0 items-center justify-center rounded-full bg-surface-muted text-sm font-bold text-fg-muted",
+  stepDotCurrent: "bg-primary text-primary-fg",
+  stepDotDone: "bg-success text-white",
   stepLabel: "truncate",
   review: "mt-2 grid gap-2",
-  reviewRow: "flex flex-col gap-0.5 border-b border-[#e2e8f0] py-2.5",
-  reviewLabel: "text-sm font-semibold text-[#64748b]",
-  reviewValue: "m-0 flex items-center justify-between gap-2 text-base text-[#0f172a]",
-  editLink: "cursor-pointer border-none bg-transparent p-0 text-sm font-semibold text-[#2563eb] hover:underline",
-  error: "mt-4 rounded-lg border border-[#fecaca] bg-[#fef2f2] px-3 py-2.5 text-[#b91c1c]",
-  softError: "mt-4 text-sm text-[#92400e]",
-  spinner: "mt-6 text-lg font-semibold text-[#2563eb]",
+  reviewRow: "flex flex-col gap-0.5 border-b border-border py-2.5",
+  reviewLabel: "text-sm font-semibold text-fg-muted",
+  reviewValue: "m-0 flex items-center justify-between gap-2 text-base text-fg",
+  editLink: "cursor-pointer border-none bg-transparent p-0 text-sm font-semibold text-primary hover:underline",
+  error: "mt-4 rounded-lg border border-danger bg-danger-bg px-3 py-2.5 text-danger-fg",
+  softError: "mt-4 text-sm text-warning-fg",
+  spinner: "mt-6 text-lg font-semibold text-primary",
   linkButton:
-    "mt-6 inline-block rounded-lg bg-[#2563eb] px-5 py-2.5 font-semibold text-white no-underline hover:bg-[#1d4ed8]",
+    "mt-6 inline-block rounded-lg bg-primary px-5 py-2.5 font-semibold text-primary-fg no-underline transition-colors hover:bg-primary-hover",
 };

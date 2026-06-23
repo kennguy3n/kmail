@@ -1,7 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
+import { CalendarDays, CalendarPlus } from "lucide-react";
 
 import { cn } from "../../lib/cn";
+import { Button } from "../../components/ui/Button";
+import { EmptyState } from "../../components/ui/EmptyState";
 
 import { jmapClient } from "../../api/jmap";
 import type {
@@ -236,9 +239,25 @@ export default function CalendarView() {
           </button>
         </div>
         {isLoadingCalendars ? (
-          <p className={styles.muted}>Loading calendars…</p>
+          <EmptyState
+            icon={<CalendarDays />}
+            title="Loading calendars…"
+            description="Please wait while we fetch your schedule."
+          />
         ) : (calendars ?? []).length === 0 ? (
-          <p className={styles.muted}>No calendars.</p>
+          <EmptyState
+            icon={<CalendarDays />}
+            title="No calendars yet"
+            description="Create your first calendar to start scheduling events."
+            action={
+              <Button
+                iconLeft={<CalendarPlus />}
+                onClick={() => navigate("/calendar/new")}
+              >
+                New event
+              </Button>
+            }
+          />
         ) : (
           <ul className={styles.calendarList}>
             {(calendars ?? []).map((c) => {

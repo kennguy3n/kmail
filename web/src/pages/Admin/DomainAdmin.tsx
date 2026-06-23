@@ -1,4 +1,5 @@
 import { Fragment, useCallback, useEffect, useState } from "react";
+import { Globe } from "lucide-react";
 
 import {
   AdminApiError,
@@ -9,6 +10,7 @@ import {
   type DomainVerificationResult,
   type TenantDomain,
 } from "../../api/admin";
+import { EmptyState } from "../../components/ui/EmptyState";
 
 import { useTenantSelection } from "./useTenantSelection";
 
@@ -195,7 +197,11 @@ export default function DomainAdmin() {
           )}
 
           {domains && domains.length === 0 && !domainsLoading && (
-            <p>No domains configured for this tenant.</p>
+            <EmptyState
+              icon={<Globe />}
+              title="No domains configured"
+              description="Add a domain and run the DNS wizard to start receiving mail."
+            />
           )}
 
           {domains && domains.length > 0 && (

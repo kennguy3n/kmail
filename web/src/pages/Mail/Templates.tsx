@@ -1,7 +1,10 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
+import { FileText } from "lucide-react";
 
 import { cn } from "../../lib/cn";
+import { Button } from "../../components/ui/Button";
+import { EmptyState } from "../../components/ui/EmptyState";
 
 import {
   createTemplate,
@@ -91,7 +94,14 @@ export default function Templates() {
             + New template
           </button>
           {templates.length === 0 && (
-            <p className={styles.muted}>No templates yet.</p>
+            <EmptyState
+              icon={<FileText />}
+              title="No templates yet"
+              description="Create reusable templates to speed up your replies."
+              action={
+                <Button onClick={startNew}>Create template</Button>
+              }
+            />
           )}
           <ul className={styles.ul}>
             {templates.map((t) => (

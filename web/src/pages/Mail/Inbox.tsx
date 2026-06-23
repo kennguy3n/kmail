@@ -1,7 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
+import { InboxIcon, Mail, Search, Tag } from "lucide-react";
 
 import { cn } from "../../lib/cn";
+import { Button } from "../../components/ui/Button";
+import { EmptyState } from "../../components/ui/EmptyState";
 
 import { jmapClient } from "../../api/jmap";
 import { snoozeEmail } from "../../api/snooze";
@@ -903,7 +906,11 @@ export default function Inbox() {
             </Link>
           </div>
           {labels.length === 0 ? (
-            <p className={layoutStyles.muted}>No labels yet.</p>
+            <EmptyState
+              icon={<Tag />}
+              title="No labels yet"
+              description="Create labels to organize your messages."
+            />
           ) : (
             <ul className={layoutStyles.mailboxList}>
               {labelFilter && (
@@ -1025,19 +1032,39 @@ export default function Inbox() {
           </p>
         )}
         {!inSearchMode && isLoadingEmails && (
-          <p className={layoutStyles.muted}>Loading emails…</p>
+          <EmptyState
+            icon={<Mail />}
+            title="Loading emails…"
+            description="Please wait while we fetch your messages."
+          />
         )}
         {!inSearchMode &&
           !isLoadingEmails &&
           emails &&
           emails.length === 0 && (
-            <p className={layoutStyles.muted}>No messages.</p>
+            <EmptyState
+              icon={<InboxIcon />}
+              title="Inbox is empty"
+              description="You're all caught up. New messages will appear here."
+              action={
+                <Button
+                  iconLeft={<Mail />}
+                  onClick={() => navigate("/mail/compose")}
+                >
+                  Compose
+                </Button>
+              }
+            />
           )}
         {inSearchMode &&
           !isSearching &&
           searchResults &&
           searchResults.length === 0 && (
-            <p className={layoutStyles.muted}>No matching messages.</p>
+            <EmptyState
+              icon={<Search />}
+              title="No matching messages"
+              description={`We couldn't find anything for “${submittedQuery}”. Try a different term or search across all mail.`}
+            />
           )}
         {/* WS7: category tabs — shown when viewing the normal inbox. */}
         {!inSearchMode && !isPriorityView && (
@@ -1058,9 +1085,18 @@ export default function Inbox() {
         {isPriorityView && (
           <div>
             <h3 className="mb-2 mt-0 text-base font-semibold">Priority Inbox</h3>
-            {isPriorityLoading && <p className="text-fg-muted">Loading…</p>}
+            {isPriorityLoading && (
+              <EmptyState
+                icon={<Mail />}
+                title="Loading priority messages…"
+              />
+            )}
             {!isPriorityLoading && priorityItems.length === 0 && (
-              <p className="text-fg-muted">No priority messages.</p>
+              <EmptyState
+                icon={<InboxIcon />}
+                title="No priority messages"
+                description="Important messages will surface here once they arrive."
+              />
             )}
             {!isPriorityLoading && priorityItems.length > 0 && (
               <ul className="m-0 list-none p-0">

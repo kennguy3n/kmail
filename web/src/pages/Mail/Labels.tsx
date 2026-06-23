@@ -1,7 +1,9 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
+import { Tag } from "lucide-react";
 
 import { cn } from "../../lib/cn";
+import { EmptyState } from "../../components/ui/EmptyState";
 
 import {
   createLabel,
@@ -86,7 +88,11 @@ export default function Labels() {
       </div>
 
       {labels.length === 0 ? (
-        <p className={styles.muted}>No labels yet.</p>
+        <EmptyState
+          icon={<Tag />}
+          title="No labels yet"
+          description="Create a label above to start organizing your mail."
+        />
       ) : (
         <ul className={styles.list}>
           {labels.map((label) => (

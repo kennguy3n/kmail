@@ -232,10 +232,11 @@ export default function Layout(): JSX.Element {
           )}
           <NavLink
             to="/mail"
-            className="inline-flex items-center gap-2 text-lg font-bold text-fg hover:no-underline"
+            className="inline-flex items-center gap-2.5 text-lg font-bold text-fg hover:no-underline"
+            aria-label="KMail home"
           >
             <span
-              className="inline-flex size-8 items-center justify-center rounded-lg bg-primary text-primary-fg"
+              className="inline-flex size-8 items-center justify-center rounded-xl bg-primary text-primary-fg shadow-sm"
               aria-hidden="true"
             >
               <svg
@@ -247,8 +248,8 @@ export default function Layout(): JSX.Element {
                 strokeLinecap="round"
                 strokeLinejoin="round"
               >
-                <rect x="2" y="4" width="20" height="16" rx="2" />
-                <path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7" />
+                <rect x="3" y="5" width="18" height="14" rx="3" />
+                <path d="m21 7-7.97 5.7a1.94 1.94 0 0 1-2.06 0L3 7" />
               </svg>
             </span>
             <span className="max-sm:hidden">KMail</span>
