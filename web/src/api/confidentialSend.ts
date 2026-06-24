@@ -20,6 +20,10 @@ export interface SecureMessage {
   view_count: number;
   revoked: boolean;
   created_at: string;
+  /** Optional decrypted content returned by the BFF once the portal is open. */
+  subject?: string;
+  body?: string;
+  body_html?: string;
 }
 
 export interface CreateSecureMessageInput {

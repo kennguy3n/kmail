@@ -251,9 +251,10 @@ export default function SearchAdmin() {
   };
 
   return (
-    <div className="admin-page">
+    <div className="kmail-admin-page">
       <h2>Search backend</h2>
-      <div className="tenant-picker">
+      <p className="kmail-admin-hint">Choose the search index for this tenant and run cutovers or reindexes.</p>
+      <div className="kmail-admin-tenant-picker">
         <label>
           Tenant{" "}
           <select
@@ -269,15 +270,15 @@ export default function SearchAdmin() {
           </select>
         </label>
       </div>
-      {error && <p className="error">{error}</p>}
-      {info && <p className="info">{info}</p>}
+      {error && <p className="kmail-error">{error}</p>}
+      {info && <p className="kmail-info">{info}</p>}
       {config && (
         <div>
-          <p>
-            Current backend: <strong>{config.backend}</strong>{" "}
+          <p className="mb-3 text-sm">
+            Current backend: <strong className="text-fg">{config.backend}</strong>{" "}
             <span className="muted">({BACKEND_DESCRIPTIONS[config.backend]?.label ?? "unknown"})</span>
           </p>
-          <ul className="backend-options" role="radiogroup" aria-label="Search backend">
+          <ul className="backend-options grid gap-3" role="radiogroup" aria-label="Search backend">
             {SEARCH_BACKENDS.map((backend) => {
               const desc = BACKEND_DESCRIPTIONS[backend];
               const isCurrent = config.backend === backend;
@@ -308,7 +309,7 @@ export default function SearchAdmin() {
               );
             })}
           </ul>
-          <div className="actions">
+          <div className="kmail-actions">
             <button type="button" disabled={pending} onClick={onReindex}>
               Reindex now
             </button>

@@ -486,30 +486,30 @@ function errorMessage(err: unknown): string {
 
 /** Theme-aware Tailwind class recipes for the event create/edit form. */
 const styles: Record<string, string> = {
-  root: "max-w-[760px] p-4",
-  header: "mb-3",
-  title: "m-0 text-xl font-semibold",
+  root: "mx-auto max-w-[800px] p-6",
+  header: "mb-5",
+  title: "m-0 text-2xl font-semibold tracking-tight text-fg",
   error:
-    "mb-3 flex items-center justify-between gap-2 rounded-md bg-danger-bg px-3 py-2 text-danger-fg",
+    "mb-3 flex items-center justify-between gap-2 rounded-lg bg-danger-bg px-3 py-2.5 text-sm text-danger-fg",
   errorDismiss:
-    "cursor-pointer border-0 bg-transparent px-1 text-lg leading-none text-danger-fg",
-  muted: "italic text-fg-muted",
-  form: "flex flex-col gap-2 rounded-lg border border-border bg-surface p-4",
-  row: "grid grid-cols-[120px_1fr] items-center gap-2",
-  bodyRow: "grid grid-cols-[120px_1fr] items-start gap-2",
-  label: "text-sm font-semibold text-fg-muted",
+    "cursor-pointer rounded-md border-0 bg-transparent px-1.5 text-lg leading-none text-danger-fg hover:bg-danger-bg",
+  muted: "text-sm italic text-fg-muted",
+  form: "flex flex-col gap-3 rounded-xl border border-border bg-surface p-6 shadow-sm",
+  row: "grid grid-cols-[110px_1fr] items-center gap-3",
+  bodyRow: "grid grid-cols-[110px_1fr] items-start gap-3",
+  label: "text-sm font-medium text-fg-muted",
   input:
-    "rounded-md border border-border bg-surface px-2.5 py-1.5 text-sm text-fg outline-none focus-visible:border-primary focus-visible:ring-2 focus-visible:ring-primary-subtle",
+    "rounded-lg border border-border bg-surface px-3 py-2 text-sm text-fg outline-none transition-colors placeholder:text-fg-subtle focus-visible:border-primary focus-visible:ring-2 focus-visible:ring-primary-subtle",
   select:
-    "rounded-md border border-border bg-surface px-2.5 py-1.5 text-sm text-fg outline-none focus-visible:border-primary focus-visible:ring-2 focus-visible:ring-primary-subtle",
+    "rounded-lg border border-border bg-surface px-3 py-2 text-sm text-fg outline-none transition-colors focus-visible:border-primary focus-visible:ring-2 focus-visible:ring-primary-subtle",
   textarea:
-    "min-h-24 resize-y rounded-md border border-border bg-surface px-2.5 py-1.5 font-[inherit] text-sm text-fg outline-none focus-visible:border-primary focus-visible:ring-2 focus-visible:ring-primary-subtle",
-  inlineCheckbox: "flex items-center gap-1.5 text-sm",
-  buttonRow: "mt-2 flex gap-2",
+    "min-h-28 resize-y rounded-lg border border-border bg-surface p-3 font-[inherit] text-sm text-fg outline-none transition-colors focus-visible:border-primary focus-visible:ring-2 focus-visible:ring-primary-subtle",
+  inlineCheckbox: "flex items-center gap-2 text-sm text-fg",
+  buttonRow: "mt-4 flex items-center gap-3",
   primaryButton:
-    "cursor-pointer rounded-md border-0 bg-primary px-4 py-1.5 text-sm font-medium text-primary-fg transition-colors hover:bg-primary-hover",
+    "cursor-pointer rounded-lg border-0 bg-primary px-5 py-2.5 text-sm font-semibold text-primary-fg shadow-sm transition-colors hover:bg-primary-hover",
   secondaryButton:
-    "cursor-pointer rounded-md border border-border bg-surface px-4 py-1.5 text-sm text-fg transition-colors hover:bg-surface-hover",
+    "cursor-pointer rounded-lg border border-border bg-surface px-5 py-2.5 text-sm font-semibold text-fg transition-colors hover:bg-surface-hover",
 };
 
 interface FreeBusyResp {

@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 
+import { cn } from "../../lib/cn";
 import {
   addNote,
   assignEmail,
@@ -25,7 +26,7 @@ const STATUS_OPTIONS: AssignmentStatus[] = [
  * internal-notes panel visible only to shared inbox members.
  */
 export default function SharedInboxView() {
-  const [inboxId, setInboxId] = useState("");
+  const [inboxId, setInboxId] = useState("shared-support");
   const [filter, setFilter] = useState<AssignmentStatus | "">("");
   const [rows, setRows] = useState<EmailAssignment[]>([]);
   const [selected, setSelected] = useState<EmailAssignment | null>(null);
@@ -112,42 +113,69 @@ export default function SharedInboxView() {
         </label>
       </div>
 
-      <table className="kmail-admin-table">
-        <thead>
-          <tr>
-            <th>Email</th>
-            <th>Assignee</th>
-            <th>Status</th>
-            <th>Updated</th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((r) => (
-            <tr
-              key={r.id}
-              onClick={() => setSelected(r)}
-              className={selected?.id === r.id ? "selected" : ""}
-            >
-              <td>{r.email_id}</td>
-              <td>{r.assignee_user_id || "—"}</td>
-              <td>{r.status}</td>
-              <td>{new Date(r.updated_at).toLocaleString()}</td>
+      {rows.length === 0 && !error && (
+        <p className="kmail-admin-hint">No assignments found for this inbox.</p>
+      )}
+      {rows.length > 0 && (
+        <table className="kmail-admin-table">
+          <thead>
+            <tr>
+              <th>Conversation</th>
+              <th>Assignee</th>
+              <th>Status</th>
+              <th>Updated</th>
             </tr>
-          ))}
-        </tbody>
-      </table>
+          </thead>
+          <tbody>
+            {rows.map((r) => (
+              <tr
+                key={r.id}
+                onClick={() => setSelected(r)}
+                className={selected?.id === r.id ? "selected" : ""}
+              >
+                <td>
+                  <div className="font-semibold text-fg">
+                    {r.subject || r.email_id}
+                  </div>
+                  <div className="text-xs text-fg-muted">
+                    {r.sender_name ? `${r.sender_name} <${r.sender_email}>` : r.sender_email}
+                    {r.preview && ` — ${r.preview}`}
+                  </div>
+                </td>
+                <td>{r.assignee_user_id || "—"}</td>
+                <td>
+                  <span className={cn(
+                    "inline-flex rounded-pill px-2.5 py-0.5 text-xs font-semibold",
+                    r.status === "open" && "bg-info-bg text-info-fg",
+                    r.status === "in_progress" && "bg-warning-bg text-warning-fg",
+                    r.status === "waiting" && "bg-warning-bg text-warning-fg",
+                    r.status === "resolved" && "bg-success-bg text-success-fg",
+                    r.status === "closed" && "bg-surface-muted text-fg-muted",
+                  )}>
+                    {r.status.replace("_", " ")}
+                  </span>
+                </td>
+                <td>{new Date(r.updated_at).toLocaleString()}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
 
       {selected && (
         <div className="kmail-inbox-detail">
-          <h3>{selected.email_id}</h3>
+          <h3>{selected.subject || selected.email_id}</h3>
+          <div className="kmail-admin-hint">
+            {selected.sender_name ? `${selected.sender_name} <${selected.sender_email}>` : selected.sender_email}
+          </div>
           <div className="kmail-inbox-controls">
             <label>
               Assign to
               <input value={assignee} onChange={(e) => setAssignee(e.target.value)} />
-              <button type="button" onClick={doAssign}>Assign</button>
             </label>
+            <button type="button" className="kmail-button" onClick={doAssign}>Assign</button>
             <label>
-              Assignment status
+              Status
               <select
                 value={selected.status}
                 onChange={(e) => doStatus(e.target.value as AssignmentStatus)}
@@ -160,6 +188,7 @@ export default function SharedInboxView() {
           </div>
 
           <h4>Internal notes</h4>
+          {notes.length === 0 && <p className="kmail-admin-hint">No notes yet.</p>}
           <ul>
             {notes.map((n) => (
               <li key={n.id}>
@@ -174,7 +203,7 @@ export default function SharedInboxView() {
             value={noteText}
             onChange={(e) => setNoteText(e.target.value)}
           />
-          <button type="button" onClick={doNote}>Add note</button>
+          <button type="button" className="kmail-button" onClick={doNote}>Add note</button>
         </div>
       )}
     </section>

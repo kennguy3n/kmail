@@ -83,13 +83,13 @@ export default function SecuritySettings() {
   };
 
   return (
-    <div className="admin-page">
+    <div className="kmail-admin-page">
       <h2>Security</h2>
-      <p>
+      <p className="kmail-admin-hint">
         Manage hardware-backed second factors (FIDO2 security keys, platform
         authenticators) and the TOTP fallback for your account.
       </p>
-      <div className="tenant-picker">
+      <div className="kmail-admin-tenant-picker">
         <label>
           Tenant{" "}
           <select
@@ -105,28 +105,43 @@ export default function SecuritySettings() {
           </select>
         </label>
       </div>
-      <nav className="tabs my-3 flex gap-3">
-        <button type="button" onClick={() => setTab("webauthn")} aria-pressed={tab === "webauthn"}>
+      <nav className="mb-4 flex gap-1 border-b border-border">
+        <button
+          type="button"
+          onClick={() => setTab("webauthn")}
+          aria-pressed={tab === "webauthn"}
+          className={`relative px-4 py-2 text-sm font-medium transition-colors ${tab === "webauthn" ? "text-primary after:absolute after:bottom-0 after:left-2 after:right-2 after:h-0.5 after:rounded-full after:bg-primary" : "text-fg-muted hover:bg-surface-hover hover:text-fg"}`}
+        >
           Security keys (WebAuthn)
         </button>
-        <button type="button" onClick={() => setTab("totp")} aria-pressed={tab === "totp"}>
+        <button
+          type="button"
+          onClick={() => setTab("totp")}
+          aria-pressed={tab === "totp"}
+          className={`relative px-4 py-2 text-sm font-medium transition-colors ${tab === "totp" ? "text-primary after:absolute after:bottom-0 after:left-2 after:right-2 after:h-0.5 after:rounded-full after:bg-primary" : "text-fg-muted hover:bg-surface-hover hover:text-fg"}`}
+        >
           TOTP (authenticator app)
         </button>
-        <button type="button" onClick={() => setTab("sessions")} aria-pressed={tab === "sessions"}>
+        <button
+          type="button"
+          onClick={() => setTab("sessions")}
+          aria-pressed={tab === "sessions"}
+          className={`relative px-4 py-2 text-sm font-medium transition-colors ${tab === "sessions" ? "text-primary after:absolute after:bottom-0 after:left-2 after:right-2 after:h-0.5 after:rounded-full after:bg-primary" : "text-fg-muted hover:bg-surface-hover hover:text-fg"}`}
+        >
           Active sessions
         </button>
       </nav>
-      {error && <p className="error">{error}</p>}
-      {info && <p className="info">{info}</p>}
+      {error && <p className="kmail-error">{error}</p>}
+      {info && <p className="kmail-info">{info}</p>}
       {tab === "webauthn" && (
         <section>
-          <div className="actions">
-            <button type="button" onClick={onRegister} disabled={!selectedTenantId}>
+          <div className="kmail-actions mb-3">
+            <button type="button" className="kmail-button" onClick={onRegister} disabled={!selectedTenantId}>
               Register a new key
             </button>
           </div>
           {selectedTenantId && (
-            <table className="admin-table">
+            <table className="kmail-admin-table">
               <thead>
                 <tr>
                   <th>Name</th>
@@ -253,7 +268,7 @@ function SessionsSection({ tenantId }: { tenantId: string }) {
 
   return (
     <section>
-      {error && <p className="error">{error}</p>}
+      {error && <p className="kmail-error">{error}</p>}
       <p>
         Devices and browsers currently signed in to your account.
         {data && (
@@ -264,12 +279,12 @@ function SessionsSection({ tenantId }: { tenantId: string }) {
           </>
         )}
       </p>
-      <div className="actions">
+      <div className="kmail-actions">
         <button type="button" onClick={() => void revokeOthers()} disabled={busy}>
           Sign out everywhere else
         </button>
       </div>
-      <table className="admin-table">
+      <table className="kmail-admin-table">
         <thead>
           <tr>
             <th>Device / agent</th>
@@ -421,13 +436,13 @@ function TOTPSection({ tenantId }: { tenantId: string }) {
   if (!tenantId) return <p className="muted">Select a tenant to manage TOTP.</p>;
   return (
     <section>
-      {error && <p className="error">{error}</p>}
+      {error && <p className="kmail-error">{error}</p>}
       <p>
         Status:{" "}
         {status?.enabled ? <strong>enabled</strong> : status?.enrolled ? "enrolment in progress" : "not enrolled"}
       </p>
       {!status?.enabled && (
-        <div className="actions">
+        <div className="kmail-actions">
           <button type="button" onClick={enroll} disabled={busy}>
             {status?.enrolled ? "Restart enrolment" : "Begin enrolment"}
           </button>
@@ -476,7 +491,7 @@ function TOTPSection({ tenantId }: { tenantId: string }) {
         </div>
       )}
       {status?.enabled && (
-        <div className="actions">
+        <div className="kmail-actions">
           <label>
             Current 6-digit or recovery code:{" "}
             <input

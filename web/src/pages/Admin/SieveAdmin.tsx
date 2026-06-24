@@ -95,9 +95,10 @@ export default function SieveAdmin() {
     : { value: draft as SieveRule, set: (r: SieveRule) => setDraft(r) };
 
   return (
-    <div className="admin-page">
+    <div className="kmail-admin-page">
       <h2>Sieve rules</h2>
-      <div className="tenant-picker">
+      <p className="kmail-admin-hint">Author Sieve filters, validate them, and push the enabled set to the mail server.</p>
+      <div className="kmail-admin-tenant-picker">
         <label>
           Tenant{" "}
           <select
@@ -112,11 +113,11 @@ export default function SieveAdmin() {
             ))}
           </select>
         </label>
-        <button type="button" onClick={onDeploy}>Deploy enabled rules</button>
+        <button type="button" className="kmail-button" onClick={onDeploy}>Deploy enabled rules</button>
       </div>
-      {error && <p className="error">{error}</p>}
-      {info && <p className="info">{info}</p>}
-      <table className="admin-table">
+      {error && <p className="kmail-error">{error}</p>}
+      {info && <p className="kmail-info">{info}</p>}
+      <table className="kmail-admin-table">
         <thead>
           <tr>
             <th>Name</th>
@@ -140,50 +141,53 @@ export default function SieveAdmin() {
         </tbody>
       </table>
 
-      <h3>{editing ? "Edit rule" : "New rule"}</h3>
-      <label>
-        Name{" "}
-        <input
-          value={target.value.name}
+      <div className="kmail-admin-card">
+        <h3>{editing ? "Edit rule" : "New rule"}</h3>
+        <div className="kmail-admin-controls">
+          <label>
+            Name{" "}
+            <input
+              value={target.value.name}
+              onChange={(e) =>
+                target.set({ ...target.value, name: e.target.value })
+              }
+            />
+          </label>
+          <label>
+            Priority{" "}
+            <input
+              type="number"
+              value={target.value.priority}
+              onChange={(e) =>
+                target.set({ ...target.value, priority: Number(e.target.value) })
+              }
+            />
+          </label>
+          <label className="flex-row items-center gap-2">
+            <input
+              type="checkbox"
+              checked={target.value.enabled}
+              onChange={(e) =>
+                target.set({ ...target.value, enabled: e.target.checked })
+              }
+            />
+            Enabled
+          </label>
+        </div>
+        <textarea
+          rows={10}
+          value={target.value.script}
           onChange={(e) =>
-            target.set({ ...target.value, name: e.target.value })
+            target.set({ ...target.value, script: e.target.value })
           }
         />
-      </label>
-      <label>
-        Priority{" "}
-        <input
-          type="number"
-          value={target.value.priority}
-          onChange={(e) =>
-            target.set({ ...target.value, priority: Number(e.target.value) })
-          }
-        />
-      </label>
-      <label>
-        <input
-          type="checkbox"
-          checked={target.value.enabled}
-          onChange={(e) =>
-            target.set({ ...target.value, enabled: e.target.checked })
-          }
-        />
-        Enabled
-      </label>
-      <textarea
-        rows={10}
-        cols={80}
-        value={target.value.script}
-        onChange={(e) =>
-          target.set({ ...target.value, script: e.target.value })
-        }
-      />
-      <div className="actions">
-        <button type="button" onClick={onValidate}>Validate</button>
-        <button type="button" onClick={onSave}>Save</button>
-        {editing && (
-          <button type="button" onClick={() => setEditing(null)}>Cancel</button>
-        )}
+        <div className="kmail-actions">
+          <button type="button" className="kmail-button" onClick={onValidate}>Validate</button>
+          <button type="button" className="kmail-button" onClick={onSave}>Save</button>
+          {editing && (
+            <button type="button" onClick={() => setEditing(null)}>Cancel</button>
+          )}
+        </div>
       </div>
     </div>
   );

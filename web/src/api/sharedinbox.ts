@@ -16,6 +16,11 @@ export interface EmailAssignment {
   status: AssignmentStatus;
   created_at: string;
   updated_at: string;
+  /** Optional display metadata returned by the BFF for shared-inbox queues. */
+  subject?: string;
+  preview?: string;
+  sender_name?: string;
+  sender_email?: string;
 }
 
 export interface InternalNote {

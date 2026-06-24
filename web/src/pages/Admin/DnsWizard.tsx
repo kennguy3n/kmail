@@ -29,7 +29,14 @@ export default function DnsWizard() {
 
   useEffect(() => {
     if (!selectedTenantId) return;
-    listDomains(selectedTenantId).then(setDomains).catch((e) => setError(String(e)));
+    listDomains(selectedTenantId)
+      .then((list) => {
+        setDomains(list);
+        if (list.length > 0 && !selectedDomainId) {
+          setSelectedDomainId(list[0].id);
+        }
+      })
+      .catch((e) => setError(String(e)));
   }, [selectedTenantId]);
 
   const reload = async () => {

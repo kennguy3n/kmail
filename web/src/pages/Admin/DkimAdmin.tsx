@@ -59,9 +59,10 @@ export default function DkimAdmin() {
   };
 
   return (
-    <div className="admin-page">
+    <div className="kmail-admin-page">
       <h2>DKIM keys</h2>
-      <div className="tenant-picker">
+      <p className="kmail-admin-hint">View and rotate signing keys per domain. Add the new DNS record before traffic switches over.</p>
+      <div className="kmail-admin-tenant-picker">
         <label>
           Tenant{" "}
           <select
@@ -87,13 +88,13 @@ export default function DkimAdmin() {
             ))}
           </select>
         </label>
-        <button type="button" disabled={pending || !domainId} onClick={onRotate}>
+        <button type="button" className="kmail-button" disabled={pending || !domainId} onClick={onRotate}>
           Rotate key
         </button>
       </div>
-      {error && <p className="error">{error}</p>}
-      {info && <p className="info">{info}</p>}
-      <table className="admin-table">
+      {error && <p className="kmail-error">{error}</p>}
+      {info && <p className="kmail-info">{info}</p>}
+      <table className="kmail-admin-table">
         <thead>
           <tr>
             <th>Selector</th>
@@ -106,8 +107,20 @@ export default function DkimAdmin() {
         <tbody>
           {keys.map((k) => (
             <tr key={k.id}>
-              <td>{k.selector}</td>
-              <td>{k.status}</td>
+              <td className="font-mono text-xs">{k.selector}</td>
+              <td>
+                <span
+                  className={
+                    k.status === "active"
+                      ? "kmail-flag-ok"
+                      : k.status === "deprecated"
+                        ? "kmail-flag-pending"
+                        : "inline-flex rounded-pill bg-surface-muted px-2 py-0.5 text-xs font-semibold text-fg-muted"
+                  }
+                >
+                  {k.status}
+                </span>
+              </td>
               <td>{k.created_at}</td>
               <td>{k.activated_at ?? "—"}</td>
               <td>{k.revoked_at ?? "—"}</td>

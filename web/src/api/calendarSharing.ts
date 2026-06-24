@@ -8,6 +8,10 @@ export interface CalendarShare {
   target_account_id: string;
   permission: "read" | "readwrite" | "admin";
   created_at: string;
+  /** Optional display metadata from the BFF. */
+  calendar_name?: string;
+  target_name?: string;
+  owner_name?: string;
 }
 
 export interface ResourceCalendar {

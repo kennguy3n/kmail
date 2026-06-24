@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
-import { InboxIcon, Mail, Search, Tag } from "lucide-react";
+import { InboxIcon, Mail, Search, Tag, Trash2, Clock, Eye, EyeOff, AlertTriangle } from "lucide-react";
 
 import { cn } from "../../lib/cn";
+import { Avatar } from "../../components/ui/Avatar";
 import { Button } from "../../components/ui/Button";
 import { EmptyState } from "../../components/ui/EmptyState";
 
@@ -32,14 +33,14 @@ const CATEGORY_TABS: { label: string; value: EmailCategory | "all" }[] = [
   { label: "Forums", value: "forums" },
 ];
 
-const CATEGORY_TAB_STYLE = "flex border-b-2 border-border mb-2 px-2";
+const CATEGORY_TAB_STYLE = "flex gap-1 border-b border-border px-2 pb-0";
 
 function categoryTabBtn(active: boolean): string {
   return cn(
-    "-mb-0.5 cursor-pointer border-0 border-b-2 bg-transparent px-3.5 py-1.5 transition-colors",
+    "relative -mb-px cursor-pointer rounded-t-lg border-0 bg-transparent px-4 py-2 text-sm font-medium transition-colors",
     active
-      ? "border-primary font-semibold text-primary"
-      : "border-transparent font-normal text-fg-muted hover:text-fg",
+      ? "text-primary after:absolute after:bottom-0 after:left-2 after:right-2 after:h-0.5 after:rounded-full after:bg-primary"
+      : "text-fg-muted hover:bg-surface-hover hover:text-fg",
   );
 }
 
@@ -1351,9 +1352,10 @@ function EmailRow({
   const from = email.from?.[0];
   const sender = from?.name ?? from?.email ?? "(unknown sender)";
   const subject = email.subject ?? "(no subject)";
+  const preview = email.preview ?? "";
   const dateLabel = formatDate(email.receivedAt);
   return (
-    <li>
+    <li className="group relative">
       <div
         draggable
         onDragStart={(e) => {
@@ -1363,10 +1365,9 @@ function EmailRow({
         }}
         onDragEnd={onDragEnd}
         className={cn(
-          layoutStyles.emailRow,
-          isUnread && layoutStyles.emailRowUnread,
-          inJunkView && layoutStyles.emailRowJunk,
-          selected && layoutStyles.emailRowSelected,
+          "flex cursor-pointer items-center gap-3 border-b border-border px-3 py-2.5 transition-colors hover:bg-surface-hover",
+          isUnread && "bg-surface",
+          selected && "bg-surface-active",
         )}
       >
         <input
@@ -1374,12 +1375,12 @@ function EmailRow({
           checked={selected}
           onClick={(e) => e.stopPropagation()}
           onChange={onToggleSelected}
-          className={layoutStyles.rowCheckbox}
+          className="shrink-0 cursor-pointer"
           aria-label={`Select message from ${sender}`}
         />
         {inJunkView && (
           <span
-            className={layoutStyles.junkRowBadge}
+            className="inline-flex shrink-0 items-center rounded-md bg-warning px-1.5 py-0.5 text-[0.65rem] font-bold tracking-wider text-white"
             title="Filed as spam by the server or by a user"
             aria-label="Junk"
           >
@@ -1389,41 +1390,58 @@ function EmailRow({
         <button
           type="button"
           onClick={onOpen}
-          className={layoutStyles.emailRowMain}
+          className="flex flex-1 items-center gap-3 overflow-hidden text-left"
         >
-          <span className={layoutStyles.emailSender}>
+          <Avatar name={sender} size="sm" />
+          <span className="w-36 shrink-0 truncate text-sm font-medium text-fg">
             {sender}
+          </span>
+          <span className="min-w-0 flex-1 truncate">
+            <span className={cn("text-sm", isUnread ? "font-semibold text-fg" : "text-fg")}>
+              {subject}
+            </span>
+            {preview && (
+              <span className="text-sm text-fg-muted">
+                {" — "}
+                {preview}
+              </span>
+            )}
+            {rowLabels.length > 0 && (
+              <span className="ml-2 inline-flex gap-1">
+                {rowLabels.map((l) => (
+                  <span
+                    key={l.id}
+                    className="inline-flex items-center rounded-pill px-2 py-0.5 text-[0.65rem] font-semibold text-white"
+                    style={{ background: l.color }}
+                  >
+                    {l.name}
+                  </span>
+                ))}
+              </span>
+            )}
             {threadCount > 1 && (
-              <span className={layoutStyles.threadBadge} title={`${threadCount} messages in this conversation`}>
+              <span
+                className="ml-2 inline-flex h-[1.1rem] min-w-[1.1rem] items-center justify-center rounded-pill bg-fg-subtle px-1 text-[0.7rem] font-bold text-white"
+                title={`${threadCount} messages in this conversation`}
+              >
                 {threadCount}
               </span>
             )}
           </span>
-          <span className={layoutStyles.emailSubjectWrap}>
-            <span className={layoutStyles.emailSubject}>{subject}</span>
-            {rowLabels.map((l) => (
-              <span
-                key={l.id}
-                className={layoutStyles.rowLabelChip}
-                style={{ background: l.color }}
-              >
-                {l.name}
-              </span>
-            ))}
-          </span>
-          <span className={layoutStyles.emailDate}>{dateLabel}</span>
+          <span className="shrink-0 text-xs text-fg-muted">{dateLabel}</span>
         </button>
-        <div className={layoutStyles.emailActions}>
+        <div className="flex shrink-0 items-center gap-1 opacity-0 transition-opacity group-hover:opacity-100">
           <button
             type="button"
             onClick={(e) => {
               e.stopPropagation();
               onToggleRead();
             }}
-            className={layoutStyles.actionButton}
+            className="inline-flex size-8 items-center justify-center rounded-md text-fg-muted hover:bg-surface-hover hover:text-fg"
             title={isUnread ? "Mark as read" : "Mark as unread"}
+            aria-label={isUnread ? "Mark as read" : "Mark as unread"}
           >
-            {isUnread ? "Mark read" : "Mark unread"}
+            {isUnread ? <Eye className="size-4" /> : <EyeOff className="size-4" />}
           </button>
           {hasJunkMailbox && (
             <button
@@ -1432,14 +1450,15 @@ function EmailRow({
                 e.stopPropagation();
                 onToggleSpam();
               }}
-              className={layoutStyles.actionButton}
+              className="inline-flex size-8 items-center justify-center rounded-md text-fg-muted hover:bg-warning-bg hover:text-warning"
               title={
                 inJunkView
-                  ? "Not spam — move back to Inbox and clear the junk flag"
-                  : "Mark as spam — move to Junk and train the spam classifier"
+                  ? "Not spam — move back to Inbox"
+                  : "Mark as spam"
               }
+              aria-label={inJunkView ? "Not spam" : "Mark as spam"}
             >
-              {inJunkView ? "Not spam" : "Spam"}
+              <AlertTriangle className="size-4" />
             </button>
           )}
           <button
@@ -1448,12 +1467,13 @@ function EmailRow({
               e.stopPropagation();
               onMoveToTrash();
             }}
-            className={layoutStyles.actionButton}
+            className="inline-flex size-8 items-center justify-center rounded-md text-fg-muted hover:bg-danger-bg hover:text-danger"
             title={inTrashView ? "Delete permanently" : "Move to trash"}
+            aria-label={inTrashView ? "Delete permanently" : "Move to trash"}
           >
-            {inTrashView ? "Delete" : "Trash"}
+            <Trash2 className="size-4" />
           </button>
-          <div className={layoutStyles.snoozeWrap}>
+          <div className="relative inline-block">
             <button
               type="button"
               onClick={(e) => {
@@ -1461,12 +1481,13 @@ function EmailRow({
                 onOpenSnooze();
               }}
               disabled={snoozeBusy}
-              className={layoutStyles.actionButton}
-              title="Snooze this email until later"
+              className="inline-flex size-8 items-center justify-center rounded-md text-fg-muted hover:bg-surface-hover hover:text-fg disabled:opacity-50"
+              title="Snooze"
               aria-haspopup="dialog"
               aria-expanded={snoozeOpen}
+              aria-label="Snooze"
             >
-              {snoozeBusy ? "Snoozing…" : "Snooze"}
+              <Clock className="size-4" />
             </button>
             {snoozeOpen && (
               <SnoozePicker

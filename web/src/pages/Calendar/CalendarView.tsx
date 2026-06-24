@@ -819,80 +819,80 @@ function errorMessage(err: unknown): string {
 
 /** Theme-aware Tailwind class recipes for the calendar view. */
 const styles: Record<string, string> = {
-  root: "relative grid min-h-[calc(100vh-4rem)] grid-cols-[220px_1fr] gap-4",
-  sidebar: "border-r border-border bg-surface-muted p-4",
-  sidebarHeader: "mb-3 flex items-center justify-between",
-  sidebarTitle: "m-0 text-lg font-semibold",
+  root: "relative grid min-h-[calc(100vh-4rem)] grid-cols-[240px_1fr] gap-5 bg-canvas",
+  sidebar: "border-r border-border bg-surface p-5",
+  sidebarHeader: "mb-4 flex items-center justify-between",
+  sidebarTitle: "m-0 text-lg font-semibold tracking-tight text-fg",
   newEventButton:
-    "cursor-pointer rounded-md border-0 bg-primary px-2 py-1 text-sm font-medium text-primary-fg transition-colors hover:bg-primary-hover",
+    "inline-flex cursor-pointer items-center gap-1.5 rounded-lg border-0 bg-primary px-3 py-1.5 text-sm font-semibold text-primary-fg shadow-sm transition-colors hover:bg-primary-hover",
   calendarList: "m-0 flex list-none flex-col gap-1 p-0",
-  calendarItem: "py-1",
-  calendarLabel: "flex cursor-pointer items-center gap-1.5 text-sm",
-  colorSwatch: "mr-1 inline-block size-3 rounded-sm align-middle",
-  defaultBadge: "ml-auto text-xs text-fg-muted",
-  main: "min-w-0 p-4",
-  toolbar: "mb-3 flex flex-wrap items-center justify-between gap-3",
+  calendarItem: "rounded-lg px-2 py-1.5 transition-colors hover:bg-surface-hover",
+  calendarLabel: "flex cursor-pointer items-center gap-2 text-sm",
+  colorSwatch: "inline-block size-3 rounded-full",
+  defaultBadge: "ml-auto rounded-pill bg-surface-muted px-1.5 py-0.5 text-[0.65rem] font-semibold uppercase tracking-wider text-fg-muted",
+  main: "min-w-0 p-5",
+  toolbar: "mb-4 flex flex-wrap items-center justify-between gap-3",
   toolbarLeft: "flex items-center gap-2",
   navButton:
-    "cursor-pointer rounded-md border border-border bg-surface px-2 py-1 leading-none transition-colors hover:bg-surface-hover",
+    "inline-flex size-8 cursor-pointer items-center justify-center rounded-lg border border-border bg-surface text-lg text-fg-muted transition-colors hover:bg-surface-hover hover:text-fg",
   todayButton:
-    "cursor-pointer rounded-md border border-border bg-surface px-3 py-1.5 text-sm transition-colors hover:bg-surface-hover",
+    "cursor-pointer rounded-lg border border-border bg-surface px-3 py-1.5 text-sm font-semibold text-fg transition-colors hover:bg-surface-hover",
   rangeLabel: "ml-2 text-base font-semibold text-fg",
   viewToggle:
-    "inline-flex overflow-hidden rounded-md border border-border",
+    "inline-flex overflow-hidden rounded-lg border border-border bg-surface p-0.5",
   viewToggleButton:
-    "cursor-pointer border-0 border-r border-border bg-surface px-3 py-1.5 text-sm transition-colors last:border-r-0 hover:bg-surface-hover",
-  viewToggleButtonActive: "bg-primary-subtle font-semibold text-primary",
+    "cursor-pointer rounded-md border-0 bg-transparent px-3 py-1 text-sm font-medium text-fg-muted transition-colors hover:bg-surface-hover hover:text-fg",
+  viewToggleButtonActive: "bg-surface-muted font-semibold text-primary shadow-sm",
   error:
-    "mb-3 flex items-center justify-between gap-2 rounded-md bg-danger-bg px-3 py-2 text-danger-fg",
+    "mb-3 flex items-center justify-between gap-2 rounded-lg bg-danger-bg px-3 py-2.5 text-sm text-danger-fg",
   errorDismiss:
-    "cursor-pointer border-0 bg-transparent px-1 text-lg leading-none text-danger-fg",
-  muted: "italic text-fg-muted",
+    "cursor-pointer rounded-md border-0 bg-transparent px-1.5 text-lg leading-none text-danger-fg hover:bg-danger-bg",
+  muted: "text-sm italic text-fg-muted",
   timeGrid:
-    "grid overflow-hidden rounded-md border border-border bg-surface",
+    "grid overflow-hidden rounded-xl border border-border bg-surface shadow-sm",
   timeGutterHeader: "border-b border-border bg-surface-muted",
   dayHeader:
-    "border-b border-l border-border bg-surface-muted p-1.5 text-center",
-  dayHeaderDow: "text-xs uppercase text-fg-muted",
-  dayHeaderDom: "text-base font-semibold",
+    "border-b border-l border-border bg-surface-muted p-2 text-center",
+  dayHeaderDow: "text-xs font-semibold uppercase tracking-wider text-fg-muted",
+  dayHeaderDom: "text-lg font-semibold text-fg",
   timeGutter:
-    "border-b border-r border-border px-1.5 py-1 text-right text-xs text-fg-muted",
+    "border-b border-r border-border px-2 py-1.5 text-right text-xs font-medium text-fg-muted",
   timeSlot:
     "relative flex min-h-10 cursor-pointer flex-col gap-0.5 border-b border-l border-border bg-surface p-1 text-left font-[inherit] transition-colors hover:bg-surface-hover",
   eventChip:
-    "flex cursor-pointer flex-col rounded-sm px-1.5 py-1 text-xs leading-tight text-white",
+    "flex cursor-pointer flex-col gap-0.5 rounded-md px-2 py-1 text-xs leading-tight text-white shadow-sm transition-transform hover:scale-[1.02]",
   eventChipTitle: "overflow-hidden text-ellipsis whitespace-nowrap font-semibold",
-  eventChipTime: "text-[0.65rem] opacity-90",
+  eventChipTime: "text-[0.65rem] font-medium opacity-90",
   monthGrid:
-    "grid auto-rows-[minmax(5rem,1fr)] grid-cols-7 overflow-hidden rounded-md border border-border bg-surface",
+    "grid auto-rows-[minmax(5rem,1fr)] grid-cols-7 overflow-hidden rounded-xl border border-border bg-surface shadow-sm",
   monthHeader:
-    "border-b border-l border-border bg-surface-muted p-1.5 text-center text-xs uppercase text-fg-muted",
+    "border-b border-l border-border bg-surface-muted p-2 text-center text-xs font-semibold uppercase tracking-wider text-fg-muted",
   monthCell:
-    "flex cursor-pointer flex-col gap-0.5 border-l border-t border-border bg-surface p-1 text-left font-[inherit] transition-colors hover:bg-surface-hover",
+    "flex cursor-pointer flex-col gap-0.5 border-l border-t border-border bg-surface p-2 text-left font-[inherit] transition-colors hover:bg-surface-hover",
   monthCellOut: "bg-surface-muted text-fg-subtle",
-  monthDom: "text-sm font-semibold",
-  monthEvents: "flex flex-col gap-0.5",
+  monthDom: "mb-1 text-sm font-semibold",
+  monthEvents: "flex flex-col gap-1",
   monthEventChip:
-    "cursor-pointer overflow-hidden text-ellipsis whitespace-nowrap rounded-sm px-1.5 py-0.5 text-xs text-white",
-  monthMore: "text-xs text-fg-muted",
+    "cursor-pointer overflow-hidden text-ellipsis whitespace-nowrap rounded-md px-2 py-0.5 text-xs font-medium text-white shadow-sm transition-transform hover:scale-[1.02]",
+  monthMore: "text-xs font-medium text-fg-muted",
   detailsPanel:
-    "fixed right-4 top-20 z-modal max-h-[calc(100vh-6rem)] w-80 overflow-y-auto rounded-lg border border-border bg-elevated p-4 shadow-lg",
-  detailsHeader: "mb-2 flex items-center justify-between",
-  detailsTitle: "m-0 text-lg font-semibold",
+    "fixed right-5 top-20 z-modal max-h-[calc(100vh-6rem)] w-80 overflow-y-auto rounded-xl border border-border bg-elevated p-5 shadow-xl",
+  detailsHeader: "mb-3 flex items-center justify-between",
+  detailsTitle: "m-0 text-lg font-semibold tracking-tight text-fg",
   detailsClose:
-    "cursor-pointer border-0 bg-transparent text-xl leading-none text-fg-muted hover:text-fg",
-  detailsRow: "my-1 text-sm",
+    "cursor-pointer rounded-md border-0 bg-transparent p-1 text-xl leading-none text-fg-muted transition-colors hover:bg-surface-hover hover:text-fg",
+  detailsRow: "my-1.5 text-sm text-fg-muted",
   participantList: "m-0 mt-1 list-none p-0 text-sm",
-  rsvpBadge: "text-xs italic text-fg-muted",
-  detailsActions: "mt-3 flex gap-1.5",
+  rsvpBadge: "text-xs font-medium text-fg-muted",
+  detailsActions: "mt-3 flex gap-2",
   rsvpAccept:
-    "cursor-pointer rounded-md border-0 bg-success px-2.5 py-1 text-xs text-white transition-opacity hover:opacity-90",
+    "cursor-pointer rounded-lg border-0 bg-success px-3 py-1.5 text-xs font-semibold text-white transition-colors hover:bg-success/90",
   rsvpTentative:
-    "cursor-pointer rounded-md border-0 bg-warning px-2.5 py-1 text-xs text-white transition-opacity hover:opacity-90",
+    "cursor-pointer rounded-lg border-0 bg-warning px-3 py-1.5 text-xs font-semibold text-white transition-colors hover:bg-warning/90",
   rsvpDecline:
-    "cursor-pointer rounded-md border-0 bg-danger px-2.5 py-1 text-xs text-white transition-opacity hover:opacity-90",
+    "cursor-pointer rounded-lg border-0 bg-danger px-3 py-1.5 text-xs font-semibold text-white transition-colors hover:bg-danger/90",
   editButton:
-    "cursor-pointer rounded-md border-0 bg-primary px-2.5 py-1 text-xs font-medium text-primary-fg transition-colors hover:bg-primary-hover",
+    "cursor-pointer rounded-lg border-0 bg-primary px-3 py-1.5 text-xs font-semibold text-primary-fg transition-colors hover:bg-primary-hover",
   deleteButton:
-    "cursor-pointer rounded-md border border-danger/40 bg-surface px-2.5 py-1 text-xs text-danger-fg transition-colors hover:bg-danger-bg",
+    "cursor-pointer rounded-lg border border-danger/40 bg-surface px-3 py-1.5 text-xs font-semibold text-danger-fg transition-colors hover:bg-danger-bg",
 };

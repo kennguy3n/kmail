@@ -7,6 +7,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Contact2, User } from "lucide-react";
 
+import { cn } from "../../lib/cn";
+import { Avatar } from "../../components/ui/Avatar";
 import { Button } from "../../components/ui/Button";
 import { EmptyState } from "../../components/ui/EmptyState";
 import {
@@ -37,7 +39,7 @@ type Tab = "personal" | "global";
 
 export default function ContactsView() {
   const { tenants, selectedTenantId, selectTenant } = useTenantSelection();
-  const [tab, setTab] = useState<Tab>("personal");
+  const [tab, setTab] = useState<Tab>("global");
   const [accountId, setAccountId] = useState("");
   const [books, setBooks] = useState<AddressBook[]>([]);
   const [bookId, setBookId] = useState<string>("");
@@ -231,11 +233,17 @@ export default function ContactsView() {
         )}
       </div>
 
-      <div role="tablist" className="mb-4 flex gap-2">
+      <div role="tablist" className="mb-4 flex gap-1 border-b border-border">
         <button
           role="tab"
           aria-selected={tab === "personal"}
           onClick={() => setTab("personal")}
+          className={cn(
+            "relative px-4 py-2 text-sm font-medium transition-colors",
+            tab === "personal"
+              ? "text-primary after:absolute after:bottom-0 after:left-2 after:right-2 after:h-0.5 after:rounded-full after:bg-primary"
+              : "text-fg-muted hover:bg-surface-hover hover:text-fg",
+          )}
         >
           Personal
         </button>
@@ -243,6 +251,12 @@ export default function ContactsView() {
           role="tab"
           aria-selected={tab === "global"}
           onClick={() => setTab("global")}
+          className={cn(
+            "relative px-4 py-2 text-sm font-medium transition-colors",
+            tab === "global"
+              ? "text-primary after:absolute after:bottom-0 after:left-2 after:right-2 after:h-0.5 after:rounded-full after:bg-primary"
+              : "text-fg-muted hover:bg-surface-hover hover:text-fg",
+          )}
         >
           Global Directory
         </button>
@@ -300,22 +314,26 @@ export default function ContactsView() {
             </div>
             <ul className="kmail-list">
               {filtered.map((c) => (
-                <li key={c.uid}>
-                  <button className="kmail-link" onClick={() => startEdit(c)}>
-                    {c.photoUrl && (
-                      <img
-                        src={c.photoUrl}
-                        alt=""
-                        className="mr-2 inline-block size-6 rounded-full align-middle"
-                      />
-                    )}
-                    <strong>{c.fn}</strong>
-                    {c.emails && c.emails.length > 0 && <small> · {c.emails[0]}</small>}
-                    {c.org && <small> · {c.org}</small>}
-                    {c.groups && c.groups.length > 0 && (
-                      <small> · {c.groups.map((g) => `[${g}]`).join(" ")}</small>
-                    )}
-                  </button>
+                <li
+                  key={c.uid}
+                  onClick={() => startEdit(c)}
+                  className="flex cursor-pointer items-center gap-3 rounded-lg border border-border bg-surface p-3 shadow-sm transition-colors hover:bg-surface-hover"
+                >
+                  <Avatar name={c.fn} src={c.photoUrl} size="md" />
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate text-sm font-semibold text-fg">
+                      {c.fn}
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2 text-xs text-fg-muted">
+                      {c.emails && c.emails.length > 0 && <span>{c.emails[0]}</span>}
+                      {c.org && <span className="rounded-pill bg-surface-muted px-1.5 py-0.5">{c.org}</span>}
+                      {c.groups && c.groups.length > 0 && (
+                        <span className="rounded-pill bg-primary-subtle px-1.5 py-0.5 text-primary">
+                          {c.groups.join(", ")}
+                        </span>
+                      )}
+                    </div>
+                  </div>
                 </li>
               ))}
               {filtered.length === 0 && (
@@ -418,13 +436,23 @@ export default function ContactsView() {
             />
             <button onClick={loadGAL}>Refresh</button>
           </div>
-          <ul className="kmail-list">
+          <ul className="kmail-list grid gap-2 sm:grid-cols-2">
             {galEntries.map((g) => (
-              <li key={`${g.email}`}>
-                <strong>{g.display_name || g.email}</strong>
-                {g.email && <small> · {g.email}</small>}
-                {g.org && <small> · {g.org}</small>}
-                {g.phone && <small> · {g.phone}</small>}
+              <li
+                key={`${g.email}`}
+                className="flex items-center gap-3 rounded-lg border border-border bg-surface p-3 shadow-sm"
+              >
+                <Avatar name={g.display_name || g.email} size="md" />
+                <div className="min-w-0 flex-1">
+                  <div className="truncate text-sm font-semibold text-fg">
+                    {g.display_name || g.email}
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2 text-xs text-fg-muted">
+                    {g.email && <span>{g.email}</span>}
+                    {g.org && <span className="rounded-pill bg-surface-muted px-1.5 py-0.5">{g.org}</span>}
+                    {g.phone && <span className="rounded-pill bg-primary-subtle px-1.5 py-0.5 text-primary">{g.phone}</span>}
+                  </div>
+                </div>
               </li>
             ))}
             {galEntries.length === 0 && (

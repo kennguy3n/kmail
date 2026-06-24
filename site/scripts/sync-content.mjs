@@ -27,6 +27,8 @@ const REPO_ROOT = path.resolve(SITE_DIR, "..");
 
 const DOCS_PUBLIC = path.join(REPO_ROOT, "docs", "public");
 const HELP_DEST = path.join(SITE_DIR, "src", "content", "help");
+const SCREENSHOTS_SRC = path.join(REPO_ROOT, "docs", "screenshots");
+const SCREENSHOTS_DEST = path.join(SITE_DIR, "public", "screenshots");
 const DEV_LOG = path.join(REPO_ROOT, "docs", "DEVELOPMENT_LOG.md");
 const PROGRESS = path.join(REPO_ROOT, "docs", "PROGRESS.md");
 const CHANGELOG_OUT = path.join(SITE_DIR, "src", "data", "changelog.generated.json");
@@ -69,6 +71,21 @@ async function mirrorHelp() {
     n++;
   }
   console.log(`[sync-content] mirrored ${n} help article(s) → src/content/help/`);
+}
+
+async function mirrorScreenshots() {
+  await rmrf(SCREENSHOTS_DEST);
+  await fs.mkdir(SCREENSHOTS_DEST, { recursive: true });
+  const files = await fs.readdir(SCREENSHOTS_SRC).catch(() => []);
+  let n = 0;
+  for (const name of files) {
+    if (!name.endsWith(".png")) continue;
+    const src = path.join(SCREENSHOTS_SRC, name);
+    const dest = path.join(SCREENSHOTS_DEST, name);
+    await fs.copyFile(src, dest);
+    n++;
+  }
+  console.log(`[sync-content] mirrored ${n} screenshot(s) → public/screenshots/`);
 }
 
 /** Collapse soft-wrapped markdown into single-spaced text. */
@@ -184,5 +201,6 @@ async function publishOpenApi() {
 }
 
 await mirrorHelp();
+await mirrorScreenshots();
 await generateChangelog();
 await publishOpenApi();

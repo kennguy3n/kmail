@@ -7,7 +7,9 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { useParams } from "react-router-dom";
+import { Lock, Mail, Shield, AlertCircle } from "lucide-react";
 
+import { Avatar } from "../../components/ui/Avatar";
 import {
   getSecureMessage,
   type SecureMessage,
@@ -64,8 +66,11 @@ export default function SecurePortal() {
   if (!token) {
     return (
       <main className="kmail-secure-portal">
-        <h1>Secure portal</h1>
-        <p>No token in URL.</p>
+        <div className="kmail-portal-body text-center">
+          <Lock className="mx-auto mb-3 size-10 text-primary" />
+          <h1 className="mb-1 text-xl font-semibold">Secure portal</h1>
+          <p className="kmail-portal-hint">No token in URL.</p>
+        </div>
       </main>
     );
   }
@@ -73,8 +78,11 @@ export default function SecurePortal() {
   if (loading && !message && !needsPassword) {
     return (
       <main className="kmail-secure-portal">
-        <h1>Secure portal</h1>
-        <p>Loading…</p>
+        <div className="kmail-portal-body text-center">
+          <Lock className="mx-auto mb-3 size-10 text-primary" />
+          <h1 className="mb-1 text-xl font-semibold">Secure portal</h1>
+          <p className="kmail-portal-hint">Unlocking message…</p>
+        </div>
       </main>
     );
   }
@@ -82,26 +90,38 @@ export default function SecurePortal() {
   if (needsPassword && !message) {
     return (
       <main className="kmail-secure-portal">
-        <h1>Secure portal</h1>
-        <p>This message is password-protected.</p>
-        <form onSubmit={onSubmit}>
-          <label>
-            Password
-            <input
-              type="password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              required
-            />
-          </label>
-          <button type="submit" disabled={loading || !password}>
-            {loading ? "Checking…" : "Open message"}
-          </button>
-        </form>
-        {error && <p className="kmail-error">{error}</p>}
-        <p className="kmail-portal-hint">
-          The link is rate-limited to 5 attempts every 15 minutes per token.
-        </p>
+        <div className="kmail-portal-body">
+          <div className="mb-4 text-center">
+            <div className="mx-auto mb-3 inline-flex size-12 items-center justify-center rounded-full bg-primary-subtle">
+              <Lock className="size-6 text-primary" />
+            </div>
+            <h1 className="mb-1 text-xl font-semibold">This message is protected</h1>
+            <p className="kmail-portal-hint">Enter the password shared by the sender to open it.</p>
+          </div>
+          <form onSubmit={onSubmit} className="flex flex-col gap-3">
+            <label className="flex flex-col gap-1 text-sm font-medium text-fg-muted">
+              Password
+              <input
+                type="password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                required
+                className="rounded-lg border border-border bg-surface px-3 py-2 text-sm text-fg outline-none focus-visible:border-primary focus-visible:ring-2 focus-visible:ring-primary-subtle"
+              />
+            </label>
+            <button
+              type="submit"
+              disabled={loading || !password}
+              className="kmail-button"
+            >
+              {loading ? "Checking…" : "Open message"}
+            </button>
+          </form>
+          {error && <p className="kmail-error">{error}</p>}
+          <p className="kmail-portal-hint text-center">
+            This link is rate-limited to 5 attempts every 15 minutes per token.
+          </p>
+        </div>
       </main>
     );
   }
@@ -109,8 +129,11 @@ export default function SecurePortal() {
   if (error) {
     return (
       <main className="kmail-secure-portal">
-        <h1>Secure portal</h1>
-        <p className="kmail-error">{error}</p>
+        <div className="kmail-portal-body text-center">
+          <AlertCircle className="mx-auto mb-3 size-10 text-danger" />
+          <h1 className="mb-1 text-xl font-semibold">Could not open message</h1>
+          <p className="kmail-error">{error}</p>
+        </div>
       </main>
     );
   }
@@ -122,27 +145,53 @@ export default function SecurePortal() {
       ? Math.max(0, message.max_views - message.view_count)
       : null;
 
+  const expiry = new Date(message.expires_at).toLocaleDateString(undefined, {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+  });
+
   return (
     <main className="kmail-secure-portal">
-      <h1>Confidential message</h1>
-      <p className="kmail-portal-meta">
-        From: <code>{message.sender_id}</code>
-        <br />
-        Expires: <code>{message.expires_at}</code>
-        <br />
-        Views: {message.view_count}
-        {remainingViews !== null && <> &middot; Remaining: {remainingViews}</>}
-      </p>
-      <article className="kmail-portal-body">
-        <p>
-          The encrypted message envelope lives in zk-object-fabric under
-          reference: <code>{message.encrypted_blob_ref ?? "—"}</code>
+      <div className="kmail-portal-body">
+        <div className="flex items-center justify-center gap-2 rounded-lg bg-primary-subtle px-3 py-2 text-sm font-semibold text-primary">
+          <Shield className="size-4" />
+          Confidential send — end-to-end encrypted
+        </div>
+
+        <div className="flex items-center gap-3 border-b border-border pb-4">
+          <Avatar name={message.sender_id} size="lg" />
+          <div>
+            <div className="font-semibold text-fg">{message.sender_id}</div>
+            <div className="text-sm text-fg-muted">Sender</div>
+          </div>
+        </div>
+
+        <div>
+          <h1 className="mb-2 text-xl font-semibold tracking-tight text-fg">
+            {message.subject || "Confidential message"}
+          </h1>
+          <div className="kmail-portal-hint flex flex-wrap gap-3">
+            <span className="inline-flex items-center gap-1">
+              <Mail className="size-3.5" />
+              Expires {expiry}
+            </span>
+            <span>Viewed {message.view_count} time{message.view_count === 1 ? "" : "s"}</span>
+            {remainingViews !== null && <span>{remainingViews} remaining</span>}
+          </div>
+        </div>
+
+        <article
+          className="rounded-lg border border-border bg-surface p-4 text-sm leading-relaxed text-fg"
+          dangerouslySetInnerHTML={{
+            __html: message.body_html ?? `<p>${message.body ?? "No content."}</p>`,
+          }}
+        />
+
+        <p className="kmail-portal-hint text-center">
+          The encrypted envelope is decrypted client-side. KMail servers cannot read this message.
         </p>
-        <p>
-          The KMail BFF only stores opaque pointers; the actual ciphertext is
-          fetched and decrypted client-side.
-        </p>
-      </article>
+      </div>
     </main>
   );
 }

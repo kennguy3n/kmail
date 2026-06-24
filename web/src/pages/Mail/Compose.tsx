@@ -1441,53 +1441,55 @@ function parseLocalDatetime(raw: string): Date | null {
  * the previous hard-coded palette.
  */
 const styles: Record<string, string> = {
-  root: "max-w-[900px] p-4",
-  header: "mb-3",
-  title: "m-0 text-xl font-semibold",
-  form: "flex flex-col gap-2 rounded-lg border border-border bg-surface p-4",
-  row: "grid grid-cols-[80px_1fr] items-center gap-2",
-  bodyRow: "relative mt-1 flex flex-col",
-  bodyRowDragging: "rounded-sm outline-dashed outline-2 outline-offset-2 outline-primary",
+  root: "mx-auto max-w-[960px] p-6",
+  header: "mb-5",
+  title: "m-0 text-2xl font-semibold tracking-tight text-fg",
+  form: "flex flex-col gap-3 rounded-xl border border-border bg-surface p-6 shadow-sm",
+  row: "grid grid-cols-[72px_1fr] items-center gap-3",
+  bodyRow: "relative mt-1 flex flex-col rounded-lg border border-border bg-surface overflow-hidden",
+  bodyRowDragging: "ring-2 ring-primary ring-offset-2 ring-offset-canvas",
   dropHint:
-    "pointer-events-none absolute inset-0 flex items-center justify-center rounded-sm bg-primary/10 font-semibold text-primary",
-  composeToolbar: "mt-2 flex flex-wrap items-center gap-2",
+    "pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-lg bg-primary/10 font-semibold text-primary",
+  composeToolbar: "flex flex-wrap items-center gap-1 border-b border-border bg-surface-muted px-2 py-1.5",
   toolbarButton:
-    "cursor-pointer rounded-md border border-border bg-surface px-2.5 py-1.5 text-xs text-fg transition-colors hover:bg-surface-hover",
-  receiptLabel: "ml-auto inline-flex items-center text-xs text-fg-muted",
-  attachmentList: "m-0 mt-1.5 grid list-none gap-1 p-0",
+    "inline-flex h-8 items-center justify-center rounded-md px-2 text-xs font-medium text-fg-muted transition-colors hover:bg-surface-hover hover:text-fg",
+  toolbarButtonActive:
+    "inline-flex h-8 items-center justify-center rounded-md bg-surface px-2 text-xs font-semibold text-primary transition-colors",
+  receiptLabel: "ml-auto inline-flex items-center gap-1 text-xs text-fg-muted",
+  attachmentList: "m-0 mt-2 grid list-none gap-1.5 p-0",
   attachmentItem:
-    "flex items-center justify-between gap-2 rounded-md bg-surface-muted px-2 py-1 text-xs text-fg",
+    "flex items-center justify-between gap-3 rounded-md border border-border bg-surface px-3 py-2 text-sm text-fg",
   attachmentRemove:
-    "cursor-pointer border-0 bg-transparent text-base leading-none text-fg-muted hover:text-fg",
-  largeFileDetails: "mt-2 text-xs",
-  largeFileSummary: "cursor-pointer text-fg-muted",
-  label: "text-sm font-semibold text-fg-muted",
+    "cursor-pointer rounded-md border-0 bg-transparent p-1 text-fg-muted transition-colors hover:bg-danger-bg hover:text-danger",
+  largeFileDetails: "mt-2 text-xs text-fg-muted",
+  largeFileSummary: "cursor-pointer text-fg-muted hover:text-fg",
+  label: "text-sm font-medium text-fg-muted",
   input:
-    "rounded-md border border-border bg-surface px-2 py-1.5 text-sm text-fg outline-none focus-visible:border-primary focus-visible:ring-2 focus-visible:ring-primary-subtle",
+    "rounded-lg border border-border bg-surface px-3 py-2 text-sm text-fg outline-none transition-colors placeholder:text-fg-subtle focus-visible:border-primary focus-visible:ring-2 focus-visible:ring-primary-subtle",
   select:
-    "rounded-md border border-border bg-surface px-2 py-1.5 text-sm text-fg outline-none focus-visible:border-primary focus-visible:ring-2 focus-visible:ring-primary-subtle",
+    "rounded-lg border border-border bg-surface px-3 py-2 text-sm text-fg outline-none transition-colors focus-visible:border-primary focus-visible:ring-2 focus-visible:ring-primary-subtle",
   textarea:
-    "min-h-64 resize-y rounded-md border border-border bg-surface p-2.5 text-sm text-fg outline-none focus-visible:border-primary focus-visible:ring-2 focus-visible:ring-primary-subtle",
-  buttonRow: "mt-2 flex gap-2",
+    "min-h-72 resize-y border-0 bg-surface p-4 text-sm text-fg outline-none focus-visible:ring-0",
+  buttonRow: "mt-4 flex items-center gap-3",
   primaryButton:
-    "cursor-pointer rounded-md border-0 bg-primary px-4 py-2 text-sm font-medium text-primary-fg transition-colors hover:bg-primary-hover",
+    "cursor-pointer rounded-lg border-0 bg-primary px-5 py-2.5 text-sm font-semibold text-primary-fg shadow-sm transition-colors hover:bg-primary-hover",
   secondaryButton:
-    "cursor-pointer rounded-md border border-border bg-surface px-4 py-2 text-sm text-fg transition-colors hover:bg-surface-hover",
+    "cursor-pointer rounded-lg border border-border bg-surface px-5 py-2.5 text-sm font-semibold text-fg transition-colors hover:bg-surface-hover",
   error:
-    "mb-2 flex items-center justify-between gap-2 rounded-md bg-danger-bg px-3 py-2 text-danger-fg",
+    "mb-3 flex items-center justify-between gap-2 rounded-lg bg-danger-bg px-3 py-2.5 text-sm text-danger-fg",
   errorDismiss:
-    "cursor-pointer border-0 bg-transparent px-1 text-lg leading-none text-danger-fg",
-  success: "mb-2 rounded-md bg-success-bg px-3 py-2 text-success-fg",
+    "cursor-pointer rounded-md border-0 bg-transparent px-1.5 text-lg leading-none text-danger-fg hover:bg-danger-bg",
+  success: "mb-3 rounded-lg bg-success-bg px-3 py-2.5 text-sm text-success-fg",
   undoBanner:
-    "mb-2 flex items-center justify-between gap-3 rounded-md bg-fg px-3 py-2 text-canvas",
+    "mb-3 flex items-center justify-between gap-3 rounded-lg bg-fg px-4 py-3 text-sm text-canvas",
   undoCancel:
-    "cursor-pointer rounded-md border border-canvas bg-transparent px-3 py-1 font-semibold text-canvas",
+    "cursor-pointer rounded-md border border-canvas bg-transparent px-3 py-1 text-sm font-semibold text-canvas transition-colors hover:bg-canvas/10",
   scheduledBanner:
-    "mb-2 flex items-center gap-3 rounded-md bg-info-bg px-3 py-2 text-info-fg",
+    "mb-3 flex items-center gap-3 rounded-lg bg-info-bg px-4 py-3 text-sm text-info-fg",
   linkButton:
-    "cursor-pointer border-0 bg-transparent p-0 font-[inherit] text-primary underline",
+    "cursor-pointer border-0 bg-transparent p-0 font-[inherit] text-primary underline hover:text-primary-hover",
   secondarySelect:
-    "rounded-md border border-border bg-surface px-3 py-2 text-sm text-fg",
+    "rounded-lg border border-border bg-surface px-3 py-2 text-sm text-fg",
   scheduleInput:
-    "rounded-md border border-border bg-surface px-3 py-2 text-sm text-fg",
+    "rounded-lg border border-border bg-surface px-3 py-2 text-sm text-fg",
 };
